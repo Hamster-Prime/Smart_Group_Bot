@@ -53,7 +53,7 @@ class RAGService:
         system_prompt = build_defended_system(RAG_SYSTEM.format(context=context))
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         if history:
-            messages.extend(sanitize_history_for_llm(history))
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("用户问题", q, max_len=1000)})
 
         result = await self.llm.chat(messages)

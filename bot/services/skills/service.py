@@ -135,7 +135,7 @@ class SkillService:
 
         messages: list[dict[str, str]] = [{"role": "system", "content": build_defended_system(SKILL_ANSWER_SYSTEM)}]
         if history:
-            messages.extend(sanitize_history_for_llm(history))
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append(
             {
                 "role": "user",
@@ -152,4 +152,3 @@ class SkillService:
             log.info("技能回复生成成功: skill=%s", result.skill)
             return reply
         return result.summary
-

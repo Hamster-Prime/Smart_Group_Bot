@@ -26,7 +26,7 @@ class CasualService:
 
         messages: list[dict[str, str]] = [{"role": "system", "content": build_defended_system(CASUAL_SYSTEM)}]
         if history:
-            messages.extend(sanitize_history_for_llm(history))
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("用户消息", q, max_len=1000)})
 
         log.info("闲聊请求: '%s', history=%d条", q[:50], len(history) if history else 0)

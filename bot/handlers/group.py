@@ -277,7 +277,7 @@ async def on_group_message(
         log.info("[%s] 决策结果: action=%s", group_id, action)
 
         if action != "skip":
-            history = memory.get_history(group_id)
+            history = memory.get_history_for_llm(group_id)
             log.info("[%s] 步骤3: 生成回复 action=%s history_len=%d", group_id, action, len(history))
 
             if action == "knowledge":
