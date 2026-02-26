@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ModerationConfig
-from bot.db.models import ModerationRule, UserWarning, Violation
+from bot.db.models import ModerationExemption, ModerationRule, UserWarning, Violation
 from bot.services.llm import LLMService
 from bot.utils.prompts import MODERATION_SYSTEM
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
@@ -128,6 +128,15 @@ class ModerationService:
     def __init__(self, config: ModerationConfig, llm: LLMService) -> None:
         self.config = config
         self.llm = llm
+
+    async def is_user_exempt(self, session: AsyncSession, group_id: int, user_id: int) -> bool:
+        stmt = select(ModerationExemption.id).where(
+            ModerationExemption.group_id == group_id,
+            ModerationExemption.user_id == user_id,
+        )
+        with session.no_autoflush:
+            result = await session.execute(stmt)
+        return result.scalar_one_or_none() is not None
 
     async def check_rules(
         self, session: AsyncSession, group_id: int, text: str

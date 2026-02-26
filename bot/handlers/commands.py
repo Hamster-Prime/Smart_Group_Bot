@@ -70,6 +70,8 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/addrule &lt;自然语言指令&gt; - 管理审核规则\n"
         "/rules - 查看审核规则\n"
         "/warnings &lt;用户ID&gt; - 查看警告记录\n\n"
+        "/aiexempt - 回复目标用户消息，开启 AI 审查豁免\n"
+        "/unaiexempt - 回复目标用户消息，取消 AI 审查豁免\n\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup [群ID] - 授权群组\n"
         "/unauthgroup [群ID] - 取消授权群组\n"

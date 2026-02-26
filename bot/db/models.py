@@ -90,6 +90,18 @@ class UserWarning(Base):
     __table_args__ = (Index("ix_warn_group_user", "group_id", "user_id", unique=True),)
 
 
+class ModerationExemption(Base):
+    __tablename__ = "moderation_exemptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    created_by: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (Index("ix_exempt_group_user", "group_id", "user_id", unique=True),)
+
+
 class Admin(Base):
     __tablename__ = "admins"
 

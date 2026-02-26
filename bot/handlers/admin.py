@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import ModerationRule, UserWarning
+from bot.db.models import ModerationExemption, ModerationRule, UserWarning
 from bot.services.authz import (
     authorize_group,
     deauthorize_group,
@@ -284,4 +284,70 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
     else:
         status = "已封禁" if warn.is_banned else "正常"
         await message.answer(f"用户 {user_id}: 警告 {warn.count} 次，状态: {status}")
+
+
+@router.message(Command("aiexempt"))
+async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
+        return
+
+    reply = message.reply_to_message
+    target = reply.from_user if reply else None
+    if not target:
+        await message.answer("请回复目标用户的一条消息后再执行：/aiexempt")
+        return
+    if target.is_bot:
+        await message.answer("机器人账号无需设置 AI 审查豁免。")
+        return
+
+    stmt = select(ModerationExemption).where(
+        ModerationExemption.group_id == message.chat.id,
+        ModerationExemption.user_id == target.id,
+    )
+    result = await session.execute(stmt)
+    existing = result.scalar_one_or_none()
+    if existing:
+        await message.answer(f"用户 {target.full_name}（{target.id}）已在 AI 审查豁免名单中。")
+        return
+
+    session.add(
+        ModerationExemption(
+            group_id=message.chat.id,
+            user_id=target.id,
+            created_by=(message.from_user.id if message.from_user else 0),
+        )
+    )
+    await message.answer(f"已为用户 {target.full_name}（{target.id}）开启 AI 审查豁免。")
+
+
+@router.message(Command("unaiexempt"))
+async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
+        return
+
+    reply = message.reply_to_message
+    target = reply.from_user if reply else None
+    if not target:
+        await message.answer("请回复目标用户的一条消息后再执行：/unaiexempt")
+        return
+    if target.is_bot:
+        await message.answer("机器人账号不在 AI 审查豁免名单中。")
+        return
+
+    stmt = select(ModerationExemption).where(
+        ModerationExemption.group_id == message.chat.id,
+        ModerationExemption.user_id == target.id,
+    )
+    result = await session.execute(stmt)
+    existing = result.scalar_one_or_none()
+    if not existing:
+        await message.answer(f"用户 {target.full_name}（{target.id}）当前不在 AI 审查豁免名单。")
+        return
+
+    await session.delete(existing)
+    await message.answer(f"已取消用户 {target.full_name}（{target.id}）的 AI 审查豁免。")
 

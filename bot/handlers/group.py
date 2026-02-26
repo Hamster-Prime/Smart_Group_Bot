@@ -222,28 +222,32 @@ async def on_group_message(
     log.info("[%s] step1 moderation check", group_id)
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
-        violated, reason, rule = await mod.check_rules(session, group_id, text)
-        log.info("[%s] moderation result: violated=%s reason=%s", group_id, violated, reason)
-        if violated:
-            action = rule.action if rule else "warn"
-            await mod.record_violation(session, group_id, user_id, text, action, rule)
-            count, should_ban = await mod.add_warning(session, group_id, user_id)
+        exempt = await mod.is_user_exempt(session, group_id, user_id)
+        if exempt:
+            log.info("[%s] moderation bypass: exempt user_id=%s", group_id, user_id)
+        else:
+            violated, reason, rule = await mod.check_rules(session, group_id, text)
+            log.info("[%s] moderation result: violated=%s reason=%s", group_id, violated, reason)
+            if violated:
+                action = rule.action if rule else "warn"
+                await mod.record_violation(session, group_id, user_id, text, action, rule)
+                count, should_ban = await mod.add_warning(session, group_id, user_id)
 
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-            if should_ban:
                 try:
-                    await message.chat.ban(user_id)
+                    await message.delete()
                 except Exception:
                     pass
-                await message.answer(f"{warn_target} 用户已封禁（累计 {count} 次警告）。原因：{reason}")
-            else:
-                await message.answer(f"{warn_target} 警告（第{count}次）：{reason}")
-            _add_message_log(text)
-            return
+
+                if should_ban:
+                    try:
+                        await message.chat.ban(user_id)
+                    except Exception:
+                        pass
+                    await message.answer(f"{warn_target} 用户已封禁（累计 {count} 次警告）。原因：{reason}")
+                else:
+                    await message.answer(f"{warn_target} 警告（第{count}次）：{reason}")
+                _add_message_log(text)
+                return
 
     memory = memory_holder.get()
     memory.add_message(group_id, "user", f"[{user_tag}] {text}")
