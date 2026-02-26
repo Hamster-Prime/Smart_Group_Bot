@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    LargeBinary,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Group(Base):
+    __tablename__ = "groups"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # TG chat_id
+    title: Mapped[str] = mapped_column(String(255), default="")
+    settings: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    knowledge_entries: Mapped[list[KnowledgeEntry]] = relationship(back_populates="group")
+    moderation_rules: Mapped[list[ModerationRule]] = relationship(back_populates="group")
+    violations: Mapped[list[Violation]] = relationship(back_populates="group")
+
+
+class KnowledgeEntry(Base):
+    __tablename__ = "knowledge_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"))
+    title: Mapped[str] = mapped_column(String(255), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    embedding: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    group: Mapped[Group] = relationship(back_populates="knowledge_entries")
+
+
+class ModerationRule(Base):
+    __tablename__ = "moderation_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"))
+    rule_type: Mapped[str] = mapped_column(String(32))  # keyword, regex, llm
+    pattern: Mapped[str] = mapped_column(Text, default="")
+    action: Mapped[str] = mapped_column(String(32), default="warn")  # warn, delete, ban
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    group: Mapped[Group] = relationship(back_populates="moderation_rules")
+
+
+class Violation(Base):
+    __tablename__ = "violations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"))
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    rule_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("moderation_rules.id"), nullable=True)
+    message_text: Mapped[str] = mapped_column(Text, default="")
+    action_taken: Mapped[str] = mapped_column(String(32), default="warn")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    group: Mapped[Group] = relationship(back_populates="violations")
+
+
+class UserWarning(Base):
+    __tablename__ = "user_warnings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (Index("ix_warn_group_user", "group_id", "user_id", unique=True),)
+
+
+class Admin(Base):
+    __tablename__ = "admins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    role: Mapped[str] = mapped_column(String(32), default="admin")
+
+    __table_args__ = (Index("ix_admin_group_user", "group_id", "user_id", unique=True),)
+
+
+class MessageLog(Base):
+    __tablename__ = "message_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
