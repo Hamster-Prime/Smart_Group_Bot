@@ -162,7 +162,17 @@ class ModerationService:
         data = _parse_moderation_json(llm_raw)
 
         if not data:
-            log.warning("审核模型输出不可解析，按不违规处理: %s", (llm_raw or "")[:200])
+            raw_text = llm_raw or ""
+            escaped = raw_text.replace("\r", "\\r").replace("\n", "\\n")
+            preview_limit = 500
+            preview_truncated = len(escaped) > preview_limit
+            preview = escaped[:preview_limit]
+            log.warning(
+                "审核模型输出不可解析，按不违规处理: response_len=%d preview_truncated=%s preview=%s",
+                len(raw_text),
+                preview_truncated,
+                preview,
+            )
             return False, "", None
 
         violated = bool(data.get("violated", data.get("violation", False)))

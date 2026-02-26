@@ -32,12 +32,12 @@ class BotConfig(BaseModel):
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=512,
     )
     moderation_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=1024,
     )
     compress_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",

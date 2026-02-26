@@ -59,6 +59,14 @@ class LLMService:
             return "\n".join(parts)
         return str(content or "")
 
+    @staticmethod
+    def _preview_for_log(text: str, *, limit: int) -> tuple[str, bool]:
+        """Render a single-line preview for logs and report whether it was truncated."""
+        escaped = (text or "").replace("\r", "\\r").replace("\n", "\\n")
+        if len(escaped) <= limit:
+            return escaped, False
+        return escaped[:limit], True
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -78,17 +86,27 @@ class LLMService:
             label = "main"
 
         kwargs = self._build_kwargs(cfg)
-        log.info("[LLM:%s] model=%s, messages=%d", label, cfg.model, len(messages))
+        log.info(
+            "[LLM:%s] model=%s, messages=%d, max_tokens=%d",
+            label,
+            cfg.model,
+            len(messages),
+            cfg.max_tokens,
+        )
         try:
             resp = await litellm.acompletion(messages=messages, **kwargs)
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content)
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
+            preview_limit = 1200 if label == "moderation" else 240
+            preview, truncated = self._preview_for_log(text, limit=preview_limit)
             log.info(
-                "[LLM:%s] response=%s (in=%d out=%d tokens)",
+                "[LLM:%s] response_len=%d preview_truncated=%s preview=%s (in=%d out=%d tokens)",
                 label,
-                text[:120],
+                len(text),
+                truncated,
+                preview,
                 tokens_in,
                 tokens_out,
             )
@@ -166,9 +184,12 @@ class LLMService:
             text = self._normalize_content_text(content).strip()
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
+            preview, truncated = self._preview_for_log(text, limit=240)
             log.info(
-                "[LLM:vision] response=%s (in=%d out=%d tokens)",
-                text[:120],
+                "[LLM:vision] response_len=%d preview_truncated=%s preview=%s (in=%d out=%d tokens)",
+                len(text),
+                truncated,
+                preview,
                 tokens_in,
                 tokens_out,
             )
