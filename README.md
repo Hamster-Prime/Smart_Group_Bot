@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram)](https://telegram.org)
 
@@ -51,7 +51,7 @@
 ## 🚀 快速开始
 
 ### 环境要求
-- Python 3.10+
+- Python 3.12+
 - Telegram Bot Token
 - 大模型 API（支持 GPT/Claude/Gemini 等）
 
