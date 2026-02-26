@@ -107,7 +107,7 @@ async def start_bot(settings, session_factory) -> None:
             allowed_updates=dp.resolve_used_update_types(),
             drop_pending_updates=settings.bot.drop_pending_updates,
             handle_as_tasks=True,
-            tasks_concurrency_limit=64,
+            tasks_concurrency_limit=8,
         )
     finally:
         compress_task.cancel()

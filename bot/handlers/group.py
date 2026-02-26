@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import io
 import logging
 
@@ -33,7 +34,7 @@ log = logging.getLogger(__name__)
 
 def _build_kb_index(entries: list) -> str:
     if not entries:
-        return "（空）"
+        return "(empty)"
 
     lines: list[str] = []
     for e in entries[:20]:
@@ -87,7 +88,7 @@ async def _build_telegram_image_data_uri(message: Message) -> str:
     if not raw:
         return ""
 
-    log.info("[vision] 图片已下载 bytes=%d mime=%s", len(raw), mime)
+    log.info("[vision] image downloaded bytes=%d mime=%s", len(raw), mime)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
@@ -121,8 +122,8 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
         return text
 
     vision_prompt = (
-        "请识别这张图片里的关键信息，优先提取可见文字(OCR)和主要物体；"
-        "用中文简洁回答，不超过80字；若无法识别请回答：未识别到有效图片内容。"
+        "请识别图片中的关键信息，优先提取可见文字（OCR）和主要对象；"
+        "用中文简洁回答，不超过40字；若无法识别请回复：未识别到有效图片内容。"
     )
 
     data_uri = await _build_telegram_image_data_uri(message)
@@ -136,10 +137,10 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
             vision_text = (await llm.vision_describe(image_url, vision_prompt)).strip()
 
     if not vision_text:
-        log.info("[vision] 未获取到图片识别结果")
+        log.info("[vision] no image recognition result")
         return text
 
-    log.info("[vision] 图片识别结果: %s", vision_text[:120])
+    log.info("[vision] image recognition result: %s", vision_text[:120])
     return f"{text}\n[图片识别]\n{vision_text}"
 
 
@@ -172,6 +173,21 @@ async def on_group_message(
     group_id = message.chat.id
     user = message.from_user
     user_id = user.id if user else 0
+    warn_target = (
+        f"@{user.username}"
+        if user and user.username
+        else f'<a href="tg://user?id={user_id}">{html.escape((user.full_name if user else str(user_id)) or str(user_id))}</a>'
+    )
+
+    def _add_message_log(payload: str) -> None:
+        session.add(
+            MessageLog(
+                group_id=group_id,
+                user_id=user_id,
+                username=(user.username if user else None),
+                text=payload[:1000],
+            )
+        )
 
     group = await session.get(Group, group_id)
     if not group:
@@ -179,15 +195,8 @@ async def on_group_message(
         session.add(group)
 
     if msg_type in {"video", "video_caption", "video_note"}:
-        log.info("[%s] 视频类媒体直接放行: msg_type=%s", group_id, msg_type)
-        session.add(
-            MessageLog(
-                group_id=group_id,
-                user_id=user_id,
-                username=(user.username if user else None),
-                text=text[:1000],
-            )
-        )
+        log.info("[%s] media bypass msg_type=%s", group_id, msg_type)
+        _add_message_log(text)
         return
 
     if user:
@@ -209,20 +218,12 @@ async def on_group_message(
 
     text = await _append_image_context(message, llm, text, msg_type)
 
-    session.add(
-        MessageLog(
-            group_id=group_id,
-            user_id=user_id,
-            username=(user.username if user else None),
-            text=text[:1000],
-        )
-    )
 
-    log.info("[%s] 步骤1: 审核检查", group_id)
+    log.info("[%s] step1 moderation check", group_id)
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
         violated, reason, rule = await mod.check_rules(session, group_id, text)
-        log.info("[%s] 审核结果: violated=%s reason=%s", group_id, violated, reason)
+        log.info("[%s] moderation result: violated=%s reason=%s", group_id, violated, reason)
         if violated:
             action = rule.action if rule else "warn"
             await mod.record_violation(session, group_id, user_id, text, action, rule)
@@ -238,9 +239,10 @@ async def on_group_message(
                     await message.chat.ban(user_id)
                 except Exception:
                     pass
-                await message.answer(f"用户已封禁（累计 {count} 次警告）。原因：{reason}")
+                await message.answer(f"{warn_target} 用户已封禁（累计 {count} 次警告）。原因：{reason}")
             else:
-                await message.answer(f"⚠️ 警告（第{count}次）：{reason}")
+                await message.answer(f"{warn_target} 警告（第{count}次）：{reason}")
+            _add_message_log(text)
             return
 
     memory = memory_holder.get()
@@ -254,7 +256,7 @@ async def on_group_message(
     kb_index = _build_kb_index(entries)
 
     log.info(
-        "[%s] 步骤2: 决策 mentioned=%s msg_type=%s kb_entries=%d",
+        "[%s] step2 decision mentioned=%s msg_type=%s kb_entries=%d",
         group_id,
         mentioned,
         msg_type,
@@ -274,31 +276,31 @@ async def on_group_message(
             knowledge_titles=kb_titles,
             knowledge_index=kb_index,
         )
-        log.info("[%s] 决策结果: action=%s", group_id, action)
+        log.info("[%s] decision result: action=%s", group_id, action)
 
         if action != "skip":
             history = memory.get_history_for_llm(group_id)
-            log.info("[%s] 步骤3: 生成回复 action=%s history_len=%d", group_id, action, len(history))
+            log.info("[%s] step3 generate reply action=%s history_len=%d", group_id, action, len(history))
 
             if action == "knowledge":
                 rag = RAGService(llm, kb)
                 reply = await rag.answer(session, group_id, text, history=history)
-                log.info("[%s] RAG回复: %s", group_id, reply[:120] if reply else "(空)")
+                log.info("[%s] RAG reply: %s", group_id, reply[:120] if reply else "(empty)")
 
                 if reply and any(x in reply for x in ("参考资料中没有", "我不知道", "没有相关信息")):
-                    log.info("[%s] RAG未命中有效答案，尝试技能", group_id)
+                    log.info("[%s] RAG answer not useful, fallback to skill", group_id)
                     reply = ""
 
             if not reply:
                 skill_reply = await skill.answer_with_skill(text, history=history)
                 if skill_reply:
                     reply = skill_reply
-                    log.info("[%s] 技能回复: %s", group_id, reply[:120])
+                    log.info("[%s] skill reply: %s", group_id, reply[:120])
 
             if not reply:
                 casual = CasualService(llm)
                 reply = await casual.reply(text, history=history)
-                log.info("[%s] 闲聊回复: %s", group_id, reply[:120] if reply else "(空)")
+                log.info("[%s] casual reply: %s", group_id, reply[:120] if reply else "(empty)")
 
             if reply:
                 sent_ok = await send_reply(
@@ -310,11 +312,13 @@ async def on_group_message(
                 )
 
     if action == "skip":
-        log.info("[%s] 跳过，不回复", group_id)
+        log.info("[%s] skip reply", group_id)
         await memory.maybe_compress(group_id)
+        _add_message_log(text)
         return
 
     if reply and sent_ok:
         memory.add_message(group_id, "assistant", reply)
 
     await memory.maybe_compress(group_id)
+    _add_message_log(text)

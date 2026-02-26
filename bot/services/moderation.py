@@ -137,7 +137,8 @@ class ModerationService:
             ModerationRule.group_id == group_id,
             ModerationRule.enabled == True,
         ).order_by(ModerationRule.id)
-        result = await session.execute(stmt)
+        with session.no_autoflush:
+            result = await session.execute(stmt)
         rules = list(result.scalars().all())
 
         if not rules:
@@ -212,7 +213,6 @@ class ModerationService:
             action_taken=action,
         )
         session.add(v)
-        await session.flush()
         return v
 
     async def add_warning(
@@ -236,5 +236,4 @@ class ModerationService:
         if should_ban:
             warn.is_banned = True
 
-        await session.flush()
         return warn.count, should_ban

@@ -67,6 +67,8 @@ async def main() -> None:
             bot,
             allowed_updates=dp.resolve_used_update_types(),
             drop_pending_updates=settings.bot.drop_pending_updates,
+            handle_as_tasks=True,
+            tasks_concurrency_limit=8,
         )
     finally:
         await engine.dispose()

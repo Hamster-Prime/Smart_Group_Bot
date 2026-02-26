@@ -28,7 +28,7 @@ async def init_db(
     engine = create_async_engine(
         url,
         echo=False,
-        connect_args={"timeout": 30} if "sqlite" in url else {},
+        connect_args={"timeout": 60} if "sqlite" in url else {},
     )
 
     async with engine.begin() as conn:
@@ -36,6 +36,8 @@ async def init_db(
         # Enable WAL mode for concurrent read/write
         if "sqlite" in url:
             await conn.execute(text("PRAGMA journal_mode=WAL"))
+            await conn.execute(text("PRAGMA busy_timeout=60000"))
+            await conn.execute(text("PRAGMA synchronous=NORMAL"))
             # Migrate: add embedding column if missing
             result = await conn.execute(text("PRAGMA table_info(knowledge_entries)"))
             columns = [row[1] for row in result.fetchall()]
@@ -50,6 +52,10 @@ async def init_db(
             "USING fts5(title, content, content=knowledge_entries, content_rowid=id)"
         ))
 
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        engine,
+        expire_on_commit=False,
+        autoflush=False,
+    )
     log.info("Database initialized: %s", url)
     return engine, session_factory
