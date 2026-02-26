@@ -14,14 +14,18 @@ from bot.config import Settings
 from bot.db.models import ModerationExemption, ModerationRule, UserWarning
 from bot.services.authz import (
     authorize_group,
+    authorize_group_admin,
+    deauthorize_group_admin,
     deauthorize_group,
+    ensure_group_admin_permission,
     ensure_group_authorized,
     ensure_super_admin,
+    list_group_admins,
     list_authorized_groups,
 )
 from bot.services.llm import LLMService
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
-from bot.utils.telegram import ensure_admin, is_group
+from bot.utils.telegram import is_group
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -65,6 +69,30 @@ def _resolve_target_group_id(message: Message, args: str) -> int | None:
     return None
 
 
+def _resolve_admin_binding(message: Message, args: str) -> tuple[int | None, int | None]:
+    arg = (args or "").strip()
+    parts = arg.split() if arg else []
+
+    if len(parts) >= 2:
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None, None
+
+    if len(parts) == 1 and is_group(message):
+        try:
+            return message.chat.id, int(parts[0])
+        except ValueError:
+            return None, None
+
+    if is_group(message):
+        reply = message.reply_to_message
+        if reply and reply.from_user:
+            return message.chat.id, reply.from_user.id
+
+    return None, None
+
+
 async def _reply_rules(message: Message, session: AsyncSession) -> None:
     stmt = (
         select(ModerationRule)
@@ -93,7 +121,7 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await message.answer("用法: /authgroup <群ID> 或在群内直接 /authgroup")
+        await message.answer("用法: /authgroup &lt;群ID&gt; 或在群内直接 /authgroup")
         return
 
     created = await authorize_group(session, group_id, message.from_user.id if message.from_user else 0)
@@ -111,7 +139,7 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await message.answer("用法: /unauthgroup <群ID> 或在群内直接 /unauthgroup")
+        await message.answer("用法: /unauthgroup &lt;群ID&gt; 或在群内直接 /unauthgroup")
         return
 
     removed = await deauthorize_group(session, group_id)
@@ -137,11 +165,79 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("authadmin"))
+async def cmd_authadmin(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    group_id, user_id = _resolve_admin_binding(message, args)
+    if group_id is None or user_id is None:
+        await message.answer(
+            "用法:\n"
+            "1) 群内回复目标用户消息后发送 /authadmin\n"
+            "2) /authadmin &lt;群ID&gt; &lt;用户ID&gt;\n"
+            "3) 群内 /authadmin &lt;用户ID&gt;"
+        )
+        return
+
+    created = await authorize_group_admin(session, group_id, user_id, role="admin")
+    if created:
+        await message.answer(f"已授权群管理权限: group={group_id} user={user_id}")
+    else:
+        await message.answer(f"该用户已拥有群管理权限: group={group_id} user={user_id}")
+
+
+@router.message(Command("unauthadmin"))
+async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    group_id, user_id = _resolve_admin_binding(message, args)
+    if group_id is None or user_id is None:
+        await message.answer(
+            "用法:\n"
+            "1) 群内回复目标用户消息后发送 /unauthadmin\n"
+            "2) /unauthadmin &lt;群ID&gt; &lt;用户ID&gt;\n"
+            "3) 群内 /unauthadmin &lt;用户ID&gt;"
+        )
+        return
+
+    removed = await deauthorize_group_admin(session, group_id, user_id)
+    if removed:
+        await message.answer(f"已取消群管理权限: group={group_id} user={user_id}")
+    else:
+        await message.answer(f"该用户未拥有群管理权限: group={group_id} user={user_id}")
+
+
+@router.message(Command("adminlist"))
+async def cmd_adminlist(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    group_id = _resolve_target_group_id(message, args)
+    if group_id is None:
+        await message.answer("用法: /adminlist &lt;群ID&gt; 或在群内直接 /adminlist")
+        return
+
+    rows = await list_group_admins(session, group_id)
+    if not rows:
+        await message.answer(f"群 {group_id} 暂无已授权群管理。")
+        return
+
+    lines = [f"群 {group_id} 已授权群管理列表:"]
+    for row in rows[:200]:
+        lines.append(f"- user={row.user_id} role={row.role}")
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("addrule"))
 async def cmd_addrule(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
     args = (message.text or "").partition(" ")[2].strip()
@@ -249,7 +345,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
 async def cmd_rules(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
     await _reply_rules(message, session)
 
@@ -258,7 +354,7 @@ async def cmd_rules(message: Message, session: AsyncSession, settings: Settings)
 async def cmd_warnings(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
     parts = (message.text or "").split()
@@ -290,7 +386,7 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
 async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
     reply = message.reply_to_message
@@ -326,7 +422,7 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
 async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
     reply = message.reply_to_message

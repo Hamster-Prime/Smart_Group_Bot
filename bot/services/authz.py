@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import AuthorizedGroup
+from bot.db.models import Admin, AuthorizedGroup
 
 
 def is_super_admin_user_id(user_id: int, settings: Settings) -> bool:
@@ -49,6 +49,55 @@ async def list_authorized_groups(session: AsyncSession) -> list[AuthorizedGroup]
     return list(result.scalars().all())
 
 
+async def is_group_admin_authorized(session: AsyncSession, group_id: int, user_id: int) -> bool:
+    stmt = select(Admin.id).where(
+        Admin.group_id == group_id,
+        Admin.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+async def authorize_group_admin(
+    session: AsyncSession, group_id: int, user_id: int, role: str = "admin"
+) -> bool:
+    stmt = select(Admin).where(
+        Admin.group_id == group_id,
+        Admin.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    row = result.scalar_one_or_none()
+    if row:
+        if row.role != role:
+            row.role = role
+            await session.flush()
+        return False
+
+    session.add(Admin(group_id=group_id, user_id=user_id, role=role))
+    await session.flush()
+    return True
+
+
+async def deauthorize_group_admin(session: AsyncSession, group_id: int, user_id: int) -> bool:
+    stmt = select(Admin).where(
+        Admin.group_id == group_id,
+        Admin.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    row = result.scalar_one_or_none()
+    if not row:
+        return False
+    await session.delete(row)
+    await session.flush()
+    return True
+
+
+async def list_group_admins(session: AsyncSession, group_id: int) -> list[Admin]:
+    stmt = select(Admin).where(Admin.group_id == group_id).order_by(Admin.id.desc())
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def ensure_group_authorized(
     message: Message,
     session: AsyncSession,
@@ -68,5 +117,32 @@ async def ensure_group_authorized(
         return True
 
     await message.answer("无授权,禁止使用")
+    return False
+
+
+async def ensure_group_admin_permission(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    allow_super_admin: bool = True,
+) -> bool:
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await message.answer("该命令仅可在群内使用。")
+        return False
+
+    user = message.from_user
+    if user and allow_super_admin and is_super_admin_user_id(user.id, settings):
+        return True
+
+    if not user:
+        await message.answer("无法识别操作者。")
+        return False
+
+    ok = await is_group_admin_authorized(session, message.chat.id, user.id)
+    if ok:
+        return True
+
+    await message.answer("你没有群管理权限，请联系最高管理员授权。")
     return False
 

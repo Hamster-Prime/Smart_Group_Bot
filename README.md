@@ -142,8 +142,9 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 | `/kb <内容>` | 添加知识库条目 | `/kb 白菜是 LongEmby 的服主` |
 | `/addrule <规则>` | 添加群规 | `/addrule 禁止骂人` |
 | `/rules` | 查看当前群规 | `/rules` |
-| `/aiexempt` | 回复用户消息，设置 AI 审查豁免（管理员） | `回复某人后发送 /aiexempt` |
-| `/unaiexempt` | 回复用户消息，取消 AI 审查豁免（管理员） | `回复某人后发送 /unaiexempt` |
+| `/aiexempt` | 回复用户消息，设置 AI 审查豁免（已授权群管理） | `回复某人后发送 /aiexempt` |
+| `/unaiexempt` | 回复用户消息，取消 AI 审查豁免（已授权群管理） | `回复某人后发送 /unaiexempt` |
+| `/authadmin <群ID> <用户ID>` | 最高管理员授权群管理权限 | `/authadmin -1001234567890 12345678` |
 
 ### 自然语言交互
 

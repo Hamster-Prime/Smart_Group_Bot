@@ -10,11 +10,10 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.services.authz import ensure_group_authorized
+from bot.services.authz import ensure_group_admin_permission, ensure_group_authorized
 from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.utils.prompts import KB_MANAGE_SYSTEM
-from bot.utils.telegram import ensure_admin
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -64,9 +63,9 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "<b>命令列表</b>\n\n"
         "/start - 开始使用\n"
         "/help - 帮助信息\n"
-        "/kb &lt;自然语言指令&gt; - 管理知识库（管理员）\n"
-        "/kb list - 列出知识条目（管理员）\n\n"
-        "<b>管理员命令</b>\n"
+        "/kb &lt;自然语言指令&gt; - 管理知识库（已授权群管理）\n"
+        "/kb list - 列出知识条目（已授权群管理）\n\n"
+        "<b>群管理命令（需最高管理员授权）</b>\n"
         "/addrule &lt;自然语言指令&gt; - 管理审核规则\n"
         "/rules - 查看审核规则\n"
         "/warnings &lt;用户ID&gt; - 查看警告记录\n\n"
@@ -75,7 +74,10 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "<b>最高管理员命令</b>\n"
         "/authgroup [群ID] - 授权群组\n"
         "/unauthgroup [群ID] - 取消授权群组\n"
-        "/authlist - 查看已授权群组"
+        "/authlist - 查看已授权群组\n"
+        "/authadmin [群ID] [用户ID] - 授权群管理\n"
+        "/unauthadmin [群ID] [用户ID] - 取消群管理授权\n"
+        "/adminlist [群ID] - 查看群管理授权列表"
     )
 
 
@@ -85,7 +87,7 @@ async def cmd_kb(
 ) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
     args = (message.text or "").partition(" ")[2].strip()
