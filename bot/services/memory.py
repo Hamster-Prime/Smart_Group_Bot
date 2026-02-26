@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -147,12 +148,26 @@ class MemoryService:
         path.write_text(summary, encoding="utf-8")
         log.info("Memory saved: %s", path)
 
+    @staticmethod
+    def _parse_group_id_from_filename(path: Path) -> int | None:
+        """Parse legacy memory filename like '<group_id>_*.md'."""
+        m = re.match(r"^(-?\d+)", path.stem)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
     def load_all(self) -> None:
-        """On startup, load latest memory file for each group."""
+        """On startup, load all memory markdown files for each group."""
         if not MEMORY_DIR.exists():
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             return
 
+        group_files: dict[int, list[Path]] = {}
+
+        # Preferred layout: memory/<group_id>/*.md
         for group_dir in MEMORY_DIR.iterdir():
             if not group_dir.is_dir():
                 continue
@@ -160,15 +175,57 @@ class MemoryService:
                 group_id = int(group_dir.name)
             except ValueError:
                 continue
+            files = sorted(group_dir.glob("*.md"), key=lambda p: p.name)
+            if files:
+                group_files.setdefault(group_id, []).extend(files)
 
-            files = sorted(group_dir.glob("*.md"))
-            if not files:
+        # Backward-compatible layout: memory/<group_id>_*.md
+        for path in MEMORY_DIR.glob("*.md"):
+            group_id = self._parse_group_id_from_filename(path)
+            if group_id is None:
+                continue
+            group_files.setdefault(group_id, []).append(path)
+
+        loaded_groups = 0
+        loaded_files = 0
+        for group_id, files in group_files.items():
+            ordered = sorted(files, key=lambda p: p.name)
+            chunks: list[str] = []
+            previous_content: str | None = None
+            for f in ordered:
+                try:
+                    content = f.read_text(encoding="utf-8").strip()
+                except Exception:
+                    log.exception("Failed to read memory file: %s", f)
+                    continue
+                if not content:
+                    continue
+                loaded_files += 1
+                # Skip exact duplicate snapshots to avoid exploding prompt size.
+                if previous_content is not None and content == previous_content:
+                    continue
+                chunks.append(content)
+                previous_content = content
+
+            if not chunks:
                 continue
 
-            latest = files[-1]
-            content = latest.read_text(encoding="utf-8").strip()
-            if content:
-                self._history[group_id] = [
-                    {"role": "system", "content": f"{SUMMARY_PREFIX}\n{content}"},
-                ]
-                log.info("Loaded memory for group %s from %s", group_id, latest.name)
+            merged = "\n\n".join(
+                f"[memory:{idx}] {chunk}" for idx, chunk in enumerate(chunks, start=1)
+            )
+            self._history[group_id] = [
+                {"role": "system", "content": f"{SUMMARY_PREFIX}\n{merged}"},
+            ]
+            loaded_groups += 1
+            log.info(
+                "Loaded memory for group %s from %d file(s)",
+                group_id,
+                len(chunks),
+            )
+
+        if loaded_groups:
+            log.info(
+                "Memory bootstrap completed: groups=%d files=%d",
+                loaded_groups,
+                loaded_files,
+            )
