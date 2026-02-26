@@ -24,6 +24,10 @@ class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
     drop_pending_updates: bool = True
+    enable_typing: bool = True
+    enable_streaming: bool = True
+    stream_chunk_size: int = 36
+    stream_edit_interval_sec: float = 1.0
     main_model: ModelConfig = ModelConfig()
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
@@ -82,6 +86,10 @@ class Settings(BaseSettings):
     embed_api_base: str = ""
     max_context_tokens: int = 4096
     max_output_tokens: int = 2048
+    bot_enable_typing: bool = True
+    bot_enable_streaming: bool = True
+    bot_stream_chunk_size: int = 36
+    bot_stream_edit_interval_sec: float = 1.0
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
     bot: BotConfig = BotConfig()
@@ -129,6 +137,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
 
     # Set bot token
     settings.bot.token = settings.bot_token
+    settings.bot.enable_typing = settings.bot_enable_typing
+    settings.bot.enable_streaming = settings.bot_enable_streaming
+    settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)
+    settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
 
     # Build main model config from env
     mc = settings.bot.main_model

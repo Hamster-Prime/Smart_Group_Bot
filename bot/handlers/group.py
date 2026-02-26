@@ -19,7 +19,13 @@ from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.rag import RAGService
 from bot.services.skills import SkillService
-from bot.utils.telegram import extract_message_text, is_bot_mentioned, is_group, md_to_html
+from bot.utils.telegram import (
+    extract_message_text,
+    is_bot_mentioned,
+    is_group,
+    send_reply,
+    typing_action,
+)
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -256,51 +262,59 @@ async def on_group_message(
     )
 
     decision_svc = DecisionService(llm)
-    action = await decision_svc.decide(
-        text,
-        is_mentioned=mentioned,
-        user_tag=user_tag,
-        msg_type=msg_type,
-        knowledge_titles=kb_titles,
-        knowledge_index=kb_index,
-    )
-    log.info("[%s] 决策结果: action=%s", group_id, action)
+    action = "skip"
+    reply = ""
+    sent_ok = False
+    async with typing_action(message, enabled=settings.bot.enable_typing):
+        action = await decision_svc.decide(
+            text,
+            is_mentioned=mentioned,
+            user_tag=user_tag,
+            msg_type=msg_type,
+            knowledge_titles=kb_titles,
+            knowledge_index=kb_index,
+        )
+        log.info("[%s] 决策结果: action=%s", group_id, action)
+
+        if action != "skip":
+            history = memory.get_history(group_id)
+            log.info("[%s] 步骤3: 生成回复 action=%s history_len=%d", group_id, action, len(history))
+
+            if action == "knowledge":
+                rag = RAGService(llm, kb)
+                reply = await rag.answer(session, group_id, text, history=history)
+                log.info("[%s] RAG回复: %s", group_id, reply[:120] if reply else "(空)")
+
+                if reply and any(x in reply for x in ("参考资料中没有", "我不知道", "没有相关信息")):
+                    log.info("[%s] RAG未命中有效答案，尝试技能", group_id)
+                    reply = ""
+
+            if not reply:
+                skill_reply = await skill.answer_with_skill(text, history=history)
+                if skill_reply:
+                    reply = skill_reply
+                    log.info("[%s] 技能回复: %s", group_id, reply[:120])
+
+            if not reply:
+                casual = CasualService(llm)
+                reply = await casual.reply(text, history=history)
+                log.info("[%s] 闲聊回复: %s", group_id, reply[:120] if reply else "(空)")
+
+            if reply:
+                sent_ok = await send_reply(
+                    message,
+                    reply,
+                    stream=settings.bot.enable_streaming,
+                    stream_chunk_size=settings.bot.stream_chunk_size,
+                    stream_interval=settings.bot.stream_edit_interval_sec,
+                )
 
     if action == "skip":
         log.info("[%s] 跳过，不回复", group_id)
         await memory.maybe_compress(group_id)
         return
 
-    history = memory.get_history(group_id)
-    log.info("[%s] 步骤3: 生成回复 action=%s history_len=%d", group_id, action, len(history))
-    reply = ""
-
-    if action == "knowledge":
-        rag = RAGService(llm, kb)
-        reply = await rag.answer(session, group_id, text, history=history)
-        log.info("[%s] RAG回复: %s", group_id, reply[:120] if reply else "(空)")
-
-        if reply and any(x in reply for x in ("参考资料中没有", "我不知道", "没有相关信息")):
-            log.info("[%s] RAG未命中有效答案，尝试技能", group_id)
-            reply = ""
-
-    if not reply:
-        skill_reply = await skill.answer_with_skill(text, history=history)
-        if skill_reply:
-            reply = skill_reply
-            log.info("[%s] 技能回复: %s", group_id, reply[:120])
-
-    if not reply:
-        casual = CasualService(llm)
-        reply = await casual.reply(text, history=history)
-        log.info("[%s] 闲聊回复: %s", group_id, reply[:120] if reply else "(空)")
-
-    if reply:
+    if reply and sent_ok:
         memory.add_message(group_id, "assistant", reply)
-        html = md_to_html(reply)
-        try:
-            await message.reply(html)
-        except Exception:
-            await message.reply(reply, parse_mode=None)
 
     await memory.maybe_compress(group_id)

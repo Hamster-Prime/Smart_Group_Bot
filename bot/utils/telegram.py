@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatAction, ChatMemberStatus
 from aiogram.types import Message
 
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
+
+log = logging.getLogger(__name__)
 
 
 def get_display_name(msg: Message) -> str:
@@ -74,6 +81,171 @@ def md_to_html(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text
+
+
+def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
+    """Split text to natural chunks for streaming edits."""
+    if not text:
+        return []
+
+    source = text.strip()
+    if len(source) <= chunk_size:
+        return [source]
+
+    seps = ("\n", "。", "！", "？", ".", "!", "?", "，", ",", "；", ";", " ")
+    chunks: list[str] = []
+    cursor = 0
+
+    while cursor < len(source):
+        end = min(cursor + chunk_size, len(source))
+        if end >= len(source):
+            chunks.append(source[cursor:])
+            break
+
+        split_at = -1
+        for sep in seps:
+            idx = source.rfind(sep, cursor, end)
+            if idx > split_at:
+                split_at = idx
+
+        if split_at <= cursor:
+            split_at = end
+        else:
+            split_at += 1
+
+        chunk = source[cursor:split_at]
+        if chunk:
+            chunks.append(chunk)
+        cursor = split_at
+
+    return chunks
+
+
+@asynccontextmanager
+async def typing_action(
+    message: Message, *, enabled: bool, interval: float = 4.5
+) -> AsyncIterator[None]:
+    """Continuously send typing chat-action while the context is active."""
+    if not enabled:
+        yield
+        return
+
+    stop = asyncio.Event()
+
+    async def _worker() -> None:
+        while not stop.is_set():
+            try:
+                await message.bot.send_chat_action(
+                    chat_id=message.chat.id,
+                    action=ChatAction.TYPING,
+                )
+            except Exception:
+                break
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    task = asyncio.create_task(_worker(), name=f"typing:{message.chat.id}")
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def send_reply(
+    message: Message,
+    text: str,
+    *,
+    stream: bool = False,
+    stream_chunk_size: int = 36,
+    stream_interval: float = 1.0,
+) -> bool:
+    """Send reply in normal mode or as stream-like incremental edits."""
+
+    async def _safe_reply(
+        body: str,
+        *,
+        parse_mode: str | None,
+        retries: int = 1,
+        retry_delay: float = 0.8,
+    ) -> Message | None:
+        for attempt in range(retries + 1):
+            try:
+                return await message.reply(body, parse_mode=parse_mode)
+            except Exception:
+                if attempt >= retries:
+                    log.exception(
+                        "reply failed chat_id=%s retries=%d",
+                        message.chat.id,
+                        retries,
+                    )
+                    return None
+                await asyncio.sleep(retry_delay * (attempt + 1))
+        return None
+
+    async def _safe_edit(
+        sent: Message,
+        body: str,
+        *,
+        parse_mode: str | None,
+        retries: int = 0,
+    ) -> bool:
+        for attempt in range(retries + 1):
+            try:
+                await sent.edit_text(body, parse_mode=parse_mode)
+                return True
+            except Exception:
+                if attempt >= retries:
+                    return False
+                await asyncio.sleep(0.3 * (attempt + 1))
+        return False
+
+    payload = (text or "").strip()
+    if not payload:
+        return False
+
+    if not stream:
+        html = md_to_html(payload)
+        sent = await _safe_reply(html, parse_mode="HTML")
+        if sent:
+            return True
+        plain = await _safe_reply(payload, parse_mode=None)
+        return bool(plain)
+
+    chunks = _stream_chunks(payload, chunk_size=stream_chunk_size)
+    if len(chunks) <= 1 and len(payload) >= 18:
+        mid = max(1, len(payload) // 2)
+        chunks = [payload[:mid], payload[mid:]]
+
+    if len(chunks) <= 1:
+        sent = await _safe_reply(payload, parse_mode=None)
+        return bool(sent)
+
+    sent = await _safe_reply(chunks[0], parse_mode=None)
+    if not sent:
+        return False
+    merged = chunks[0]
+    last_edit_ts = time.monotonic()
+
+    for chunk in chunks[1:]:
+        merged += chunk
+        elapsed = time.monotonic() - last_edit_ts
+        if elapsed < stream_interval:
+            await asyncio.sleep(stream_interval - elapsed)
+        edited = await _safe_edit(sent, merged, parse_mode=None)
+        if edited:
+            last_edit_ts = time.monotonic()
+
+    final_html = md_to_html(payload)
+    if final_html == payload:
+        return True
+    await _safe_edit(sent, final_html, parse_mode="HTML")
+    return True
 
 
 def extract_message_text(message: Message) -> tuple[str, str]:
