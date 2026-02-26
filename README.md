@@ -89,28 +89,44 @@ docker run -d --env-file .env --name smart-bot smart-group-bot
 编辑 `.env` 文件：
 
 ```env
-# Telegram 配置
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_GROUP_ID=your_group_id
+# Telegram Bot
+BOT_TOKEN=
+SUPER_ADMIN_ID=
 
-# 大模型配置
-LLM_API_KEY=your_api_key
-LLM_MODEL=gpt-4o  # 或其他支持的模型
-LLM_BASE_URL=https://api.openai.com/v1  # 可选
+# ---- 主模型 (知识库问答、闲聊) ----
+# MAIN_PROVIDER: gemini / openai / openai_compatible
+MAIN_PROVIDER=
+MAIN_MODEL=
+MAIN_API_KEY=
+# 仅 openai_compatible 需要填写:
+MAIN_API_BASE=
 
-# 决策模型配置（可选，用于轻量级决策）
-DECISION_MODEL=gpt-3.5-turbo
+# ---- 决策模型 (回复判断、内容审核) ----
+# 留空则复用主模型配置
+DECISION_PROVIDER=
+DECISION_MODEL=
+DECISION_API_KEY=
+DECISION_API_BASE=
 
-# 嵌入模型配置（用于知识库）
-EMBEDDING_MODEL=text-embedding-3-small
+# ---- 压缩模型 (上下文压缩) ----
+# 留空则复用主模型配置
+COMPRESS_PROVIDER=
+COMPRESS_MODEL=
+COMPRESS_API_KEY=
+COMPRESS_API_BASE=
 
-# 内容审查配置
-ENABLE_CONTENT_MODERATION=true
-MAX_WARNINGS=3
+# ---- 嵌入模型 (知识库语义搜索) ----
+EMBED_PROVIDER=
+EMBED_MODEL=
+EMBED_API_KEY=
+EMBED_API_BASE=
 
-# 其他配置
-LOG_LEVEL=INFO
-DATA_DIR=./data
+# ---- 上下文设置 ----
+MAX_CONTEXT_TOKENS=256000
+MAX_OUTPUT_TOKENS=64000
+
+# 数据库（默认 SQLite）
+DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 ```
 
 ---
