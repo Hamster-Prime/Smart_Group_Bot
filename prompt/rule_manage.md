@@ -3,13 +3,13 @@
 
 支持输出：
 1) 添加规则：
-{"action":"add","rule_type":"keyword|regex","pattern":"规则内容","hit_action":"warn|delete|ban"}
+{"action":"add","rule_type":"keyword|regex|llm","pattern":"规则内容","hit_action":"warn|delete|ban"}
 
 2) 删除规则（按ID）：
 {"action":"delete","rule_id":123}
 
 3) 删除规则（按pattern，可选rule_type）：
-{"action":"delete","rule_type":"keyword|regex","pattern":"规则内容"}
+{"action":"delete","rule_type":"keyword|regex|llm","pattern":"规则内容"}
 
 4) 列出规则：
 {"action":"list"}
@@ -25,5 +25,9 @@
 
 关键约束：
 - 尽量给出可直接执行的 pattern。
-- 对“禁止骂人/辱骂/脏话”这类请求，pattern 可输出为“骂人”（由后端做进一步归一化）。
+- `rule_type=keyword`：用于明确关键词命中（字面词）。
+- `rule_type=regex`：用于需要正则表达式匹配的规则。
+- `rule_type=llm`：用于语义判定规则（不限关键词；按语义/意图判断是否违规）。
+- 当用户表达“由AI判断/语义判断/不限关键词/类似都算/擦边变体也算”时，应优先输出 `rule_type=llm`。
+- 对“禁止骂人/辱骂/脏话”这类请求，优先输出 `rule_type=llm`，pattern 可写“禁止辱骂、人身攻击、脏话”。
 - 只输出 JSON，不要任何额外文本。

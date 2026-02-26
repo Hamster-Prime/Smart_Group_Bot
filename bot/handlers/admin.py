@@ -26,9 +26,9 @@ from bot.utils.telegram import ensure_admin, is_group
 router = Router()
 log = logging.getLogger(__name__)
 
-# 将“禁止骂人”等自然语言规则归一为可执行模式
+# 将“禁止骂人”等自然语言规则归一为语义审核模式（llm）
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
-_ABUSE_REGEX = r"(操你妈|草泥马|傻逼|煞笔|沙比|sb|妈的|去死|干死你|狗东西|废物|脑残)"
+_ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
 
 
 def _parse_json_payload(raw: str) -> dict | None:
@@ -175,8 +175,8 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         pattern = str(data.get("pattern", "")).strip()
         hit_action = str(data.get("hit_action", "warn")).strip().lower()
 
-        if rule_type not in ("keyword", "regex"):
-            await message.answer("rule_type 必须是 keyword 或 regex。")
+        if rule_type not in ("keyword", "regex", "llm"):
+            await message.answer("rule_type 必须是 keyword、regex 或 llm。")
             return
         if not pattern:
             await message.answer("pattern 不能为空。")
@@ -184,9 +184,10 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         if hit_action not in ("warn", "delete", "ban"):
             hit_action = "warn"
 
-        if pattern.lower() in _SEMANTIC_ABUSE_HINTS:
-            rule_type = "regex"
-            pattern = _ABUSE_REGEX
+        # 对典型“骂人/辱骂/脏话”语义规则，默认走 llm 语义判定，避免只靠固定词表。
+        if rule_type == "keyword" and pattern.lower() in _SEMANTIC_ABUSE_HINTS:
+            rule_type = "llm"
+            pattern = _ABUSE_LLM_PATTERN
 
         rule = ModerationRule(
             group_id=message.chat.id,
