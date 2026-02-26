@@ -9,26 +9,30 @@ from bot.config import EmbedConfig, ModelConfig
 
 log = logging.getLogger(__name__)
 
-# 关闭 litellm 额外调试日志
+# Disable extra LiteLLM debug logs.
 litellm.suppress_debug_info = True
 
 
 class LLMService:
-    """统一 LLM 接口：主模型、决策模型、压缩模型、嵌入模型。"""
+    """Unified LLM interface for main/decision/moderation/compress/embed."""
 
     def __init__(
         self,
         main: ModelConfig,
         decision: ModelConfig,
         compress: ModelConfig | None = None,
+        *,
+        moderation: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
     ) -> None:
         self.main = main
         self.decision_config = decision
+        self.moderation_config = moderation or decision
         self.compress_config = compress or main
         self.embed_config = embed or EmbedConfig()
 
-    def _build_kwargs(self, cfg: ModelConfig) -> dict[str, Any]:
+    @staticmethod
+    def _build_kwargs(cfg: ModelConfig) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "temperature": cfg.temperature,
@@ -42,7 +46,7 @@ class LLMService:
 
     @staticmethod
     def _normalize_content_text(content: Any) -> str:
-        """兼容不同模型返回结构，提取文本。"""
+        """Normalize text across providers that return different structures."""
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -60,34 +64,57 @@ class LLMService:
         messages: list[dict[str, Any]],
         *,
         use_decision: bool = False,
+        use_moderation: bool = False,
     ) -> str:
-        """发送对话请求，返回 assistant 文本。"""
-        cfg = self.decision_config if use_decision else self.main
-        label = "decision" if use_decision else "main"
+        """Send chat completion request and return assistant text."""
+        if use_moderation:
+            cfg = self.moderation_config
+            label = "moderation"
+        elif use_decision:
+            cfg = self.decision_config
+            label = "decision"
+        else:
+            cfg = self.main
+            label = "main"
+
         kwargs = self._build_kwargs(cfg)
-        log.info("[LLM:%s] model=%s, messages=%d条", label, cfg.model, len(messages))
+        log.info("[LLM:%s] model=%s, messages=%d", label, cfg.model, len(messages))
         try:
             resp = await litellm.acompletion(messages=messages, **kwargs)
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content)
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            log.info("[LLM:%s] 响应: %s (in=%d out=%d tokens)", label, text[:120], tokens_in, tokens_out)
+            log.info(
+                "[LLM:%s] response=%s (in=%d out=%d tokens)",
+                label,
+                text[:120],
+                tokens_in,
+                tokens_out,
+            )
             return text
         except Exception:
-            log.exception("[LLM:%s] 调用失败 model=%s", label, cfg.model)
+            log.exception("[LLM:%s] call failed model=%s", label, cfg.model)
             return ""
 
     async def decision(self, system: str, user_text: str) -> str:
-        """快速决策调用（使用决策模型）。"""
+        """Fast decision call (uses decision model)."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
         return await self.chat(messages, use_decision=True)
 
+    async def moderation(self, system: str, user_text: str) -> str:
+        """Moderation call (uses moderation model)."""
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ]
+        return await self.chat(messages, use_moderation=True)
+
     async def generate(self, system: str, user_text: str) -> str:
-        """生成回复（使用主模型）。"""
+        """General generation call (uses main model)."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
@@ -95,25 +122,33 @@ class LLMService:
         return await self.chat(messages)
 
     async def compress(self, system: str, user_text: str) -> str:
-        """对历史对话进行压缩（使用压缩模型）。"""
+        """Compress conversation history (uses compress model)."""
         kwargs = self._build_kwargs(self.compress_config)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
-        log.info("[LLM:compress] model=%s, input_len=%d chars", self.compress_config.model, len(user_text))
+        log.info(
+            "[LLM:compress] model=%s, input_len=%d chars",
+            self.compress_config.model,
+            len(user_text),
+        )
         try:
             resp = await litellm.acompletion(messages=messages, **kwargs)
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content)
-            log.info("[LLM:compress] 压缩完成: %d chars -> %d chars", len(user_text), len(text))
+            log.info(
+                "[LLM:compress] done: %d chars -> %d chars",
+                len(user_text),
+                len(text),
+            )
             return text
         except Exception:
-            log.exception("[LLM:compress] 调用失败 model=%s", self.compress_config.model)
+            log.exception("[LLM:compress] call failed model=%s", self.compress_config.model)
             return ""
 
     async def vision_describe(self, image_url: str, prompt: str) -> str:
-        """图片理解：让模型读取图片并输出简短中文描述。"""
+        """Image understanding with the main model."""
         kwargs = self._build_kwargs(self.main)
         messages: list[dict[str, Any]] = [
             {
@@ -124,33 +159,38 @@ class LLMService:
                 ],
             }
         ]
-        log.info("[LLM:vision] model=%s, 发送1张图片", self.main.model)
+        log.info("[LLM:vision] model=%s, sending image", self.main.model)
         try:
             resp = await litellm.acompletion(messages=messages, **kwargs)
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content).strip()
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            log.info("[LLM:vision] 响应: %s (in=%d out=%d tokens)", text[:120], tokens_in, tokens_out)
+            log.info(
+                "[LLM:vision] response=%s (in=%d out=%d tokens)",
+                text[:120],
+                tokens_in,
+                tokens_out,
+            )
             return text
         except Exception:
-            log.exception("[LLM:vision] 调用失败 model=%s", self.main.model)
+            log.exception("[LLM:vision] call failed model=%s", self.main.model)
             return ""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        """生成文本向量。"""
+        """Generate embeddings."""
         cfg = self.embed_config
         kwargs: dict[str, Any] = {"model": cfg.model, "input": texts}
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
         if cfg.api_base:
             kwargs["api_base"] = cfg.api_base
-        log.info("[LLM:embed] model=%s, texts=%d条", cfg.model, len(texts))
+        log.info("[LLM:embed] model=%s, texts=%d", cfg.model, len(texts))
         try:
             resp = await litellm.aembedding(**kwargs)
             embeddings = [item["embedding"] for item in resp.data]
-            log.info("[LLM:embed] 完成, dim=%d", len(embeddings[0]) if embeddings else 0)
+            log.info("[LLM:embed] done, dim=%d", len(embeddings[0]) if embeddings else 0)
             return embeddings
         except Exception:
-            log.exception("[LLM:embed] 调用失败 model=%s", cfg.model)
+            log.exception("[LLM:embed] call failed model=%s", cfg.model)
             return []

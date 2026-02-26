@@ -30,6 +30,11 @@ class BotConfig(BaseModel):
         temperature=0.1,
         max_tokens=256,
     )
+    moderation_model: ModelConfig = ModelConfig(
+        model="gemini/gemini-2.0-flash",
+        temperature=0.1,
+        max_tokens=256,
+    )
     compress_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.3,
@@ -63,6 +68,10 @@ class Settings(BaseSettings):
     decision_model: str = ""
     decision_api_key: str = ""
     decision_api_base: str = ""
+    moderation_provider: str = ""
+    moderation_model: str = ""
+    moderation_api_key: str = ""
+    moderation_api_base: str = ""
     compress_provider: str = ""
     compress_model: str = ""
     compress_api_key: str = ""
@@ -106,6 +115,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             settings.bot.main_model = ModelConfig(**bot_data["main_model"])
         if "decision_model" in bot_data:
             settings.bot.decision_model = ModelConfig(**bot_data["decision_model"])
+        if "moderation_model" in bot_data:
+            settings.bot.moderation_model = ModelConfig(**bot_data["moderation_model"])
         if "parse_mode" in bot_data:
             settings.bot.parse_mode = bot_data["parse_mode"]
         if "drop_pending_updates" in bot_data:
@@ -126,7 +137,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     if settings.main_api_base:
         mc.api_base = settings.main_api_base
 
-    # Build decision model config (留空则复用主模型)
+    # Build decision model config (blank => reuse main model config)
     dc = settings.bot.decision_model
     d_provider = settings.decision_provider or settings.main_provider
     d_model = settings.decision_model or settings.main_model
@@ -136,8 +147,23 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         dc.api_base = settings.decision_api_base
     elif d_provider == "openai_compatible" and settings.main_api_base:
         dc.api_base = settings.main_api_base
+    # Build moderation model config (leave blank to reuse decision, then main)
+    moc = settings.bot.moderation_model
+    m_provider = settings.moderation_provider or settings.decision_provider or settings.main_provider
+    m_model = settings.moderation_model or settings.decision_model or settings.main_model
+    moc.model = _build_litellm_model(m_provider, m_model)
+    moc.api_key = (
+        settings.moderation_api_key
+        or settings.decision_api_key
+        or settings.main_api_key
+        or moc.api_key
+    )
+    if settings.moderation_api_base:
+        moc.api_base = settings.moderation_api_base
+    elif m_provider == "openai_compatible":
+        moc.api_base = settings.decision_api_base or settings.main_api_base or moc.api_base
 
-    # Build compress model config (留空则复用主模型)
+    # Build compress model config (blank => reuse main model config)
     cc = settings.bot.compress_model
     c_provider = settings.compress_provider or settings.main_provider
     c_model = settings.compress_model or settings.main_model
@@ -148,7 +174,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     elif c_provider == "openai_compatible" and settings.main_api_base:
         cc.api_base = settings.main_api_base
 
-    # Build embed model config (留空则复用主模型)
+    # Build embed model config (blank => reuse main model config)
     ec = settings.bot.embed_model
     e_provider = settings.embed_provider or settings.main_provider
     e_model = settings.embed_model or "text-embedding-004"

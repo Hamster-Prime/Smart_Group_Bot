@@ -31,7 +31,13 @@ async def main() -> None:
     dp["session_factory"] = session_factory
 
     # Init memory service and load history from disk
-    llm = LLMService(settings.bot.main_model, settings.bot.decision_model, settings.bot.compress_model, embed=settings.bot.embed_model)
+    llm = LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        embed=settings.bot.embed_model,
+    )
     memory = MemoryService(settings.bot, llm)
     memory.load_all()
     memory_holder.init(memory)

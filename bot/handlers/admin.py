@@ -159,6 +159,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
     llm = LLMService(
         settings.bot.main_model,
         settings.bot.decision_model,
+        moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
     )
     result = await llm.generate(RULE_MANAGE_SYSTEM, args)

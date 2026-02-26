@@ -195,6 +195,7 @@ async def on_group_message(
         settings.bot.main_model,
         settings.bot.decision_model,
         settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
     )
     kb = KnowledgeService(settings.knowledge, llm)

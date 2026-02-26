@@ -98,6 +98,7 @@ async def cmd_kb(
     llm = LLMService(
         settings.bot.main_model,
         settings.bot.decision_model,
+        moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
     )
     kb = KnowledgeService(settings.knowledge, llm)

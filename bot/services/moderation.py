@@ -16,22 +16,108 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 log = logging.getLogger(__name__)
 
 
-def _parse_moderation_json(raw: str) -> dict | None:
-    payload = (raw or "").strip()
-
+def _strip_markdown_fence(text: str) -> str:
+    payload = (text or "").strip()
     if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json)?", "", payload).strip()
+        payload = re.sub(r"^```(?:json)?", "", payload, flags=re.IGNORECASE).strip()
         payload = re.sub(r"```$", "", payload).strip()
+    return payload
 
-    if not payload.startswith("{"):
-        m = re.search(r"\{[\s\S]*\}", payload)
-        if m:
-            payload = m.group(0)
+
+def _extract_balanced_object(text: str) -> str | None:
+    """Extract first balanced JSON object from text, ignoring braces in strings."""
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
+
+
+def _decode_json_fragment(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        return value
+
+
+def _extract_field_by_regex(payload: str, key: str) -> str:
+    # Support escaped quote content inside JSON strings.
+    pattern = rf'"{re.escape(key)}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    m = re.search(pattern, payload, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    return _decode_json_fragment(m.group(1)).strip()
+
+
+def _salvage_moderation_fields(payload: str) -> dict | None:
+    data: dict = {}
+
+    bool_match = re.search(
+        r'"(?:violated|violation)"\s*:\s*(true|false)\b(?!\s*/)',
+        payload,
+        flags=re.IGNORECASE,
+    )
+    if bool_match:
+        data["violated"] = bool_match.group(1).lower() == "true"
+
+    rid_match = re.search(
+        r'"rule_id"\s*:\s*(null|-?\d+)',
+        payload,
+        flags=re.IGNORECASE,
+    )
+    if rid_match:
+        rid_raw = rid_match.group(1).lower()
+        data["rule_id"] = None if rid_raw == "null" else int(rid_raw)
+
+    reason = _extract_field_by_regex(payload, "reason")
+    if reason:
+        data["reason"] = reason
+
+    rule = _extract_field_by_regex(payload, "rule")
+    if rule:
+        data["rule"] = rule
+
+    # Moderation decision must at least contain violated boolean.
+    if "violated" not in data:
+        return None
+    return data
+
+
+def _parse_moderation_json(raw: str) -> dict | None:
+    payload = _strip_markdown_fence(raw)
+    candidate = _extract_balanced_object(payload)
+    if candidate:
+        payload = candidate
+    elif "{" in payload:
+        # LLM can return truncated object; keep from first "{" for regex salvage.
+        payload = payload[payload.find("{") :]
 
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        return None
+        return _salvage_moderation_fields(payload)
 
     if not isinstance(data, dict):
         return None
@@ -71,7 +157,7 @@ class ModerationService:
 
         system_prompt = build_defended_system(MODERATION_SYSTEM.format(rules_json=rules_json))
         user_input = wrap_untrusted("待审核消息", clean_text(text, max_len=1200), max_len=1200)
-        llm_raw = await self.llm.generate(system_prompt, user_input)
+        llm_raw = await self.llm.moderation(system_prompt, user_input)
         data = _parse_moderation_json(llm_raw)
 
         if not data:
