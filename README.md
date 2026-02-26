@@ -1,115 +1,215 @@
-# Smart Group Bot
+# 🤖 Smart Group Bot
 
-一个面向 Telegram 群聊的智能机器人，支持：
-- AI 审核（基于群规语义判定）
-- 知识库问答（RAG）
-- 日常闲聊回复
-- 图片/贴纸视觉理解（OCR + 场景描述）
-- 技能系统（`websearch` / `webfetch`）
-- 记忆压缩与落盘（定时 + 停机前）
+<div align="center">
 
-## 功能概览
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram)](https://telegram.org)
 
-### 1. 群消息处理链路
-1. 内容审核（AI）
-2. 决策模型（`skip` / `knowledge` / `casual`）
-3. RAG 或技能调用
-4. 闲聊兜底
-5. 记忆写入与压缩
+**基于 LLM 的智能群聊管理机器人**
 
-### 2. 媒体消息能力
-- 图片：支持视觉识别
-- 图片+文字：支持视觉识别并与文字合并
-- 贴纸：按图片逻辑处理（静态贴纸直接识别，动态贴纸优先缩略图）
-- 视频类媒体：直接放行（不触发回复）
+🎯 智能决策 · 📚 知识库 · 🛡️ 内容审查 · 🔍 联网搜索
 
-### 3. 技能（Skills）
-- `websearch`：基于 DDGS 搜索网页
-- `webfetch`：抓取 URL 并提取正文
+</div>
 
-### 4. 安全防护
-- 提示词注入检测
-- 用户输入 / 历史上下文 / 知识片段 / 网页内容统一按不可信数据处理
-- 模型系统提示词前置安全规则，避免越权指令执行
+---
 
-## 项目结构
+## ✨ 功能特性
 
-```text
-bot/
-  handlers/        # Telegram 事件处理
-  services/        # 决策、审核、RAG、技能、记忆等服务
-  middlewares/     # 日志、限流、数据库会话
-  db/              # 数据模型与数据库初始化
-  utils/           # 工具函数与 prompt 加载
-prompt/            # 模型提示词模板
-data/              # SQLite 数据目录（运行时生成）
-memory/            # 记忆压缩落盘目录（运行时生成）
-start.py           # 推荐启动入口
-```
+### 🧠 智能决策系统
+- **LLM 驱动决策**：由大模型判断何时回复、回复什么内容
+- **三级响应策略**：
+  - `skip` - 忽略消息（闲聊场景）
+  - `knowledge` - 调用知识库回复（问题场景）
+  - `casual` - 自由闲聊（互动场景）
+- **强制触发机制**：被 @ 时强制响应
 
-## 运行要求
+### 📚 知识库系统
+- **自然语言录入**：无需复杂命令，直接描述即可添加知识
+- **自动向量化**：每小时自动整理和嵌入记忆
+- **上下文感知**：基于群聊上下文智能检索相关信息
+- **持久化存储**：本地存储，重启不丢失
 
-- Python `>= 3.12`
+### 🛡️ 群规与审查
+- **动态群规**：支持自然语言添加群规则
+- **内容审查**：LLM 实时检测违规内容
+- **自动处罚**：
+  - 警告提示（3 次机会）
+  - 自动删除违规消息（需管理权限）
+  - 多次违规自动踢出群组
+- **正则支持**：支持正则表达式匹配规则
+
+### 🔍 内置技能
+| 技能 | 说明 |
+|------|------|
+| `websearch` | 联网搜索实时信息 |
+| `webfetch` | 获取网页详细内容 |
+
+---
+
+## 🚀 快速开始
+
+### 环境要求
+- Python 3.10+
 - Telegram Bot Token
-- 可用的 LLM / Embedding 提供方配置（在 `.env`）
+- 大模型 API（支持 GPT/Claude/Gemini 等）
 
-## 快速开始
-
-### 1) 安装依赖
+### 安装部署
 
 ```bash
-pip install -e .
-```
+# 克隆项目
+git clone https://github.com/Hamster-Prime/Smart_Group_Bot.git
+cd Smart_Group_Bot
 
-### 2) 配置环境变量
+# 安装依赖
+pip install -r requirements.txt
 
-复制并编辑：
-
-```bash
+# 配置环境变量
 cp .env.example .env
+# 编辑 .env 文件填写配置
+
+# 启动机器人
+python main.py
 ```
 
-至少配置：
-- `BOT_TOKEN`
-- 主模型与 API Key（`MAIN_PROVIDER` / `MAIN_MODEL` / `MAIN_API_KEY`）
-
-### 3) 启动 Bot
+### Docker 部署（可选）
 
 ```bash
-python start.py
+# 构建镜像
+docker build -t smart-group-bot .
+
+# 运行
+docker run -d --env-file .env --name smart-bot smart-group-bot
 ```
 
-Windows 可用：
+---
 
-```bat
-start.bat
+## ⚙️ 配置说明
+
+编辑 `.env` 文件：
+
+```env
+# Telegram 配置
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_GROUP_ID=your_group_id
+
+# 大模型配置
+LLM_API_KEY=your_api_key
+LLM_MODEL=gpt-4o  # 或其他支持的模型
+LLM_BASE_URL=https://api.openai.com/v1  # 可选
+
+# 决策模型配置（可选，用于轻量级决策）
+DECISION_MODEL=gpt-3.5-turbo
+
+# 嵌入模型配置（用于知识库）
+EMBEDDING_MODEL=text-embedding-3-small
+
+# 内容审查配置
+ENABLE_CONTENT_MODERATION=true
+MAX_WARNINGS=3
+
+# 其他配置
+LOG_LEVEL=INFO
+DATA_DIR=./data
 ```
 
-## 常用命令
+---
 
-- `/start`
-- `/help`
-- `/kb <自然语言指令>`（管理员）
-- `/addrule <自然语言指令>`（管理员）
-- `/rules`（管理员）
-- `/warnings <用户ID>`（管理员）
+## 📖 使用指南
 
-## Docker（仅 Bot）
+### 基础命令
 
-```bash
-docker compose up --build -d
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `/help` | 显示帮助信息 | `/help` |
+| `/kb <内容>` | 添加知识库条目 | `/kb 白菜是 LongEmby 的服主` |
+| `/addrule <规则>` | 添加群规 | `/addrule 禁止骂人` |
+| `/rules` | 查看当前群规 | `/rules` |
+
+### 自然语言交互
+
+无需记忆命令，直接用自然语言与机器人交互：
+
+```
+用户：白菜是谁？
+Bot：白菜是 LongEmby 的服主和主理人。
+
+用户：增加一条规则，禁止发广告
+Bot：已添加群规：禁止发广告
+
+用户：@Bot 今天的天气怎么样？
+Bot：[调用 websearch 查询天气并回复]
 ```
 
-## GitHub 提交建议
+### 决策提示词示例
 
-建议不要提交以下内容：
-- `.env`
-- `data/`、`memory/`
-- 本地虚拟环境与缓存文件
-- IDE 临时文件
+机器人内置的决策逻辑：
 
-本仓库 `.gitignore` 已覆盖常见场景，可按需再扩展。
+```
+你是一个群聊消息决策器。判断机器人是否应回复，以及回复类型。
 
-## 许可证
+输入区块：
+- [是否@机器人]：是/否
+- [消息类型]
+- [知识库标题]
+- [知识库条目摘要]
+- [消息正文]
 
-如需开源发布，请自行补充 `LICENSE` 文件。
+决策规则：
+1. 如果 [是否@机器人]=是，必须回复
+2. 如果消息是"问题"且知识库有答案，输出 knowledge
+3. 普通闲聊、寒暄：优先 skip
+4. 不要因为"有问号"就一律回复
+
+仅输出一个词（小写）：skip / knowledge / casual
+```
+
+---
+
+## 🏗️ 架构设计
+
+```
+┌─────────────────────────────────────────┐
+│           Telegram Group                │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│         Smart Group Bot                 │
+│  ┌──────────────┐  ┌──────────────┐    │
+│  │   Decision   │  │   Knowledge  │    │
+│  │     LLM      │  │     Base     │    │
+│  └──────────────┘  └──────────────┘    │
+│  ┌──────────────┐  ┌──────────────┐    │
+│  │   Content    │  │    Skills    │    │
+│  │  Moderation  │  │(websearch...)│    │
+│  └──────────────┘  └──────────────┘    │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 🤝 贡献指南
+
+欢迎提交 Issue 和 PR！
+
+1. Fork 本项目
+2. 创建特性分支：`git checkout -b feature/AmazingFeature`
+3. 提交更改：`git commit -m 'Add some AmazingFeature'`
+4. 推送分支：`git push origin feature/AmazingFeature`
+5. 提交 Pull Request
+
+---
+
+## 📄 开源协议
+
+本项目基于 [MIT](LICENSE) 协议开源。
+
+---
+
+<div align="center">
+
+**Made with ❤️ by Hamster-Prime**
+
+[问题反馈](https://github.com/Hamster-Prime/Smart_Group_Bot/issues) · [功能建议](https://github.com/Hamster-Prime/Smart_Group_Bot/discussions)
+
+</div>
