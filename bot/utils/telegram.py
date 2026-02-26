@@ -7,6 +7,9 @@ import re
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import Message
 
+from bot.config import Settings
+from bot.services.authz import is_super_admin_user_id
+
 
 def get_display_name(msg: Message) -> str:
     if msg.from_user:
@@ -28,9 +31,9 @@ def is_bot_mentioned(msg: Message, bot_username: str) -> bool:
 
 
 async def is_user_admin(message: Message) -> bool:
-    """Check if message sender is a chat admin/creator.
+    """Check if sender is group admin/creator.
 
-    In private chat there is no admin concept; return True.
+    In private chats, returns True.
     """
     if not message.from_user or not message.chat:
         return False
@@ -46,8 +49,11 @@ async def is_user_admin(message: Message) -> bool:
     return member.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
 
 
-async def ensure_admin(message: Message) -> bool:
-    """Return True if sender is admin, otherwise reply and return False."""
+async def ensure_admin(message: Message, settings: Settings | None = None) -> bool:
+    """Return True if sender is admin (or super admin), otherwise reply and return False."""
+    if settings and message.from_user and is_super_admin_user_id(message.from_user.id, settings):
+        return True
+
     ok = await is_user_admin(message)
     if ok:
         return True
@@ -58,21 +64,14 @@ async def ensure_admin(message: Message) -> bool:
 
 def md_to_html(text: str) -> str:
     """Convert common Markdown to Telegram HTML."""
-    # Code blocks first (```lang\n...\n```)
     text = re.sub(r"```\w*\n(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
-    # Inline code
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    # Bold: **text** or __text__
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    # Italic: *text* or _text_
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
-    # Strikethrough: ~~text~~
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    # Links: [text](url)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
-    # Headers: ### text -> bold
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text
 
@@ -119,3 +118,4 @@ def extract_message_text(message: Message) -> tuple[str, str]:
     if message.location:
         return "[location]", "location"
     return "", "unknown"
+

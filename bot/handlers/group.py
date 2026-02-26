@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Group, MessageLog
 from bot.services import memory_holder
+from bot.services.authz import ensure_group_authorized
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.knowledge import KnowledgeService
@@ -152,6 +153,10 @@ async def on_group_message(
     message: Message, session: AsyncSession, settings: Settings
 ) -> None:
     if not is_group(message):
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+    if not await ensure_group_authorized(message, session, settings):
         return
 
     text, msg_type = extract_message_text(message)

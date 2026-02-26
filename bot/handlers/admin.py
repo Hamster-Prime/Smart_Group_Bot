@@ -12,20 +12,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import ModerationRule, UserWarning
+from bot.services.authz import (
+    authorize_group,
+    deauthorize_group,
+    ensure_group_authorized,
+    ensure_super_admin,
+    list_authorized_groups,
+)
 from bot.services.llm import LLMService
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
-from bot.utils.telegram import ensure_admin
+from bot.utils.telegram import ensure_admin, is_group
 
 router = Router()
 log = logging.getLogger(__name__)
 
-# 对“禁止骂人”等自然语言规则的模式归一化
+# 将“禁止骂人”等自然语言规则归一为可执行模式
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
 _ABUSE_REGEX = r"(操你妈|草泥马|傻逼|煞笔|沙比|sb|妈的|去死|干死你|狗东西|废物|脑残)"
 
 
 def _parse_json_payload(raw: str) -> dict | None:
-    payload = raw.strip()
+    payload = (raw or "").strip()
 
     if payload.startswith("```"):
         payload = re.sub(r"^```(?:json)?", "", payload).strip()
@@ -44,6 +51,18 @@ def _parse_json_payload(raw: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _resolve_target_group_id(message: Message, args: str) -> int | None:
+    arg = (args or "").strip()
+    if arg:
+        try:
+            return int(arg)
+        except ValueError:
+            return None
+    if is_group(message):
+        return message.chat.id
+    return None
 
 
 async def _reply_rules(message: Message, session: AsyncSession) -> None:
@@ -66,9 +85,63 @@ async def _reply_rules(message: Message, session: AsyncSession) -> None:
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("authgroup"))
+async def cmd_authgroup(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    group_id = _resolve_target_group_id(message, args)
+    if group_id is None:
+        await message.answer("用法: /authgroup <群ID> 或在群内直接 /authgroup")
+        return
+
+    created = await authorize_group(session, group_id, message.from_user.id if message.from_user else 0)
+    if created:
+        await message.answer(f"授权成功: {group_id}")
+    else:
+        await message.answer(f"该群已授权: {group_id}")
+
+
+@router.message(Command("unauthgroup"))
+async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    group_id = _resolve_target_group_id(message, args)
+    if group_id is None:
+        await message.answer("用法: /unauthgroup <群ID> 或在群内直接 /unauthgroup")
+        return
+
+    removed = await deauthorize_group(session, group_id)
+    if removed:
+        await message.answer(f"已取消授权: {group_id}")
+    else:
+        await message.answer(f"该群未授权: {group_id}")
+
+
+@router.message(Command("authlist"))
+async def cmd_authlist(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+
+    rows = await list_authorized_groups(session)
+    if not rows:
+        await message.answer("暂无已授权群组。")
+        return
+
+    lines = ["已授权群组列表:"]
+    for r in rows[:100]:
+        lines.append(f"- {r.group_id} (by={r.authorized_by or 0})")
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("addrule"))
 async def cmd_addrule(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_admin(message):
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
         return
 
     args = (message.text or "").partition(" ")[2].strip()
@@ -110,7 +183,6 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         if hit_action not in ("warn", "delete", "ban"):
             hit_action = "warn"
 
-        # “禁止骂人”之类规则自动转为可执行 regex
         if pattern.lower() in _SEMANTIC_ABUSE_HINTS:
             rule_type = "regex"
             pattern = _ABUSE_REGEX
@@ -123,9 +195,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         )
         session.add(rule)
         await session.flush()
-        await message.answer(
-            f"已添加规则 #{rule.id}: [{rule_type}] {pattern} -> {hit_action}"
-        )
+        await message.answer(f"已添加规则 #{rule.id}: [{rule_type}] {pattern} -> {hit_action}")
         return
 
     if action == "delete":
@@ -174,15 +244,19 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
 
 
 @router.message(Command("rules"))
-async def cmd_rules(message: Message, session: AsyncSession) -> None:
-    if not await ensure_admin(message):
+async def cmd_rules(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
         return
     await _reply_rules(message, session)
 
 
 @router.message(Command("warnings"))
-async def cmd_warnings(message: Message, session: AsyncSession) -> None:
-    if not await ensure_admin(message):
+async def cmd_warnings(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
         return
 
     parts = (message.text or "").split()
@@ -208,3 +282,4 @@ async def cmd_warnings(message: Message, session: AsyncSession) -> None:
     else:
         status = "已封禁" if warn.is_banned else "正常"
         await message.answer(f"用户 {user_id}: 警告 {warn.count} 次，状态: {status}")
+

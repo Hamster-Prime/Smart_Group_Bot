@@ -101,6 +101,14 @@ class Admin(Base):
     __table_args__ = (Index("ix_admin_group_user", "group_id", "user_id", unique=True),)
 
 
+class AuthorizedGroup(Base):
+    __tablename__ = "authorized_groups"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    authorized_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class MessageLog(Base):
     __tablename__ = "message_log"
 

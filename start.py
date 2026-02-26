@@ -36,9 +36,12 @@ def preflight() -> None:
 
     load_dotenv()
     token = os.getenv("BOT_TOKEN", "")
+    super_admin_id = os.getenv("SUPER_ADMIN_ID", "").strip()
     if not token or token == "your_bot_token_here":
         print("\n⚠️  请在 .env 中设置有效 BOT_TOKEN 后重试。\n")
         sys.exit(1)
+    if not super_admin_id:
+        log.warning("未设置 SUPER_ADMIN_ID，群组授权命令将无法使用。")
 
     Path("data").mkdir(exist_ok=True)
     log.info("预检通过 ✓")

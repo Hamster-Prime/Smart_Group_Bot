@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     bot_token: str = ""
+    super_admin_id: int = 0
     main_provider: str = "gemini"
     main_model: str = "gemini-2.0-flash"
     main_api_key: str = ""

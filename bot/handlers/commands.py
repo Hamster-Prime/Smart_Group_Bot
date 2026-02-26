@@ -10,6 +10,7 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
+from bot.services.authz import ensure_group_authorized
 from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.utils.prompts import KB_MANAGE_SYSTEM
@@ -20,7 +21,7 @@ log = logging.getLogger(__name__)
 
 
 def _parse_json_payload(raw: str) -> dict | None:
-    payload = raw.strip()
+    payload = (raw or "").strip()
 
     if payload.startswith("```"):
         payload = re.sub(r"^```(?:json)?", "", payload).strip()
@@ -42,7 +43,9 @@ def _parse_json_payload(raw: str) -> dict | None:
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
     await message.answer(
         "你好，我是智能群管机器人。\n\n"
         "功能:\n"
@@ -54,7 +57,9 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
     await message.answer(
         "<b>命令列表</b>\n\n"
         "/start - 开始使用\n"
@@ -64,7 +69,11 @@ async def cmd_help(message: Message) -> None:
         "<b>管理员命令</b>\n"
         "/addrule &lt;自然语言指令&gt; - 管理审核规则\n"
         "/rules - 查看审核规则\n"
-        "/warnings &lt;用户ID&gt; - 查看警告记录"
+        "/warnings &lt;用户ID&gt; - 查看警告记录\n\n"
+        "<b>最高管理员命令</b>\n"
+        "/authgroup [群ID] - 授权群组\n"
+        "/unauthgroup [群ID] - 取消授权群组\n"
+        "/authlist - 查看已授权群组"
     )
 
 
@@ -72,7 +81,9 @@ async def cmd_help(message: Message) -> None:
 async def cmd_kb(
     message: Message, session: AsyncSession, settings: Settings
 ) -> None:
-    if not await ensure_admin(message):
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_admin(message, settings):
         return
 
     args = (message.text or "").partition(" ")[2].strip()
@@ -144,3 +155,4 @@ async def cmd_kb(
 
     else:
         await message.answer("无法理解指令，请重试。")
+
