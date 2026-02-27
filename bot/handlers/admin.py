@@ -162,8 +162,8 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
     if group_id is None:
         await message.answer(
             "<b>命令用法</b>\n"
-            "- /authgroup &lt;群ID&gt;\n"
-            "- 或在群内直接发送 /authgroup"
+            "/authgroup &lt;群ID&gt;\n"
+            "或在群内直接发送 /authgroup"
         )
         return
 
@@ -171,14 +171,14 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
     if created:
         await message.answer(
             "<b>群组授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            "- <b>状态</b>: 授权成功"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>状态</b>: 授权成功"
         )
     else:
         await message.answer(
             "<b>群组授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            "- <b>状态</b>: 已处于授权状态"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>状态</b>: 已处于授权状态"
         )
 
 
@@ -192,8 +192,8 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
     if group_id is None:
         await message.answer(
             "<b>命令用法</b>\n"
-            "- /unauthgroup &lt;群ID&gt;\n"
-            "- 或在群内直接发送 /unauthgroup"
+            "/unauthgroup &lt;群ID&gt;\n"
+            "或在群内直接发送 /unauthgroup"
         )
         return
 
@@ -201,14 +201,14 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
     if removed:
         await message.answer(
             "<b>群组授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            "- <b>状态</b>: 已取消授权"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>状态</b>: 已取消授权"
         )
     else:
         await message.answer(
             "<b>群组授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            "- <b>状态</b>: 当前未授权"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>状态</b>: 当前未授权"
         )
 
 
@@ -248,16 +248,16 @@ async def cmd_authadmin(message: Message, session: AsyncSession, settings: Setti
     if created:
         await message.answer(
             "<b>群管理授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            "- <b>状态</b>: 授权成功"
+            f"<b>群ID</b>: {group_id}\n"
+            f"<b>用户ID</b>: {user_id}\n"
+            "<b>状态</b>: 授权成功"
         )
     else:
         await message.answer(
             "<b>群管理授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            "- <b>状态</b>: 已有群管理权限"
+            f"<b>群ID</b>: {group_id}\n"
+            f"<b>用户ID</b>: {user_id}\n"
+            "<b>状态</b>: 已有群管理权限"
         )
 
 
@@ -281,16 +281,16 @@ async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Set
     if removed:
         await message.answer(
             "<b>群管理授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            "- <b>状态</b>: 已取消群管理权限"
+            f"<b>群ID</b>: {group_id}\n"
+            f"<b>用户ID</b>: {user_id}\n"
+            "<b>状态</b>: 已取消群管理权限"
         )
     else:
         await message.answer(
             "<b>群管理授权结果</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            "- <b>状态</b>: 当前未拥有群管理权限"
+            f"<b>群ID</b>: {group_id}\n"
+            f"<b>用户ID</b>: {user_id}\n"
+            "<b>状态</b>: 当前未拥有群管理权限"
         )
 
 
@@ -304,8 +304,8 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
     if group_id is None:
         await message.answer(
             "<b>命令用法</b>\n"
-            "- /adminlist &lt;群ID&gt;\n"
-            "- 或在群内直接发送 /adminlist"
+            "/adminlist &lt;群ID&gt;\n"
+            "或在群内直接发送 /adminlist"
         )
         return
 
@@ -313,8 +313,8 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
     if not rows:
         await message.answer(
             "<b>群管理授权列表</b>\n"
-            f"- <b>群ID</b>: {group_id}\n"
-            "- <b>结果</b>: 当前无已授权群管理"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>结果</b>: 当前无已授权群管理"
         )
         return
 
@@ -335,8 +335,8 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
     if not args:
         await message.answer(
             "<b>规则管理指令格式</b>\n"
-            "- 用法: /addrule &lt;自然语言&gt;\n"
-            "- 示例: /addrule 增加群规 禁止骂人"
+            "用法: /addrule &lt;自然语言&gt;\n"
+            "示例: /addrule 增加群规 禁止骂人"
         )
         return
 
@@ -366,11 +366,11 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         if rule_type not in ("keyword", "regex", "llm"):
             await message.answer(
                 "<b>规则添加失败</b>\n"
-                "- rule_type 必须是 keyword、regex 或 llm"
+                "rule_type 必须是 keyword、regex 或 llm"
             )
             return
         if not pattern:
-            await message.answer("<b>规则添加失败</b>\n- pattern 不能为空")
+            await message.answer("<b>规则添加失败</b>\npattern 不能为空")
             return
         if hit_action not in ("warn", "delete", "ban"):
             hit_action = "warn"
@@ -390,10 +390,10 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         await session.flush()
         await message.answer(
             "<b>规则添加成功</b>\n"
-            f"- <b>规则编号</b>: #{rule.id}\n"
-            f"- <b>规则类型</b>: {_rule_type_label(rule_type)}\n"
-            f"- <b>命中动作</b>: {_action_label(hit_action)}\n"
-            f"- <b>规则内容</b>: {html.escape(_truncate_text(pattern, 160))}"
+            f"<b>规则编号</b>: #{rule.id}\n"
+            f"<b>规则类型</b>: {_rule_type_label(rule_type)}\n"
+            f"<b>命中动作</b>: {_action_label(hit_action)}\n"
+            f"<b>规则内容</b>: {html.escape(_truncate_text(pattern, 160))}"
         )
         return
 
@@ -404,7 +404,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             try:
                 rid = int(data["rule_id"])
             except (TypeError, ValueError):
-                await message.answer("<b>规则删除失败</b>\n- rule_id 必须是整数")
+                await message.answer("<b>规则删除失败</b>\nrule_id 必须是整数")
                 return
             candidate = await session.get(ModerationRule, rid)
             if candidate and candidate.group_id == message.chat.id:
@@ -413,7 +413,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             pattern = str(data.get("pattern", "")).strip()
             rule_type = str(data.get("rule_type", "")).strip().lower()
             if not pattern:
-                await message.answer("<b>规则删除失败</b>\n- 删除时请提供 rule_id 或 pattern")
+                await message.answer("<b>规则删除失败</b>\n删除时请提供 rule_id 或 pattern")
                 return
 
             stmt = select(ModerationRule).where(
@@ -427,16 +427,16 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             rule = result.scalars().first()
 
         if not rule:
-            await message.answer("<b>规则删除失败</b>\n- 未找到对应规则")
+            await message.answer("<b>规则删除失败</b>\n未找到对应规则")
             return
 
         rid = rule.id
         await session.delete(rule)
         await message.answer(
             "<b>规则删除成功</b>\n"
-            f"- <b>规则编号</b>: #{rid}\n"
-            f"- <b>规则类型</b>: {_rule_type_label(rule.rule_type)}\n"
-            f"- <b>规则内容</b>: {html.escape(_truncate_text(rule.pattern or '', 160))}"
+            f"<b>规则编号</b>: #{rid}\n"
+            f"<b>规则类型</b>: {_rule_type_label(rule.rule_type)}\n"
+            f"<b>规则内容</b>: {html.escape(_truncate_text(rule.pattern or '', 160))}"
         )
         return
 
@@ -463,43 +463,38 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
     if not await ensure_group_admin_permission(message, session, settings):
         return
 
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer(
-            "<b>命令用法</b>\n"
-            "- /warnings &lt;用户ID&gt;"
+    stmt = (
+        select(UserWarning)
+        .where(
+            UserWarning.group_id == message.chat.id,
+            UserWarning.count > 0,
         )
-        return
-
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("<b>查询失败</b>\n- 用户ID 必须是数字")
-        return
-
-    stmt = select(UserWarning).where(
-        UserWarning.group_id == message.chat.id,
-        UserWarning.user_id == user_id,
+        .order_by(UserWarning.is_banned.desc(), UserWarning.count.desc(), UserWarning.user_id.asc())
     )
     result = await session.execute(stmt)
-    warn = result.scalar_one_or_none()
+    rows = result.scalars().all()
 
-    if not warn:
+    if not rows:
         await message.answer(
-            "<b>用户警告记录</b>\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            "- <b>警告次数</b>: 0\n"
-            "- <b>状态</b>: 无记录"
+            "<b>当前群组警告/封禁名单</b>\n"
+            "<b>结果</b>: 暂无被警告或封禁用户"
         )
-    else:
-        status = "已封禁" if warn.is_banned else "正常"
-        threshold = max(1, settings.moderation.warn_threshold)
-        await message.answer(
-            "<b>用户警告记录</b>\n"
-            f"- <b>用户ID</b>: {user_id}\n"
-            f"- <b>警告次数</b>: {warn.count}/{threshold}\n"
-            f"- <b>状态</b>: {status}"
-        )
+        return
+
+    threshold = max(1, settings.moderation.warn_threshold)
+    banned_count = sum(1 for row in rows if row.is_banned)
+    lines = [
+        "<b>当前群组警告/封禁名单</b>",
+        f"<b>总人数</b>: {len(rows)}",
+        f"<b>已封禁</b>: {banned_count}",
+        f"<b>警告中</b>: {len(rows) - banned_count}",
+        "",
+    ]
+    for idx, row in enumerate(rows[:100], start=1):
+        status = "已封禁" if row.is_banned else "警告中"
+        lines.append(f"{idx}. 用户ID: {row.user_id} | 次数: {row.count}/{threshold} | 状态: {status}")
+
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("aiexempt"))
@@ -514,7 +509,7 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     if not target:
         await message.answer(
             "<b>命令用法</b>\n"
-            "- 请先回复目标用户的一条消息，再执行 /aiexempt"
+            "请先回复目标用户的一条消息，再执行 /aiexempt"
         )
         return
     if target.is_bot:
@@ -530,8 +525,8 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     if existing:
         await message.answer(
             "<b>AI 审查豁免</b>\n"
-            f"- <b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
-            "- <b>状态</b>: 已在豁免名单中"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 已在豁免名单中"
         )
         return
 
@@ -544,8 +539,8 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     )
     await message.answer(
         "<b>AI 审查豁免</b>\n"
-        f"- <b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
-        "- <b>状态</b>: 已开启豁免"
+        f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+        "<b>状态</b>: 已开启豁免"
     )
 
 
@@ -561,7 +556,7 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
     if not target:
         await message.answer(
             "<b>命令用法</b>\n"
-            "- 请先回复目标用户的一条消息，再执行 /unaiexempt"
+            "请先回复目标用户的一条消息，再执行 /unaiexempt"
         )
         return
     if target.is_bot:
@@ -577,15 +572,15 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
     if not existing:
         await message.answer(
             "<b>AI 审查豁免</b>\n"
-            f"- <b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
-            "- <b>状态</b>: 当前不在豁免名单"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 当前不在豁免名单"
         )
         return
 
     await session.delete(existing)
     await message.answer(
         "<b>AI 审查豁免</b>\n"
-        f"- <b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
-        "- <b>状态</b>: 已取消豁免"
+        f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+        "<b>状态</b>: 已取消豁免"
     )
 

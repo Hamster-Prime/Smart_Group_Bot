@@ -81,9 +81,9 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
         "<b>智能群管机器人</b>\n"
         "欢迎使用。\n\n"
         "<b>核心功能</b>\n"
-        "- 知识库问答\n"
-        "- 内容审核\n"
-        "- 智能闲聊\n\n"
+        "知识库问答\n"
+        "内容审核\n"
+        "智能闲聊\n\n"
         "<b>快速开始</b>\n"
         "发送 /help 查看完整命令。"
     )
@@ -96,24 +96,24 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
     await message.answer(
         "<b>命令总览</b>\n\n"
         "<b>基础命令</b>\n"
-        "- /start：开始使用\n"
-        "- /help：查看帮助\n\n"
+        "/start：开始使用\n"
+        "/help：查看帮助\n\n"
         "<b>知识库管理（已授权群管理）</b>\n"
-        "- /kb &lt;自然语言指令&gt;\n"
-        "- /kb list\n\n"
+        "/kb &lt;自然语言指令&gt;\n"
+        "/kb list 知识库列表\n\n"
         "<b>群审核管理（需已授权）</b>\n"
-        "- /addrule &lt;自然语言指令&gt;\n"
-        "- /rules\n"
-        "- /warnings &lt;用户ID&gt;\n"
-        "- /aiexempt（回复目标用户消息）\n"
-        "- /unaiexempt（回复目标用户消息）\n\n"
+        "/addrule &lt;自然语言指令&gt;\n"
+        "/rules 审核规则列表\n"
+        "/warnings（群内查看警告/封禁名单）\n"
+        "/aiexempt（回复目标用户消息）\n"
+        "/unaiexempt（回复目标用户消息）\n\n"
         "<b>最高管理员命令</b>\n"
-        "- /authgroup [群ID]\n"
-        "- /unauthgroup [群ID]\n"
-        "- /authlist\n"
-        "- /authadmin [群ID] [用户ID]\n"
-        "- /unauthadmin [群ID] [用户ID]\n"
-        "- /adminlist [群ID]"
+        "/authgroup 授权群组\n"
+        "/unauthgroup 撤销授权群组\n"
+        "/authlist 授权群组列表\n"
+        "/authadmin 授权群管理\n"
+        "/unauthadmin 撤销授权群管理\n"
+        "/adminlist 群管理列表"
     )
 
 
@@ -130,8 +130,8 @@ async def cmd_kb(
     if not args:
         await message.answer(
             "<b>知识库指令格式</b>\n"
-            "- 用法: /kb &lt;自然语言指令&gt;\n"
-            "- 示例: /kb 添加 标题:问候语 内容:你好世界"
+            "用法: /kb &lt;自然语言指令&gt;\n"
+            "示例: /kb 添加 标题:问候语 内容:你好世界"
         )
         return
 
@@ -166,8 +166,8 @@ async def cmd_kb(
         await kb.add(session, group_id, title, content)
         await message.answer(
             "<b>知识库新增成功</b>\n"
-            f"- <b>标题</b>: {html.escape(title)}\n"
-            f"- <b>内容预览</b>: {html.escape(_truncate_text(content, 90) or '(空)')}"
+            f"<b>标题</b>: {html.escape(title)}\n"
+            f"<b>内容预览</b>: {html.escape(_truncate_text(content, 90) or '(空)')}"
         )
 
     elif action == "delete":
@@ -179,12 +179,12 @@ async def cmd_kb(
         if ok:
             await message.answer(
                 "<b>知识库删除成功</b>\n"
-                f"- <b>标题</b>: {html.escape(title)}"
+                f"<b>标题</b>: {html.escape(title)}"
             )
         else:
             await message.answer(
                 "<b>知识库删除失败</b>\n"
-                f"- 未找到标题: {html.escape(title)}"
+                f"未找到标题: {html.escape(title)}"
             )
 
     elif action == "search":
