@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 
 from bot.config import load_settings
@@ -11,7 +11,7 @@ from bot.services import memory_holder
 from bot.handlers import commands, admin, group
 from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.throttle import ThrottleMiddleware
-from bot.middlewares.logging_mw import LoggingMiddleware
+from bot.middlewares.logging_mw import LoggingMiddleware`r`nfrom bot.middlewares.request_queue import RequestQueueMiddleware
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,10 +49,10 @@ async def main() -> None:
         if count:
             await session.commit()
 
-    # Register middlewares (outer → inner)
+    # Register middlewares (outer 鈫?inner)
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(ThrottleMiddleware(rate_limit=1.0))
-    dp.message.middleware(DbSessionMiddleware(session_factory, memory=memory))
+    dp.message.middleware(RequestQueueMiddleware())`r`n    dp.message.middleware(DbSessionMiddleware(session_factory))
 
     # Register routers
     dp.include_router(commands.router)
@@ -76,3 +76,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

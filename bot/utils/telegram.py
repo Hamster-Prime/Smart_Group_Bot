@@ -10,12 +10,18 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 from aiogram.enums import ChatAction, ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message
 
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
 
 log = logging.getLogger(__name__)
+
+TG_MESSAGE_LIMIT = 4096
+TG_STREAM_SAFE_LIMIT = 3800
+CHAT_SEND_PARALLEL = 3
+_SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
 
 def get_display_name(msg: Message) -> str:
@@ -84,7 +90,7 @@ def md_to_html(text: str) -> str:
 
 
 def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
-    """Split text to natural chunks for streaming edits."""
+    """Split text into natural chunks for streaming edits."""
     if not text:
         return []
 
@@ -92,7 +98,7 @@ def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
     if len(source) <= chunk_size:
         return [source]
 
-    seps = ("\n", "。", "！", "？", ".", "!", "?", "，", ",", "；", ";", " ")
+    seps = ("\n", "。", "！", "？", ".", "!", "?", "，", ",", ";", " ")
     chunks: list[str] = []
     cursor = 0
 
@@ -121,11 +127,45 @@ def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
     return chunks
 
 
+def _split_for_telegram(text: str, limit: int) -> list[str]:
+    """Split long text so each part stays under Telegram length limits."""
+    source = (text or "").strip()
+    if not source:
+        return []
+    if len(source) <= limit:
+        return [source]
+
+    parts: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        end = min(cursor + limit, len(source))
+        if end >= len(source):
+            tail = source[cursor:].strip()
+            if tail:
+                parts.append(tail)
+            break
+
+        split_at = source.rfind("\n", cursor, end)
+        if split_at <= cursor:
+            split_at = source.rfind(" ", cursor, end)
+        if split_at <= cursor:
+            split_at = end
+        else:
+            split_at += 1
+
+        part = source[cursor:split_at].strip()
+        if part:
+            parts.append(part)
+        cursor = split_at
+
+    return parts
+
+
 @asynccontextmanager
 async def typing_action(
-    message: Message, *, enabled: bool, interval: float = 4.5
+    message: Message, *, enabled: bool, interval: float = 4.0
 ) -> AsyncIterator[None]:
-    """Continuously send typing chat-action while the context is active."""
+    """Continuously send typing action while the context is active."""
     if not enabled:
         yield
         return
@@ -135,11 +175,12 @@ async def typing_action(
     async def _worker() -> None:
         while not stop.is_set():
             try:
-                await message.bot.send_chat_action(
-                    chat_id=message.chat.id,
-                    action=ChatAction.TYPING,
+                await asyncio.wait_for(
+                    message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING),
+                    timeout=3.0,
                 )
             except Exception:
+                # Don't keep a broken typing loop alive forever.
                 break
 
             try:
@@ -152,9 +193,10 @@ async def typing_action(
         yield
     finally:
         stop.set()
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=1.0)
 
 
 async def send_reply(
@@ -165,7 +207,13 @@ async def send_reply(
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
 ) -> bool:
-    """Send reply in normal mode or as stream-like incremental edits."""
+    """Send reply in normal mode or stream-like incremental edits.
+
+    Guarantees best effort to land full content:
+    - long content is split under Telegram limits
+    - stream mode force-syncs final full text
+    - fallback keeps editing the same message (no delete-and-resend)
+    """
 
     async def _safe_reply(
         body: str,
@@ -174,9 +222,15 @@ async def send_reply(
         retries: int = 1,
         retry_delay: float = 0.8,
     ) -> Message | None:
-        for attempt in range(retries + 1):
+        attempt = 0
+        while attempt <= retries:
             try:
                 return await message.reply(body, parse_mode=parse_mode)
+            except TelegramRetryAfter as exc:
+                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                log.warning("telegram flood control on reply, waiting %.2fs", wait_s)
+                await asyncio.sleep(wait_s)
+                attempt += 1
             except Exception:
                 if attempt >= retries:
                     log.exception(
@@ -185,7 +239,8 @@ async def send_reply(
                         retries,
                     )
                     return None
-                await asyncio.sleep(retry_delay * (attempt + 1))
+                attempt += 1
+                await asyncio.sleep(retry_delay * attempt)
         return None
 
     async def _safe_edit(
@@ -193,59 +248,120 @@ async def send_reply(
         body: str,
         *,
         parse_mode: str | None,
-        retries: int = 0,
+        retries: int = 1,
     ) -> bool:
-        for attempt in range(retries + 1):
+        attempt = 0
+        while attempt <= retries:
             try:
                 await sent.edit_text(body, parse_mode=parse_mode)
                 return True
+            except TelegramBadRequest as exc:
+                detail = str(exc).lower()
+                if "message is not modified" in detail:
+                    return True
+                return False
+            except TelegramRetryAfter as exc:
+                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                log.warning("telegram flood control on edit, waiting %.2fs", wait_s)
+                await asyncio.sleep(wait_s)
+                attempt += 1
             except Exception:
                 if attempt >= retries:
                     return False
-                await asyncio.sleep(0.3 * (attempt + 1))
+                attempt += 1
+                await asyncio.sleep(0.3 * attempt)
         return False
+
+    async def _finalize_stream_format(sent: Message, segment: str) -> bool:
+        """Try to preserve markdown formatting after stream plain-text phase."""
+        final_html = md_to_html(segment)
+        if final_html == segment:
+            return True
+
+        html_ok = await _safe_edit(sent, final_html, parse_mode="HTML", retries=2)
+        if html_ok:
+            return True
+
+        md_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
+        if md_ok:
+            return True
+
+        # Keep single-message behavior: final fallback edits same message as plain text.
+        plain_ok = await _safe_edit(sent, segment, parse_mode=None, retries=1)
+        if plain_ok:
+            return True
+        log.warning("stream format finalize failed to apply markdown/html")
+        return False
+
+    async def _send_stream_segment(segment: str) -> bool:
+        chunks = _stream_chunks(segment, chunk_size=stream_chunk_size)
+        if len(chunks) <= 1 and len(segment) >= 18:
+            mid = max(1, len(segment) // 2)
+            chunks = [segment[:mid], segment[mid:]]
+
+        if len(chunks) <= 1:
+            sent = await _safe_reply(segment, parse_mode=None, retries=3)
+            if not sent:
+                return False
+            return await _finalize_stream_format(sent, segment)
+
+        sent = await _safe_reply(chunks[0], parse_mode=None, retries=3)
+        if not sent:
+            return False
+
+        merged = chunks[0]
+        last_edit_ts = time.monotonic()
+        for chunk in chunks[1:]:
+            merged += chunk
+            elapsed = time.monotonic() - last_edit_ts
+            if elapsed < stream_interval:
+                await asyncio.sleep(stream_interval - elapsed)
+            edited = await _safe_edit(sent, merged, parse_mode=None, retries=3)
+            if edited:
+                last_edit_ts = time.monotonic()
+
+        final_plain_ok = await _safe_edit(sent, segment, parse_mode=None, retries=3)
+        if not final_plain_ok:
+            # Do not send/delete as fallback to avoid duplicate notifications.
+            markdown_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
+            if not markdown_ok:
+                return False
+
+        return await _finalize_stream_format(sent, segment)
 
     payload = (text or "").strip()
     if not payload:
         return False
 
-    if not stream:
-        html = md_to_html(payload)
-        sent = await _safe_reply(html, parse_mode="HTML")
-        if sent:
-            return True
-        plain = await _safe_reply(payload, parse_mode=None)
-        return bool(plain)
+    semaphore = _SEND_SEMAPHORES.setdefault(message.chat.id, asyncio.Semaphore(CHAT_SEND_PARALLEL))
+    async with semaphore:
+        if not stream:
+            parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+            ok = True
+            for part in parts:
+                html = md_to_html(part)
+                sent = await _safe_reply(html, parse_mode="HTML", retries=3)
+                if not sent:
+                    sent = await _safe_reply(part, parse_mode="Markdown", retries=2)
+                if not sent:
+                    sent = await _safe_reply(part, parse_mode=None, retries=2)
+                ok = ok and bool(sent)
+            return ok
 
-    chunks = _stream_chunks(payload, chunk_size=stream_chunk_size)
-    if len(chunks) <= 1 and len(payload) >= 18:
-        mid = max(1, len(payload) // 2)
-        chunks = [payload[:mid], payload[mid:]]
+        parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+        if not parts:
+            return False
 
-    if len(chunks) <= 1:
-        sent = await _safe_reply(payload, parse_mode=None)
-        return bool(sent)
-
-    sent = await _safe_reply(chunks[0], parse_mode=None)
-    if not sent:
-        return False
-    merged = chunks[0]
-    last_edit_ts = time.monotonic()
-
-    for chunk in chunks[1:]:
-        merged += chunk
-        elapsed = time.monotonic() - last_edit_ts
-        if elapsed < stream_interval:
-            await asyncio.sleep(stream_interval - elapsed)
-        edited = await _safe_edit(sent, merged, parse_mode=None)
-        if edited:
-            last_edit_ts = time.monotonic()
-
-    final_html = md_to_html(payload)
-    if final_html == payload:
-        return True
-    await _safe_edit(sent, final_html, parse_mode="HTML")
-    return True
+        all_ok = True
+        for part in parts:
+            if len(part) > TG_MESSAGE_LIMIT:
+                slices = [part[i : i + TG_STREAM_SAFE_LIMIT] for i in range(0, len(part), TG_STREAM_SAFE_LIMIT)]
+            else:
+                slices = [part]
+            for segment in slices:
+                seg_ok = await _send_stream_segment(segment)
+                all_ok = all_ok and seg_ok
+        return all_ok
 
 
 def extract_message_text(message: Message) -> tuple[str, str]:
@@ -290,4 +406,3 @@ def extract_message_text(message: Message) -> tuple[str, str]:
     if message.location:
         return "[location]", "location"
     return "", "unknown"
-

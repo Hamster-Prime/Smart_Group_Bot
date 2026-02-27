@@ -7,6 +7,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.types import Message
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
@@ -30,6 +31,23 @@ from bot.utils.telegram import (
 
 router = Router()
 log = logging.getLogger(__name__)
+
+
+async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> None:
+    """Ensure group metadata row exists, tolerating concurrent inserts."""
+    existing = await session.get(Group, group_id)
+    if existing:
+        if title and existing.title != title:
+            existing.title = title
+        return
+
+    # Avoid failing the whole update when two messages from the same new group race.
+    try:
+        async with session.begin_nested():
+            session.add(Group(id=group_id, title=title or ""))
+            await session.flush()
+    except IntegrityError:
+        log.debug("group row already inserted concurrently: group_id=%s", group_id)
 
 
 def _build_kb_index(entries: list) -> str:
@@ -122,8 +140,9 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
         return text
 
     vision_prompt = (
-        "请识别图片中的关键信息，优先提取可见文字（OCR）和主要对象；"
-        "用中文简洁回答，不超过40字；若无法识别请回复：未识别到有效图片内容。"
+        "Please describe key information in this image, prioritizing visible text (OCR) and main objects. "
+        "Respond briefly in Chinese within 30 words. "
+        "If no useful content can be identified, reply exactly: NO_VALID_IMAGE_CONTENT."
     )
 
     data_uri = await _build_telegram_image_data_uri(message)
@@ -141,7 +160,7 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
         return text
 
     log.info("[vision] image recognition result: %s", vision_text[:120])
-    return f"{text}\n[图片识别]\n{vision_text}"
+    return f"{text}\n[image-vision]\n{vision_text}"
 
 
 @router.message(
@@ -189,22 +208,21 @@ async def on_group_message(
             )
         )
 
-    group = await session.get(Group, group_id)
-    if not group:
-        group = Group(id=group_id, title=message.chat.title or "")
-        session.add(group)
+    await _ensure_group_row(session, group_id, message.chat.title or "")
 
     if msg_type in {"video", "video_caption", "video_note"}:
         log.info("[%s] media bypass msg_type=%s", group_id, msg_type)
         _add_message_log(text)
         return
 
+    sender_username = (user.username or "").strip() if user else ""
+    sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
     if user:
-        display_name = user.full_name or ""
-        uname = f"@{user.username}" if user.username else ""
-        user_tag = f"{display_name}({uname} id:{user_id})" if uname else f"{display_name}(id:{user_id})"
+        display_name = (user.full_name or "").strip() or "unknown"
+        # Keep id/username at the front so identity survives truncation/compression.
+        user_tag = f"id:{user_id} username:{sender_username_tag} name:{display_name}"
     else:
-        user_tag = f"unknown(id:{user_id})"
+        user_tag = f"id:{user_id} username:(none) name:unknown"
 
     llm = LLMService(
         settings.bot.main_model,
@@ -243,9 +261,9 @@ async def on_group_message(
                         await message.chat.ban(user_id)
                     except Exception:
                         pass
-                    await message.answer(f"{warn_target} 用户已封禁（累计 {count} 次警告）。原因：{reason}")
+                    await message.answer(f"{warn_target} User banned (warnings={count}). Reason: {reason}")
                 else:
-                    await message.answer(f"{warn_target} 警告（第{count}次）：{reason}")
+                    await message.answer(f"{warn_target} Warning #{count}: {reason}")
                 _add_message_log(text)
                 return
 
@@ -271,42 +289,59 @@ async def on_group_message(
     action = "skip"
     reply = ""
     sent_ok = False
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        action = await decision_svc.decide(
-            text,
-            is_mentioned=mentioned,
-            user_tag=user_tag,
-            msg_type=msg_type,
-            knowledge_titles=kb_titles,
-            knowledge_index=kb_index,
-        )
-        log.info("[%s] decision result: action=%s", group_id, action)
+    action = await decision_svc.decide(
+        text,
+        is_mentioned=mentioned,
+        user_tag=user_tag,
+        msg_type=msg_type,
+        knowledge_titles=kb_titles,
+        knowledge_index=kb_index,
+    )
+    log.info("[%s] decision result: action=%s", group_id, action)
 
-        if action != "skip":
-            history = memory.get_history_for_llm(group_id)
-            log.info("[%s] step3 generate reply action=%s history_len=%d", group_id, action, len(history))
+    if action != "skip":
+        history = memory.get_history_for_llm(group_id)
+        log.info("[%s] step3 generate reply action=%s history_len=%d", group_id, action, len(history))
 
-            if action == "knowledge":
-                rag = RAGService(llm, kb)
-                reply = await rag.answer(session, group_id, text, history=history)
-                log.info("[%s] RAG reply: %s", group_id, reply[:120] if reply else "(empty)")
+        if action == "knowledge":
+            rag = RAGService(llm, kb)
+            reply = await rag.answer(
+                session,
+                group_id,
+                text,
+                history=history,
+                sender_user_id=user_id,
+                sender_username=sender_username,
+            )
+            log.info("[%s] RAG reply: %s", group_id, reply[:120] if reply else "(empty)")
 
-                if reply and any(x in reply for x in ("参考资料中没有", "我不知道", "没有相关信息")):
-                    log.info("[%s] RAG answer not useful, fallback to skill", group_id)
-                    reply = ""
+            if reply and any(x in reply for x in ("NO_RELEVANT_INFO", "I_DONT_KNOW", "NO_INFORMATION")):
+                log.info("[%s] RAG answer not useful, fallback to skill", group_id)
+                reply = ""
 
-            if not reply:
-                skill_reply = await skill.answer_with_skill(text, history=history)
-                if skill_reply:
-                    reply = skill_reply
-                    log.info("[%s] skill reply: %s", group_id, reply[:120])
+        if not reply:
+            skill_reply = await skill.answer_with_skill(
+                text,
+                history=history,
+                sender_user_id=user_id,
+                sender_username=sender_username,
+            )
+            if skill_reply:
+                reply = skill_reply
+                log.info("[%s] skill reply: %s", group_id, reply[:120])
 
-            if not reply:
-                casual = CasualService(llm)
-                reply = await casual.reply(text, history=history)
-                log.info("[%s] casual reply: %s", group_id, reply[:120] if reply else "(empty)")
+        if not reply:
+            casual = CasualService(llm)
+            reply = await casual.reply(
+                text,
+                history=history,
+                sender_user_id=user_id,
+                sender_username=sender_username,
+            )
+            log.info("[%s] casual reply: %s", group_id, reply[:120] if reply else "(empty)")
 
-            if reply:
+        if reply:
+            async with typing_action(message, enabled=settings.bot.enable_typing):
                 sent_ok = await send_reply(
                     message,
                     reply,
@@ -326,3 +361,4 @@ async def on_group_message(
 
     await memory.maybe_compress(group_id)
     _add_message_log(text)
+
