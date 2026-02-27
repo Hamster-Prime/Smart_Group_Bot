@@ -34,13 +34,56 @@ def is_group(msg: Message) -> bool:
     return msg.chat.type in ("group", "supergroup")
 
 
-def is_bot_mentioned(msg: Message, bot_username: str) -> bool:
-    """Check if the bot is @mentioned or replied to."""
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if msg.reply_to_message.from_user.is_bot:
+def _reply_origin_is_bot(msg: Message, bot_username: str, bot_user_id: int | None) -> bool:
+    """Best-effort check whether message is replying to this bot."""
+    username_norm = (bot_username or "").lstrip("@").lower()
+
+    reply = getattr(msg, "reply_to_message", None)
+    if reply:
+        from_user = getattr(reply, "from_user", None)
+        if from_user:
+            if bot_user_id is not None:
+                return from_user.id == bot_user_id
+            if getattr(from_user, "is_bot", False):
+                return True
+
+        sender_chat = getattr(reply, "sender_chat", None)
+        sender_username = (getattr(sender_chat, "username", None) or "").lower()
+        if username_norm and sender_username == username_norm:
             return True
-    text = msg.text or msg.caption or ""
-    return f"@{bot_username}" in text
+
+    external = getattr(msg, "external_reply", None)
+    origin = getattr(external, "origin", None) if external else None
+    if origin:
+        sender_user = getattr(origin, "sender_user", None)
+        if sender_user:
+            if bot_user_id is not None:
+                return sender_user.id == bot_user_id
+            if getattr(sender_user, "is_bot", False):
+                return True
+
+        origin_chat = getattr(origin, "chat", None)
+        origin_username = (getattr(origin_chat, "username", None) or "").lower()
+        if username_norm and origin_username == username_norm:
+            return True
+
+    return False
+
+
+def is_reply_message(msg: Message) -> bool:
+    return bool(getattr(msg, "reply_to_message", None) or getattr(msg, "external_reply", None) or getattr(msg, "quote", None))
+
+
+def is_bot_mentioned(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
+    """Check if the bot is @mentioned or directly replied to."""
+    if _reply_origin_is_bot(msg, bot_username, bot_user_id):
+        return True
+
+    text = (msg.text or msg.caption or "").lower()
+    username = (bot_username or "").lstrip("@").lower()
+    if not username:
+        return False
+    return f"@{username}" in text
 
 
 async def is_user_admin(message: Message) -> bool:
@@ -406,3 +449,28 @@ def extract_message_text(message: Message) -> tuple[str, str]:
     if message.location:
         return "[location]", "location"
     return "", "unknown"
+
+
+def extract_reply_context(message: Message, max_len: int = 320) -> str:
+    """Extract concise replied content for downstream LLM context."""
+    lines: list[str] = []
+
+    reply = getattr(message, "reply_to_message", None)
+    if reply:
+        reply_text, reply_type = extract_message_text(reply)
+        reply_text = re.sub(r"\s+", " ", (reply_text or "")).strip()
+        if reply_text:
+            if len(reply_text) > max_len:
+                reply_text = reply_text[:max_len] + "..."
+            lines.append(f"[reply_to:{reply_type}] {reply_text}")
+
+    quote = getattr(message, "quote", None)
+    quote_text = re.sub(r"\s+", " ", (getattr(quote, "text", None) or "")).strip()
+    if quote_text:
+        if len(quote_text) > max_len:
+            quote_text = quote_text[:max_len] + "..."
+        quote_line = f"[reply_quote] {quote_text}"
+        if quote_line not in lines:
+            lines.append(quote_line)
+
+    return "\n".join(lines)

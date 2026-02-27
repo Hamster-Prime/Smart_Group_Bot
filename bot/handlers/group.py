@@ -4,6 +4,7 @@ import base64
 import html
 import io
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.types import Message
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Group, MessageLog
 from bot.services import memory_holder
-from bot.services.authz import ensure_group_authorized
+from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.knowledge import KnowledgeService
@@ -22,15 +23,34 @@ from bot.services.moderation import ModerationService
 from bot.services.rag import RAGService
 from bot.services.skills import SkillService
 from bot.utils.telegram import (
+    extract_reply_context,
     extract_message_text,
     is_bot_mentioned,
     is_group,
+    is_reply_message,
     send_reply,
     typing_action,
 )
 
 router = Router()
 log = logging.getLogger(__name__)
+_OWNER_SALUTATION_RE = re.compile(
+    r"^\s*(?:(?:好(?:的)?|嗯|嗨|嘿|哈喽|收到|明白|行|是的|当然|ok)\s*)?主人(?:[，,：:!！。\s]|$)+",
+    re.IGNORECASE,
+)
+
+
+def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
+    """Avoid misaddressing non-owner users as '主人'."""
+    if sender_is_owner:
+        return reply
+    if "主人" not in reply:
+        return reply
+
+    cleaned = _OWNER_SALUTATION_RE.sub("", reply, count=1).lstrip()
+    if not cleaned:
+        return "好的，我在。"
+    return cleaned
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> None:
@@ -188,6 +208,7 @@ async def on_group_message(
     text, msg_type = extract_message_text(message)
     if not text:
         return
+    input_text = text
 
     group_id = message.chat.id
     user = message.from_user
@@ -216,6 +237,7 @@ async def on_group_message(
         return
 
     sender_username = (user.username or "").strip() if user else ""
+    sender_is_owner = bool(user and is_super_admin_user_id(user.id, settings))
     sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
     if user:
         display_name = (user.full_name or "").strip() or "unknown"
@@ -234,7 +256,7 @@ async def on_group_message(
     kb = KnowledgeService(settings.knowledge, llm)
     skill = SkillService(llm)
 
-    text = await _append_image_context(message, llm, text, msg_type)
+    input_text = await _append_image_context(message, llm, input_text, msg_type)
 
 
     log.info("[%s] step1 moderation check", group_id)
@@ -244,11 +266,11 @@ async def on_group_message(
         if exempt:
             log.info("[%s] moderation bypass: exempt user_id=%s", group_id, user_id)
         else:
-            violated, reason, rule = await mod.check_rules(session, group_id, text)
+            violated, reason, rule = await mod.check_rules(session, group_id, input_text)
             log.info("[%s] moderation result: violated=%s reason=%s", group_id, violated, reason)
             if violated:
                 action = rule.action if rule else "warn"
-                await mod.record_violation(session, group_id, user_id, text, action, rule)
+                await mod.record_violation(session, group_id, user_id, input_text, action, rule)
                 count, should_ban = await mod.add_warning(session, group_id, user_id)
 
                 try:
@@ -264,23 +286,29 @@ async def on_group_message(
                     await message.answer(f"{warn_target} User banned (warnings={count}). Reason: {reason}")
                 else:
                     await message.answer(f"{warn_target} Warning #{count}: {reason}")
-                _add_message_log(text)
+                _add_message_log(input_text)
                 return
 
+    reply_context = extract_reply_context(message)
+    if reply_context:
+        input_text = f"{input_text}\n{reply_context}"
+
     memory = memory_holder.get()
-    memory.add_message(group_id, "user", f"[{user_tag}] {text}")
+    memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
 
     bot_me = await message.bot.me()
-    mentioned = is_bot_mentioned(message, bot_me.username or "")
+    mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
+    is_reply = is_reply_message(message)
 
     entries = await kb.list_entries(session, group_id)
     kb_titles = [e.title for e in entries if e.title]
     kb_index = _build_kb_index(entries)
 
     log.info(
-        "[%s] step2 decision mentioned=%s msg_type=%s kb_entries=%d",
+        "[%s] step2 decision mentioned=%s is_reply=%s msg_type=%s kb_entries=%d",
         group_id,
         mentioned,
+        is_reply,
         msg_type,
         len(entries),
     )
@@ -290,8 +318,10 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     action = await decision_svc.decide(
-        text,
+        input_text,
         is_mentioned=mentioned,
+        is_reply=is_reply,
+        is_owner=sender_is_owner,
         user_tag=user_tag,
         msg_type=msg_type,
         knowledge_titles=kb_titles,
@@ -308,10 +338,11 @@ async def on_group_message(
             reply = await rag.answer(
                 session,
                 group_id,
-                text,
+                input_text,
                 history=history,
                 sender_user_id=user_id,
                 sender_username=sender_username,
+                sender_is_owner=sender_is_owner,
             )
             log.info("[%s] RAG reply: %s", group_id, reply[:120] if reply else "(empty)")
 
@@ -321,10 +352,11 @@ async def on_group_message(
 
         if not reply:
             skill_reply = await skill.answer_with_skill(
-                text,
+                input_text,
                 history=history,
                 sender_user_id=user_id,
                 sender_username=sender_username,
+                sender_is_owner=sender_is_owner,
             )
             if skill_reply:
                 reply = skill_reply
@@ -333,14 +365,19 @@ async def on_group_message(
         if not reply:
             casual = CasualService(llm)
             reply = await casual.reply(
-                text,
+                input_text,
                 history=history,
                 sender_user_id=user_id,
                 sender_username=sender_username,
+                sender_is_owner=sender_is_owner,
             )
             log.info("[%s] casual reply: %s", group_id, reply[:120] if reply else "(empty)")
 
         if reply:
+            normalized_reply = _normalize_owner_address(reply, sender_is_owner)
+            if normalized_reply != reply:
+                log.info("[%s] owner salutation stripped for non-owner sender", group_id)
+                reply = normalized_reply
             async with typing_action(message, enabled=settings.bot.enable_typing):
                 sent_ok = await send_reply(
                     message,
@@ -353,12 +390,12 @@ async def on_group_message(
     if action == "skip":
         log.info("[%s] skip reply", group_id)
         await memory.maybe_compress(group_id)
-        _add_message_log(text)
+        _add_message_log(input_text)
         return
 
     if reply and sent_ok:
         memory.add_message(group_id, "assistant", reply)
 
     await memory.maybe_compress(group_id)
-    _add_message_log(text)
+    _add_message_log(input_text)
 
