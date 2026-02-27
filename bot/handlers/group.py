@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group, MessageLog
+from bot.db.models import Group, MessageLog, ModerationRule
 from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
@@ -54,6 +54,49 @@ def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
     if not cleaned:
         return "好的，我在。"
     return cleaned
+
+
+def _truncate_text(text: str, max_len: int) -> str:
+    cleaned = (text or "").replace("\n", " ").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len] + "..."
+
+
+def _build_moderation_notice(
+    warn_target: str,
+    count: int,
+    threshold: int,
+    reason: str,
+    should_ban: bool,
+    rule: ModerationRule | None,
+) -> str:
+    rule_type_labels = {
+        "keyword": "关键词",
+        "regex": "正则",
+        "llm": "语义",
+    }
+    reason_text = html.escape((reason or "命中群审核规则（AI判定）").strip())
+    title = "AI审查自动封禁" if should_ban else "AI审查警告"
+    action_result = "已删除违规消息并封禁用户" if should_ban else "已删除违规消息并发出警告"
+
+    if rule:
+        rule_type = rule_type_labels.get((rule.rule_type or "").lower(), rule.rule_type or "未知")
+        pattern_preview = _truncate_text(rule.pattern or "", 60)
+        if pattern_preview:
+            rule_ref = f"#{rule.id}（{html.escape(rule_type)}） {html.escape(pattern_preview)}"
+        else:
+            rule_ref = f"#{rule.id}（{html.escape(rule_type)}）"
+    else:
+        rule_ref = "未定位具体规则（AI语义判定）"
+
+    return (
+        f"{warn_target} <b>{title}</b>\n"
+        f"- <b>警告次数</b>: {count}/{threshold}\n"
+        f"- <b>原因</b>: {reason_text}\n"
+        f"- <b>依据规则</b>: {rule_ref}\n"
+        f"- <b>处理结果</b>: {action_result}"
+    )
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> None:
@@ -283,6 +326,15 @@ async def on_group_message(
                 action = rule.action if rule else "warn"
                 await mod.record_violation(session, group_id, user_id, input_text, action, rule)
                 count, should_ban = await mod.add_warning(session, group_id, user_id)
+                warn_threshold = max(1, settings.moderation.warn_threshold)
+                notice = _build_moderation_notice(
+                    warn_target=warn_target,
+                    count=count,
+                    threshold=warn_threshold,
+                    reason=reason,
+                    should_ban=should_ban,
+                    rule=rule,
+                )
 
                 try:
                     await message.delete()
@@ -294,9 +346,7 @@ async def on_group_message(
                         await message.chat.ban(user_id)
                     except Exception:
                         pass
-                    await message.answer(f"{warn_target} User banned (warnings={count}). Reason: {reason}")
-                else:
-                    await message.answer(f"{warn_target} Warning #{count}: {reason}")
+                await message.answer(notice)
                 _add_message_log(input_text)
                 log.info(
                     "[%s]【结束】审核拦截 | 已回复=是 | 总耗时=%dms",
