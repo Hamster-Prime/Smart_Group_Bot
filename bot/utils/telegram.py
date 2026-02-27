@@ -242,24 +242,32 @@ async def typing_action(
         return
 
     stop = asyncio.Event()
+    chat_id = message.chat.id
+
+    async def _send_typing_once() -> bool:
+        try:
+            await asyncio.wait_for(
+                message.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
+                timeout=3.0,
+            )
+            return True
+        except Exception:
+            return False
 
     async def _worker() -> None:
+        # Wait one interval before the next heartbeat, because we send one immediately.
         while not stop.is_set():
             try:
-                await asyncio.wait_for(
-                    message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING),
-                    timeout=3.0,
-                )
-            except Exception:
-                # Don't keep a broken typing loop alive forever.
-                break
-
-            try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
+                break
             except asyncio.TimeoutError:
-                continue
+                sent = await _send_typing_once()
+                if not sent:
+                    # Don't keep a broken typing loop alive forever.
+                    break
 
-    task = asyncio.create_task(_worker(), name=f"typing:{message.chat.id}")
+    await _send_typing_once()
+    task = asyncio.create_task(_worker(), name=f"typing:{chat_id}")
     try:
         yield
     finally:

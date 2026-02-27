@@ -417,60 +417,60 @@ async def on_group_message(
 
     if action != "skip":
         history = memory.get_history_for_llm(group_id)
-        log.info("[%s]【流程】生成回复 | 动作=%s | 历史=%d", group_id, action, len(history))
+        log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
 
-        if action == "knowledge":
-            rag = RAGService(llm, kb)
-            reply = await rag.answer(
-                session,
-                group_id,
-                input_text,
-                history=history,
-                sender_user_id=user_id,
-                sender_username=sender_username,
-                sender_is_owner=sender_is_owner,
-            )
-            log.info("[%s]【回复】RAG | %s", group_id, reply[:80] if reply else "(empty)")
+        async with typing_action(message, enabled=settings.bot.enable_typing):
+            if action == "knowledge":
+                rag = RAGService(llm, kb)
+                reply = await rag.answer(
+                    session,
+                    group_id,
+                    input_text,
+                    history=history,
+                    sender_user_id=user_id,
+                    sender_username=sender_username,
+                    sender_is_owner=sender_is_owner,
+                )
+                log.info("[%s] reply via rag | %s", group_id, reply[:80] if reply else "(empty)")
+                if reply:
+                    reply_source = "rag"
+
+                if reply and any(x in reply for x in ("NO_RELEVANT_INFO", "I_DONT_KNOW", "NO_INFORMATION")):
+                    log.info("[%s] rag returned no relevant info -> fallback to skill", group_id)
+                    reply = ""
+                    reply_source = "none"
+
+            if not reply:
+                skill_reply = await skill.answer_with_skill(
+                    input_text,
+                    history=history,
+                    sender_user_id=user_id,
+                    sender_username=sender_username,
+                    sender_is_owner=sender_is_owner,
+                )
+                if skill_reply:
+                    reply = skill_reply
+                    log.info("[%s] reply via skill | %s", group_id, reply[:80])
+                    reply_source = "skill"
+
+            if not reply:
+                casual = CasualService(llm)
+                reply = await casual.reply(
+                    input_text,
+                    history=history,
+                    sender_user_id=user_id,
+                    sender_username=sender_username,
+                    sender_is_owner=sender_is_owner,
+                )
+                log.info("[%s] reply via casual | %s", group_id, reply[:80] if reply else "(empty)")
+                if reply:
+                    reply_source = "casual"
+
             if reply:
-                reply_source = "rag"
-
-            if reply and any(x in reply for x in ("NO_RELEVANT_INFO", "I_DONT_KNOW", "NO_INFORMATION")):
-                log.info("[%s]【回复】RAG无有效信息 -> 技能", group_id)
-                reply = ""
-                reply_source = "none"
-
-        if not reply:
-            skill_reply = await skill.answer_with_skill(
-                input_text,
-                history=history,
-                sender_user_id=user_id,
-                sender_username=sender_username,
-                sender_is_owner=sender_is_owner,
-            )
-            if skill_reply:
-                reply = skill_reply
-                log.info("[%s]【回复】技能 | %s", group_id, reply[:80])
-                reply_source = "skill"
-
-        if not reply:
-            casual = CasualService(llm)
-            reply = await casual.reply(
-                input_text,
-                history=history,
-                sender_user_id=user_id,
-                sender_username=sender_username,
-                sender_is_owner=sender_is_owner,
-            )
-            log.info("[%s]【回复】闲聊 | %s", group_id, reply[:80] if reply else "(empty)")
-            if reply:
-                reply_source = "casual"
-
-        if reply:
-            normalized_reply = _normalize_owner_address(reply, sender_is_owner)
-            if normalized_reply != reply:
-                log.info("[%s]【回复】称呼修正 | 非主人发送者", group_id)
-                reply = normalized_reply
-            async with typing_action(message, enabled=settings.bot.enable_typing):
+                normalized_reply = _normalize_owner_address(reply, sender_is_owner)
+                if normalized_reply != reply:
+                    log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
+                    reply = normalized_reply
                 sent_ok = await send_reply(
                     message,
                     reply,
@@ -509,4 +509,5 @@ async def on_group_message(
         len(reply or ""),
         int((time.perf_counter() - flow_started) * 1000),
     )
+
 

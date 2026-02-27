@@ -22,45 +22,8 @@ class DecisionService:
     @staticmethod
     def _format_titles(knowledge_titles: list[str] | None) -> str:
         if not knowledge_titles:
-            return "（空）"
+            return "(empty)"
         return "\n".join(f"- {clean_text(title, max_len=120)}" for title in knowledge_titles)
-
-    @staticmethod
-    def _contains_bot_trigger(text: str) -> bool:
-        lower = text.lower()
-        triggers = (
-            "@",
-            "机器人",
-            "bot",
-            "助手",
-            "sanite",
-            "小助理",
-            "你能",
-            "你会",
-            "帮我",
-            "请你",
-        )
-        return any(t in lower for t in triggers)
-
-    @staticmethod
-    def _looks_like_question(text: str) -> bool:
-        if "?" in text or "？" in text:
-            return True
-        hints = (
-            "怎么",
-            "如何",
-            "为什么",
-            "请问",
-            "是什么",
-            "多少",
-            "哪个",
-            "哪一个",
-            "哪里",
-            "吗",
-            "呢",
-            "么",
-        )
-        return any(k in text for k in hints)
 
     async def _llm_decide(
         self,
@@ -102,7 +65,7 @@ class DecisionService:
         result = await self.llm.decision(build_defended_system(DECISION_SYSTEM), context)
         result = result.strip().lower()
         log.info(
-            "【决策】LLM返回 | 结果=%s | @机=%s | 类型=%s | 知识=%d",
+            "decision llm returned=%s mention=%s msg_type=%s knowledge_titles=%d",
             result,
             is_mentioned,
             msg_type,
@@ -122,31 +85,13 @@ class DecisionService:
         user_tag: str = "",
         msg_type: str = "text",
         knowledge_titles: list[str] | None = None,
-        knowledge_index: str = "（空）",
+        knowledge_index: str = "(empty)",
     ) -> str:
-        """返回: skip / knowledge / casual"""
+        """Return one of: skip / knowledge / casual."""
         normalized = clean_text(re.sub(r"\s+", " ", text).strip(), max_len=1200)
 
         if contains_prompt_injection(normalized):
-            log.warning("【决策】阶段=输入检查 | 状态=疑似提示词注入")
-
-        if mentions_other_user:
-            log.info("【决策】阶段=前置规则 | 原因=@其他用户 | 动作=skip")
-            return "skip"
-
-        if is_reply_to_other:
-            log.info("【决策】阶段=前置规则 | 原因=回复其他用户 | 动作=skip")
-            return "skip"
-
-        # 非@、非回复场景：非问题 + 无触发词 => skip，避免群聊噪声全回复
-        if (
-            not is_mentioned
-            and not is_reply
-            and not self._looks_like_question(normalized)
-            and not self._contains_bot_trigger(normalized)
-        ):
-            log.info("【决策】阶段=前置规则 | 原因=非问题且无触发词 | 动作=skip")
-            return "skip"
+            log.warning("decision input may contain prompt injection")
 
         result = await self._llm_decide(
             normalized,
@@ -170,8 +115,5 @@ class DecisionService:
         if result in ("skip", "knowledge", "casual"):
             return result
 
-        if self._looks_like_question(normalized):
-            log.info("【决策】阶段=兜底 | 原因=非法输出且像问题 | 动作=casual")
-            return "casual"
-        log.info("【决策】阶段=兜底 | 原因=非法输出且非问题 | 动作=skip")
+        log.info("decision fallback=skip reason=invalid_output")
         return "skip"
