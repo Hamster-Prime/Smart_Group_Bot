@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 
 # Disable extra LiteLLM debug logs.
 litellm.suppress_debug_info = True
+litellm.set_verbose = False
 
 
 class LLMService:
@@ -67,6 +68,18 @@ class LLMService:
             return escaped, False
         return escaped[:limit], True
 
+    @staticmethod
+    def _label_cn(label: str) -> str:
+        mapping = {
+            "main": "主回复",
+            "decision": "决策",
+            "moderation": "审核",
+            "compress": "压缩",
+            "vision": "视觉",
+            "embed": "嵌入",
+        }
+        return mapping.get(label, label)
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -86,9 +99,10 @@ class LLMService:
             label = "main"
 
         kwargs = self._build_kwargs(cfg)
+        label_cn = self._label_cn(label)
         log.info(
-            "[LLM:%s] model=%s, messages=%d, max_tokens=%d",
-            label,
+            "【LLM请求】阶段=%s | 模型=%s | 消息数=%d | max_tokens=%d",
+            label_cn,
             cfg.model,
             len(messages),
             cfg.max_tokens,
@@ -99,20 +113,20 @@ class LLMService:
             text = self._normalize_content_text(content)
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview_limit = 1200 if label == "moderation" else 240
+            preview_limit = 360 if label == "moderation" else 180
             preview, truncated = self._preview_for_log(text, limit=preview_limit)
             log.info(
-                "[LLM:%s] response_len=%d preview_truncated=%s preview=%s (in=%d out=%d tokens)",
-                label,
+                "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
+                label_cn,
                 len(text),
-                truncated,
-                preview,
                 tokens_in,
                 tokens_out,
+                truncated,
+                preview,
             )
             return text
         except Exception:
-            log.exception("[LLM:%s] call failed model=%s", label, cfg.model)
+            log.exception("【LLM失败】阶段=%s | 模型=%s", label_cn, cfg.model)
             return ""
 
     async def decision(self, system: str, user_text: str) -> str:
@@ -147,7 +161,8 @@ class LLMService:
             {"role": "user", "content": user_text},
         ]
         log.info(
-            "[LLM:compress] model=%s, input_len=%d chars",
+            "【LLM请求】阶段=%s | 模型=%s | 输入长度=%d字符",
+            self._label_cn("compress"),
             self.compress_config.model,
             len(user_text),
         )
@@ -156,13 +171,18 @@ class LLMService:
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content)
             log.info(
-                "[LLM:compress] done: %d chars -> %d chars",
+                "【LLM返回】阶段=%s | 压缩前=%d字符 | 压缩后=%d字符",
+                self._label_cn("compress"),
                 len(user_text),
                 len(text),
             )
             return text
         except Exception:
-            log.exception("[LLM:compress] call failed model=%s", self.compress_config.model)
+            log.exception(
+                "【LLM失败】阶段=%s | 模型=%s",
+                self._label_cn("compress"),
+                self.compress_config.model,
+            )
             return ""
 
     async def vision_describe(self, image_url: str, prompt: str) -> str:
@@ -177,25 +197,26 @@ class LLMService:
                 ],
             }
         ]
-        log.info("[LLM:vision] model=%s, sending image", self.main.model)
+        log.info("【LLM请求】阶段=%s | 模型=%s | 输入=图片", self._label_cn("vision"), self.main.model)
         try:
             resp = await litellm.acompletion(messages=messages, **kwargs)
             content = resp.choices[0].message.content
             text = self._normalize_content_text(content).strip()
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview, truncated = self._preview_for_log(text, limit=240)
+            preview, truncated = self._preview_for_log(text, limit=180)
             log.info(
-                "[LLM:vision] response_len=%d preview_truncated=%s preview=%s (in=%d out=%d tokens)",
+                "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
+                self._label_cn("vision"),
                 len(text),
-                truncated,
-                preview,
                 tokens_in,
                 tokens_out,
+                truncated,
+                preview,
             )
             return text
         except Exception:
-            log.exception("[LLM:vision] call failed model=%s", self.main.model)
+            log.exception("【LLM失败】阶段=%s | 模型=%s", self._label_cn("vision"), self.main.model)
             return ""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -206,12 +227,16 @@ class LLMService:
             kwargs["api_key"] = cfg.api_key
         if cfg.api_base:
             kwargs["api_base"] = cfg.api_base
-        log.info("[LLM:embed] model=%s, texts=%d", cfg.model, len(texts))
+        log.info("【LLM请求】阶段=%s | 模型=%s | 文本数=%d", self._label_cn("embed"), cfg.model, len(texts))
         try:
             resp = await litellm.aembedding(**kwargs)
             embeddings = [item["embedding"] for item in resp.data]
-            log.info("[LLM:embed] done, dim=%d", len(embeddings[0]) if embeddings else 0)
+            log.info(
+                "【LLM返回】阶段=%s | 向量维度=%d",
+                self._label_cn("embed"),
+                len(embeddings[0]) if embeddings else 0,
+            )
             return embeddings
         except Exception:
-            log.exception("[LLM:embed] call failed model=%s", cfg.model)
+            log.exception("【LLM失败】阶段=%s | 模型=%s", self._label_cn("embed"), cfg.model)
             return []

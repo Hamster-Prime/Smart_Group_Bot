@@ -74,6 +74,11 @@ def is_reply_message(msg: Message) -> bool:
     return bool(getattr(msg, "reply_to_message", None) or getattr(msg, "external_reply", None) or getattr(msg, "quote", None))
 
 
+def is_reply_to_bot(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
+    """Check whether this message is replying to the bot itself."""
+    return _reply_origin_is_bot(msg, bot_username, bot_user_id)
+
+
 def is_bot_mentioned(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
     """Check if the bot is @mentioned or directly replied to."""
     if _reply_origin_is_bot(msg, bot_username, bot_user_id):
@@ -84,6 +89,29 @@ def is_bot_mentioned(msg: Message, bot_username: str, bot_user_id: int | None = 
     if not username:
         return False
     return f"@{username}" in text
+
+
+def mentions_other_user(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
+    """Check whether message mentions any user except this bot."""
+    bot_name = (bot_username or "").lstrip("@").lower()
+    text = msg.text or msg.caption or ""
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+
+    for entity in entities:
+        et = getattr(entity, "type", None)
+        if et == "mention":
+            offset = int(getattr(entity, "offset", 0) or 0)
+            length = int(getattr(entity, "length", 0) or 0)
+            mention = text[offset : offset + length].strip().lstrip("@").lower()
+            if mention and mention != bot_name:
+                return True
+        elif et == "text_mention":
+            user = getattr(entity, "user", None)
+            uid = getattr(user, "id", None) if user else None
+            if uid is not None and (bot_user_id is None or uid != bot_user_id):
+                return True
+
+    return False
 
 
 async def is_user_admin(message: Message) -> bool:

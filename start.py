@@ -14,10 +14,9 @@ ROOT = Path(__file__).parent
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from bot.utils.logging_setup import configure_logging
+
+configure_logging()
 log = logging.getLogger("launcher")
 
 
@@ -35,6 +34,7 @@ def preflight() -> None:
     from dotenv import load_dotenv
 
     load_dotenv()
+    configure_logging(force=True)
     token = os.getenv("BOT_TOKEN", "")
     super_admin_id = os.getenv("SUPER_ADMIN_ID", "").strip()
     if not token or token == "your_bot_token_here":

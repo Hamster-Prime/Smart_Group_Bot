@@ -94,6 +94,10 @@ docker run -d --env-file .env --name smart-bot smart-group-bot
 BOT_TOKEN=
 SUPER_ADMIN_ID=
 
+# ---- 日志 ----
+LOG_LEVEL=INFO
+LOG_THIRD_PARTY_LEVEL=WARNING
+
 # ---- 主模型 (知识库问答、闲聊) ----
 # MAIN_PROVIDER: gemini / openai / openai_compatible
 MAIN_PROVIDER=
@@ -129,6 +133,12 @@ MAX_OUTPUT_TOKENS=64000
 # 数据库（默认 SQLite）
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 ```
+
+日志行会携带上下文：
+- `u`：Telegram update_id
+- `req`：本条消息的请求ID（`chat_id:message_id`）
+- `g`：群ID
+- `usr`：用户ID
 
 ---
 
