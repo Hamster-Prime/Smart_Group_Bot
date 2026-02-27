@@ -129,7 +129,7 @@ async def _build_telegram_image_data_uri(message: Message) -> str:
     if not raw:
         return ""
 
-    log.info("【视觉】图片下载完成 | 字节=%d | mime=%s", len(raw), mime)
+    log.info("【视觉】图片下载完成 | 大小=%dB | 类型=%s", len(raw), mime)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
@@ -179,10 +179,10 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
             vision_text = (await llm.vision_describe(image_url, vision_prompt)).strip()
 
     if not vision_text:
-        log.info("【视觉】识别结果为空")
+        log.info("【视觉】识别为空")
         return text
 
-    log.info("【视觉】识别结果 | 预览=%s", vision_text[:120])
+    log.info("【视觉】识别结果 | %s", vision_text[:80])
     return f"{text}\n[image-vision]\n{vision_text}"
 
 
@@ -236,7 +236,7 @@ async def on_group_message(
     await _ensure_group_row(session, group_id, message.chat.title or "")
 
     if msg_type in {"video", "video_caption", "video_note"}:
-        log.info("[%s]【流程】阶段=媒体旁路 | 类型=%s", group_id, msg_type)
+        log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
         _add_message_log(text)
         return
 
@@ -263,17 +263,17 @@ async def on_group_message(
     input_text = await _append_image_context(message, llm, input_text, msg_type)
 
 
-    log.info("[%s]【流程】阶段=审核检查 | 状态=开始", group_id)
+    log.info("[%s]【流程】审核 | 开始", group_id)
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
         exempt = await mod.is_user_exempt(session, group_id, user_id)
         if exempt:
-            log.info("[%s]【流程】阶段=审核检查 | 状态=豁免 | 用户=%s", group_id, user_id)
+            log.info("[%s]【流程】审核 | 豁免用户=%s", group_id, user_id)
         else:
             violated, reason, rule = await mod.check_rules(session, group_id, input_text)
             log.info(
-                "[%s]【流程】阶段=审核检查 | 状态=完成 | 违规=%s | 原因=%s | 耗时=%dms",
+                "[%s]【流程】审核 | 完成 | 违规=%s | 原因=%s | 耗时=%dms",
                 group_id,
                 violated,
                 reason,
@@ -299,13 +299,13 @@ async def on_group_message(
                     await message.answer(f"{warn_target} Warning #{count}: {reason}")
                 _add_message_log(input_text)
                 log.info(
-                    "[%s]【流程】阶段=结束 | 动作=审核拦截 | 已回复=是 | 总耗时=%dms",
+                    "[%s]【结束】审核拦截 | 已回复=是 | 总耗时=%dms",
                     group_id,
                     int((time.perf_counter() - flow_started) * 1000),
                 )
                 return
     else:
-        log.info("[%s]【流程】阶段=审核检查 | 状态=关闭", group_id)
+        log.info("[%s]【流程】审核 | 关闭", group_id)
 
     reply_context = extract_reply_context(message)
     if reply_context:
@@ -326,7 +326,7 @@ async def on_group_message(
     kb_index = _build_kb_index(entries)
 
     log.info(
-        "[%s]【流程】阶段=决策输入 | @机器人=%s | @他人=%s | 是回复=%s | 回复机器人=%s | 回复他人=%s | 类型=%s | 知识条目=%d",
+        "[%s]【决策】输入 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 类型=%s 知识=%d",
         group_id,
         mentioned,
         mention_other,
@@ -357,7 +357,7 @@ async def on_group_message(
         knowledge_index=kb_index,
     )
     log.info(
-        "[%s]【流程】阶段=决策完成 | 动作=%s | 耗时=%dms",
+        "[%s]【决策】完成 | 动作=%s | 耗时=%dms",
         group_id,
         action,
         int((time.perf_counter() - decision_started) * 1000),
@@ -365,7 +365,7 @@ async def on_group_message(
 
     if action != "skip":
         history = memory.get_history_for_llm(group_id)
-        log.info("[%s]【流程】阶段=生成回复 | 动作=%s | 历史条数=%d", group_id, action, len(history))
+        log.info("[%s]【流程】生成回复 | 动作=%s | 历史=%d", group_id, action, len(history))
 
         if action == "knowledge":
             rag = RAGService(llm, kb)
@@ -378,12 +378,12 @@ async def on_group_message(
                 sender_username=sender_username,
                 sender_is_owner=sender_is_owner,
             )
-            log.info("[%s]【回复】来源=RAG | 预览=%s", group_id, reply[:120] if reply else "(empty)")
+            log.info("[%s]【回复】RAG | %s", group_id, reply[:80] if reply else "(empty)")
             if reply:
                 reply_source = "rag"
 
             if reply and any(x in reply for x in ("NO_RELEVANT_INFO", "I_DONT_KNOW", "NO_INFORMATION")):
-                log.info("[%s]【回复】来源=RAG | 状态=无有效信息 | 转入=技能", group_id)
+                log.info("[%s]【回复】RAG无有效信息 -> 技能", group_id)
                 reply = ""
                 reply_source = "none"
 
@@ -397,7 +397,7 @@ async def on_group_message(
             )
             if skill_reply:
                 reply = skill_reply
-                log.info("[%s]【回复】来源=技能 | 预览=%s", group_id, reply[:120])
+                log.info("[%s]【回复】技能 | %s", group_id, reply[:80])
                 reply_source = "skill"
 
         if not reply:
@@ -409,14 +409,14 @@ async def on_group_message(
                 sender_username=sender_username,
                 sender_is_owner=sender_is_owner,
             )
-            log.info("[%s]【回复】来源=闲聊 | 预览=%s", group_id, reply[:120] if reply else "(empty)")
+            log.info("[%s]【回复】闲聊 | %s", group_id, reply[:80] if reply else "(empty)")
             if reply:
                 reply_source = "casual"
 
         if reply:
             normalized_reply = _normalize_owner_address(reply, sender_is_owner)
             if normalized_reply != reply:
-                log.info("[%s]【回复】称呼修正 | 原因=非主人发送者", group_id)
+                log.info("[%s]【回复】称呼修正 | 非主人发送者", group_id)
                 reply = normalized_reply
             async with typing_action(message, enabled=settings.bot.enable_typing):
                 sent_ok = await send_reply(
@@ -429,7 +429,7 @@ async def on_group_message(
 
     if action == "skip":
         log.info(
-            "[%s]【流程】阶段=结束 | 动作=跳过 | 已回复=否 | @机器人=%s | @他人=%s | 是回复=%s | 回复机器人=%s | 回复他人=%s | 总耗时=%dms",
+            "[%s]【结束】跳过 | @机=%s @他=%s 回=%s 回机=%s 回他=%s | 耗时=%dms",
             group_id,
             mentioned,
             mention_other,
@@ -448,7 +448,7 @@ async def on_group_message(
     await memory.maybe_compress(group_id)
     _add_message_log(input_text)
     log.info(
-        "[%s]【流程】阶段=结束 | 动作=%s | 来源=%s | 已生成=%s | 发送成功=%s | 回复长度=%d | 总耗时=%dms",
+        "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 长度=%d 耗时=%dms",
         group_id,
         action,
         reply_source,

@@ -97,6 +97,11 @@ SUPER_ADMIN_ID=
 # ---- 日志 ----
 LOG_LEVEL=INFO
 LOG_THIRD_PARTY_LEVEL=WARNING
+LOG_COLOR=on
+LOG_TO_FILE=false
+LOG_FILE_PATH=bot.log
+LOG_FILE_MAX_BYTES=5242880
+LOG_FILE_BACKUP_COUNT=3
 
 # ---- 主模型 (知识库问答、闲聊) ----
 # MAIN_PROVIDER: gemini / openai / openai_compatible
@@ -134,11 +139,20 @@ MAX_OUTPUT_TOKENS=64000
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 ```
 
-日志行会携带上下文：
-- `u`：Telegram update_id
-- `req`：本条消息的请求ID（`chat_id:message_id`）
-- `g`：群ID
-- `usr`：用户ID
+日志行会携带流程上下文：
+- `流`：单条消息处理链路ID（同一条消息全流程一致）
+
+日志可选彩色输出：
+- `LOG_COLOR=on`：始终彩色
+- `LOG_COLOR=off`：关闭彩色
+- `LOG_COLOR=auto`：仅在终端支持时彩色
+
+日志可选写入文件（默认关闭）：
+- `LOG_TO_FILE=false`：关闭文件输出
+- `LOG_TO_FILE=true`：开启文件输出
+- `LOG_FILE_PATH=bot.log`：日志文件路径（相对路径默认以项目根目录为基准）
+- `LOG_FILE_MAX_BYTES=5242880`：单个日志文件最大字节数（超出后自动轮转）
+- `LOG_FILE_BACKUP_COUNT=3`：保留历史轮转文件数量
 
 ---
 

@@ -102,13 +102,11 @@ class DecisionService:
         result = await self.llm.decision(build_defended_system(DECISION_SYSTEM), context)
         result = result.strip().lower()
         log.info(
-            "【决策】阶段=LLM返回 | @机器人=%s | 类型=%s | 知识标题数=%d | 发送者=%s | 文本预览=%s | 结果=%s",
+            "【决策】LLM返回 | 结果=%s | @机=%s | 类型=%s | 知识=%d",
+            result,
             is_mentioned,
             msg_type,
             len(knowledge_titles or []),
-            clean_text(user_tag, max_len=80),
-            normalized[:80],
-            result,
         )
         return result
 

@@ -113,7 +113,7 @@ class LLMService:
             text = self._normalize_content_text(content)
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview_limit = 360 if label == "moderation" else 180
+            preview_limit = 120 if label == "moderation" else 80
             preview, truncated = self._preview_for_log(text, limit=preview_limit)
             log.info(
                 "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
@@ -204,7 +204,7 @@ class LLMService:
             text = self._normalize_content_text(content).strip()
             tokens_in = getattr(resp.usage, "prompt_tokens", 0)
             tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview, truncated = self._preview_for_log(text, limit=180)
+            preview, truncated = self._preview_for_log(text, limit=80)
             log.info(
                 "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
                 self._label_cn("vision"),
