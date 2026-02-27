@@ -38,9 +38,12 @@ class MemoryService:
         self._summary: dict[int, str] = {}
         # group_id -> message count at last successful compression
         self._last_compressed_len: dict[int, int] = {}
-        self._compress_min_new_messages = 20
         self._llm_max_history_items = 2000
         self._llm_reserve_tokens = max(1024, self.max_output // 2)
+        # Keep a compact recent window in memory after snapshot compression.
+        base_runtime_budget = max(256, self.max_context // 4)
+        self._runtime_history_budget_tokens = min(self.max_context, base_runtime_budget)
+        self._runtime_history_max_items = 120
         self._compress_lock = asyncio.Lock()
 
     # ---- Token counting ----
@@ -134,6 +137,29 @@ class MemoryService:
     def token_usage(self, group_id: int) -> int:
         return self._count_tokens(self.get_history(group_id))
 
+    def _compact_runtime_history(self, group_id: int) -> tuple[int, int, int, int]:
+        history = self.get_history(group_id)
+        before_items = len(history)
+        before_tokens = self._count_tokens(history) if history else 0
+        if not history:
+            self._history[group_id] = []
+            return 0, 0, 0, 0
+
+        compacted = self._select_recent_messages(
+            history,
+            budget_tokens=self._runtime_history_budget_tokens,
+            max_items=self._runtime_history_max_items,
+        )
+
+        # Exact-token fallback if rough char-based selection still exceeds budget.
+        while len(compacted) > 1 and self._count_tokens(compacted) > self._runtime_history_budget_tokens:
+            compacted = compacted[len(compacted) // 2 :]
+
+        self._history[group_id] = compacted
+        after_items = len(compacted)
+        after_tokens = self._count_tokens(compacted) if compacted else 0
+        return before_items, after_items, before_tokens, after_tokens
+
     # ---- Compression ----
 
     async def maybe_compress(self, group_id: int) -> bool:
@@ -185,10 +211,6 @@ class MemoryService:
             usage = self._count_tokens(history)
             if not force and usage < self.max_context:
                 return False
-            if not force:
-                delta = len(history) - self._last_compressed_len.get(group_id, 0)
-                if delta < self._compress_min_new_messages:
-                    return False
 
             log.info(
                 "Memory compress start: group=%s context=%d/%d force=%s",
@@ -212,8 +234,17 @@ class MemoryService:
 
             self._save_memory(group_id, summary)
             self._summary[group_id] = summary
-            self._last_compressed_len[group_id] = len(history)
-            log.info("Memory compress saved snapshot: group=%s", group_id)
+            before_items, after_items, before_tokens, after_tokens = self._compact_runtime_history(group_id)
+            self._last_compressed_len[group_id] = after_items
+            log.info(
+                "Memory compress saved snapshot: group=%s history=%d->%d tokens~%d->%d budget=%d",
+                group_id,
+                before_items,
+                after_items,
+                before_tokens,
+                after_tokens,
+                self._runtime_history_budget_tokens,
+            )
             return True
 
     # ---- File persistence ----
