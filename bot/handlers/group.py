@@ -91,11 +91,13 @@ def _build_moderation_notice(
         rule_ref = "未定位具体规则（AI语义判定）"
 
     return (
-        f"{warn_target} <b>{title}</b>\n"
-        f"- <b>警告次数</b>: {count}/{threshold}\n"
-        f"- <b>原因</b>: {reason_text}\n"
-        f"- <b>依据规则</b>: {rule_ref}\n"
-        f"- <b>处理结果</b>: {action_result}"
+        f"<b>{title}</b>\n"
+        f"————————\n"
+        f"<b>用户</b>: {warn_target}\n"
+        f"<b>警告次数</b>: {count}/{threshold}\n"
+        f"<b>原因</b>: {reason_text}\n"
+        f"<b>依据规则</b>: {rule_ref}\n"
+        f"<b>处理结果</b>: {action_result}"
     )
 
 
