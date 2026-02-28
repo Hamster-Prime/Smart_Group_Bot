@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from aiogram.types import Message
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @dataclass(slots=True)
 class SkillContext:
+    session: AsyncSession | None = None
     message: Message | None = None
     sender_user_id: int = 0
     sender_username: str = ""

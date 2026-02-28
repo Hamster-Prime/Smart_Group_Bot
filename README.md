@@ -50,7 +50,7 @@
 | `send_sticker` | 在群里发送贴纸（支持自动学习贴纸库 + 默认贴纸池） |
 
 贴纸学习机制：
-- 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入 `memory/stickers/<group_id>.json`。
+- 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入数据库表 `sticker_library`。
 - 后续调用 `send_sticker` 时会优先按语义描述匹配已学习贴纸，实现“边聊边学”的贴纸选择。
 
 ---
@@ -155,7 +155,7 @@ MAX_OUTPUT_TOKENS=64000
 
 # ---- 技能配置 ----
 # 贴纸 file_id 列表，逗号分隔（供 send_sticker 默认使用）
-# 已学习贴纸会自动保存到 memory/stickers/<group_id>.json
+# 已学习贴纸会保存到数据库表 sticker_library（首次会自动导入 memory/stickers/<group_id>.json）
 SKILL_STICKER_FILE_IDS=
 
 # 数据库（默认 SQLite）

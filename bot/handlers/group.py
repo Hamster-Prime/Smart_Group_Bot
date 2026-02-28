@@ -316,7 +316,8 @@ async def on_group_message(
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     if msg_type == "sticker":
         try:
-            learned = sticker_library.learn_from_message(
+            learned = await sticker_library.learn_from_message(
+                session,
                 group_id,
                 message,
                 vision_description=vision_text,
@@ -468,6 +469,7 @@ async def on_group_message(
             if not reply:
                 skill_reply = await skill.answer_with_skill(
                     input_text,
+                    session=session,
                     history=history,
                     sender_user_id=user_id,
                     sender_username=sender_username,

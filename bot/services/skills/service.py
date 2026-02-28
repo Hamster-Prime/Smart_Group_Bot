@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import litellm
 
@@ -23,6 +23,9 @@ from bot.utils.security import (
 )
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class SkillService:
@@ -222,6 +225,7 @@ class SkillService:
         self,
         text: str,
         *,
+        session: AsyncSession | None = None,
         history: list[dict[str, str]] | None = None,
         sender_user_id: int = 0,
         sender_username: str = "",
@@ -250,6 +254,7 @@ class SkillService:
 
         tools = self._tool_definitions(self.skills)
         context = SkillContext(
+            session=session,
             message=message,
             sender_user_id=sender_user_id,
             sender_username=sender_username,

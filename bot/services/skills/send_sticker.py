@@ -53,14 +53,17 @@ class SendStickerSkill:
         sticker_file_id = str(arguments.get("sticker_file_id", "")).strip()
         description = str(arguments.get("description", "")).strip()
         reason = str(arguments.get("reason", "")).strip()
+        session = context.session
         if not sticker_file_id:
             query = description or reason or context.current_user_text
-            picked = sticker_library.pick_sticker(
-                message.chat.id,
-                query=query,
-                fallback_pool=context.default_sticker_file_ids,
-            )
-            sticker_file_id = picked.file_id
+            if session:
+                picked = await sticker_library.pick_sticker(
+                    session,
+                    message.chat.id,
+                    query=query,
+                    fallback_pool=context.default_sticker_file_ids,
+                )
+                sticker_file_id = picked.file_id
             if not sticker_file_id:
                 sticker_file_id = self._pick_default_sticker(context)
         if not sticker_file_id:
@@ -73,7 +76,8 @@ class SendStickerSkill:
 
         try:
             sent = await message.answer_sticker(sticker=sticker_file_id)
-            sticker_library.mark_sent(message.chat.id, sticker_file_id)
+            if session:
+                await sticker_library.mark_sent(session, message.chat.id, sticker_file_id)
             log.info("skill send_sticker ok: chat=%s reason=%s", message.chat.id, reason or "-")
             return SkillRunResult(
                 ok=True,
