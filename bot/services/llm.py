@@ -5,7 +5,7 @@ from typing import Any
 
 import litellm
 
-from bot.config import EmbedConfig, ModelConfig
+from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class LLMService:
         self.embed_config = embed or EmbedConfig()
 
     @staticmethod
-    def _build_kwargs(cfg: ModelConfig) -> dict[str, Any]:
+    def _build_chat_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "temperature": cfg.temperature,
@@ -44,6 +44,35 @@ class LLMService:
         if cfg.api_base:
             kwargs["api_base"] = cfg.api_base
         return kwargs
+
+    @staticmethod
+    def _build_embed_kwargs(cfg: EmbedEndpointConfig, texts: list[str]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"model": cfg.model, "input": texts}
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        if cfg.api_base:
+            kwargs["api_base"] = cfg.api_base
+        return kwargs
+
+    @staticmethod
+    def _chat_candidates(cfg: ModelConfig) -> list[ChatEndpointConfig]:
+        return [
+            ChatEndpointConfig(
+                model=cfg.model,
+                api_key=cfg.api_key,
+                api_base=cfg.api_base,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+            ),
+            *cfg.fallbacks,
+        ]
+
+    @staticmethod
+    def _embed_candidates(cfg: EmbedConfig) -> list[EmbedEndpointConfig]:
+        return [
+            EmbedEndpointConfig(model=cfg.model, api_key=cfg.api_key, api_base=cfg.api_base),
+            *cfg.fallbacks,
+        ]
 
     @staticmethod
     def _normalize_content_text(content: Any) -> str:
@@ -80,6 +109,76 @@ class LLMService:
         }
         return mapping.get(label, label)
 
+    async def _chat_with_fallbacks(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        candidates: list[ChatEndpointConfig],
+        label: str,
+        preview_limit: int,
+    ) -> str:
+        label_cn = self._label_cn(label)
+        total = len(candidates)
+        for idx, cfg in enumerate(candidates, start=1):
+            kwargs = self._build_chat_kwargs(cfg)
+            log.info(
+                "【LLM请求】阶段=%s | 尝试=%d/%d | 模型=%s | 消息数=%d | max_tokens=%d",
+                label_cn,
+                idx,
+                total,
+                cfg.model,
+                len(messages),
+                cfg.max_tokens,
+            )
+            try:
+                resp = await litellm.acompletion(messages=messages, **kwargs)
+                content = resp.choices[0].message.content
+                text = self._normalize_content_text(content)
+                if not text.strip():
+                    log.warning(
+                        "【LLM空响应】阶段=%s | 尝试=%d/%d | 模型=%s",
+                        label_cn,
+                        idx,
+                        total,
+                        cfg.model,
+                    )
+                    continue
+                tokens_in = getattr(resp.usage, "prompt_tokens", 0)
+                tokens_out = getattr(resp.usage, "completion_tokens", 0)
+                preview, truncated = self._preview_for_log(text, limit=preview_limit)
+                log.info(
+                    "【LLM返回】阶段=%s | 尝试=%d/%d | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
+                    label_cn,
+                    idx,
+                    total,
+                    len(text),
+                    tokens_in,
+                    tokens_out,
+                    truncated,
+                    preview,
+                )
+                return text
+            except Exception as exc:
+                if idx < total:
+                    log.warning(
+                        "【LLM失败】阶段=%s | 尝试=%d/%d | 模型=%s | 错误=%s | 准备fallback",
+                        label_cn,
+                        idx,
+                        total,
+                        cfg.model,
+                        exc,
+                    )
+                    continue
+                log.exception(
+                    "【LLM失败】阶段=%s | 尝试=%d/%d | 模型=%s (已无fallback)",
+                    label_cn,
+                    idx,
+                    total,
+                    cfg.model,
+                )
+                return ""
+        return ""
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -98,36 +197,12 @@ class LLMService:
             cfg = self.main
             label = "main"
 
-        kwargs = self._build_kwargs(cfg)
-        label_cn = self._label_cn(label)
-        log.info(
-            "【LLM请求】阶段=%s | 模型=%s | 消息数=%d | max_tokens=%d",
-            label_cn,
-            cfg.model,
-            len(messages),
-            cfg.max_tokens,
+        return await self._chat_with_fallbacks(
+            messages=messages,
+            candidates=self._chat_candidates(cfg),
+            label=label,
+            preview_limit=(120 if label == "moderation" else 80),
         )
-        try:
-            resp = await litellm.acompletion(messages=messages, **kwargs)
-            content = resp.choices[0].message.content
-            text = self._normalize_content_text(content)
-            tokens_in = getattr(resp.usage, "prompt_tokens", 0)
-            tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview_limit = 120 if label == "moderation" else 80
-            preview, truncated = self._preview_for_log(text, limit=preview_limit)
-            log.info(
-                "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
-                label_cn,
-                len(text),
-                tokens_in,
-                tokens_out,
-                truncated,
-                preview,
-            )
-            return text
-        except Exception:
-            log.exception("【LLM失败】阶段=%s | 模型=%s", label_cn, cfg.model)
-            return ""
 
     async def decision(self, system: str, user_text: str) -> str:
         """Fast decision call (uses decision model)."""
@@ -155,39 +230,27 @@ class LLMService:
 
     async def compress(self, system: str, user_text: str) -> str:
         """Compress conversation history (uses compress model)."""
-        kwargs = self._build_kwargs(self.compress_config)
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ]
-        log.info(
-            "【LLM请求】阶段=%s | 模型=%s | 输入长度=%d字符",
-            self._label_cn("compress"),
-            self.compress_config.model,
-            len(user_text),
+        text = await self._chat_with_fallbacks(
+            messages=messages,
+            candidates=self._chat_candidates(self.compress_config),
+            label="compress",
+            preview_limit=100,
         )
-        try:
-            resp = await litellm.acompletion(messages=messages, **kwargs)
-            content = resp.choices[0].message.content
-            text = self._normalize_content_text(content)
+        if text:
             log.info(
                 "【LLM返回】阶段=%s | 压缩前=%d字符 | 压缩后=%d字符",
                 self._label_cn("compress"),
                 len(user_text),
                 len(text),
             )
-            return text
-        except Exception:
-            log.exception(
-                "【LLM失败】阶段=%s | 模型=%s",
-                self._label_cn("compress"),
-                self.compress_config.model,
-            )
-            return ""
+        return text
 
     async def vision_describe(self, image_url: str, prompt: str) -> str:
         """Image understanding with the main model."""
-        kwargs = self._build_kwargs(self.main)
         messages: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -197,46 +260,64 @@ class LLMService:
                 ],
             }
         ]
-        log.info("【LLM请求】阶段=%s | 模型=%s | 输入=图片", self._label_cn("vision"), self.main.model)
-        try:
-            resp = await litellm.acompletion(messages=messages, **kwargs)
-            content = resp.choices[0].message.content
-            text = self._normalize_content_text(content).strip()
-            tokens_in = getattr(resp.usage, "prompt_tokens", 0)
-            tokens_out = getattr(resp.usage, "completion_tokens", 0)
-            preview, truncated = self._preview_for_log(text, limit=80)
-            log.info(
-                "【LLM返回】阶段=%s | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
-                self._label_cn("vision"),
-                len(text),
-                tokens_in,
-                tokens_out,
-                truncated,
-                preview,
-            )
-            return text
-        except Exception:
-            log.exception("【LLM失败】阶段=%s | 模型=%s", self._label_cn("vision"), self.main.model)
-            return ""
+        return await self._chat_with_fallbacks(
+            messages=messages,
+            candidates=self._chat_candidates(self.main),
+            label="vision",
+            preview_limit=80,
+        )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings."""
-        cfg = self.embed_config
-        kwargs: dict[str, Any] = {"model": cfg.model, "input": texts}
-        if cfg.api_key:
-            kwargs["api_key"] = cfg.api_key
-        if cfg.api_base:
-            kwargs["api_base"] = cfg.api_base
-        log.info("【LLM请求】阶段=%s | 模型=%s | 文本数=%d", self._label_cn("embed"), cfg.model, len(texts))
-        try:
-            resp = await litellm.aembedding(**kwargs)
-            embeddings = [item["embedding"] for item in resp.data]
+        candidates = self._embed_candidates(self.embed_config)
+        total = len(candidates)
+        for idx, cfg in enumerate(candidates, start=1):
+            kwargs = self._build_embed_kwargs(cfg, texts)
             log.info(
-                "【LLM返回】阶段=%s | 向量维度=%d",
+                "【LLM请求】阶段=%s | 尝试=%d/%d | 模型=%s | 文本数=%d",
                 self._label_cn("embed"),
-                len(embeddings[0]) if embeddings else 0,
+                idx,
+                total,
+                cfg.model,
+                len(texts),
             )
-            return embeddings
-        except Exception:
-            log.exception("【LLM失败】阶段=%s | 模型=%s", self._label_cn("embed"), cfg.model)
-            return []
+            try:
+                resp = await litellm.aembedding(**kwargs)
+                embeddings = [item["embedding"] for item in resp.data]
+                if not embeddings:
+                    log.warning(
+                        "【LLM空响应】阶段=%s | 尝试=%d/%d | 模型=%s",
+                        self._label_cn("embed"),
+                        idx,
+                        total,
+                        cfg.model,
+                    )
+                    continue
+                log.info(
+                    "【LLM返回】阶段=%s | 尝试=%d/%d | 向量维度=%d",
+                    self._label_cn("embed"),
+                    idx,
+                    total,
+                    len(embeddings[0]),
+                )
+                return embeddings
+            except Exception as exc:
+                if idx < total:
+                    log.warning(
+                        "【LLM失败】阶段=%s | 尝试=%d/%d | 模型=%s | 错误=%s | 准备fallback",
+                        self._label_cn("embed"),
+                        idx,
+                        total,
+                        cfg.model,
+                        exc,
+                    )
+                    continue
+                log.exception(
+                    "【LLM失败】阶段=%s | 尝试=%d/%d | 模型=%s (已无fallback)",
+                    self._label_cn("embed"),
+                    idx,
+                    total,
+                    cfg.model,
+                )
+                return []
+        return []
