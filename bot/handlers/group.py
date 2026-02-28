@@ -303,6 +303,9 @@ async def on_group_message(
     skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
+    reply_context = extract_reply_context(message)
+    if reply_context:
+        input_text = f"{input_text}\n{reply_context}"
     if msg_type == "sticker":
         try:
             learned = await sticker_library.learn_from_message(
@@ -372,10 +375,6 @@ async def on_group_message(
                 return
     else:
         log.info("[%s]【流程】审核 | 关闭", group_id)
-
-    reply_context = extract_reply_context(message)
-    if reply_context:
-        input_text = f"{input_text}\n{reply_context}"
 
     memory = memory_holder.get()
     memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")

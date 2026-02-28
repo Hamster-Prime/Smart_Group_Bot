@@ -500,6 +500,41 @@ def extract_reply_context(message: Message, max_len: int = 320) -> str:
                 reply_text = reply_text[:max_len] + "..."
             lines.append(f"[reply_to:{reply_type}] {reply_text}")
 
+    external_reply = getattr(message, "external_reply", None)
+    if external_reply:
+        # External replies can omit full text/caption; keep best-effort signal.
+        ext_text = re.sub(
+            r"\s+",
+            " ",
+            (getattr(external_reply, "text", None) or getattr(external_reply, "caption", None) or ""),
+        ).strip()
+        if ext_text:
+            if len(ext_text) > max_len:
+                ext_text = ext_text[:max_len] + "..."
+            ext_line = f"[external_reply:text] {ext_text}"
+        else:
+            media_markers: tuple[tuple[str, str], ...] = (
+                ("photo", "[image]"),
+                ("video", "[video]"),
+                ("animation", "[gif]"),
+                ("document", "[document]"),
+                ("audio", "[audio]"),
+                ("voice", "[voice]"),
+                ("sticker", "[sticker]"),
+                ("location", "[location]"),
+                ("contact", "[contact]"),
+                ("poll", "[poll]"),
+            )
+            marker = ""
+            for field_name, label in media_markers:
+                if getattr(external_reply, field_name, None):
+                    marker = label
+                    break
+            ext_line = f"[external_reply] {marker}".strip() if marker else ""
+
+        if ext_line and ext_line not in lines:
+            lines.append(ext_line)
+
     quote = getattr(message, "quote", None)
     quote_text = re.sub(r"\s+", " ", (getattr(quote, "text", None) or "")).strip()
     if quote_text:
