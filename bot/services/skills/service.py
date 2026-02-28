@@ -12,7 +12,7 @@ from bot.services.skills.base import Skill, SkillContext, SkillRunResult
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
-from bot.utils.prompts import SKILL_TOOL_SYSTEM
+from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -237,7 +237,7 @@ class SkillService:
             log.warning("skill input may contain prompt injection")
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_defended_system(SKILL_TOOL_SYSTEM)},
+            {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
             {"role": "system", "content": build_current_time_context()},
             {
                 "role": "system",

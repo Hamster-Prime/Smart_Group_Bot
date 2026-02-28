@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
-from bot.utils.prompts import RAG_SYSTEM
+from bot.utils.prompts import RAG_SYSTEM, with_persona
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -72,7 +72,7 @@ class RAGService:
             context_parts.append(f"[title] {title}\n{wrap_untrusted('knowledge_chunk', doc, max_len=1800)}")
         context = "\n\n---\n".join(context_parts)
 
-        system_prompt = build_defended_system(RAG_SYSTEM.format(context=context))
+        system_prompt = build_defended_system(with_persona(RAG_SYSTEM.format(context=context)))
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": build_current_time_context()},

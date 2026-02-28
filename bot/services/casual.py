@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from bot.services.llm import LLMService
-from bot.utils.prompts import CASUAL_SYSTEM
+from bot.utils.prompts import CASUAL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -53,7 +53,7 @@ class CasualService:
             log.warning("casual input may contain prompt injection")
 
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": build_defended_system(CASUAL_SYSTEM)},
+            {"role": "system", "content": build_defended_system(with_persona(CASUAL_SYSTEM))},
             {"role": "system", "content": build_current_time_context()},
             {
                 "role": "system",
