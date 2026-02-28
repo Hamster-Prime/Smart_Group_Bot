@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from bot.services.skills.base import SkillRunResult
+from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,15 @@ _TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 
 class WebFetchSkill:
     name = "webfetch"
+    description = "抓取并提取指定 URL 的网页正文内容。"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "要抓取的网页 URL（http/https）"},
+        },
+        "required": ["url"],
+        "additionalProperties": False,
+    }
 
     @staticmethod
     def _valid_url(url: str) -> bool:
@@ -39,8 +48,9 @@ class WebFetchSkill:
         body = clean_text(body, max_len=6000)
         return title, body
 
-    async def run(self, url: str) -> SkillRunResult:
-        u = (url or "").strip()
+    async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
+        _ = context  # Unused for this skill.
+        u = str(arguments.get("url", "")).strip()
         if not self._valid_url(u):
             return SkillRunResult(ok=False, skill=self.name, summary="URL 非法", error="invalid_url")
 

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
+import litellm
+
+from bot.config import ChatEndpointConfig, ModelConfig
 from bot.services.llm import LLMService
-from bot.services.skills.base import SkillRunResult
+from bot.services.skills.base import Skill, SkillContext, SkillRunResult
+from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
-from bot.utils.prompts import SKILL_ANSWER_SYSTEM, SKILL_SYSTEM
+from bot.utils.prompts import SKILL_TOOL_SYSTEM
+from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
     clean_text,
@@ -20,35 +24,25 @@ from bot.utils.security import (
 
 log = logging.getLogger(__name__)
 
-_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-
-
-def _parse_json_payload(raw: str) -> dict[str, Any] | None:
-    payload = (raw or "").strip()
-    if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json)?", "", payload).strip()
-        payload = re.sub(r"```$", "", payload).strip()
-    if not payload.startswith("{"):
-        m = re.search(r"\{[\s\S]*\}", payload)
-        if m:
-            payload = m.group(0)
-    try:
-        data = json.loads(payload)
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
 
 class SkillService:
-    def __init__(self, llm: LLMService) -> None:
+    def __init__(
+        self,
+        llm: LLMService,
+        *,
+        default_sticker_file_ids: list[str] | None = None,
+        max_tool_rounds: int = 4,
+    ) -> None:
         self.llm = llm
-        self.websearch = WebSearchSkill()
-        self.webfetch = WebFetchSkill()
+        self.max_tool_rounds = max(1, max_tool_rounds)
+        self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
+        self.skills: dict[str, Skill] = {}
+        self._register(WebSearchSkill())
+        self._register(WebFetchSkill())
+        self._register(SendStickerSkill())
 
-    @staticmethod
-    def _extract_first_url(text: str) -> str:
-        m = _URL_RE.search(text or "")
-        return m.group(0) if m else ""
+    def _register(self, skill: Skill) -> None:
+        self.skills[skill.name] = skill
 
     @staticmethod
     def _build_sender_context(
@@ -70,85 +64,159 @@ class SkillService:
         )
 
     @staticmethod
-    def _heuristic_plan(text: str) -> dict[str, Any]:
-        t = clean_text(text, max_len=800)
-        lower = t.lower()
-        url = SkillService._extract_first_url(t)
-        if url and any(k in lower for k in ("summary", "summarize", "fetch", "read", "analyze", "解析", "总结", "链接")):
-            return {
-                "use_skill": True,
-                "skill": "webfetch",
-                "url": url,
-                "query": "",
-                "reason": "user asked to read/summarize a url",
-            }
-        if url:
-            return {"use_skill": True, "skill": "webfetch", "url": url, "query": "", "reason": "url detected"}
-        if any(
-            k in lower
-            for k in ("search", "websearch", "ddgs", "latest", "news", "官网", "搜索", "查一下", "资料", "最新")
-        ):
-            return {"use_skill": True, "skill": "websearch", "url": "", "query": t, "reason": "search intent detected"}
-        return {"use_skill": False, "skill": "none", "url": "", "query": "", "reason": "no external skill needed"}
+    def _normalize_content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    txt = str(item.get("text", "")).strip()
+                    if txt:
+                        parts.append(txt)
+            return "\n".join(parts)
+        return str(content or "")
 
-    async def _plan(self, text: str) -> dict[str, Any]:
-        user_text = clean_text(text, max_len=1200)
-        has_url = bool(self._extract_first_url(user_text))
+    @staticmethod
+    def _build_chat_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": cfg.model,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+        }
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        if cfg.api_base:
+            kwargs["api_base"] = cfg.api_base
+        return kwargs
 
-        if contains_prompt_injection(user_text):
-            log.warning("skill planner input may contain prompt injection")
-            if has_url:
-                return {
-                    "use_skill": True,
-                    "skill": "webfetch",
-                    "url": self._extract_first_url(user_text),
-                    "query": "",
-                    "reason": "safe mode: explicit url only",
+    @staticmethod
+    def _candidate_models(cfg: ModelConfig) -> list[ChatEndpointConfig]:
+        return [
+            ChatEndpointConfig(
+                model=cfg.model,
+                api_key=cfg.api_key,
+                api_base=cfg.api_base,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+            ),
+            *cfg.fallbacks,
+        ]
+
+    @staticmethod
+    def _tool_definitions(skills: dict[str, Skill]) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        for s in skills.values():
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": s.name,
+                        "description": s.description,
+                        "parameters": s.parameters_schema,
+                    },
                 }
-            return {"use_skill": False, "skill": "none", "url": "", "query": "", "reason": "safe mode"}
+            )
+        return tools
 
-        planner_input = (
-            "[USER_MESSAGE]\n"
-            f"{wrap_untrusted('user_message', user_text, max_len=1200)}\n\n"
-            "[AVAILABLE_SKILLS]\n"
-            "- websearch: search web pages via DDGS, best for finding references/news/official pages.\n"
-            "- webfetch: fetch and read a specific URL, best for summarize/analyze link content.\n\n"
-            "[OUTPUT_FORMAT]\n"
-            "{\"use_skill\":true|false,\"skill\":\"websearch|webfetch|none\",\"query\":\"\",\"url\":\"\",\"reason\":\"\"}"
-        )
-        raw = await self.llm.decision(build_defended_system(SKILL_SYSTEM), planner_input)
-        data = _parse_json_payload(raw)
-        if not data:
-            return self._heuristic_plan(user_text)
+    async def _completion_with_fallbacks(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> Any | None:
+        candidates = self._candidate_models(self.llm.main)
+        total = len(candidates)
 
-        use_skill = bool(data.get("use_skill", False))
-        skill = str(data.get("skill", "none")).strip().lower()
-        query = clean_text(str(data.get("query", "")), max_len=300)
-        url = str(data.get("url", "")).strip()
-        reason = clean_text(str(data.get("reason", "")), max_len=120)
+        for idx, cfg in enumerate(candidates, start=1):
+            kwargs = self._build_chat_kwargs(cfg)
+            log.info(
+                "skill planner+answer request: try=%d/%d model=%s messages=%d tools=%d",
+                idx,
+                total,
+                cfg.model,
+                len(messages),
+                len(tools),
+            )
+            try:
+                return await litellm.acompletion(
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    **kwargs,
+                )
+            except Exception as exc:
+                if idx < total:
+                    log.warning(
+                        "skill llm call failed: try=%d/%d model=%s error=%s -> fallback",
+                        idx,
+                        total,
+                        cfg.model,
+                        exc,
+                    )
+                    continue
+                log.exception("skill llm call failed: all fallbacks exhausted")
+                return None
+        return None
 
-        if not use_skill or skill not in {"websearch", "webfetch"}:
-            return {"use_skill": False, "skill": "none", "url": "", "query": "", "reason": reason or "no skill"}
+    @staticmethod
+    def _parse_tool_calls(message: Any) -> list[dict[str, str]]:
+        raw_tool_calls = getattr(message, "tool_calls", None)
+        if raw_tool_calls is None and isinstance(message, dict):
+            raw_tool_calls = message.get("tool_calls")
+        if not raw_tool_calls:
+            return []
 
-        if skill == "webfetch" and not url:
-            url = self._extract_first_url(user_text)
-        if skill == "websearch" and not query:
-            query = user_text
+        parsed: list[dict[str, str]] = []
+        for call in raw_tool_calls:
+            if isinstance(call, dict):
+                call_id = str(call.get("id", "")).strip()
+                fn = call.get("function", {}) or {}
+                name = str(fn.get("name", "")).strip()
+                raw_args = fn.get("arguments", "")
+            else:
+                call_id = str(getattr(call, "id", "") or "").strip()
+                fn = getattr(call, "function", None)
+                name = str(getattr(fn, "name", "") if fn else "").strip()
+                raw_args = getattr(fn, "arguments", "") if fn else ""
+            if isinstance(raw_args, dict):
+                arguments = json.dumps(raw_args, ensure_ascii=False)
+            else:
+                arguments = str(raw_args or "").strip()
+            if call_id and name:
+                parsed.append({"id": call_id, "name": name, "arguments": arguments or "{}"})
+        return parsed
 
-        if skill == "webfetch" and not url:
-            return self._heuristic_plan(user_text)
-        if skill == "websearch" and not query:
-            return self._heuristic_plan(user_text)
+    @staticmethod
+    def _parse_tool_arguments(raw: str) -> dict[str, Any]:
+        text = (raw or "").strip() or "{}"
+        try:
+            data = json.loads(text)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
-        return {"use_skill": True, "skill": skill, "url": url, "query": query, "reason": reason or "planned by model"}
+    async def _run_tool(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        context: SkillContext,
+    ) -> SkillRunResult:
+        skill = self.skills.get(name)
+        if not skill:
+            return SkillRunResult(ok=False, skill=name, summary="未知技能", error="unknown_skill")
+        return await skill.run(arguments, context)
 
-    async def _run_plan(self, plan: dict[str, Any]) -> SkillRunResult:
-        skill = plan.get("skill")
-        if skill == "websearch":
-            return await self.websearch.run(str(plan.get("query", "")))
-        if skill == "webfetch":
-            return await self.webfetch.run(str(plan.get("url", "")))
-        return SkillRunResult(ok=False, skill="none", summary="no skill executed", error="none")
+    @staticmethod
+    def _tool_result_to_payload(result: SkillRunResult) -> dict[str, Any]:
+        return {
+            "ok": result.ok,
+            "skill": result.skill,
+            "summary": result.summary,
+            "error": result.error,
+            "payload": result.payload,
+        }
 
     async def answer_with_skill(
         self,
@@ -158,21 +226,15 @@ class SkillService:
         sender_user_id: int = 0,
         sender_username: str = "",
         sender_is_owner: bool = False,
+        message: Any | None = None,
     ) -> str:
-        plan = await self._plan(text)
-        if not plan.get("use_skill"):
-            return ""
+        user_text = clean_text(text, max_len=1200)
+        if contains_prompt_injection(user_text):
+            log.warning("skill input may contain prompt injection")
 
-        result = await self._run_plan(plan)
-        if not result.ok:
-            log.warning("skill execution failed: skill=%s error=%s", result.skill, result.error)
-            return ""
-
-        payload_text = json.dumps(result.payload, ensure_ascii=False)
-        payload_text = clean_text(payload_text, max_len=6000)
-
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": build_defended_system(SKILL_ANSWER_SYSTEM)},
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": build_defended_system(SKILL_TOOL_SYSTEM)},
+            {"role": "system", "content": build_current_time_context()},
             {
                 "role": "system",
                 "content": self._build_sender_context(
@@ -184,19 +246,72 @@ class SkillService:
         ]
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    f"[USER_QUESTION]\n{wrap_untrusted('user_question', text, max_len=800)}\n"
-                    f"[SKILL]\n{result.skill}\n"
-                    f"[SKILL_SUMMARY]\n{result.summary}\n"
-                    f"[SKILL_OUTPUT]\n{wrap_untrusted('skill_output', payload_text, max_len=6000)}"
-                ),
-            }
+        messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
+
+        tools = self._tool_definitions(self.skills)
+        context = SkillContext(
+            message=message,
+            sender_user_id=sender_user_id,
+            sender_username=sender_username,
+            sender_is_owner=sender_is_owner,
+            current_user_text=user_text,
+            default_sticker_file_ids=self.default_sticker_file_ids,
         )
-        reply = (await self.llm.chat(messages)).strip()
-        if reply:
-            log.info("skill answer generated: skill=%s", result.skill)
-            return reply
-        return result.summary
+        sticker_sent_once = False
+        last_success_summary = ""
+
+        for step in range(1, self.max_tool_rounds + 1):
+            resp = await self._completion_with_fallbacks(messages=messages, tools=tools)
+            if not resp:
+                return ""
+
+            msg = resp.choices[0].message
+            content = self._normalize_content_text(getattr(msg, "content", "")).strip()
+            tool_calls = self._parse_tool_calls(msg)
+
+            assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
+            if tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls
+                ]
+            messages.append(assistant_message)
+
+            if not tool_calls:
+                if content:
+                    log.info("skill tool loop finished: step=%d no_tool_call", step)
+                    return content
+                return last_success_summary
+
+            log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
+            for tc in tool_calls:
+                args = self._parse_tool_arguments(tc["arguments"])
+                if tc["name"] == "send_sticker" and sticker_sent_once:
+                    result = SkillRunResult(
+                        ok=False,
+                        skill="send_sticker",
+                        summary="本轮已发送过贴纸，忽略重复发送",
+                        error="sticker_already_sent",
+                    )
+                else:
+                    result = await self._run_tool(name=tc["name"], arguments=args, context=context)
+                    if tc["name"] == "send_sticker" and result.ok:
+                        sticker_sent_once = True
+                if result.ok and result.summary:
+                    last_success_summary = result.summary
+                payload = self._tool_result_to_payload(result)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["name"],
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    }
+                )
+
+        log.info("skill tool loop reached max steps: %d", self.max_tool_rounds)
+        return last_success_summary

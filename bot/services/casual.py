@@ -4,6 +4,7 @@ import logging
 
 from bot.services.llm import LLMService
 from bot.utils.prompts import CASUAL_SYSTEM
+from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
     clean_text,
@@ -53,6 +54,7 @@ class CasualService:
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": build_defended_system(CASUAL_SYSTEM)},
+            {"role": "system", "content": build_current_time_context()},
             {
                 "role": "system",
                 "content": self._build_sender_context(

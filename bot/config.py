@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     bot_enable_streaming: bool = True
     bot_stream_chunk_size: int = 36
     bot_stream_edit_interval_sec: float = 1.0
+    skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
     bot: BotConfig = BotConfig()

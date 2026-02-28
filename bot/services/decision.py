@@ -5,6 +5,7 @@ import re
 
 from bot.services.llm import LLMService
 from bot.utils.prompts import DECISION_SYSTEM
+from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
     clean_text,
@@ -49,6 +50,7 @@ class DecisionService:
         titles_block = self._format_titles(knowledge_titles)
 
         context = (
+            f"{build_current_time_context()}\n"
             f"{sender}"
             f"{mention_tag}\n"
             f"{reply_tag}\n"

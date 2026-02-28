@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from bot.services.skills.base import SkillRunResult
+from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
 
 log = logging.getLogger(__name__)
@@ -11,9 +11,26 @@ log = logging.getLogger(__name__)
 
 class WebSearchSkill:
     name = "websearch"
+    description = "联网搜索公开网页信息，返回标题、链接和摘要。"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "搜索关键词"},
+            "max_results": {"type": "integer", "description": "返回数量(1-10)", "default": 5},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
 
-    async def run(self, query: str, max_results: int = 5) -> SkillRunResult:
-        q = clean_text(query, max_len=300)
+    async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
+        _ = context  # Unused for this skill.
+        q = clean_text(str(arguments.get("query", "")), max_len=300)
+        try:
+            max_results = int(arguments.get("max_results", 5))
+        except Exception:
+            max_results = 5
+        max_results = max(1, min(max_results, 10))
+
         if not q:
             return SkillRunResult(ok=False, skill=self.name, summary="搜索词为空", error="empty_query")
 

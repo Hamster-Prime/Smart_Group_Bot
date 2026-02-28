@@ -23,6 +23,7 @@ from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.rag import RAGService
 from bot.services.skills import SkillService
+from bot.services.sticker_library import sticker_library
 from bot.utils.telegram import (
     extract_reply_context,
     extract_message_text,
@@ -194,8 +195,10 @@ async def _build_telegram_image_url(message: Message) -> str:
     return f"https://api.telegram.org/file/bot{token}/{tg_file.file_path}"
 
 
-async def _append_image_context(message: Message, llm: LLMService, text: str, msg_type: str) -> str:
-    """Append image understanding text for moderation/decision/RAG."""
+async def _append_image_context(
+    message: Message, llm: LLMService, text: str, msg_type: str
+) -> tuple[str, str]:
+    """Append image understanding text for moderation/decision/RAG and return vision text."""
     if msg_type not in {
         "photo",
         "photo_caption",
@@ -205,7 +208,7 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
         "animation_caption",
         "sticker",
     }:
-        return text
+        return text, ""
 
     vision_prompt = (
         "Please describe key information in this image, prioritizing visible text (OCR) and main objects. "
@@ -225,10 +228,10 @@ async def _append_image_context(message: Message, llm: LLMService, text: str, ms
 
     if not vision_text:
         log.info("【视觉】识别为空")
-        return text
+        return text, ""
 
     log.info("【视觉】识别结果 | %s", vision_text[:80])
-    return f"{text}\n[image-vision]\n{vision_text}"
+    return f"{text}\n[image-vision]\n{vision_text}", vision_text
 
 
 @router.message(
@@ -303,9 +306,31 @@ async def on_group_message(
         embed=settings.bot.embed_model,
     )
     kb = KnowledgeService(settings.knowledge, llm)
-    skill = SkillService(llm)
+    sticker_pool = [
+        x.strip()
+        for x in (settings.skill_sticker_file_ids or "").split(",")
+        if x and x.strip()
+    ]
+    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
 
-    input_text = await _append_image_context(message, llm, input_text, msg_type)
+    input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
+    if msg_type == "sticker":
+        try:
+            learned = sticker_library.learn_from_message(
+                group_id,
+                message,
+                vision_description=vision_text,
+            )
+            if learned:
+                log.info(
+                    "[%s] sticker learned: file_id=%s desc=%s seen=%s",
+                    group_id,
+                    str(learned.get("file_id", ""))[:32],
+                    str(learned.get("description", ""))[:80],
+                    learned.get("seen_count", 1),
+                )
+        except Exception:
+            log.exception("[%s] sticker learning failed", group_id)
 
 
     log.info("[%s]【流程】审核 | 开始", group_id)
@@ -447,6 +472,7 @@ async def on_group_message(
                     sender_user_id=user_id,
                     sender_username=sender_username,
                     sender_is_owner=sender_is_owner,
+                    message=message,
                 )
                 if skill_reply:
                     reply = skill_reply
