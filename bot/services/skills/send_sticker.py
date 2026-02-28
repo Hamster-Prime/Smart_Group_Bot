@@ -75,7 +75,7 @@ class SendStickerSkill:
             )
 
         try:
-            sent = await message.answer_sticker(sticker=sticker_file_id)
+            sent = await message.reply_sticker(sticker=sticker_file_id)
             if session:
                 await sticker_library.mark_sent(session, message.chat.id, sticker_file_id)
             log.info("skill send_sticker ok: chat=%s reason=%s", message.chat.id, reason or "-")

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from aiogram.types import Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import StickerLibraryRecord
@@ -20,6 +20,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 _LEGACY_STICKER_DIR = _ROOT / "memory" / "stickers"
 _INVALID_VISION_MARKERS = {"NO_VALID_IMAGE_CONTENT", "NO_VALID_IMAGE"}
 _SPACE_RE = re.compile(r"\s+")
+_MAX_STICKERS_PER_GROUP = 100
 
 
 def _now_utc() -> datetime:
@@ -80,6 +81,7 @@ class StickerLibrary:
         )
         exists = (await session.execute(exists_stmt)).scalar_one_or_none()
         if exists is not None:
+            await self._trim_group_records(session, group_id)
             self._checked_groups.add(group_id)
             return
 
@@ -135,6 +137,7 @@ class StickerLibrary:
             )
 
         await session.flush()
+        await self._trim_group_records(session, group_id)
         self._checked_groups.add(group_id)
 
     @staticmethod
@@ -192,6 +195,32 @@ class StickerLibrary:
             "source": row.source,
         }
 
+    @staticmethod
+    async def _group_row_count(session: AsyncSession, group_id: int) -> int:
+        stmt = select(func.count(StickerLibraryRecord.id)).where(
+            StickerLibraryRecord.group_id == group_id
+        )
+        return int((await session.execute(stmt)).scalar_one() or 0)
+
+    async def _trim_group_records(self, session: AsyncSession, group_id: int) -> None:
+        stmt = (
+            select(StickerLibraryRecord)
+            .where(StickerLibraryRecord.group_id == group_id)
+            .order_by(
+                StickerLibraryRecord.last_seen_at.desc(),
+                StickerLibraryRecord.last_sent_at.desc(),
+                StickerLibraryRecord.sent_count.desc(),
+                StickerLibraryRecord.seen_count.desc(),
+                StickerLibraryRecord.id.desc(),
+            )
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        if len(rows) <= _MAX_STICKERS_PER_GROUP:
+            return
+        for stale in rows[_MAX_STICKERS_PER_GROUP:]:
+            await session.delete(stale)
+        await session.flush()
+
     async def learn_from_message(
         self,
         session: AsyncSession,
@@ -220,6 +249,10 @@ class StickerLibrary:
         )
         row = (await session.execute(stmt)).scalar_one_or_none()
         if row is None:
+            row_count = await self._group_row_count(session, group_id)
+            if row_count >= _MAX_STICKERS_PER_GROUP:
+                await self._trim_group_records(session, group_id)
+                return None
             row = StickerLibraryRecord(
                 group_id=group_id,
                 file_id=file_id,
@@ -235,6 +268,7 @@ class StickerLibrary:
             )
             session.add(row)
             await session.flush()
+            await self._trim_group_records(session, group_id)
             return self._row_to_dict(row)
 
         row.emoji = emoji or row.emoji
@@ -266,6 +300,10 @@ class StickerLibrary:
         )
         row = (await session.execute(stmt)).scalar_one_or_none()
         if row is None:
+            row_count = await self._group_row_count(session, group_id)
+            if row_count >= _MAX_STICKERS_PER_GROUP:
+                await self._trim_group_records(session, group_id)
+                return
             row = StickerLibraryRecord(
                 group_id=group_id,
                 file_id=fid,
@@ -281,6 +319,9 @@ class StickerLibrary:
                 last_sent_at=now,
             )
             session.add(row)
+            await session.flush()
+            await self._trim_group_records(session, group_id)
+            return
         else:
             row.sent_count = max(0, int(row.sent_count or 0)) + 1
             row.last_sent_at = now
