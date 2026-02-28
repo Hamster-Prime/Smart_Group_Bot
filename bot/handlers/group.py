@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group, MessageLog, ModerationRule
+from bot.db.models import Group, ModerationRule
 from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
@@ -271,21 +271,10 @@ async def on_group_message(
         else f'<a href="tg://user?id={user_id}">{html.escape((user.full_name if user else str(user_id)) or str(user_id))}</a>'
     )
 
-    def _add_message_log(payload: str) -> None:
-        session.add(
-            MessageLog(
-                group_id=group_id,
-                user_id=user_id,
-                username=(user.username if user else None),
-                text=payload[:1000],
-            )
-        )
-
     await _ensure_group_row(session, group_id, message.chat.title or "")
 
     if msg_type in {"video", "video_caption", "video_note"}:
         log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
-        _add_message_log(text)
         return
 
     sender_username = (user.username or "").strip() if user else ""
@@ -375,7 +364,6 @@ async def on_group_message(
                     except Exception:
                         pass
                 await message.answer(notice)
-                _add_message_log(input_text)
                 log.info(
                     "[%s]【结束】审核拦截 | 已回复=是 | 总耗时=%dms",
                     group_id,
@@ -519,14 +507,12 @@ async def on_group_message(
             int((time.perf_counter() - flow_started) * 1000),
         )
         await memory.maybe_compress(group_id)
-        _add_message_log(input_text)
         return
 
     if reply and sent_ok:
         memory.add_message(group_id, "assistant", reply)
 
     await memory.maybe_compress(group_id)
-    _add_message_log(input_text)
     log.info(
         "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 长度=%d 耗时=%dms",
         group_id,
@@ -537,5 +523,4 @@ async def on_group_message(
         len(reply or ""),
         int((time.perf_counter() - flow_started) * 1000),
     )
-
 
