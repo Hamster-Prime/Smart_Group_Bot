@@ -22,6 +22,7 @@ from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.skills import SkillService
+from bot.services.sticker_decision import StickerDecisionService
 from bot.services.sticker_library import sticker_library
 from bot.utils.telegram import (
     extract_reply_context,
@@ -317,6 +318,7 @@ async def on_group_message(
         if x and x.strip()
     ]
     skill = SkillService(llm, knowledge=kb, default_sticker_file_ids=sticker_pool)
+    sticker_decider = StickerDecisionService(llm)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     reply_context = extract_reply_context(message)
@@ -418,6 +420,10 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     reply_source = "none"
+    sticker_decision_send = False
+    sticker_decision_reason = ""
+    sticker_decision_file = ""
+    sticker_sent_ok = False
     decision_started = time.perf_counter()
     action = await decision_svc.decide(
         input_text,
@@ -488,24 +494,66 @@ async def on_group_message(
                 normalized_reply = _normalize_owner_address(reply, sender_is_owner)
                 if normalized_reply != reply:
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
-                    reply = normalized_reply
-                sent_ok = await send_reply(
-                    message,
-                    reply,
-                    stream=settings.bot.enable_streaming,
-                    stream_chunk_size=settings.bot.stream_chunk_size,
-                    stream_interval=settings.bot.stream_edit_interval_sec,
-                )
+                reply = normalized_reply
+
+    sticker_decision_started = time.perf_counter()
+    sticker_decision = await sticker_decider.decide(
+        session=session,
+        group_id=group_id,
+        action=action,
+        msg_type=msg_type,
+        is_mentioned=mentioned,
+        is_reply_to_bot=reply_to_bot,
+        user_text=input_text,
+        assistant_reply=reply,
+        reply_source=reply_source,
+        default_sticker_file_ids=sticker_pool,
+    )
+    sticker_decision_send = bool(sticker_decision.send)
+    sticker_decision_reason = sticker_decision.reason or ""
+    sticker_decision_file = sticker_decision.sticker_file_id or ""
+    log.info(
+        "[%s] sticker decision done | send=%s file=%s reason=%s elapsed=%dms",
+        group_id,
+        sticker_decision_send,
+        sticker_decision_file[:32] if sticker_decision_file else "-",
+        sticker_decision_reason or "-",
+        int((time.perf_counter() - sticker_decision_started) * 1000),
+    )
+
+    if action != "skip" and reply and sticker_decision_send and sticker_decision_file:
+        try:
+            await message.reply_sticker(sticker=sticker_decision_file)
+            await sticker_library.mark_sent(session, group_id, sticker_decision_file)
+            sticker_sent_ok = True
+            log.info(
+                "[%s] sticker sent via decision | file=%s reason=%s",
+                group_id,
+                sticker_decision_file[:32],
+                sticker_decision_reason or "-",
+            )
+        except Exception:
+            log.exception("[%s] sticker send failed via decision", group_id)
+
+    if action != "skip" and reply:
+        sent_ok = await send_reply(
+            message,
+            reply,
+            stream=settings.bot.enable_streaming,
+            stream_chunk_size=settings.bot.stream_chunk_size,
+            stream_interval=settings.bot.stream_edit_interval_sec,
+        )
 
     if action == "skip":
         log.info(
-            "[%s]【结束】跳过 | @机=%s @他=%s 回=%s 回机=%s 回他=%s | 耗时=%dms",
+            "[%s]【结束】跳过 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 贴纸决策=%s | 耗时=%dms",
             group_id,
             mentioned,
             mention_other,
             is_reply,
             reply_to_bot,
             reply_to_other,
+            sticker_decision_send,
             int((time.perf_counter() - flow_started) * 1000),
         )
         await memory.maybe_compress(group_id)
@@ -516,12 +564,14 @@ async def on_group_message(
 
     await memory.maybe_compress(group_id)
     log.info(
-        "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 长度=%d 耗时=%dms",
+        "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 贴纸决策=%s 贴纸发送=%s 长度=%d 耗时=%dms",
         group_id,
         action,
         reply_source,
         bool(reply),
         sent_ok,
+        sticker_decision_send,
+        sticker_sent_ok,
         len(reply or ""),
         int((time.perf_counter() - flow_started) * 1000),
     )

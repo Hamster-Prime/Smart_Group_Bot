@@ -11,7 +11,6 @@ from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillContext, SkillRunResult
 from bot.services.skills.kb_search import KBSearchSkill
-from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
@@ -47,7 +46,6 @@ class SkillService:
             self._register(KBSearchSkill(knowledge))
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
-        self._register(SendStickerSkill())
 
     def _register(self, skill: Skill) -> None:
         self.skills[skill.name] = skill
@@ -287,7 +285,6 @@ class SkillService:
             current_user_text=user_text,
             default_sticker_file_ids=self.default_sticker_file_ids,
         )
-        sticker_sent_once = False
         last_success_summary = ""
 
         for step in range(1, self.max_tool_rounds + 1):
@@ -320,17 +317,7 @@ class SkillService:
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
             for tc in tool_calls:
                 args = self._parse_tool_arguments(tc["arguments"])
-                if tc["name"] == "send_sticker" and sticker_sent_once:
-                    result = SkillRunResult(
-                        ok=False,
-                        skill="send_sticker",
-                        summary="本轮已发送过贴纸，忽略重复发送",
-                        error="sticker_already_sent",
-                    )
-                else:
-                    result = await self._run_tool(name=tc["name"], arguments=args, context=context)
-                    if tc["name"] == "send_sticker" and result.ok:
-                        sticker_sent_once = True
+                result = await self._run_tool(name=tc["name"], arguments=args, context=context)
                 if result.ok and result.summary:
                     last_success_summary = result.summary
                 payload = self._tool_result_to_payload(result)

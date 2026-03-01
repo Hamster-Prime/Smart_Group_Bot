@@ -382,5 +382,70 @@ class StickerLibrary:
             return StickerPick(file_id=random.choice(fallback), score=0, source="fallback_pool", description="")
         return StickerPick()
 
+    async def list_candidates(
+        self,
+        session: AsyncSession,
+        group_id: int,
+        *,
+        limit: int = 20,
+        fallback_pool: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        await self._ensure_legacy_import(session, group_id)
+
+        stmt = (
+            select(StickerLibraryRecord)
+            .where(StickerLibraryRecord.group_id == group_id)
+            .order_by(
+                StickerLibraryRecord.last_seen_at.desc(),
+                StickerLibraryRecord.last_sent_at.desc(),
+                StickerLibraryRecord.sent_count.desc(),
+                StickerLibraryRecord.seen_count.desc(),
+                StickerLibraryRecord.id.desc(),
+            )
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+
+        normalized_limit = max(1, min(int(limit or 20), 50))
+        out: list[dict[str, Any]] = []
+        used: set[str] = set()
+        for row in rows:
+            fid = (row.file_id or "").strip()
+            if not fid or fid in used:
+                continue
+            used.add(fid)
+            out.append(
+                {
+                    "file_id": fid,
+                    "emoji": (row.emoji or "").strip(),
+                    "set_name": (row.set_name or "").strip(),
+                    "description": clean_text(str(row.description or ""), max_len=180),
+                    "seen_count": int(row.seen_count or 0),
+                    "sent_count": int(row.sent_count or 0),
+                    "source": (row.source or "").strip() or "group_message",
+                }
+            )
+            if len(out) >= normalized_limit:
+                break
+
+        for fid in [x.strip() for x in (fallback_pool or []) if x and x.strip()]:
+            if fid in used:
+                continue
+            used.add(fid)
+            out.append(
+                {
+                    "file_id": fid,
+                    "emoji": "",
+                    "set_name": "",
+                    "description": "默认贴纸",
+                    "seen_count": 0,
+                    "sent_count": 0,
+                    "source": "fallback_pool",
+                }
+            )
+            if len(out) >= normalized_limit:
+                break
+
+        return out
+
 
 sticker_library = StickerLibrary()
