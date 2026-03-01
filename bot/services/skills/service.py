@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, Any
 import litellm
 
 from bot.config import ChatEndpointConfig, ModelConfig
+from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillContext, SkillRunResult
+from bot.services.skills.kb_search import KBSearchSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
@@ -33,6 +35,7 @@ class SkillService:
         self,
         llm: LLMService,
         *,
+        knowledge: KnowledgeService | None = None,
         default_sticker_file_ids: list[str] | None = None,
         max_tool_rounds: int = 4,
     ) -> None:
@@ -40,6 +43,8 @@ class SkillService:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
+        if knowledge is not None:
+            self._register(KBSearchSkill(knowledge))
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
         self._register(SendStickerSkill())
@@ -231,6 +236,7 @@ class SkillService:
         sender_username: str = "",
         sender_is_owner: bool = False,
         message: Any | None = None,
+        mandatory_kb_context: str = "",
     ) -> str:
         user_text = clean_text(text, max_len=1200)
         if contains_prompt_injection(user_text):
@@ -248,6 +254,25 @@ class SkillService:
                 ),
             },
         ]
+        kb_ctx = clean_text(mandatory_kb_context, max_len=4800)
+        if kb_ctx:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "系统要求：本轮已强制执行本地知识库检索。"
+                        "你必须先参考知识库检索结果，再结合对话上下文回答。"
+                        "若知识库结果为空或不足，请明确说明，不要编造。"
+                    ),
+                }
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": wrap_untrusted("mandatory_kb_search", kb_ctx, max_len=4800),
+                }
+            )
+
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})

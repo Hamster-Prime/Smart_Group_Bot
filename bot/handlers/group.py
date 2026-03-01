@@ -21,7 +21,6 @@ from bot.services.decision import DecisionService
 from bot.services.knowledge import KnowledgeService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
-from bot.services.rag import RAGService
 from bot.services.skills import SkillService
 from bot.services.sticker_library import sticker_library
 from bot.utils.telegram import (
@@ -62,6 +61,37 @@ def _truncate_text(text: str, max_len: int) -> str:
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[:max_len] + "..."
+
+
+def _format_mandatory_kb_context(query: str, results: list[dict]) -> str:
+    lines = [f"query={_truncate_text(query, 300)}"]
+    if not results:
+        lines.append("results=(empty)")
+        return "\n".join(lines)
+
+    lines.append(f"hit_count={len(results)}")
+    for idx, item in enumerate(results[:5], start=1):
+        metadata = item.get("metadata", {}) or {}
+        title = str(metadata.get("title", "")).strip()
+        document = str(item.get("document", "")).strip()
+        if not title and document:
+            title = document.split("\n", 1)[0].strip()
+        content = document
+        if "\n" in document:
+            content = document.split("\n", 1)[1]
+
+        score_raw = item.get("score", 0.0)
+        try:
+            score = float(score_raw)
+        except Exception:
+            score = 0.0
+        fallback = "yes" if bool(metadata.get("fallback", False)) else "no"
+
+        lines.append(
+            f"[{idx}] title={_truncate_text(title, 120)} score={score:.4f} fallback={fallback}"
+        )
+        lines.append(f"content={_truncate_text(content, 800)}")
+    return "\n".join(lines)
 
 
 def _build_moderation_notice(
@@ -117,20 +147,6 @@ async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) ->
             await session.flush()
     except IntegrityError:
         log.debug("group row already inserted concurrently: group_id=%s", group_id)
-
-
-def _build_kb_index(entries: list) -> str:
-    if not entries:
-        return "(empty)"
-
-    lines: list[str] = []
-    for e in entries[:20]:
-        title = (e.title or "").strip()
-        content = (e.content or "").replace("\n", " ").strip()
-        if len(content) > 120:
-            content = content[:120] + "..."
-        lines.append(f"- {title}: {content}")
-    return "\n".join(lines)
 
 
 def _extract_image_file_info(message: Message) -> tuple[str, str] | None:
@@ -198,7 +214,7 @@ async def _build_telegram_image_url(message: Message) -> str:
 async def _append_image_context(
     message: Message, llm: LLMService, text: str, msg_type: str
 ) -> tuple[str, str]:
-    """Append image understanding text for moderation/decision/RAG and return vision text."""
+    """Append image understanding text for moderation/decision/reply and return vision text."""
     if msg_type not in {
         "photo",
         "photo_caption",
@@ -300,7 +316,7 @@ async def on_group_message(
         for x in (settings.skill_sticker_file_ids or "").split(",")
         if x and x.strip()
     ]
-    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
+    skill = SkillService(llm, knowledge=kb, default_sticker_file_ids=sticker_pool)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     reply_context = extract_reply_context(message)
@@ -386,12 +402,8 @@ async def on_group_message(
     reply_to_other = is_reply and not reply_to_bot
     mention_other = mentions_other_user(message, bot_me.username or "", bot_me.id)
 
-    entries = await kb.list_entries(session, group_id)
-    kb_titles = [e.title for e in entries if e.title]
-    kb_index = _build_kb_index(entries)
-
     log.info(
-        "[%s]【决策】输入 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 类型=%s 知识=%d",
+        "[%s]【决策】输入 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 类型=%s",
         group_id,
         mentioned,
         mention_other,
@@ -399,7 +411,6 @@ async def on_group_message(
         reply_to_bot,
         reply_to_other,
         msg_type,
-        len(entries),
     )
 
     decision_svc = DecisionService(llm)
@@ -418,8 +429,6 @@ async def on_group_message(
         is_owner=sender_is_owner,
         user_tag=user_tag,
         msg_type=msg_type,
-        knowledge_titles=kb_titles,
-        knowledge_index=kb_index,
     )
     log.info(
         "[%s]【决策】完成 | 动作=%s | 耗时=%dms",
@@ -431,42 +440,35 @@ async def on_group_message(
     if action != "skip":
         history = memory.get_history_for_llm(group_id)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
+        kb_search_started = time.perf_counter()
+        kb_results: list[dict] = []
+        try:
+            kb_results = await kb.search(session, group_id, input_text)
+        except Exception:
+            log.exception("[%s] mandatory kb search failed", group_id)
+        kb_context = _format_mandatory_kb_context(input_text, kb_results)
+        log.info(
+            "[%s] mandatory kb search done | hit=%d | elapsed=%dms",
+            group_id,
+            len(kb_results),
+            int((time.perf_counter() - kb_search_started) * 1000),
+        )
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
-            if action == "knowledge":
-                rag = RAGService(llm, kb)
-                reply = await rag.answer(
-                    session,
-                    group_id,
-                    input_text,
-                    history=history,
-                    sender_user_id=user_id,
-                    sender_username=sender_username,
-                    sender_is_owner=sender_is_owner,
-                )
-                log.info("[%s] reply via rag | %s", group_id, reply[:80] if reply else "(empty)")
-                if reply:
-                    reply_source = "rag"
-
-                if reply and any(x in reply for x in ("NO_RELEVANT_INFO", "I_DONT_KNOW", "NO_INFORMATION")):
-                    log.info("[%s] rag returned no relevant info -> fallback to skill", group_id)
-                    reply = ""
-                    reply_source = "none"
-
-            if not reply:
-                skill_reply = await skill.answer_with_skill(
-                    input_text,
-                    session=session,
-                    history=history,
-                    sender_user_id=user_id,
-                    sender_username=sender_username,
-                    sender_is_owner=sender_is_owner,
-                    message=message,
-                )
-                if skill_reply:
-                    reply = skill_reply
-                    log.info("[%s] reply via skill | %s", group_id, reply[:80])
-                    reply_source = "skill"
+            skill_reply = await skill.answer_with_skill(
+                input_text,
+                session=session,
+                history=history,
+                sender_user_id=user_id,
+                sender_username=sender_username,
+                sender_is_owner=sender_is_owner,
+                message=message,
+                mandatory_kb_context=kb_context,
+            )
+            if skill_reply:
+                reply = skill_reply
+                log.info("[%s] reply via skill | %s", group_id, reply[:80])
+                reply_source = "skill"
 
             if not reply:
                 casual = CasualService(llm)
@@ -476,6 +478,7 @@ async def on_group_message(
                     sender_user_id=user_id,
                     sender_username=sender_username,
                     sender_is_owner=sender_is_owner,
+                    mandatory_kb_context=kb_context,
                 )
                 log.info("[%s] reply via casual | %s", group_id, reply[:80] if reply else "(empty)")
                 if reply:

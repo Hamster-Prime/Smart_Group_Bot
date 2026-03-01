@@ -47,6 +47,7 @@ class CasualService:
         sender_user_id: int = 0,
         sender_username: str = "",
         sender_is_owner: bool = False,
+        mandatory_kb_context: str = "",
     ) -> str:
         q = clean_text(text, max_len=1000)
         if contains_prompt_injection(q):
@@ -64,6 +65,24 @@ class CasualService:
                 ),
             },
         ]
+        kb_ctx = clean_text(mandatory_kb_context, max_len=4800)
+        if kb_ctx:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "系统要求：本轮已强制执行本地知识库检索。"
+                        "你必须先参考知识库检索结果，再结合上下文回答。"
+                        "若知识库结果为空或不足，请明确说明，不要编造。"
+                    ),
+                }
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": wrap_untrusted("mandatory_kb_search", kb_ctx, max_len=4800),
+                }
+            )
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("user_message", q, max_len=1000)})
