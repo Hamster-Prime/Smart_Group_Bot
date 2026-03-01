@@ -202,6 +202,14 @@ class StickerLibrary:
         )
         return int((await session.execute(stmt)).scalar_one() or 0)
 
+    async def total_sent_count(self, session: AsyncSession, group_id: int) -> int:
+        await self._ensure_legacy_import(session, group_id)
+        stmt = select(func.coalesce(func.sum(StickerLibraryRecord.sent_count), 0)).where(
+            StickerLibraryRecord.group_id == group_id
+        )
+        total = (await session.execute(stmt)).scalar_one_or_none()
+        return max(0, int(total or 0))
+
     async def _trim_group_records(self, session: AsyncSession, group_id: int) -> None:
         stmt = (
             select(StickerLibraryRecord)

@@ -13,6 +13,7 @@ from bot.utils.prompts import STICKER_DECISION_SYSTEM
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
+_REPLIES_PER_STICKER = 5
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -170,9 +171,16 @@ class StickerDecisionService:
         user_text: str,
         assistant_reply: str,
         reply_source: str,
+        assistant_reply_count: int = 0,
         default_sticker_file_ids: list[str] | None = None,
     ) -> StickerDecisionResult:
         normalized_action = (action or "").strip().lower()
+        can_have_reply = normalized_action != "skip" and bool((assistant_reply or "").strip())
+        total_replies = max(0, int(assistant_reply_count or 0)) + (1 if can_have_reply else 0)
+        total_sent = await sticker_library.total_sent_count(session, group_id)
+        allowed_sent = total_replies // _REPLIES_PER_STICKER
+        if total_sent >= allowed_sent:
+            return StickerDecisionResult(send=False, reason="reply_ratio_limited")
 
         candidates = await sticker_library.list_candidates(
             session,

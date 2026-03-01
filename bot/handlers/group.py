@@ -396,6 +396,7 @@ async def on_group_message(
 
     memory = memory_holder.get()
     memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
+    assistant_reply_count = sum(1 for item in memory.get_history(group_id) if item.get("role") == "assistant")
 
     bot_me = await message.bot.me()
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
@@ -507,6 +508,7 @@ async def on_group_message(
         user_text=input_text,
         assistant_reply=reply,
         reply_source=reply_source,
+        assistant_reply_count=assistant_reply_count,
         default_sticker_file_ids=sticker_pool,
     )
     sticker_decision_send = bool(sticker_decision.send)
