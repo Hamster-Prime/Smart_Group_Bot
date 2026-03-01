@@ -40,10 +40,18 @@ class MemoryService:
         self._last_compressed_len: dict[int, int] = {}
         self._llm_max_history_items = 2000
         self._llm_reserve_tokens = max(1024, self.max_output // 2)
-        # Keep a compact recent window in memory after snapshot compression.
-        base_runtime_budget = max(256, self.max_context // 4)
-        self._runtime_history_budget_tokens = min(self.max_context, base_runtime_budget)
-        self._runtime_history_max_items = 120
+        # Runtime memory policy:
+        # 1) Always keep last N raw messages in memory.
+        # 2) Older messages are rolled into long-term summary incrementally.
+        self._runtime_keep_recent_items = 1000
+        # Non-force compression starts only when overflow reaches trigger,
+        # to avoid compressing every single new message after crossing 1000.
+        self._compress_overflow_trigger = 120
+        # Max number of old messages to summarize per compression batch.
+        self._compress_batch_items = 300
+        # Force mode can consume larger batches to catch up faster.
+        self._compress_force_batch_multiplier = 3
+        self._compress_force_max_rounds = 8
         self._compress_lock = asyncio.Lock()
 
     # ---- Token counting ----
@@ -145,15 +153,10 @@ class MemoryService:
             self._history[group_id] = []
             return 0, 0, 0, 0
 
-        compacted = self._select_recent_messages(
-            history,
-            budget_tokens=self._runtime_history_budget_tokens,
-            max_items=self._runtime_history_max_items,
-        )
-
-        # Exact-token fallback if rough char-based selection still exceeds budget.
-        while len(compacted) > 1 and self._count_tokens(compacted) > self._runtime_history_budget_tokens:
-            compacted = compacted[len(compacted) // 2 :]
+        if len(history) <= self._runtime_keep_recent_items:
+            compacted = list(history)
+        else:
+            compacted = history[-self._runtime_keep_recent_items :]
 
         self._history[group_id] = compacted
         after_items = len(compacted)
@@ -209,43 +212,90 @@ class MemoryService:
                 return False
 
             usage = self._count_tokens(history)
-            if not force and usage < self.max_context:
+            overflow = max(0, len(history) - self._runtime_keep_recent_items)
+            if (
+                not force
+                and usage < self.max_context
+                and overflow < self._compress_overflow_trigger
+            ):
                 return False
 
             log.info(
-                "Memory compress start: group=%s context=%d/%d force=%s",
+                "Memory compress start: group=%s context=%d/%d history=%d keep=%d overflow=%d force=%s",
                 group_id,
                 usage,
                 self.max_context,
+                len(history),
+                self._runtime_keep_recent_items,
+                overflow,
                 force,
             )
 
-            # Build compression input from summary + recent full history window.
-            snapshot = self.get_history_for_llm(group_id, reserve_tokens=self.max_output, max_items=500)
-            lines = [f"[{m.get('role', 'user')}] {m.get('content', '')}" for m in snapshot]
-            history_text = "\n".join(lines)
+            changed = False
+            rounds = 0
+            max_rounds = self._compress_force_max_rounds if force else 1
 
-            prompt = COMPRESS_SYSTEM.replace("{history}", history_text)
-            summary = (await self.llm.compress(prompt, "请压缩以上对话历史。")).strip()
-            if not summary:
-                log.warning("Memory compress failed: group=%s", group_id)
-                self._last_compressed_len[group_id] = len(history)
-                return False
+            while rounds < max_rounds:
+                history = self.get_history(group_id)
+                if not history:
+                    break
 
-            self._save_memory(group_id, summary)
-            self._summary[group_id] = summary
+                overflow = max(0, len(history) - self._runtime_keep_recent_items)
+                if overflow <= 0:
+                    break
+
+                if not force and overflow < self._compress_overflow_trigger:
+                    break
+
+                batch_cap = self._compress_batch_items
+                if force:
+                    batch_cap *= self._compress_force_batch_multiplier
+                batch_size = max(1, min(overflow, batch_cap))
+                batch = history[:batch_size]
+
+                # Incremental summary: old summary + new overflow batch -> new summary.
+                base_summary = self._summary.get(group_id, "").strip()
+                lines: list[str] = []
+                if base_summary:
+                    lines.append(f"[system] {SUMMARY_PREFIX}")
+                    lines.append(base_summary)
+                    lines.append("")
+                lines.extend(f"[{m.get('role', 'user')}] {m.get('content', '')}" for m in batch)
+                history_text = "\n".join(lines)
+
+                prompt = COMPRESS_SYSTEM.replace("{history}", history_text)
+                summary = (await self.llm.compress(prompt, "请压缩以上对话历史。")).strip()
+                if not summary:
+                    log.warning(
+                        "Memory compress failed: group=%s round=%d batch=%d",
+                        group_id,
+                        rounds + 1,
+                        batch_size,
+                    )
+                    self._last_compressed_len[group_id] = len(history)
+                    return changed
+
+                self._save_memory(group_id, summary)
+                self._summary[group_id] = summary
+                # Drop only the batch that has been summarized.
+                self._history[group_id] = history[batch_size:]
+                changed = True
+                rounds += 1
+
             before_items, after_items, before_tokens, after_tokens = self._compact_runtime_history(group_id)
             self._last_compressed_len[group_id] = after_items
-            log.info(
-                "Memory compress saved snapshot: group=%s history=%d->%d tokens~%d->%d budget=%d",
-                group_id,
-                before_items,
-                after_items,
-                before_tokens,
-                after_tokens,
-                self._runtime_history_budget_tokens,
-            )
-            return True
+            if changed:
+                log.info(
+                    "Memory compress saved snapshot: group=%s rounds=%d history=%d->%d tokens~%d->%d keep=%d",
+                    group_id,
+                    rounds,
+                    before_items,
+                    after_items,
+                    before_tokens,
+                    after_tokens,
+                    self._runtime_keep_recent_items,
+                )
+            return changed
 
     # ---- File persistence ----
 
