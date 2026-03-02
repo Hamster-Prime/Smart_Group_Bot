@@ -14,6 +14,7 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
 _REPLIES_PER_STICKER = 5
+_RATIO_BASELINE: dict[int, tuple[int, int]] = {}
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -178,8 +179,25 @@ class StickerDecisionService:
         can_have_reply = normalized_action != "skip" and bool((assistant_reply or "").strip())
         total_replies = max(0, int(assistant_reply_count or 0)) + (1 if can_have_reply else 0)
         total_sent = await sticker_library.total_sent_count(session, group_id)
-        allowed_sent = total_replies // _REPLIES_PER_STICKER
-        if total_sent >= allowed_sent:
+
+        base_replies, base_sent = _RATIO_BASELINE.get(group_id, (total_replies, total_sent))
+        if group_id not in _RATIO_BASELINE or total_replies < base_replies or total_sent < base_sent:
+            base_replies, base_sent = total_replies, total_sent
+            _RATIO_BASELINE[group_id] = (base_replies, base_sent)
+
+        delta_replies = max(0, total_replies - base_replies)
+        delta_sent = max(0, total_sent - base_sent)
+        allowed_delta_sent = delta_replies // _REPLIES_PER_STICKER
+        if delta_sent >= allowed_delta_sent:
+            log.info(
+                "[%s] sticker ratio limited | delta_reply=%d delta_sent=%d allowed=%d baseline=(%d,%d)",
+                group_id,
+                delta_replies,
+                delta_sent,
+                allowed_delta_sent,
+                base_replies,
+                base_sent,
+            )
             return StickerDecisionResult(send=False, reason="reply_ratio_limited")
 
         candidates = await sticker_library.list_candidates(
