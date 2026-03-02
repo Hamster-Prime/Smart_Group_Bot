@@ -97,11 +97,13 @@ def _format_mandatory_kb_context(query: str, results: list[dict]) -> str:
 
 def _build_moderation_notice(
     warn_target: str,
-    count: int,
-    threshold: int,
     reason: str,
-    should_ban: bool,
     rule: ModerationRule | None,
+    *,
+    hit_action: str,
+    count: int | None = None,
+    threshold: int | None = None,
+    should_ban: bool = False,
 ) -> str:
     rule_type_labels = {
         "keyword": "关键词",
@@ -109,8 +111,18 @@ def _build_moderation_notice(
         "llm": "语义",
     }
     reason_text = html.escape((reason or "命中群审核规则（AI判定）").strip())
-    title = "AI审查自动封禁" if should_ban else "AI审查警告"
-    action_result = "已删除违规消息并封禁用户" if should_ban else "已删除违规消息并发出警告"
+    action_norm = (hit_action or "").strip().lower()
+
+    title = "AI审查警告"
+    action_result = "已发出警告"
+    show_warning_count = False
+    if action_norm == "delete":
+        title = "AI审查删除"
+        action_result = "已删除违规消息"
+    elif action_norm == "ban":
+        title = "AI审查自动封禁" if should_ban else "AI审查警告"
+        action_result = "已删除违规消息并封禁用户" if should_ban else "已删除违规消息并发出警告"
+        show_warning_count = True
 
     if rule:
         rule_type = rule_type_labels.get((rule.rule_type or "").lower(), rule.rule_type or "未知")
@@ -122,15 +134,21 @@ def _build_moderation_notice(
     else:
         rule_ref = "未定位具体规则（AI语义判定）"
 
-    return (
-        f"<b>{title}</b>\n"
-        f"————————\n"
-        f"<b>用户</b>: {warn_target}\n"
-        f"<b>警告次数</b>: {count}/{threshold}\n"
-        f"<b>原因</b>: {reason_text}\n"
-        f"<b>依据规则</b>: {rule_ref}\n"
-        f"<b>处理结果</b>: {action_result}"
+    lines = [
+        f"<b>{title}</b>",
+        "————————",
+        f"<b>用户</b>: {warn_target}",
+    ]
+    if show_warning_count and count is not None and threshold is not None:
+        lines.append(f"<b>警告次数</b>: {count}/{threshold}")
+    lines.extend(
+        [
+            f"<b>原因</b>: {reason_text}",
+            f"<b>依据规则</b>: {rule_ref}",
+            f"<b>处理结果</b>: {action_result}",
+        ]
     )
+    return "\n".join(lines)
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> None:
@@ -361,17 +379,54 @@ async def on_group_message(
                 int((time.perf_counter() - moderation_started) * 1000),
             )
             if violated:
-                action = rule.action if rule else "warn"
+                action = str(rule.action if rule else "warn").strip().lower()
+                if action not in {"warn", "delete", "ban"}:
+                    action = "warn"
                 await mod.record_violation(session, group_id, user_id, input_text, action, rule)
+                if action == "warn":
+                    notice = _build_moderation_notice(
+                        warn_target=warn_target,
+                        reason=reason,
+                        rule=rule,
+                        hit_action=action,
+                    )
+                    await message.answer(notice)
+                    log.info(
+                        "[%s]【结束】审核拦截 | 动作=warn | 已回复=是 | 总耗时=%dms",
+                        group_id,
+                        int((time.perf_counter() - flow_started) * 1000),
+                    )
+                    return
+
+                if action == "delete":
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    notice = _build_moderation_notice(
+                        warn_target=warn_target,
+                        reason=reason,
+                        rule=rule,
+                        hit_action=action,
+                    )
+                    await message.answer(notice)
+                    log.info(
+                        "[%s]【结束】审核拦截 | 动作=delete | 已回复=是 | 总耗时=%dms",
+                        group_id,
+                        int((time.perf_counter() - flow_started) * 1000),
+                    )
+                    return
+
                 count, should_ban = await mod.add_warning(session, group_id, user_id)
                 warn_threshold = max(1, settings.moderation.warn_threshold)
                 notice = _build_moderation_notice(
                     warn_target=warn_target,
+                    reason=reason,
+                    rule=rule,
+                    hit_action=action,
                     count=count,
                     threshold=warn_threshold,
-                    reason=reason,
                     should_ban=should_ban,
-                    rule=rule,
                 )
 
                 try:
@@ -386,8 +441,11 @@ async def on_group_message(
                         pass
                 await message.answer(notice)
                 log.info(
-                    "[%s]【结束】审核拦截 | 已回复=是 | 总耗时=%dms",
+                    "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",
                     group_id,
+                    should_ban,
+                    count,
+                    warn_threshold,
                     int((time.perf_counter() - flow_started) * 1000),
                 )
                 return
