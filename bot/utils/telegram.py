@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -22,6 +23,37 @@ TG_MESSAGE_LIMIT = 4096
 TG_STREAM_SAFE_LIMIT = 3800
 CHAT_SEND_PARALLEL = 3
 _SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_MENTION_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_/])@([A-Za-z][A-Za-z0-9_]{4,31})")
+_TG_USER_LINK_HTML_RE = re.compile(
+    r"""<a\s+href\s*=\s*(?:(['"])tg://user\?id=\d+\1|tg://user\?id=\d+)\s*>(.*?)</a>""",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_TG_USER_LINK_MD_RE = re.compile(
+    r"""\[([^\]]+)\]\(\s*tg://user\?id=\d+\s*\)""",
+    flags=re.IGNORECASE,
+)
+
+
+def sanitize_outgoing_mentions(text: str) -> str:
+    """Prevent outgoing mentions while keeping a monospace @name look."""
+    if not text:
+        return text
+
+    def _to_code_style(label: str) -> str:
+        plain = re.sub(r"<[^>]+>", "", (label or "")).strip().lstrip("@")
+        if not plain:
+            plain = "user"
+        return f"<code>@\u200b{html.escape(plain, quote=False)}</code>"
+
+    cleaned = _TG_USER_LINK_HTML_RE.sub(
+        lambda match: _to_code_style(match.group(2) or ""),
+        text,
+    )
+    cleaned = _TG_USER_LINK_MD_RE.sub(
+        lambda match: _to_code_style(match.group(1) or ""),
+        cleaned,
+    )
+    return _MENTION_USERNAME_RE.sub(lambda match: _to_code_style(match.group(1)), cleaned)
 
 
 def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int) -> None:
@@ -65,7 +97,8 @@ async def answer_with_auto_delete(
     auto_delete_minutes: int = 0,
     **kwargs: object,
 ) -> Message:
-    sent = await message.answer(text, **kwargs)
+    safe_text = sanitize_outgoing_mentions(text or "")
+    sent = await message.answer(safe_text, **kwargs)
     schedule_message_auto_delete(sent, auto_delete_minutes)
     return sent
 
@@ -471,7 +504,7 @@ async def send_reply(
 
         return await _finalize_stream_format(sent, segment)
 
-    payload = (text or "").strip()
+    payload = sanitize_outgoing_mentions((text or "").strip())
     if not payload:
         return False
 
