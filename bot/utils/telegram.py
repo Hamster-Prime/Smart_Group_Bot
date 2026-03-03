@@ -46,9 +46,18 @@ def sanitize_outgoing_mentions(text: str) -> str:
     cleaned = _TG_USER_LINK_HTML_RE.sub(lambda match: (match.group(2) or ""), text)
     cleaned = _TG_USER_LINK_MD_RE.sub(lambda match: (match.group(1) or ""), cleaned)
 
+    def _break_mention_token(username: str) -> str:
+        return f"@\u200b{username}"
+
     def _replace_mentions(segment: str) -> str:
         return _MENTION_USERNAME_RE.sub(
-            lambda match: f"<code>@\u200b{match.group(1)}</code>",
+            lambda match: f"<code>{_break_mention_token(match.group(1))}</code>",
+            segment,
+        )
+
+    def _replace_mentions_in_code(segment: str) -> str:
+        return _MENTION_USERNAME_RE.sub(
+            lambda match: _break_mention_token(match.group(1)),
             segment,
         )
 
@@ -59,7 +68,7 @@ def sanitize_outgoing_mentions(text: str) -> str:
         start, end = code_match.span()
         if start > cursor:
             result_parts.append(_replace_mentions(cleaned[cursor:start]))
-        result_parts.append(cleaned[start:end])
+        result_parts.append(_replace_mentions_in_code(cleaned[start:end]))
         cursor = end
     if cursor < len(cleaned):
         result_parts.append(_replace_mentions(cleaned[cursor:]))
