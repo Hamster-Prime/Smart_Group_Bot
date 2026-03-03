@@ -152,6 +152,12 @@ EMBED_FALLBACKS=
 # ---- 上下文设置 ----
 MAX_CONTEXT_TOKENS=256000
 MAX_OUTPUT_TOKENS=64000
+BOT_ENABLE_TYPING=true
+BOT_ENABLE_STREAMING=true
+BOT_STREAM_CHUNK_SIZE=36
+BOT_STREAM_EDIT_INTERVAL_SEC=1.0
+# Bot 发出的消息在 N 分钟后自动删除，0 表示关闭
+BOT_AUTO_DELETE_MINUTES=0
 
 # ---- 技能配置 ----
 # 贴纸 file_id 列表，逗号分隔（供 send_sticker 默认使用）
@@ -191,6 +197,10 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 | `/rules` | 查看当前群规 | `/rules` |
 | `/aiexempt` | 回复用户消息，设置 AI 审查豁免（已授权群管理） | `回复某人后发送 /aiexempt` |
 | `/unaiexempt` | 回复用户消息，取消 AI 审查豁免（已授权群管理） | `回复某人后发送 /unaiexempt` |
+| `/mute` | 回复用户消息后执行，将该用户加入“只审查不回复”名单 | `回复某人后发送 /mute` |
+| `/mute all` | 本群开启“只审查不回复”模式 | `/mute all` |
+| `/unmute` | 回复用户消息后执行，将该用户移出“只审查不回复”名单 | `回复某人后发送 /unmute` |
+| `/unmute all` | 本群关闭“只审查不回复”模式，恢复正常回复 | `/unmute all` |
 | `/authadmin <群ID> <用户ID>` | 最高管理员授权群管理权限 | `/authadmin -1001234567890 12345678` |
 
 ### 自然语言交互

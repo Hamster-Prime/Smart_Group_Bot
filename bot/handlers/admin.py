@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import html
 import json
@@ -9,10 +9,11 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import ModerationExemption, ModerationRule, UserWarning
+from bot.db.models import Group, ModerationExemption, ModerationRule, ReplyMute, UserWarning
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
@@ -26,7 +27,7 @@ from bot.services.authz import (
 )
 from bot.services.llm import LLMService
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
-from bot.utils.telegram import is_group
+from bot.utils.telegram import answer_with_auto_delete, is_group
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -34,6 +35,54 @@ log = logging.getLogger(__name__)
 # 将“禁止骂人”等自然语言规则归一为语义审核模式（llm）
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
 _ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
+_MUTE_ALL_REPLIES_KEY = "mute_all_replies"
+_MUTE_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复目标用户消息后发送 /mute\n"
+    "2. 发送 /mute all（本群仅做审核，不再回复）"
+)
+_UNMUTE_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复目标用户消息后发送 /unmute\n"
+    "2. 发送 /unmute all（恢复本群正常回复）"
+)
+
+
+async def _answer(message: Message, settings: Settings, text: str) -> None:
+    await answer_with_auto_delete(
+        message,
+        text,
+        auto_delete_minutes=settings.bot.auto_delete_minutes,
+    )
+
+
+async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
+    row = await session.get(Group, group_id)
+    if row:
+        if title and row.title != title:
+            row.title = title
+        if row.settings is None:
+            row.settings = {}
+        return row
+
+    try:
+        async with session.begin_nested():
+            row = Group(id=group_id, title=title or "", settings={})
+            session.add(row)
+            await session.flush()
+            return row
+    except IntegrityError:
+        row = await session.get(Group, group_id)
+        if row:
+            if title and row.title != title:
+                row.title = title
+            if row.settings is None:
+                row.settings = {}
+            return row
+
+    row = Group(id=group_id, title=title or "", settings={})
+    session.add(row)
+    return row
 
 
 def _parse_json_payload(raw: str) -> dict | None:
@@ -124,7 +173,7 @@ def _safe_user_label(user_id: int, full_name: str | None = None) -> str:
     return str(user_id)
 
 
-async def _reply_rules(message: Message, session: AsyncSession) -> None:
+async def _reply_rules(message: Message, session: AsyncSession, settings: Settings) -> None:
     stmt = (
         select(ModerationRule)
         .where(ModerationRule.group_id == message.chat.id)
@@ -134,7 +183,7 @@ async def _reply_rules(message: Message, session: AsyncSession) -> None:
     rules = result.scalars().all()
 
     if not rules:
-        await message.answer("<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。")
+        await _answer(message, settings, "<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。")
         return
 
     lines = [f"<b>群审核规则</b>\n共 {len(rules)} 条"]
@@ -149,7 +198,7 @@ async def _reply_rules(message: Message, session: AsyncSession) -> None:
                 ]
             )
         )
-    await message.answer("\n\n".join(lines))
+    await _answer(message, settings, "\n\n".join(lines))
 
 
 @router.message(Command("authgroup"))
@@ -160,7 +209,7 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "/authgroup &lt;群ID&gt;\n"
             "或在群内直接发送 /authgroup"
@@ -169,13 +218,13 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
 
     created = await authorize_group(session, group_id, message.from_user.id if message.from_user else 0)
     if created:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 授权成功"
         )
     else:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 已处于授权状态"
@@ -190,7 +239,7 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "/unauthgroup &lt;群ID&gt;\n"
             "或在群内直接发送 /unauthgroup"
@@ -199,13 +248,13 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
 
     removed = await deauthorize_group(session, group_id)
     if removed:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 已取消授权"
         )
     else:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 当前未授权"
@@ -219,13 +268,13 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
 
     rows = await list_authorized_groups(session)
     if not rows:
-        await message.answer("<b>已授权群组</b>\n当前为空。")
+        await _answer(message, settings, "<b>已授权群组</b>\n当前为空。")
         return
 
     lines = [f"<b>已授权群组</b>\n共 {len(rows)} 个"]
     for idx, r in enumerate(rows[:100], start=1):
         lines.append(f"{idx}. <b>群ID</b>: {r.group_id} | 授权人: {r.authorized_by or 0}")
-    await message.answer("\n".join(lines))
+    await _answer(message, settings, "\n".join(lines))
 
 
 @router.message(Command("authadmin"))
@@ -236,7 +285,7 @@ async def cmd_authadmin(message: Message, session: AsyncSession, settings: Setti
     args = (message.text or "").partition(" ")[2].strip()
     group_id, user_id = _resolve_admin_binding(message, args)
     if group_id is None or user_id is None:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "1. 群内回复目标用户消息后发送 /authadmin\n"
             "2. /authadmin &lt;群ID&gt; &lt;用户ID&gt;\n"
@@ -246,14 +295,14 @@ async def cmd_authadmin(message: Message, session: AsyncSession, settings: Setti
 
     created = await authorize_group_admin(session, group_id, user_id, role="admin")
     if created:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群管理授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             f"<b>用户ID</b>: {user_id}\n"
             "<b>状态</b>: 授权成功"
         )
     else:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群管理授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             f"<b>用户ID</b>: {user_id}\n"
@@ -269,7 +318,7 @@ async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Set
     args = (message.text or "").partition(" ")[2].strip()
     group_id, user_id = _resolve_admin_binding(message, args)
     if group_id is None or user_id is None:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "1. 群内回复目标用户消息后发送 /unauthadmin\n"
             "2. /unauthadmin &lt;群ID&gt; &lt;用户ID&gt;\n"
@@ -279,14 +328,14 @@ async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Set
 
     removed = await deauthorize_group_admin(session, group_id, user_id)
     if removed:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群管理授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             f"<b>用户ID</b>: {user_id}\n"
             "<b>状态</b>: 已取消群管理权限"
         )
     else:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群管理授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             f"<b>用户ID</b>: {user_id}\n"
@@ -302,7 +351,7 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "/adminlist &lt;群ID&gt;\n"
             "或在群内直接发送 /adminlist"
@@ -311,7 +360,7 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
 
     rows = await list_group_admins(session, group_id)
     if not rows:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>群管理授权列表</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>结果</b>: 当前无已授权群管理"
@@ -321,7 +370,7 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
     lines = [f"<b>群管理授权列表</b>\n群ID: {group_id} | 共 {len(rows)} 人"]
     for idx, row in enumerate(rows[:200], start=1):
         lines.append(f"{idx}. <b>用户ID</b>: {row.user_id} | 角色: {html.escape(row.role)}")
-    await message.answer("\n".join(lines))
+    await _answer(message, settings, "\n".join(lines))
 
 
 @router.message(Command("addrule"))
@@ -333,7 +382,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
 
     args = (message.text or "").partition(" ")[2].strip()
     if not args:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>规则管理指令格式</b>\n"
             "用法: /addrule &lt;自然语言&gt;\n"
             "示例: /addrule 增加群规 禁止骂人"
@@ -341,7 +390,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         return
 
     if args.lower() == "list":
-        await _reply_rules(message, session)
+        await _reply_rules(message, session, settings)
         return
 
     llm = LLMService(
@@ -353,7 +402,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
     result = await llm.generate(RULE_MANAGE_SYSTEM, args)
     data = _parse_json_payload(result)
     if not data:
-        await message.answer("<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
+        await _answer(message, settings, "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
         return
 
     action = str(data.get("action", "unknown")).strip().lower()
@@ -364,13 +413,13 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         hit_action = str(data.get("hit_action", "warn")).strip().lower()
 
         if rule_type not in ("keyword", "regex", "llm"):
-            await message.answer(
+            await _answer(message, settings, 
                 "<b>规则添加失败</b>\n"
                 "rule_type 必须是 keyword、regex 或 llm"
             )
             return
         if not pattern:
-            await message.answer("<b>规则添加失败</b>\npattern 不能为空")
+            await _answer(message, settings, "<b>规则添加失败</b>\npattern 不能为空")
             return
         if hit_action not in ("warn", "delete", "ban"):
             hit_action = "warn"
@@ -388,7 +437,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         )
         session.add(rule)
         await session.flush()
-        await message.answer(
+        await _answer(message, settings, 
             "<b>规则添加成功</b>\n"
             f"<b>规则编号</b>: #{rule.id}\n"
             f"<b>规则类型</b>: {_rule_type_label(rule_type)}\n"
@@ -404,7 +453,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             try:
                 rid = int(data["rule_id"])
             except (TypeError, ValueError):
-                await message.answer("<b>规则删除失败</b>\nrule_id 必须是整数")
+                await _answer(message, settings, "<b>规则删除失败</b>\nrule_id 必须是整数")
                 return
             candidate = await session.get(ModerationRule, rid)
             if candidate and candidate.group_id == message.chat.id:
@@ -413,7 +462,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             pattern = str(data.get("pattern", "")).strip()
             rule_type = str(data.get("rule_type", "")).strip().lower()
             if not pattern:
-                await message.answer("<b>规则删除失败</b>\n删除时请提供 rule_id 或 pattern")
+                await _answer(message, settings, "<b>规则删除失败</b>\n删除时请提供 rule_id 或 pattern")
                 return
 
             stmt = select(ModerationRule).where(
@@ -427,12 +476,12 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             rule = result.scalars().first()
 
         if not rule:
-            await message.answer("<b>规则删除失败</b>\n未找到对应规则")
+            await _answer(message, settings, "<b>规则删除失败</b>\n未找到对应规则")
             return
 
         rid = rule.id
         await session.delete(rule)
-        await message.answer(
+        await _answer(message, settings, 
             "<b>规则删除成功</b>\n"
             f"<b>规则编号</b>: #{rid}\n"
             f"<b>规则类型</b>: {_rule_type_label(rule.rule_type)}\n"
@@ -441,10 +490,10 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         return
 
     if action == "list":
-        await _reply_rules(message, session)
+        await _reply_rules(message, session, settings)
         return
 
-    await message.answer("<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
+    await _answer(message, settings, "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
 
 
 @router.message(Command("rules"))
@@ -453,7 +502,173 @@ async def cmd_rules(message: Message, session: AsyncSession, settings: Settings)
         return
     if not await ensure_group_admin_permission(message, session, settings):
         return
-    await _reply_rules(message, session)
+    await _reply_rules(message, session, settings)
+
+
+@router.message(Command("mute"))
+async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    group_id = message.chat.id
+
+    if args == "all":
+        group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
+        settings_data = dict(group_row.settings or {})
+        already_muted = bool(settings_data.get(_MUTE_ALL_REPLIES_KEY, False))
+        if already_muted:
+            await _answer(
+                message,
+                settings,
+                "<b>回复静默设置</b>\n"
+                "<b>范围</b>: 全群\n"
+                "<b>状态</b>: 已是静默状态（仅做审核，不再回复）",
+            )
+            return
+
+        settings_data[_MUTE_ALL_REPLIES_KEY] = True
+        group_row.settings = settings_data
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            "<b>范围</b>: 全群\n"
+            "<b>状态</b>: 已开启（仅做审核，不再回复）",
+        )
+        return
+
+    if args:
+        await _answer(message, settings, _MUTE_USAGE)
+        return
+
+    reply = message.reply_to_message
+    target = reply.from_user if reply else None
+    if not target:
+        await _answer(message, settings, _MUTE_USAGE)
+        return
+
+    if target.is_bot:
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            "<b>结果</b>: 机器人账号无需设置静默",
+        )
+        return
+
+    stmt = select(ReplyMute).where(
+        ReplyMute.group_id == group_id,
+        ReplyMute.user_id == target.id,
+    )
+    result = await session.execute(stmt)
+    existing = result.scalar_one_or_none()
+    if existing:
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 已在静默名单",
+        )
+        return
+
+    session.add(
+        ReplyMute(
+            group_id=group_id,
+            user_id=target.id,
+            created_by=(message.from_user.id if message.from_user else 0),
+        )
+    )
+    await _answer(
+        message,
+        settings,
+        "<b>回复静默设置</b>\n"
+        f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+        "<b>状态</b>: 已加入静默名单（仍参与审核）",
+    )
+
+
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    group_id = message.chat.id
+
+    if args == "all":
+        group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
+        settings_data = dict(group_row.settings or {})
+        already_enabled = not bool(settings_data.get(_MUTE_ALL_REPLIES_KEY, False))
+        if already_enabled:
+            await _answer(
+                message,
+                settings,
+                "<b>回复静默设置</b>\n"
+                "<b>范围</b>: 全群\n"
+                "<b>状态</b>: 已是正常回复状态",
+            )
+            return
+
+        settings_data.pop(_MUTE_ALL_REPLIES_KEY, None)
+        group_row.settings = settings_data
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            "<b>范围</b>: 全群\n"
+            "<b>状态</b>: 已关闭静默（恢复正常回复）",
+        )
+        return
+
+    if args:
+        await _answer(message, settings, _UNMUTE_USAGE)
+        return
+
+    reply = message.reply_to_message
+    target = reply.from_user if reply else None
+    if not target:
+        await _answer(message, settings, _UNMUTE_USAGE)
+        return
+
+    if target.is_bot:
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            "<b>结果</b>: 机器人账号无需解除静默",
+        )
+        return
+
+    stmt = select(ReplyMute).where(
+        ReplyMute.group_id == group_id,
+        ReplyMute.user_id == target.id,
+    )
+    result = await session.execute(stmt)
+    existing = result.scalar_one_or_none()
+    if not existing:
+        await _answer(
+            message,
+            settings,
+            "<b>回复静默设置</b>\n"
+            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            "<b>状态</b>: 当前不在静默名单",
+        )
+        return
+
+    await session.delete(existing)
+    await _answer(
+        message,
+        settings,
+        "<b>回复静默设置</b>\n"
+        f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+        "<b>状态</b>: 已移出静默名单（恢复回复）",
+    )
 
 
 @router.message(Command("warnings"))
@@ -475,7 +690,7 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
     rows = result.scalars().all()
 
     if not rows:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>当前群组警告/封禁名单</b>\n"
             "<b>结果</b>: 暂无被警告或封禁用户"
         )
@@ -494,7 +709,7 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
         status = "已封禁" if row.is_banned else "警告中"
         lines.append(f"{idx}. 用户ID: {row.user_id} | 次数: {row.count}/{threshold} | 状态: {status}")
 
-    await message.answer("\n".join(lines))
+    await _answer(message, settings, "\n".join(lines))
 
 
 @router.message(Command("aiexempt"))
@@ -507,13 +722,13 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     reply = message.reply_to_message
     target = reply.from_user if reply else None
     if not target:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "请先回复目标用户的一条消息，再执行 /aiexempt"
         )
         return
     if target.is_bot:
-        await message.answer("<b>AI 审查豁免</b>\n机器人账号无需设置豁免。")
+        await _answer(message, settings, "<b>AI 审查豁免</b>\n机器人账号无需设置豁免。")
         return
 
     stmt = select(ModerationExemption).where(
@@ -523,7 +738,7 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     result = await session.execute(stmt)
     existing = result.scalar_one_or_none()
     if existing:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>AI 审查豁免</b>\n"
             f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
             "<b>状态</b>: 已在豁免名单中"
@@ -537,7 +752,7 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
             created_by=(message.from_user.id if message.from_user else 0),
         )
     )
-    await message.answer(
+    await _answer(message, settings, 
         "<b>AI 审查豁免</b>\n"
         f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
         "<b>状态</b>: 已开启豁免"
@@ -554,13 +769,13 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
     reply = message.reply_to_message
     target = reply.from_user if reply else None
     if not target:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>命令用法</b>\n"
             "请先回复目标用户的一条消息，再执行 /unaiexempt"
         )
         return
     if target.is_bot:
-        await message.answer("<b>AI 审查豁免</b>\n机器人账号不在豁免名单中。")
+        await _answer(message, settings, "<b>AI 审查豁免</b>\n机器人账号不在豁免名单中。")
         return
 
     stmt = select(ModerationExemption).where(
@@ -570,7 +785,7 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
     result = await session.execute(stmt)
     existing = result.scalar_one_or_none()
     if not existing:
-        await message.answer(
+        await _answer(message, settings, 
             "<b>AI 审查豁免</b>\n"
             f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
             "<b>状态</b>: 当前不在豁免名单"
@@ -578,9 +793,10 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
         return
 
     await session.delete(existing)
-    await message.answer(
+    await _answer(message, settings, 
         "<b>AI 审查豁免</b>\n"
         f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
         "<b>状态</b>: 已取消豁免"
     )
+
 

@@ -24,6 +24,64 @@ CHAT_SEND_PARALLEL = 3
 _SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
 
+def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int) -> None:
+    """Best-effort delayed delete for outgoing bot messages."""
+    minutes = int(auto_delete_minutes or 0)
+    if not sent or minutes <= 0:
+        return
+
+    delay_seconds = minutes * 60
+    chat_id = sent.chat.id
+    message_id = sent.message_id
+
+    async def _delete_later() -> None:
+        await asyncio.sleep(delay_seconds)
+        try:
+            await sent.delete()
+        except Exception:
+            log.debug(
+                "auto delete skipped chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+
+    try:
+        asyncio.create_task(
+            _delete_later(),
+            name=f"auto-delete:{chat_id}:{message_id}",
+        )
+    except RuntimeError:
+        log.debug(
+            "auto delete scheduling failed chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+
+
+async def answer_with_auto_delete(
+    message: Message,
+    text: str,
+    *,
+    auto_delete_minutes: int = 0,
+    **kwargs: object,
+) -> Message:
+    sent = await message.answer(text, **kwargs)
+    schedule_message_auto_delete(sent, auto_delete_minutes)
+    return sent
+
+
+async def reply_sticker_with_auto_delete(
+    message: Message,
+    *,
+    sticker: str,
+    auto_delete_minutes: int = 0,
+    **kwargs: object,
+) -> Message:
+    sent = await message.reply_sticker(sticker=sticker, **kwargs)
+    schedule_message_auto_delete(sent, auto_delete_minutes)
+    return sent
+
+
 def get_display_name(msg: Message) -> str:
     if msg.from_user:
         return msg.from_user.username or msg.from_user.full_name
@@ -142,7 +200,9 @@ async def ensure_admin(message: Message, settings: Settings | None = None) -> bo
     if ok:
         return True
 
-    await message.answer("仅群管理员可使用该命令。")
+    sent = await message.answer("仅群管理员可使用该命令。")
+    if settings:
+        schedule_message_auto_delete(sent, settings.bot.auto_delete_minutes)
     return False
 
 
@@ -285,6 +345,7 @@ async def send_reply(
     stream: bool = False,
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
+    auto_delete_minutes: int = 0,
 ) -> bool:
     """Send reply in normal mode or stream-like incremental edits.
 
@@ -304,7 +365,9 @@ async def send_reply(
         attempt = 0
         while attempt <= retries:
             try:
-                return await message.reply(body, parse_mode=parse_mode)
+                sent = await message.reply(body, parse_mode=parse_mode)
+                schedule_message_auto_delete(sent, auto_delete_minutes)
+                return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
                 log.warning("telegram flood control on reply, waiting %.2fs", wait_s)

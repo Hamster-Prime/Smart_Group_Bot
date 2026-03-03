@@ -9,11 +9,12 @@ import time
 
 from aiogram import F, Router
 from aiogram.types import Message
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group, ModerationRule
+from bot.db.models import Group, ModerationRule, ReplyMute
 from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
@@ -25,6 +26,7 @@ from bot.services.skills import SkillService
 from bot.services.sticker_decision import StickerDecisionService
 from bot.services.sticker_library import sticker_library
 from bot.utils.telegram import (
+    answer_with_auto_delete,
     extract_reply_context,
     extract_message_text,
     is_bot_mentioned,
@@ -32,6 +34,7 @@ from bot.utils.telegram import (
     is_group,
     is_reply_message,
     mentions_other_user,
+    reply_sticker_with_auto_delete,
     send_reply,
     typing_action,
 )
@@ -151,21 +154,35 @@ def _build_moderation_notice(
     return "\n".join(lines)
 
 
-async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> None:
+async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
     """Ensure group metadata row exists, tolerating concurrent inserts."""
     existing = await session.get(Group, group_id)
     if existing:
         if title and existing.title != title:
             existing.title = title
-        return
+        if existing.settings is None:
+            existing.settings = {}
+        return existing
 
     # Avoid failing the whole update when two messages from the same new group race.
     try:
         async with session.begin_nested():
-            session.add(Group(id=group_id, title=title or ""))
+            created = Group(id=group_id, title=title or "", settings={})
+            session.add(created)
             await session.flush()
+            return created
     except IntegrityError:
         log.debug("group row already inserted concurrently: group_id=%s", group_id)
+        existing = await session.get(Group, group_id)
+        if existing:
+            if title and existing.title != title:
+                existing.title = title
+            if existing.settings is None:
+                existing.settings = {}
+            return existing
+
+    log.warning("group row unavailable after conflict fallback: group_id=%s", group_id)
+    return Group(id=group_id, title=title or "", settings={})
 
 
 def _extract_image_file_info(message: Message) -> tuple[str, str] | None:
@@ -306,7 +323,9 @@ async def on_group_message(
         else f'<a href="tg://user?id={user_id}">{html.escape((user.full_name if user else str(user_id)) or str(user_id))}</a>'
     )
 
-    await _ensure_group_row(session, group_id, message.chat.title or "")
+    group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
+    group_settings = group_row.settings or {}
+    mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 
     if msg_type in {"video", "video_caption", "video_note"}:
         log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
@@ -390,7 +409,11 @@ async def on_group_message(
                         rule=rule,
                         hit_action=action,
                     )
-                    await message.answer(notice)
+                    await answer_with_auto_delete(
+                        message,
+                        notice,
+                        auto_delete_minutes=settings.bot.auto_delete_minutes,
+                    )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=warn | 已回复=是 | 总耗时=%dms",
                         group_id,
@@ -409,7 +432,11 @@ async def on_group_message(
                         rule=rule,
                         hit_action=action,
                     )
-                    await message.answer(notice)
+                    await answer_with_auto_delete(
+                        message,
+                        notice,
+                        auto_delete_minutes=settings.bot.auto_delete_minutes,
+                    )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=delete | 已回复=是 | 总耗时=%dms",
                         group_id,
@@ -439,7 +466,11 @@ async def on_group_message(
                         await message.chat.ban(user_id)
                     except Exception:
                         pass
-                await message.answer(notice)
+                await answer_with_auto_delete(
+                    message,
+                    notice,
+                    auto_delete_minutes=settings.bot.auto_delete_minutes,
+                )
                 log.info(
                     "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",
                     group_id,
@@ -451,6 +482,29 @@ async def on_group_message(
                 return
     else:
         log.info("[%s]【流程】审核 | 关闭", group_id)
+
+    if mute_all_replies:
+        log.info(
+            "[%s]【结束】回复静默 | 范围=all | 仅审核不回复 | 耗时=%dms",
+            group_id,
+            int((time.perf_counter() - flow_started) * 1000),
+        )
+        return
+
+    mute_stmt = select(ReplyMute.id).where(
+        ReplyMute.group_id == group_id,
+        ReplyMute.user_id == user_id,
+    )
+    mute_result = await session.execute(mute_stmt)
+    is_muted_user = mute_result.scalar_one_or_none() is not None
+    if is_muted_user:
+        log.info(
+            "[%s]【结束】回复静默 | 用户=%s | 仅审核不回复 | 耗时=%dms",
+            group_id,
+            user_id,
+            int((time.perf_counter() - flow_started) * 1000),
+        )
+        return
 
     memory = memory_holder.get()
     memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
@@ -583,7 +637,11 @@ async def on_group_message(
 
     if action != "skip" and reply and sticker_decision_send and sticker_decision_file:
         try:
-            await message.reply_sticker(sticker=sticker_decision_file)
+            await reply_sticker_with_auto_delete(
+                message,
+                sticker=sticker_decision_file,
+                auto_delete_minutes=settings.bot.auto_delete_minutes,
+            )
             await sticker_library.mark_sent(session, group_id, sticker_decision_file)
             sticker_sent_ok = True
             log.info(
@@ -602,6 +660,7 @@ async def on_group_message(
             stream=settings.bot.enable_streaming,
             stream_chunk_size=settings.bot.stream_chunk_size,
             stream_interval=settings.bot.stream_edit_interval_sec,
+            auto_delete_minutes=settings.bot.auto_delete_minutes,
         )
 
     if action == "skip":
