@@ -30,6 +30,7 @@ from bot.utils.telegram import (
     extract_reply_context,
     extract_message_text,
     is_bot_mentioned,
+    is_user_admin,
     is_reply_to_bot,
     is_group,
     is_reply_message,
@@ -45,6 +46,15 @@ _OWNER_SALUTATION_RE = re.compile(
     r"^\s*(?:(?:好(?:的)?|嗯|嗨|嘿|哈喽|收到|明白|行|是的|当然|ok)\s*)?主人(?:[，,：:!！。\s]|$)+",
     re.IGNORECASE,
 )
+_SILENT_REPLY_MARKERS = {
+    "NO_TRUSTED_ANSWER",
+    "NO_RELEVANT_INFO",
+    "NO_ANSWER",
+    "NO_RESPONSE",
+}
+_SHORT_UNCERTAIN_REPLY_RE = re.compile(
+    r"^(?:我)?(?:不知道|不确定|无法(?:确定|判断|回答)|信息不足|暂无可信来源|无可信来源|无法根据可信来源(?:回答|解释))(?:[，,。.!！?？].*)?$"
+)
 
 
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
@@ -58,6 +68,41 @@ def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
     if not cleaned:
         return "好的，我在。"
     return cleaned
+
+
+def _strip_reply_marker_payload(text: str) -> str:
+    stripped = (text or "").strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        stripped = re.sub(r"^```(?:text|md|markdown)?", "", stripped, flags=re.IGNORECASE).strip()
+        stripped = re.sub(r"```$", "", stripped).strip()
+    return stripped.strip("`").strip()
+
+
+def _is_silent_marker_reply(text: str) -> bool:
+    payload = _strip_reply_marker_payload(text)
+    if not payload:
+        return False
+
+    normalized = re.sub(r"[“”\"'`]", "", payload)
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = normalized.strip("。.!！?？，,：:;；")
+    upper = normalized.upper()
+    if upper in _SILENT_REPLY_MARKERS:
+        return True
+    return any(marker in upper and len(upper) <= len(marker) + 8 for marker in _SILENT_REPLY_MARKERS)
+
+
+def _should_silence_generated_reply(reply: str) -> tuple[bool, str]:
+    text = (reply or "").strip()
+    if not text:
+        return True, "empty"
+    if _is_silent_marker_reply(text):
+        return True, "silent_marker"
+
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) <= 24 and _SHORT_UNCERTAIN_REPLY_RE.match(text):
+        return True, "uncertain_short_reply"
+    return False, ""
 
 
 def _truncate_text(text: str, max_len: int) -> str:
@@ -333,13 +378,25 @@ async def on_group_message(
 
     sender_username = (user.username or "").strip() if user else ""
     sender_is_owner = bool(user and is_super_admin_user_id(user.id, settings))
+    sender_is_tg_admin = await is_user_admin(message)
+    owner_flag = "yes" if sender_is_owner else "no"
+    tg_admin_flag = "yes" if sender_is_tg_admin else "no"
+    trusted_source = "tg_admin" if sender_is_tg_admin else "none"
     sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
     if user:
         display_name = (user.full_name or "").strip() or "unknown"
-        # Keep id/username at the front so identity survives truncation/compression.
-        user_tag = f"id:{user_id} username:{sender_username_tag} name:{display_name}"
+        # Keep id/admin flags at the front so trust metadata survives truncation/compression.
+        user_tag = (
+            f"id:{user_id} username:{sender_username_tag} "
+            f"is_owner:{owner_flag} is_tg_admin:{tg_admin_flag} trusted_source:{trusted_source} "
+            f"name:{display_name}"
+        )
     else:
-        user_tag = f"id:{user_id} username:(none) name:unknown"
+        user_tag = (
+            "id:0 username:(none) "
+            "is_owner:no is_tg_admin:no trusted_source:none "
+            "name:unknown"
+        )
 
     llm = LLMService(
         settings.bot.main_model,
@@ -546,6 +603,7 @@ async def on_group_message(
         is_reply_to_other=reply_to_other,
         mentions_other_user=mention_other,
         is_owner=sender_is_owner,
+        is_tg_admin=sender_is_tg_admin,
         user_tag=user_tag,
         msg_type=msg_type,
     )
@@ -581,6 +639,7 @@ async def on_group_message(
                 sender_user_id=user_id,
                 sender_username=sender_username,
                 sender_is_owner=sender_is_owner,
+                sender_is_tg_admin=sender_is_tg_admin,
                 message=message,
                 mandatory_kb_context=kb_context,
             )
@@ -597,6 +656,7 @@ async def on_group_message(
                     sender_user_id=user_id,
                     sender_username=sender_username,
                     sender_is_owner=sender_is_owner,
+                    sender_is_tg_admin=sender_is_tg_admin,
                     mandatory_kb_context=kb_context,
                 )
                 log.info("[%s] reply via casual | %s", group_id, reply[:80] if reply else "(empty)")
@@ -608,6 +668,20 @@ async def on_group_message(
                 if normalized_reply != reply:
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
                 reply = normalized_reply
+
+        silence_reply, silence_reason = _should_silence_generated_reply(reply)
+        if silence_reply:
+            preview = _truncate_text(reply, 80) if reply else "-"
+            log.info(
+                "[%s] reply suppressed -> silent | reason=%s source=%s preview=%s",
+                group_id,
+                silence_reason,
+                reply_source,
+                preview,
+            )
+            reply = ""
+            reply_source = "none"
+            action = "skip"
 
     sticker_decision_started = time.perf_counter()
     sticker_decision = await sticker_decider.decide(

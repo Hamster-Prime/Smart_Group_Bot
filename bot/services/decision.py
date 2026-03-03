@@ -29,6 +29,7 @@ class DecisionService:
         is_reply_to_other: bool,
         mentions_other_user: bool,
         is_owner: bool,
+        is_tg_admin: bool,
         user_tag: str,
         msg_type: str,
     ) -> str:
@@ -39,6 +40,7 @@ class DecisionService:
         reply_other_tag = "[是否回复其他用户]\n是" if is_reply_to_other else "[是否回复其他用户]\n否"
         mention_other_tag = "[是否@其他用户]\n是" if mentions_other_user else "[是否@其他用户]\n否"
         owner_tag = "[当前发送者是否主人]\n是" if is_owner else "[当前发送者是否主人]\n否"
+        tg_admin_tag = "[当前发送者是否TG群管理员]\n是" if is_tg_admin else "[当前发送者是否TG群管理员]\n否"
 
         context = (
             f"{build_current_time_context()}\n"
@@ -49,6 +51,7 @@ class DecisionService:
             f"{reply_other_tag}\n"
             f"{mention_other_tag}\n"
             f"{owner_tag}\n"
+            f"{tg_admin_tag}\n"
             f"[消息类型]\n{clean_text(msg_type, max_len=40)}\n"
             f"[消息正文]\n{wrap_untrusted('消息正文', normalized, max_len=1000)}"
         )
@@ -72,6 +75,7 @@ class DecisionService:
         is_reply_to_other: bool = False,
         mentions_other_user: bool = False,
         is_owner: bool = False,
+        is_tg_admin: bool = False,
         user_tag: str = "",
         msg_type: str = "text",
     ) -> str:
@@ -89,6 +93,7 @@ class DecisionService:
             is_reply_to_other,
             mentions_other_user,
             is_owner,
+            is_tg_admin,
             user_tag,
             msg_type,
         )

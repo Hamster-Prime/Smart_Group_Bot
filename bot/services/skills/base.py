@@ -16,6 +16,7 @@ class SkillContext:
     sender_user_id: int = 0
     sender_username: str = ""
     sender_is_owner: bool = False
+    sender_is_tg_admin: bool = False
     current_user_text: str = ""
     default_sticker_file_ids: list[str] = field(default_factory=list)
 
