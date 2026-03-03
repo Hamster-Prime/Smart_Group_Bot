@@ -158,6 +158,8 @@ BOT_STREAM_CHUNK_SIZE=36
 BOT_STREAM_EDIT_INTERVAL_SEC=1.0
 # Bot 发出的消息在 N 分钟后自动删除，0 表示关闭
 BOT_AUTO_DELETE_MINUTES=0
+# 决策模型可见的最近上下文条数（0-20，0=不传历史）
+BOT_DECISION_CONTEXT_ITEMS=5
 
 # ---- 技能配置 ----
 # 贴纸 file_id 列表，逗号分隔（供 send_sticker 默认使用）

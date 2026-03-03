@@ -565,6 +565,7 @@ async def on_group_message(
 
     memory = memory_holder.get()
     memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
+    decision_history = memory.get_history(group_id)[:-1]
     assistant_reply_count = sum(1 for item in memory.get_history(group_id) if item.get("role") == "assistant")
 
     bot_me = await message.bot.me()
@@ -585,7 +586,7 @@ async def on_group_message(
         msg_type,
     )
 
-    decision_svc = DecisionService(llm)
+    decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
     action = "skip"
     reply = ""
     sent_ok = False
@@ -606,6 +607,7 @@ async def on_group_message(
         is_tg_admin=sender_is_tg_admin,
         user_tag=user_tag,
         msg_type=msg_type,
+        history=decision_history,
     )
     log.info(
         "[%s]【决策】完成 | 动作=%s | 耗时=%dms",

@@ -47,6 +47,7 @@ class BotConfig(BaseModel):
     stream_chunk_size: int = 36
     stream_edit_interval_sec: float = 1.0
     auto_delete_minutes: int = 0
+    decision_context_items: int = 5
     main_model: ModelConfig = ModelConfig()
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
@@ -112,6 +113,7 @@ class Settings(BaseSettings):
     bot_stream_chunk_size: int = 36
     bot_stream_edit_interval_sec: float = 1.0
     bot_auto_delete_minutes: int = 0
+    bot_decision_context_items: int = 5
     skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
@@ -318,6 +320,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
     settings.bot.auto_delete_minutes = max(0, settings.bot_auto_delete_minutes)
+    settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
 
     # New provider registry + role binding.
     raw_env = _load_raw_env()
