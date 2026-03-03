@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import re
 import time
@@ -32,6 +31,10 @@ _TG_USER_LINK_MD_RE = re.compile(
     r"""\[([^\]]+)\]\(\s*tg://user\?id=\d+\s*\)""",
     flags=re.IGNORECASE,
 )
+_CODE_SPAN_RE = re.compile(
+    r"```[\s\S]*?```|`[^`\n]*`|<code>[\s\S]*?</code>|<pre>[\s\S]*?</pre>",
+    flags=re.IGNORECASE,
+)
 
 
 def sanitize_outgoing_mentions(text: str) -> str:
@@ -39,21 +42,28 @@ def sanitize_outgoing_mentions(text: str) -> str:
     if not text:
         return text
 
-    def _to_code_style(label: str) -> str:
-        plain = re.sub(r"<[^>]+>", "", (label or "")).strip().lstrip("@")
-        if not plain:
-            plain = "user"
-        return f"<code>@\u200b{html.escape(plain, quote=False)}</code>"
+    # Keep surrounding text untouched: only strip tg://user links to visible labels.
+    cleaned = _TG_USER_LINK_HTML_RE.sub(lambda match: (match.group(2) or ""), text)
+    cleaned = _TG_USER_LINK_MD_RE.sub(lambda match: (match.group(1) or ""), cleaned)
 
-    cleaned = _TG_USER_LINK_HTML_RE.sub(
-        lambda match: _to_code_style(match.group(2) or ""),
-        text,
-    )
-    cleaned = _TG_USER_LINK_MD_RE.sub(
-        lambda match: _to_code_style(match.group(1) or ""),
-        cleaned,
-    )
-    return _MENTION_USERNAME_RE.sub(lambda match: _to_code_style(match.group(1)), cleaned)
+    def _replace_mentions(segment: str) -> str:
+        return _MENTION_USERNAME_RE.sub(
+            lambda match: f"<code>@\u200b{match.group(1)}</code>",
+            segment,
+        )
+
+    # Do not touch existing code spans; otherwise markdown/html formatting can break.
+    result_parts: list[str] = []
+    cursor = 0
+    for code_match in _CODE_SPAN_RE.finditer(cleaned):
+        start, end = code_match.span()
+        if start > cursor:
+            result_parts.append(_replace_mentions(cleaned[cursor:start]))
+        result_parts.append(cleaned[start:end])
+        cursor = end
+    if cursor < len(cleaned):
+        result_parts.append(_replace_mentions(cleaned[cursor:]))
+    return "".join(result_parts)
 
 
 def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int) -> None:
