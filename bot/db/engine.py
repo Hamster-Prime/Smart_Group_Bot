@@ -16,6 +16,20 @@ from bot.db.models import Base
 log = logging.getLogger(__name__)
 
 
+async def _sqlite_table_columns(conn, table: str) -> set[str]:
+    result = await conn.execute(text(f"PRAGMA table_info({table})"))
+    return {str(row[1]) for row in result.fetchall()}
+
+
+async def _sqlite_ensure_column(conn, table: str, column: str, column_def_sql: str) -> bool:
+    columns = await _sqlite_table_columns(conn, table)
+    if column in columns:
+        return False
+    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_def_sql}"))
+    log.info("Migrated: added %s.%s", table, column)
+    return True
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -46,6 +60,69 @@ async def init_db(
                     "ALTER TABLE knowledge_entries ADD COLUMN embedding BLOB"
                 ))
                 log.info("Migrated: added embedding column to knowledge_entries")
+
+            # Memory v2 compatibility migration for old message_vectors schema.
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "role",
+                "role VARCHAR(16) NOT NULL DEFAULT 'user'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "content",
+                "content TEXT NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "importance_score",
+                "importance_score FLOAT NOT NULL DEFAULT 0.5",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "access_count",
+                "access_count INTEGER NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "vector_id",
+                "vector_id VARCHAR(64) NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "last_accessed",
+                "last_accessed DATETIME",
+            )
+            await conn.execute(
+                text(
+                    "UPDATE message_vectors "
+                    "SET vector_id = message_id "
+                    "WHERE vector_id IS NULL OR vector_id = ''"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_created "
+                    "ON message_vectors (group_id, created_at)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_importance "
+                    "ON message_vectors (group_id, importance_score)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_message_vectors_message_id "
+                    "ON message_vectors (message_id)"
+                )
+            )
         # Create FTS5 virtual table for knowledge search
         await conn.execute(text(
             "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts "

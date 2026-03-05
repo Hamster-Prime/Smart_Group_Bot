@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -49,6 +50,34 @@ class KnowledgeEntry(Base):
     )
 
     group: Mapped[Group] = relationship(back_populates="knowledge_entries")
+
+
+class KBUsageMetric(Base):
+    """Knowledge-base usage metrics for observability."""
+
+    __tablename__ = "kb_usage_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    query: Mapped[str] = mapped_column(String(200), default="")
+    search_status: Mapped[str] = mapped_column(String(20), default="success")
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    reliable_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_score: Mapped[float] = mapped_column(Float, default=0.0)
+    reply_generated: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_is_no_answer: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_length: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_kb_usage_group_created", "group_id", "created_at"),
+        Index("ix_kb_usage_group_status", "group_id", "search_status"),
+    )
 
 
 class ModerationRule(Base):
@@ -142,6 +171,86 @@ class MessageLog(Base):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     text: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class MessageVector(Base):
+    """Long-term episodic message index. Vectors are stored in external vector DB."""
+
+    __tablename__ = "message_vectors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+
+    role: Mapped[str] = mapped_column(String(16), default="user")
+    content: Mapped[str] = mapped_column(Text, default="")
+    importance_score: Mapped[float] = mapped_column(Float, default=0.5)
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Vector is stored in external vector DB (e.g. qdrant), table stores metadata/reference.
+    vector_id: Mapped[str] = mapped_column(String(64), default="")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_accessed: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_message_vectors_group_created", "group_id", "created_at"),
+        Index("ix_message_vectors_group_importance", "group_id", "importance_score"),
+    )
+
+
+class SemanticFact(Base):
+    """Structured semantic facts extracted from conversations."""
+
+    __tablename__ = "semantic_facts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    subject: Mapped[str] = mapped_column(String(255))
+    predicate: Mapped[str] = mapped_column(String(255))
+    object: Mapped[str] = mapped_column(Text)
+
+    fact_type: Mapped[str] = mapped_column(String(32), default="fact")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    event_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_fact_group_active", "group_id", "is_active"),
+        Index("ix_fact_triplet", "group_id", "subject", "predicate"),
+    )
+
+
+class UserPreference(Base):
+    """Procedural memory for user and group preferences."""
+
+    __tablename__ = "user_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    preference_key: Mapped[str] = mapped_column(String(64))
+    preference_value: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, default=0.8)
+
+    learned_from: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_pref_group_user_key", "group_id", "user_id", "preference_key", unique=True),
+    )
 
 
 class StickerLibraryRecord(Base):

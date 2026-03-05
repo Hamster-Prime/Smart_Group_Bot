@@ -20,6 +20,7 @@ from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.knowledge import KnowledgeService
+from bot.services.kb_metrics import KBMetricsCollector, KBSearchMetrics
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.skills import SkillService
@@ -112,34 +113,96 @@ def _truncate_text(text: str, max_len: int) -> str:
     return cleaned[:max_len] + "..."
 
 
-def _format_mandatory_kb_context(query: str, results: list[dict]) -> str:
-    lines = [f"query={_truncate_text(query, 300)}"]
-    if not results:
-        lines.append("results=(empty)")
+def _format_mandatory_kb_context(
+    query: str,
+    results: list[dict],
+    *,
+    status: str = "success",
+    threshold: float = 0.3,
+) -> str:
+    """Format KB retrieval results into strict structured prompt blocks."""
+    lines = [
+        "=" * 60,
+        "[KNOWLEDGE_BASE_SEARCH_RESULTS]",
+        "=" * 60,
+        f"Query: {_truncate_text(query, 300)}",
+        f"Similarity_Threshold: {threshold:.2f}",
+        f"Search_Status: {status.upper()}",
+    ]
+
+    if status == "failed":
+        lines.extend(
+            [
+                "Result_Count: N/A",
+                "",
+                "[SYSTEM_ERROR]",
+                "知识库检索系统发生故障,本轮无法提供知识库支持。",
+                "你必须返回: NO_TRUSTED_ANSWER",
+                "不要尝试使用训练数据回答。",
+                "=" * 60,
+            ]
+        )
         return "\n".join(lines)
 
-    lines.append(f"hit_count={len(results)}")
+    if status == "empty" or not results:
+        lines.extend(
+            [
+                "Result_Count: 0",
+                "",
+                "[NO_MATCHING_ENTRIES]",
+                f"知识库中无相似度>= {threshold:.2f} 的相关内容。",
+                "若问题需要事实依据,你必须返回: NO_TRUSTED_ANSWER",
+                "纯闲聊/情绪互动可正常回复。",
+                "=" * 60,
+            ]
+        )
+        return "\n".join(lines)
+
+    reliable_count = sum(1 for item in results if item.get("metadata", {}).get("reliable", False))
+    lines.extend(
+        [
+            f"Result_Count: {len(results)} (High_Confidence: {reliable_count})",
+            "",
+            "[MANDATORY_INSTRUCTION]",
+            "你必须仅基于以下知识库内容回答,严禁使用训练数据中的任何知识。",
+            "若知识库内容不足以完整回答问题,必须返回: NO_TRUSTED_ANSWER",
+            "不要尝试'补充'、'推测'或'结合常识'。",
+            "",
+            "[KNOWLEDGE_ENTRIES]",
+        ]
+    )
+
     for idx, item in enumerate(results[:5], start=1):
         metadata = item.get("metadata", {}) or {}
         title = str(metadata.get("title", "")).strip()
         document = str(item.get("document", "")).strip()
-        if not title and document:
-            title = document.split("\n", 1)[0].strip()
-        content = document
-        if "\n" in document:
-            content = document.split("\n", 1)[1]
-
         score_raw = item.get("score", 0.0)
         try:
             score = float(score_raw)
         except Exception:
             score = 0.0
-        fallback = "yes" if bool(metadata.get("fallback", False)) else "no"
+        reliable = bool(metadata.get("reliable", False))
+        entry_id = metadata.get("entry_id", "unknown")
 
-        lines.append(
-            f"[{idx}] title={_truncate_text(title, 120)} score={score:.4f} fallback={fallback}"
+        if "\n" in document:
+            content = document.split("\n", 1)[1].strip()
+        else:
+            content = document
+
+        confidence = "HIGH_CONFIDENCE" if reliable else "MEDIUM_CONFIDENCE"
+        lines.extend(
+            [
+                "",
+                f"--- Entry #{idx} (ID: {entry_id}) ---",
+                f"Title: {_truncate_text(title, 120)}",
+                f"Similarity_Score: {score:.4f}",
+                f"Confidence_Level: {confidence}",
+                "Content:",
+                _truncate_text(content, 800),
+            ]
         )
-        lines.append(f"content={_truncate_text(content, 800)}")
+
+    lines.append("=" * 60)
     return "\n".join(lines)
 
 
@@ -564,7 +627,14 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
-    memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
+    memory.add_message(
+        group_id,
+        "user",
+        f"[{user_tag}] {input_text}",
+        user_id=user_id,
+        message_type=msg_type,
+        message_id=str(message.message_id),
+    )
     decision_history = memory.get_history(group_id)[:-1]
     assistant_reply_count = sum(1 for item in memory.get_history(group_id) if item.get("role") == "assistant")
 
@@ -591,6 +661,7 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     reply_source = "none"
+    reply_for_metrics = ""
     sticker_decision_send = False
     sticker_decision_reason = ""
     sticker_decision_file = ""
@@ -616,22 +687,48 @@ async def on_group_message(
         int((time.perf_counter() - decision_started) * 1000),
     )
 
+    kb_search_started = time.perf_counter()
+    kb_elapsed_ms = 0
+    kb_results: list[dict] = []
+    kb_search_status = "not_run"
+    kb_context = ""
+
     if action != "skip":
-        history = memory.get_history_for_llm(group_id)
+        history = await memory.get_history_for_llm(group_id, query=input_text)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
-        kb_search_started = time.perf_counter()
-        kb_results: list[dict] = []
-        try:
-            kb_results = await kb.search(session, group_id, input_text)
-        except Exception:
-            log.exception("[%s] mandatory kb search failed", group_id)
-        kb_context = _format_mandatory_kb_context(input_text, kb_results)
-        log.info(
-            "[%s] mandatory kb search done | hit=%d | elapsed=%dms",
-            group_id,
-            len(kb_results),
-            int((time.perf_counter() - kb_search_started) * 1000),
-        )
+        # 根据决策类型决定是否执行知识库搜索
+        should_search_kb = action == "question"  # 只有问题才搜索知识库
+
+        if should_search_kb:
+            kb_search_started = time.perf_counter()
+            kb_search_status = "success"
+            try:
+                kb_results = await kb.search(session, group_id, input_text)
+                if not kb_results:
+                    kb_search_status = "empty"
+            except Exception:
+                log.exception("[%s] mandatory kb search failed", group_id)
+                kb_search_status = "failed"
+                kb_results = []
+            kb_elapsed_ms = int((time.perf_counter() - kb_search_started) * 1000)
+            kb_context = _format_mandatory_kb_context(
+                input_text,
+                kb_results,
+                status=kb_search_status,
+                threshold=settings.knowledge.similarity_threshold,
+            )
+            log.info(
+                "[%s] mandatory kb search done | status=%s hit=%d | elapsed=%dms",
+                group_id,
+                kb_search_status,
+                len(kb_results),
+                kb_elapsed_ms,
+            )
+        else:
+            # 闲聊场景，不搜索知识库
+            kb_search_status = "not_run"
+            kb_context = ""
+            log.info("[%s] kb search skipped | reason=casual_chat", group_id)
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
             skill_reply = await skill.answer_with_skill(
@@ -644,6 +741,7 @@ async def on_group_message(
                 sender_is_tg_admin=sender_is_tg_admin,
                 message=message,
                 mandatory_kb_context=kb_context,
+                intent_type=action,
             )
             if skill_reply:
                 reply = skill_reply
@@ -660,8 +758,14 @@ async def on_group_message(
                     sender_is_owner=sender_is_owner,
                     sender_is_tg_admin=sender_is_tg_admin,
                     mandatory_kb_context=kb_context,
+                    intent_type=action,
                 )
-                log.info("[%s] reply via casual | %s", group_id, reply[:80] if reply else "(empty)")
+                log.info(
+                    "[%s] reply via casual | intent=%s | %s",
+                    group_id,
+                    action,
+                    reply[:80] if reply else "(empty)",
+                )
                 if reply:
                     reply_source = "casual"
 
@@ -671,19 +775,35 @@ async def on_group_message(
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
                 reply = normalized_reply
 
+        reply_for_metrics = reply or ""
         silence_reply, silence_reason = _should_silence_generated_reply(reply)
         if silence_reply:
-            preview = _truncate_text(reply, 80) if reply else "-"
-            log.info(
-                "[%s] reply suppressed -> silent | reason=%s source=%s preview=%s",
-                group_id,
-                silence_reason,
-                reply_source,
-                preview,
-            )
-            reply = ""
-            reply_source = "none"
-            action = "skip"
+            # 根据决策类型和静默原因决定是否真的要静默
+            should_really_silence = True
+            if action == "casual" and silence_reason == "silent_marker":
+                # 闲聊场景返回了 NO_TRUSTED_ANSWER，这不合理
+                # 说明提示词可能没生效，使用默认友好回复
+                log.warning("[%s] casual chat returned NO_TRUSTED_ANSWER, using fallback reply", group_id)
+                reply = "嗯嗯，我在听~"
+                should_really_silence = False
+                reply_source = "fallback"
+            elif action == "question" and silence_reason == "silent_marker":
+                # 问题场景返回 NO_TRUSTED_ANSWER，这是正常的，应该静默
+                log.info("[%s] question returned NO_TRUSTED_ANSWER, silencing as expected", group_id)
+                should_really_silence = True
+            if should_really_silence:
+                preview = _truncate_text(reply, 80) if reply else "-"
+                log.info(
+                    "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
+                    group_id,
+                    silence_reason,
+                    reply_source,
+                    action,
+                    preview,
+                )
+                reply = ""
+                reply_source = "none"
+                action = "skip"
 
     sticker_decision_started = time.perf_counter()
     sticker_decision = await sticker_decider.decide(
@@ -738,6 +858,27 @@ async def on_group_message(
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_minutes=settings.bot.auto_delete_minutes,
         )
+    if kb_search_status != "not_run":
+        metrics_reply_text = reply_for_metrics or reply or ""
+        metrics = KBSearchMetrics(
+            group_id=group_id,
+            query=input_text[:200],
+            search_status=kb_search_status,
+            hit_count=len(kb_results),
+            reliable_count=sum(
+                1 for item in kb_results if item.get("metadata", {}).get("reliable", False)
+            ),
+            max_score=max((float(item.get("score", 0.0)) for item in kb_results), default=0.0),
+            reply_generated=bool(metrics_reply_text),
+            reply_is_no_answer="NO_TRUSTED_ANSWER" in metrics_reply_text.upper(),
+            reply_length=len(metrics_reply_text),
+            elapsed_ms=kb_elapsed_ms,
+        )
+        try:
+            kb_metrics = KBMetricsCollector()
+            await kb_metrics.record_search(session, metrics)
+        except Exception:
+            log.exception("[%s] kb metrics recording failed", group_id)
 
     if action == "skip":
         log.info(
@@ -751,13 +892,11 @@ async def on_group_message(
             sticker_decision_send,
             int((time.perf_counter() - flow_started) * 1000),
         )
-        await memory.maybe_compress(group_id)
         return
 
     if reply and sent_ok:
-        memory.add_message(group_id, "assistant", reply)
+        memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
 
-    await memory.maybe_compress(group_id)
     log.info(
         "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 贴纸决策=%s 贴纸发送=%s 长度=%d 耗时=%dms",
         group_id,
