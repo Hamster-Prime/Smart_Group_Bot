@@ -577,8 +577,25 @@ async def _send_av_detail(
             )
             schedule_message_auto_delete(sent_photo, settings.bot.auto_delete_minutes)
             return True
+        except TelegramBadRequest as exc:
+            # Some source URLs are blocked for Telegram fetch or return non-image content.
+            log.warning("send_photo by url failed: %s", exc)
         except Exception:
             log.exception("failed to send av cover photo: %s", detail.cover_url)
+
+    if detail.cover_url and not sent_photo:
+        file_obj = await _download_cover_input_file(detail.cover_url, referer=detail.url)
+        if file_obj:
+            try:
+                sent_photo = await message.answer_photo(
+                    photo=file_obj,
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+                schedule_message_auto_delete(sent_photo, settings.bot.auto_delete_minutes)
+                return True
+            except Exception:
+                log.exception("failed to send av cover photo by upload")
 
     if not sent_photo:
         sent = await message.answer(
