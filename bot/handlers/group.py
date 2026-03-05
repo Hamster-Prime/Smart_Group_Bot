@@ -788,9 +788,36 @@ async def on_group_message(
                 should_really_silence = False
                 reply_source = "fallback"
             elif action == "question" and silence_reason == "silent_marker":
-                # 问题场景返回 NO_TRUSTED_ANSWER，这是正常的，应该静默
-                log.info("[%s] question returned NO_TRUSTED_ANSWER, silencing as expected", group_id)
-                should_really_silence = True
+                # 问题场景返回 NO_TRUSTED_ANSWER：强制联网搜索并降级为 casual
+                log.info("[%s] question returned NO_TRUSTED_ANSWER, forcing websearch fallback", group_id)
+                forced_reply = ""
+                async with typing_action(message, enabled=settings.bot.enable_typing):
+                    forced_reply = await skill.answer_with_forced_websearch(
+                        input_text,
+                        session=session,
+                        history=history,
+                        sender_user_id=user_id,
+                        sender_username=sender_username,
+                        sender_is_owner=sender_is_owner,
+                        sender_is_tg_admin=sender_is_tg_admin,
+                        message=message,
+                    )
+                forced_reply = _normalize_owner_address(forced_reply, sender_is_owner).strip()
+                if forced_reply and not _is_silent_marker_reply(forced_reply):
+                    reply = forced_reply
+                    reply_for_metrics = forced_reply
+                    action = "casual"
+                    should_really_silence = False
+                    reply_source = "forced_websearch"
+                    log.info(
+                        "[%s] forced websearch fallback success | action=%s source=%s",
+                        group_id,
+                        action,
+                        reply_source,
+                    )
+                else:
+                    log.warning("[%s] forced websearch fallback empty, keep silent", group_id)
+                    should_really_silence = True
             if should_really_silence:
                 preview = _truncate_text(reply, 80) if reply else "-"
                 log.info(

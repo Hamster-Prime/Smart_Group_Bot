@@ -231,6 +231,139 @@ class SkillService:
             "payload": result.payload,
         }
 
+    @staticmethod
+    def _format_forced_websearch_result(result: SkillRunResult) -> str:
+        lines = [
+            "=" * 60,
+            "[FORCED_WEBSEARCH_RESULT]",
+            "=" * 60,
+        ]
+        if not result.ok:
+            lines.extend(
+                [
+                    "status: failed",
+                    f"summary: {clean_text(result.summary or 'websearch failed', max_len=200)}",
+                    f"error: {clean_text(result.error or 'unknown_error', max_len=200)}",
+                    "",
+                    "instruction: 联网搜索失败，需明确说明已搜索但暂无可靠结果。",
+                    "=" * 60,
+                ]
+            )
+            return "\n".join(lines)
+
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        query = clean_text(str(payload.get("query", "")), max_len=300)
+        rows = payload.get("results")
+        if not isinstance(rows, list):
+            rows = []
+
+        lines.extend(
+            [
+                "status: success",
+                f"query: {query}",
+                f"result_count: {len(rows)}",
+                "",
+                "[WEB_RESULTS]",
+            ]
+        )
+        for idx, item in enumerate(rows[:8], start=1):
+            if not isinstance(item, dict):
+                continue
+            title = clean_text(str(item.get("title", "")), max_len=180)
+            url = clean_text(str(item.get("url", "")), max_len=300)
+            snippet = clean_text(str(item.get("snippet", "")), max_len=300)
+            lines.extend(
+                [
+                    f"{idx}. title: {title or '(no_title)'}",
+                    f"   url: {url or '(no_url)'}",
+                    f"   snippet: {snippet or '(empty)'}",
+                ]
+            )
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    async def answer_with_forced_websearch(
+        self,
+        text: str,
+        *,
+        session: AsyncSession | None = None,
+        history: list[dict[str, str]] | None = None,
+        sender_user_id: int = 0,
+        sender_username: str = "",
+        sender_is_owner: bool = False,
+        sender_is_tg_admin: bool = False,
+        message: Any | None = None,
+        max_results: int = 5,
+    ) -> str:
+        user_text = clean_text(text, max_len=1200)
+        if contains_prompt_injection(user_text):
+            log.warning("forced websearch input may contain prompt injection")
+
+        context = SkillContext(
+            session=session,
+            message=message,
+            sender_user_id=sender_user_id,
+            sender_username=sender_username,
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+            current_user_text=user_text,
+            default_sticker_file_ids=self.default_sticker_file_ids,
+        )
+        websearch_result = await self._run_tool(
+            name="websearch",
+            arguments={"query": user_text, "max_results": max(1, min(max_results, 10))},
+            context=context,
+        )
+        search_context = self._format_forced_websearch_result(websearch_result)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
+            {"role": "system", "content": build_current_time_context()},
+            {
+                "role": "system",
+                "content": self._build_sender_context(
+                    sender_user_id,
+                    sender_username,
+                    sender_is_owner,
+                    sender_is_tg_admin,
+                ),
+            },
+            {"role": "system", "content": "[INTENT_TYPE]\ncasual"},
+            {
+                "role": "system",
+                "content": (
+                    "系统触发降级流程：上一阶段返回 NO_TRUSTED_ANSWER，已强制执行联网搜索。"
+                    "你必须优先依据联网结果给出简短中文回复，并使用 casual 对话语气。"
+                    "若联网结果不足，请明确说明已搜索但暂无可靠结论，不要返回 NO_TRUSTED_ANSWER。"
+                ),
+            },
+            {
+                "role": "system",
+                "content": wrap_untrusted("forced_websearch_result", search_context, max_len=4800),
+            },
+        ]
+        if history:
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
+
+        answer = (await self.llm.chat(messages)).strip()
+        if answer and "NO_TRUSTED_ANSWER" not in answer.upper():
+            return answer
+
+        if websearch_result.ok:
+            payload = websearch_result.payload if isinstance(websearch_result.payload, dict) else {}
+            rows = payload.get("results")
+            if isinstance(rows, list) and rows:
+                top = rows[0] if isinstance(rows[0], dict) else {}
+                title = clean_text(str(top.get("title", "")), max_len=60)
+                url = clean_text(str(top.get("url", "")), max_len=180)
+                if title and url:
+                    return f"我联网查到：{title}。可先看：{url}"
+                if title:
+                    return f"我联网查到：{title}。"
+
+        return "我刚联网查了一下，暂时没拿到可靠结果。"
+
     async def answer_with_skill(
         self,
         text: str,
