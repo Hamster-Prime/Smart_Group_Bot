@@ -564,7 +564,14 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
-    memory.add_message(group_id, "user", f"[{user_tag}] {input_text}")
+    memory.add_message(
+        group_id,
+        "user",
+        f"[{user_tag}] {input_text}",
+        user_id=user_id,
+        message_type=msg_type,
+        message_id=str(message.message_id),
+    )
     decision_history = memory.get_history(group_id)[:-1]
     assistant_reply_count = sum(1 for item in memory.get_history(group_id) if item.get("role") == "assistant")
 
@@ -617,7 +624,7 @@ async def on_group_message(
     )
 
     if action != "skip":
-        history = memory.get_history_for_llm(group_id)
+        history = await memory.get_history_for_llm(group_id, query=input_text)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
         kb_search_started = time.perf_counter()
         kb_results: list[dict] = []
@@ -751,13 +758,11 @@ async def on_group_message(
             sticker_decision_send,
             int((time.perf_counter() - flow_started) * 1000),
         )
-        await memory.maybe_compress(group_id)
         return
 
     if reply and sent_ok:
-        memory.add_message(group_id, "assistant", reply)
+        memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
 
-    await memory.maybe_compress(group_id)
     log.info(
         "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 贴纸决策=%s 贴纸发送=%s 长度=%d 耗时=%dms",
         group_id,

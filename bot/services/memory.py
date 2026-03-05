@@ -1,91 +1,133 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import re
-from datetime import datetime, timezone
-from pathlib import Path
+from collections import deque
+from typing import Any
 
 import litellm
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from bot.config import BotConfig
+from bot.config import BotConfig, MemoryV2Config
 from bot.services.llm import LLMService
-from bot.utils.prompts import COMPRESS_SYSTEM
+from bot.services.memory_v2 import MemoryV2Manager
 
 log = logging.getLogger(__name__)
 
-MEMORY_DIR = Path(__file__).resolve().parent.parent.parent / "memory"
-HISTORY_FILE_NAME = "_history.jsonl"
-SUMMARY_PREFIX = "[history-summary]"
-LEGACY_SUMMARY_PREFIXES = (
-    SUMMARY_PREFIX,
-    "[历史记忆摘要]",
-    "[鍘嗗彶璁板繂鎽樿]",
-)
-
 
 class MemoryService:
-    """Per-group conversation memory with full-history persistence."""
+    """Memory v2 service: working memory + long-term memory manager."""
 
-    def __init__(self, config: BotConfig, llm: LLMService) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        llm: LLMService,
+        *,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        memory_v2: MemoryV2Config | None = None,
+    ) -> None:
+        if session_factory is None:
+            raise ValueError("MemoryService requires session_factory in v2 mode")
+
         self.max_context = config.max_context_tokens
         self.max_output = config.max_output_tokens
         self.llm = llm
-        # group_id -> list of {"role": ..., "content": ...}
-        self._history: dict[int, list[dict[str, str]]] = {}
-        # group_id -> latest long-term summary text
-        self._summary: dict[int, str] = {}
-        # group_id -> message count at last successful compression
-        self._last_compressed_len: dict[int, int] = {}
+
+        self._cfg = memory_v2 or MemoryV2Config()
+        if not self._cfg.enabled:
+            raise ValueError("Memory v2 is required; set MEMORY_V2_ENABLED=true")
+
+        self._working_recent_items = max(1, int(self._cfg.working_recent_items))
+        self._history: dict[int, deque[dict[str, str]]] = {}
         self._llm_max_history_items = 2000
         self._llm_reserve_tokens = max(1024, self.max_output // 2)
-        # Runtime memory policy:
-        # 1) Always keep last N raw messages in memory.
-        # 2) Older messages are rolled into long-term summary incrementally.
-        self._runtime_keep_recent_items = 1000
-        # Non-force compression starts only when overflow reaches trigger,
-        # to avoid compressing every single new message after crossing 1000.
-        self._compress_overflow_trigger = 120
-        # Max number of old messages to summarize per compression batch.
-        self._compress_batch_items = 300
-        # Force mode can consume larger batches to catch up faster.
-        self._compress_force_batch_multiplier = 3
-        self._compress_force_max_rounds = 8
-        self._compress_lock = asyncio.Lock()
 
-    # ---- Token counting ----
+        self._manager = MemoryV2Manager(
+            config=self._cfg,
+            llm=llm,
+            session_factory=session_factory,
+        )
+        log.info(
+            "Memory service initialized: working_recent_items=%d backend=%s",
+            self._working_recent_items,
+            self._cfg.vector_backend,
+        )
+
+    async def bootstrap(self) -> None:
+        """Load working memory from long-term storage and run one-time migration."""
+        migration_stats = await self._manager.migrate_legacy_if_needed()
+        working = await self._manager.load_working_memory(max_items=self._working_recent_items)
+        self._history = {
+            gid: deque(items, maxlen=self._working_recent_items)
+            for gid, items in working.items()
+        }
+
+        loaded_groups = len(self._history)
+        loaded_messages = sum(len(v) for v in self._history.values())
+        log.info(
+            "Memory bootstrap done: groups=%d working_messages=%d migrated=%d",
+            loaded_groups,
+            loaded_messages,
+            migration_stats.get("migrated_messages", 0),
+        )
+
+    def _working(self, group_id: int) -> deque[dict[str, str]]:
+        buf = self._history.get(group_id)
+        if buf is None:
+            buf = deque(maxlen=self._working_recent_items)
+            self._history[group_id] = buf
+        return buf
+
+    def get_history(self, group_id: int) -> list[dict[str, str]]:
+        return list(self._working(group_id))
+
+    def add_message(
+        self,
+        group_id: int,
+        role: str,
+        content: str,
+        *,
+        user_id: int | None = None,
+        message_type: str = "text",
+        message_id: str | None = None,
+    ) -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+
+        buf = self._working(group_id)
+        buf.append({"role": role, "content": text})
+        self._manager.schedule_index_message(
+            group_id=group_id,
+            role=role,
+            content=text,
+            user_id=user_id,
+            message_type=message_type,
+            message_id=message_id,
+        )
 
     def _count_tokens(self, messages: list[dict[str, str]]) -> int:
         try:
-            return litellm.token_counter(
-                model=self.llm.main.model,
-                messages=messages,
-            )
+            return litellm.token_counter(model=self.llm.main.model, messages=messages)
         except Exception:
-            # Fallback: rough estimate based on characters
             return sum(len(m.get("content", "")) for m in messages)
 
-    # ---- History access ----
+    def token_usage(self, group_id: int) -> int:
+        return self._count_tokens(self.get_history(group_id))
 
-    def get_history(self, group_id: int) -> list[dict[str, str]]:
-        return self._history.setdefault(group_id, [])
-
-    def _select_recent_messages(
+    def _trim_by_token_budget(
         self,
-        history: list[dict[str, str]],
+        messages: list[dict[str, str]],
         *,
         budget_tokens: int,
         max_items: int,
     ) -> list[dict[str, str]]:
-        if not history:
+        if not messages:
             return []
 
-        # Fast approximation to avoid counting tokens for each candidate message.
         budget_chars = max(2048, budget_tokens * 4)
         selected: list[dict[str, str]] = []
         used_chars = 0
-        for msg in reversed(history):
+        for msg in reversed(messages):
             content = msg.get("content", "")
             item_chars = max(24, len(content))
             if selected and used_chars + item_chars > budget_chars:
@@ -97,341 +139,51 @@ class MemoryService:
         selected.reverse()
         return selected
 
-    def get_history_for_llm(
+    async def get_history_for_llm(
         self,
         group_id: int,
         *,
+        query: str,
         reserve_tokens: int | None = None,
         max_items: int | None = None,
     ) -> list[dict[str, str]]:
-        history = self.get_history(group_id)
-        summary = self._summary.get(group_id, "").strip()
-        if not history and not summary:
-            return []
+        working = self.get_history(group_id)
+        context_messages = await self._manager.build_context_messages(
+            group_id=group_id,
+            query=query,
+            working_messages=working,
+            max_working_items=max_items,
+        )
 
         reserve = self._llm_reserve_tokens if reserve_tokens is None else max(0, reserve_tokens)
         item_limit = self._llm_max_history_items if max_items is None else max(1, max_items)
         budget_tokens = max(1024, self.max_context - self.max_output - reserve)
-        selected = self._select_recent_messages(
-            history,
+        return self._trim_by_token_budget(
+            context_messages,
             budget_tokens=budget_tokens,
             max_items=item_limit,
         )
-        if not summary:
-            return selected
 
-        # Prepend latest summary so long-term facts survive even when recent window shifts.
-        summary_msg = {"role": "system", "content": f"{SUMMARY_PREFIX}\n{summary}"}
-        if selected:
-            first = selected[0]
-            if first.get("role") == "system" and self._extract_summary(first.get("content", "")) == summary:
-                return selected
-        return [summary_msg, *selected]
-
-    def add_message(self, group_id: int, role: str, content: str) -> None:
-        history = self.get_history(group_id)
-        history.append({"role": role, "content": content})
-        self._append_history_event(group_id, role, content)
-        usage = self._count_tokens(history)
-        log.info(
-            "[Memory] group=%s +%s, history=%d, tokens~%d/%d",
+    async def get_history_for_llm_enhanced(
+        self,
+        group_id: int,
+        *,
+        query: str,
+        reserve_tokens: int | None = None,
+        max_items: int | None = None,
+    ) -> list[dict[str, str]]:
+        return await self.get_history_for_llm(
             group_id,
-            role,
-            len(history),
-            usage,
-            self.max_context,
+            query=query,
+            reserve_tokens=reserve_tokens,
+            max_items=max_items,
         )
 
-    def token_usage(self, group_id: int) -> int:
-        return self._count_tokens(self.get_history(group_id))
+    async def maybe_run_daily_memory_maintenance(self) -> dict[str, int]:
+        return await self._manager.maybe_run_daily_maintenance()
 
-    def _compact_runtime_history(self, group_id: int) -> tuple[int, int, int, int]:
-        history = self.get_history(group_id)
-        before_items = len(history)
-        before_tokens = self._count_tokens(history) if history else 0
-        if not history:
-            self._history[group_id] = []
-            return 0, 0, 0, 0
+    async def collect_metrics(self, group_id: int) -> dict[str, float | int]:
+        return await self._manager.metrics.collect_metrics(group_id)
 
-        if len(history) <= self._runtime_keep_recent_items:
-            compacted = list(history)
-        else:
-            compacted = history[-self._runtime_keep_recent_items :]
-
-        self._history[group_id] = compacted
-        after_items = len(compacted)
-        after_tokens = self._count_tokens(compacted) if compacted else 0
-        return before_items, after_items, before_tokens, after_tokens
-
-    # ---- Compression ----
-
-    async def maybe_compress(self, group_id: int) -> bool:
-        """Create snapshot summary when token usage reaches threshold."""
-        return await self._compress_group(group_id, force=False)
-
-    async def compress_all(self, force: bool = True) -> int:
-        """Compress/persist all in-memory groups."""
-        group_ids = list(self._history.keys())
-        if not group_ids:
-            return 0
-
-        processed = 0
-        for group_id in group_ids:
-            try:
-                if await self._compress_group(group_id, force=force):
-                    processed += 1
-            except Exception:
-                log.exception("Memory compression failed for group=%s", group_id)
-        return processed
-
-    @staticmethod
-    def _is_summary_only(history: list[dict[str, str]]) -> bool:
-        if len(history) != 1:
-            return False
-        item = history[0]
-        return item.get("role") == "system" and any(
-            item.get("content", "").startswith(prefix) for prefix in LEGACY_SUMMARY_PREFIXES
-        )
-
-    @staticmethod
-    def _extract_summary(content: str) -> str:
-        for prefix in LEGACY_SUMMARY_PREFIXES:
-            if content.startswith(prefix):
-                return content[len(prefix) :].lstrip("\n").strip()
-        return content.strip()
-
-    async def _compress_group(self, group_id: int, force: bool) -> bool:
-        async with self._compress_lock:
-            history = self.get_history(group_id)
-            if not history:
-                if force:
-                    summary = self._summary.get(group_id, "").strip()
-                    if summary:
-                        self._save_memory(group_id, summary)
-                        return True
-                return False
-
-            usage = self._count_tokens(history)
-            overflow = max(0, len(history) - self._runtime_keep_recent_items)
-            if (
-                not force
-                and usage < self.max_context
-                and overflow < self._compress_overflow_trigger
-            ):
-                return False
-
-            log.info(
-                "Memory compress start: group=%s context=%d/%d history=%d keep=%d overflow=%d force=%s",
-                group_id,
-                usage,
-                self.max_context,
-                len(history),
-                self._runtime_keep_recent_items,
-                overflow,
-                force,
-            )
-
-            changed = False
-            rounds = 0
-            max_rounds = self._compress_force_max_rounds if force else 1
-
-            while rounds < max_rounds:
-                history = self.get_history(group_id)
-                if not history:
-                    break
-
-                overflow = max(0, len(history) - self._runtime_keep_recent_items)
-                if overflow <= 0:
-                    break
-
-                if not force and overflow < self._compress_overflow_trigger:
-                    break
-
-                batch_cap = self._compress_batch_items
-                if force:
-                    batch_cap *= self._compress_force_batch_multiplier
-                batch_size = max(1, min(overflow, batch_cap))
-                batch = history[:batch_size]
-
-                # Incremental summary: old summary + new overflow batch -> new summary.
-                base_summary = self._summary.get(group_id, "").strip()
-                lines: list[str] = []
-                if base_summary:
-                    lines.append(f"[system] {SUMMARY_PREFIX}")
-                    lines.append(base_summary)
-                    lines.append("")
-                lines.extend(f"[{m.get('role', 'user')}] {m.get('content', '')}" for m in batch)
-                history_text = "\n".join(lines)
-
-                prompt = COMPRESS_SYSTEM.replace("{history}", history_text)
-                summary = (await self.llm.compress(prompt, "请压缩以上对话历史。")).strip()
-                if not summary:
-                    log.warning(
-                        "Memory compress failed: group=%s round=%d batch=%d",
-                        group_id,
-                        rounds + 1,
-                        batch_size,
-                    )
-                    self._last_compressed_len[group_id] = len(history)
-                    return changed
-
-                self._save_memory(group_id, summary)
-                self._summary[group_id] = summary
-                # Drop only the batch that has been summarized.
-                self._history[group_id] = history[batch_size:]
-                changed = True
-                rounds += 1
-
-            before_items, after_items, before_tokens, after_tokens = self._compact_runtime_history(group_id)
-            self._last_compressed_len[group_id] = after_items
-            if changed:
-                log.info(
-                    "Memory compress saved snapshot: group=%s rounds=%d history=%d->%d tokens~%d->%d keep=%d",
-                    group_id,
-                    rounds,
-                    before_items,
-                    after_items,
-                    before_tokens,
-                    after_tokens,
-                    self._runtime_keep_recent_items,
-                )
-            return changed
-
-    # ---- File persistence ----
-
-    def _group_dir(self, group_id: int) -> Path:
-        d = MEMORY_DIR / str(group_id)
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
-    def _history_path(self, group_id: int) -> Path:
-        return self._group_dir(group_id) / HISTORY_FILE_NAME
-
-    def _append_history_event(self, group_id: int, role: str, content: str) -> None:
-        event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "role": role,
-            "content": content,
-        }
-        path = self._history_path(group_id)
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        except Exception:
-            log.exception("Failed to append history event: group=%s", group_id)
-
-    def _save_memory(self, group_id: int, summary: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        path = self._group_dir(group_id) / f"{ts}.md"
-        path.write_text(summary, encoding="utf-8")
-        log.info("Memory saved: %s", path)
-
-    @staticmethod
-    def _parse_group_id_from_filename(path: Path) -> int | None:
-        """Parse legacy memory filename like '<group_id>_*.md'."""
-        m = re.match(r"^(-?\d+)", path.stem)
-        if not m:
-            return None
-        try:
-            return int(m.group(1))
-        except ValueError:
-            return None
-
-    def _load_history_events(self, group_id: int) -> list[dict[str, str]]:
-        path = self._history_path(group_id)
-        if not path.exists():
-            return []
-
-        messages: list[dict[str, str]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except Exception:
-                    continue
-                role = str(data.get("role", "")).strip().lower()
-                if role not in {"system", "user", "assistant"}:
-                    continue
-                content = str(data.get("content", "")).strip()
-                if not content:
-                    continue
-                messages.append({"role": role, "content": content})
-        return messages
-
-    def load_all(self) -> None:
-        """On startup, load persisted full history and legacy summary snapshots."""
-        if not MEMORY_DIR.exists():
-            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-            return
-
-        group_files: dict[int, list[Path]] = {}
-        group_ids: set[int] = set()
-
-        # Preferred layout: memory/<group_id>/*.md
-        for group_dir in MEMORY_DIR.iterdir():
-            if not group_dir.is_dir():
-                continue
-            try:
-                group_id = int(group_dir.name)
-            except ValueError:
-                continue
-            group_ids.add(group_id)
-            files = sorted(group_dir.glob("*.md"), key=lambda p: p.name)
-            if files:
-                group_files.setdefault(group_id, []).extend(files)
-
-        # Backward-compatible layout: memory/<group_id>_*.md
-        for path in MEMORY_DIR.glob("*.md"):
-            group_id = self._parse_group_id_from_filename(path)
-            if group_id is None:
-                continue
-            group_ids.add(group_id)
-            group_files.setdefault(group_id, []).append(path)
-
-        loaded_groups = 0
-        loaded_summary_files = 0
-        loaded_events = 0
-        for group_id in sorted(group_ids):
-            history = self._load_history_events(group_id)
-            if history:
-                self._history[group_id] = history
-                self._last_compressed_len[group_id] = len(history)
-                loaded_events += len(history)
-
-            files = sorted(group_files.get(group_id, []), key=lambda p: p.name)
-            latest_summary = ""
-            for f in files:
-                try:
-                    content = f.read_text(encoding="utf-8").strip()
-                except Exception:
-                    log.exception("Failed to read memory file: %s", f)
-                    continue
-                if not content:
-                    continue
-                latest_summary = self._extract_summary(content)
-                loaded_summary_files += 1
-
-            if latest_summary:
-                self._summary[group_id] = latest_summary
-
-            if not history and latest_summary:
-                # Legacy mode fallback: no event journal yet, keep summary in history.
-                self._history[group_id] = [
-                    {"role": "system", "content": f"{SUMMARY_PREFIX}\n{latest_summary}"},
-                ]
-                self._last_compressed_len[group_id] = 1
-
-            if group_id not in self._history and group_id not in self._summary:
-                continue
-            loaded_groups += 1
-
-        if loaded_groups:
-            log.info(
-                "Memory bootstrap completed: groups=%d summary_files=%d history_events=%d",
-                loaded_groups,
-                loaded_summary_files,
-                loaded_events,
-            )
+    async def flush_background_tasks(self, timeout_sec: float = 5.0) -> None:
+        await self._manager.flush_pending_index_tasks(timeout_sec=timeout_sec)

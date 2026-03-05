@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from bot.config import load_settings
 from bot.db.engine import init_db
@@ -35,8 +36,13 @@ async def main() -> None:
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
     )
-    memory = MemoryService(settings.bot, llm)
-    memory.load_all()
+    memory = MemoryService(
+        settings.bot,
+        llm,
+        session_factory=session_factory,
+        memory_v2=settings.memory_v2,
+    )
+    await memory.bootstrap()
     memory_holder.init(memory)
 
     kb = KnowledgeService(settings.knowledge, llm)
@@ -57,6 +63,28 @@ async def main() -> None:
     bot = create_bot(settings)
     log.info("Bot starting...")
 
+    async def _periodic_memory_maintenance() -> None:
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                stats = await memory.maybe_run_daily_memory_maintenance()
+                if any(int(v) > 0 for v in stats.values()):
+                    log.info(
+                        "daily memory maintenance: groups=%d consolidated_messages=%d facts=%d preferences=%d pruned=%d",
+                        stats.get("groups", 0),
+                        stats.get("consolidated_messages", 0),
+                        stats.get("facts", 0),
+                        stats.get("preferences", 0),
+                        stats.get("pruned", 0),
+                    )
+            except Exception:
+                log.exception("daily memory maintenance failed")
+
+    maintenance_task = asyncio.create_task(
+        _periodic_memory_maintenance(),
+        name="memory-v2-maintenance",
+    )
+
     try:
         await dp.start_polling(
             bot,
@@ -66,6 +94,10 @@ async def main() -> None:
             tasks_concurrency_limit=8,
         )
     finally:
+        maintenance_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await maintenance_task
+        await memory.flush_background_tasks(timeout_sec=5.0)
         await engine.dispose()
 
 
