@@ -82,6 +82,7 @@ async def start_bot(settings, session_factory) -> None:
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(ThrottleMiddleware(rate_limit=0.0))
     dp.message.middleware(DbSessionMiddleware(session_factory))
+    dp.callback_query.middleware(DbSessionMiddleware(session_factory))
 
     dp.include_router(commands.router)
     dp.include_router(admin.router)

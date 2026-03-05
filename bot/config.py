@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
+    av_enabled: bool = True
+    av_http_timeout_sec: float = 15.0
+    av_max_results: int = 18
+    av_javbus_base_url: str = "https://www.javbus.com"
+    av_madouqu_base_url: str = "https://madouqu.com"
+
     bot: BotConfig = BotConfig()
     knowledge: KnowledgeConfig = KnowledgeConfig()
     moderation: ModerationConfig = ModerationConfig()
