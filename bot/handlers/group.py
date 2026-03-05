@@ -696,30 +696,39 @@ async def on_group_message(
     if action != "skip":
         history = await memory.get_history_for_llm(group_id, query=input_text)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
-        kb_search_started = time.perf_counter()
-        kb_search_status = "success"
-        try:
-            kb_results = await kb.search(session, group_id, input_text)
-            if not kb_results:
-                kb_search_status = "empty"
-        except Exception:
-            log.exception("[%s] mandatory kb search failed", group_id)
-            kb_search_status = "failed"
-            kb_results = []
-        kb_elapsed_ms = int((time.perf_counter() - kb_search_started) * 1000)
-        kb_context = _format_mandatory_kb_context(
-            input_text,
-            kb_results,
-            status=kb_search_status,
-            threshold=settings.knowledge.similarity_threshold,
-        )
-        log.info(
-            "[%s] mandatory kb search done | status=%s hit=%d | elapsed=%dms",
-            group_id,
-            kb_search_status,
-            len(kb_results),
-            kb_elapsed_ms,
-        )
+        # 根据决策类型决定是否执行知识库搜索
+        should_search_kb = action == "question"  # 只有问题才搜索知识库
+
+        if should_search_kb:
+            kb_search_started = time.perf_counter()
+            kb_search_status = "success"
+            try:
+                kb_results = await kb.search(session, group_id, input_text)
+                if not kb_results:
+                    kb_search_status = "empty"
+            except Exception:
+                log.exception("[%s] mandatory kb search failed", group_id)
+                kb_search_status = "failed"
+                kb_results = []
+            kb_elapsed_ms = int((time.perf_counter() - kb_search_started) * 1000)
+            kb_context = _format_mandatory_kb_context(
+                input_text,
+                kb_results,
+                status=kb_search_status,
+                threshold=settings.knowledge.similarity_threshold,
+            )
+            log.info(
+                "[%s] mandatory kb search done | status=%s hit=%d | elapsed=%dms",
+                group_id,
+                kb_search_status,
+                len(kb_results),
+                kb_elapsed_ms,
+            )
+        else:
+            # 闲聊场景，不搜索知识库
+            kb_search_status = "not_run"
+            kb_context = ""
+            log.info("[%s] kb search skipped | reason=casual_chat", group_id)
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
             skill_reply = await skill.answer_with_skill(
@@ -732,6 +741,7 @@ async def on_group_message(
                 sender_is_tg_admin=sender_is_tg_admin,
                 message=message,
                 mandatory_kb_context=kb_context,
+                intent_type=action,
             )
             if skill_reply:
                 reply = skill_reply
@@ -748,8 +758,14 @@ async def on_group_message(
                     sender_is_owner=sender_is_owner,
                     sender_is_tg_admin=sender_is_tg_admin,
                     mandatory_kb_context=kb_context,
+                    intent_type=action,
                 )
-                log.info("[%s] reply via casual | %s", group_id, reply[:80] if reply else "(empty)")
+                log.info(
+                    "[%s] reply via casual | intent=%s | %s",
+                    group_id,
+                    action,
+                    reply[:80] if reply else "(empty)",
+                )
                 if reply:
                     reply_source = "casual"
 
@@ -762,17 +778,32 @@ async def on_group_message(
         reply_for_metrics = reply or ""
         silence_reply, silence_reason = _should_silence_generated_reply(reply)
         if silence_reply:
-            preview = _truncate_text(reply, 80) if reply else "-"
-            log.info(
-                "[%s] reply suppressed -> silent | reason=%s source=%s preview=%s",
-                group_id,
-                silence_reason,
-                reply_source,
-                preview,
-            )
-            reply = ""
-            reply_source = "none"
-            action = "skip"
+            # 根据决策类型和静默原因决定是否真的要静默
+            should_really_silence = True
+            if action == "casual" and silence_reason == "silent_marker":
+                # 闲聊场景返回了 NO_TRUSTED_ANSWER，这不合理
+                # 说明提示词可能没生效，使用默认友好回复
+                log.warning("[%s] casual chat returned NO_TRUSTED_ANSWER, using fallback reply", group_id)
+                reply = "嗯嗯，我在听~"
+                should_really_silence = False
+                reply_source = "fallback"
+            elif action == "question" and silence_reason == "silent_marker":
+                # 问题场景返回 NO_TRUSTED_ANSWER，这是正常的，应该静默
+                log.info("[%s] question returned NO_TRUSTED_ANSWER, silencing as expected", group_id)
+                should_really_silence = True
+            if should_really_silence:
+                preview = _truncate_text(reply, 80) if reply else "-"
+                log.info(
+                    "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
+                    group_id,
+                    silence_reason,
+                    reply_source,
+                    action,
+                    preview,
+                )
+                reply = ""
+                reply_source = "none"
+                action = "skip"
 
     sticker_decision_started = time.perf_counter()
     sticker_decision = await sticker_decider.decide(

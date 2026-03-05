@@ -243,6 +243,7 @@ class SkillService:
         sender_is_tg_admin: bool = False,
         message: Any | None = None,
         mandatory_kb_context: str = "",
+        intent_type: str = "casual",
     ) -> str:
         user_text = clean_text(text, max_len=1200)
         if contains_prompt_injection(user_text):
@@ -262,6 +263,9 @@ class SkillService:
             },
         ]
         kb_ctx = clean_text(mandatory_kb_context, max_len=4800)
+        normalized_intent = clean_text((intent_type or "casual").strip().lower(), max_len=16)
+        if normalized_intent:
+            messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
         if kb_ctx:
             messages.append(
                 {
