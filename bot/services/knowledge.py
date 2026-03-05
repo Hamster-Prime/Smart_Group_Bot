@@ -57,13 +57,21 @@ class KnowledgeService:
         return entry
 
     async def search(self, session: AsyncSession, group_id: int, query: str) -> list[dict]:
-        """Semantic search via embedding cosine similarity with relaxed fallback."""
-        log.info("[KB] 语义搜索: group=%s, query='%s', top_k=%d", group_id, query[:50], self.config.top_k)
+        """Semantic search with strict thresholding and optional degradations."""
+        log.info(
+            "[KB] semantic search: group=%s query='%s' top_k=%d threshold=%.2f relaxed=%s fallback=%s",
+            group_id,
+            query[:50],
+            self.config.top_k,
+            self.config.similarity_threshold,
+            self.config.enable_relaxed,
+            self.config.enable_fallback,
+        )
 
         query_vecs = await self.llm.embed([query])
         if not query_vecs:
-            log.warning("[KB] 查询嵌入生成失败")
-            return []
+            log.warning("[KB] query embedding generation failed")
+            raise RuntimeError("Embedding generation failed")
         query_vec = query_vecs[0]
 
         stmt = select(KnowledgeEntry).where(
@@ -72,8 +80,7 @@ class KnowledgeService:
         )
         result = await session.execute(stmt)
         entries = list(result.scalars().all())
-        log.info("[KB] 候选条目: %d 条", len(entries))
-
+        log.info("[KB] candidate entries: %d", len(entries))
         if not entries:
             return []
 
@@ -86,42 +93,56 @@ class KnowledgeService:
             if sim >= self.config.similarity_threshold:
                 strict_scored.append((entry, sim))
 
+        retrieval_mode = "strict"
         strict_scored.sort(key=lambda x: x[1], reverse=True)
         if strict_scored:
             top = strict_scored[: self.config.top_k]
-            log.info("[KB] 严格命中: %d 条 (阈值=%.2f)", len(top), self.config.similarity_threshold)
-            return [
-                {"document": f"{e.title}\n{e.content}", "metadata": {"title": e.title}, "score": sim}
-                for e, sim in top
-            ]
-
-        # 宽松召回：问题场景下避免“明明有KB却空结果”
-        relaxed_threshold = max(0.10, self.config.similarity_threshold * 0.5)
-        relaxed_scored = [(e, s) for e, s in all_scored if s >= relaxed_threshold]
-        relaxed_scored.sort(key=lambda x: x[1], reverse=True)
-        if relaxed_scored:
+        elif self.config.enable_relaxed:
+            retrieval_mode = "relaxed"
+            relaxed_threshold = max(0.10, self.config.similarity_threshold * 0.5)
+            relaxed_scored = [(entry, score) for entry, score in all_scored if score >= relaxed_threshold]
+            relaxed_scored.sort(key=lambda x: x[1], reverse=True)
             top = relaxed_scored[: self.config.top_k]
-            log.info("[KB] 宽松召回: %d 条 (阈值=%.2f)", len(top), relaxed_threshold)
-            return [
-                {"document": f"{e.title}\n{e.content}", "metadata": {"title": e.title}, "score": sim}
-                for e, sim in top
-            ]
+            if top:
+                log.info("[KB] relaxed hits: %d (threshold=%.2f)", len(top), relaxed_threshold)
+        elif self.config.enable_fallback:
+            retrieval_mode = "fallback"
+            all_scored.sort(key=lambda x: x[1], reverse=True)
+            top = all_scored[: self.config.top_k]
+            if top:
+                log.info("[KB] fallback hits: %d (best_score=%.4f)", len(top), top[0][1])
+        else:
+            top = []
 
-        # 最后兜底：返回最相近的 top_k，防止持续空命中
-        all_scored.sort(key=lambda x: x[1], reverse=True)
-        top = all_scored[: self.config.top_k]
         if top:
-            log.info("[KB] 兜底召回: %d 条 (best_score=%.4f)", len(top), top[0][1])
-            return [
-                {
-                    "document": f"{e.title}\n{e.content}",
-                    "metadata": {"title": e.title, "fallback": True},
-                    "score": sim,
-                }
-                for e, sim in top
-            ]
+            log.info(
+                "[KB] retrieval done: mode=%s hit=%d threshold=%.2f best_score=%.4f",
+                retrieval_mode,
+                len(top),
+                self.config.similarity_threshold,
+                top[0][1],
+            )
+        else:
+            log.info(
+                "[KB] no match above threshold=%.2f (mode=%s)",
+                self.config.similarity_threshold,
+                retrieval_mode,
+            )
 
-        return []
+        min_reliable_score = self.config.min_reliable_score
+        return [
+            {
+                "document": f"{entry.title}\n{entry.content}",
+                "metadata": {
+                    "title": entry.title,
+                    "reliable": score >= min_reliable_score,
+                    "entry_id": entry.id,
+                    "retrieval_mode": retrieval_mode,
+                },
+                "score": score,
+            }
+            for entry, score in top
+        ]
 
     async def backfill_embeddings(self, session: AsyncSession) -> int:
         """Generate embeddings for entries that don't have one yet."""
@@ -138,9 +159,9 @@ class KnowledgeService:
             if emb:
                 entry.embedding = emb
                 count += 1
-                log.info("[KB] 回填嵌入: id=%d title='%s'", entry.id, entry.title)
+                log.info("[KB] backfilled embedding: id=%d title='%s'", entry.id, entry.title)
         await session.flush()
-        log.info("[KB] 回填完成: %d/%d 条", count, len(entries))
+        log.info("[KB] backfill done: %d/%d", count, len(entries))
         return count
 
     async def remove(self, session: AsyncSession, group_id: int, title: str) -> bool:

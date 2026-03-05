@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
@@ -50,6 +50,34 @@ class KnowledgeEntry(Base):
     )
 
     group: Mapped[Group] = relationship(back_populates="knowledge_entries")
+
+
+class KBUsageMetric(Base):
+    """Knowledge-base usage metrics for observability."""
+
+    __tablename__ = "kb_usage_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    query: Mapped[str] = mapped_column(String(200), default="")
+    search_status: Mapped[str] = mapped_column(String(20), default="success")
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    reliable_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_score: Mapped[float] = mapped_column(Float, default=0.0)
+    reply_generated: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_is_no_answer: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_length: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_kb_usage_group_created", "group_id", "created_at"),
+        Index("ix_kb_usage_group_status", "group_id", "search_status"),
+    )
 
 
 class ModerationRule(Base):

@@ -70,8 +70,11 @@ class BotConfig(BaseModel):
 
 
 class KnowledgeConfig(BaseModel):
-    top_k: int = 5
-    similarity_threshold: float = 0.3
+    top_k: int = 3
+    similarity_threshold: float = 0.55
+    enable_fallback: bool = False
+    enable_relaxed: bool = False
+    min_reliable_score: float = 0.60
 
 
 class ModerationConfig(BaseModel):
@@ -145,6 +148,11 @@ class Settings(BaseSettings):
     bot_auto_delete_minutes: int = 0
     bot_decision_context_items: int = 5
     skill_sticker_file_ids: str = ""
+    knowledge_top_k: int | None = None
+    knowledge_similarity_threshold: float | None = None
+    knowledge_enable_fallback: bool | None = None
+    knowledge_enable_relaxed: bool | None = None
+    knowledge_min_reliable_score: float | None = None
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
     memory_v2_enabled: bool = True
@@ -386,6 +394,28 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
     settings.bot.auto_delete_minutes = max(0, settings.bot_auto_delete_minutes)
     settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
+    if settings.knowledge_top_k is not None:
+        settings.knowledge.top_k = settings.knowledge_top_k
+    if settings.knowledge_similarity_threshold is not None:
+        settings.knowledge.similarity_threshold = settings.knowledge_similarity_threshold
+    if settings.knowledge_enable_fallback is not None:
+        settings.knowledge.enable_fallback = settings.knowledge_enable_fallback
+    if settings.knowledge_enable_relaxed is not None:
+        settings.knowledge.enable_relaxed = settings.knowledge_enable_relaxed
+    if settings.knowledge_min_reliable_score is not None:
+        settings.knowledge.min_reliable_score = settings.knowledge_min_reliable_score
+
+    settings.knowledge.top_k = max(1, settings.knowledge.top_k)
+    settings.knowledge.similarity_threshold = min(
+        1.0,
+        max(-1.0, settings.knowledge.similarity_threshold),
+    )
+    settings.knowledge.min_reliable_score = min(
+        1.0,
+        max(-1.0, settings.knowledge.min_reliable_score),
+    )
+    if settings.knowledge.min_reliable_score < settings.knowledge.similarity_threshold:
+        settings.knowledge.min_reliable_score = settings.knowledge.similarity_threshold
 
     # New provider registry + role binding.
     raw_env = _load_raw_env()

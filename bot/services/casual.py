@@ -80,9 +80,13 @@ class CasualService:
                 {
                     "role": "system",
                     "content": (
-                        "系统要求：本轮已强制执行本地知识库检索。"
-                        "你必须先参考知识库检索结果，再结合上下文回答。"
-                        "若问题需要事实依据且知识库结果为空或不足，必须仅返回 NO_TRUSTED_ANSWER，不要编造。"
+                        "[KNOWLEDGE_BASE_MANDATORY_MODE]\n"
+                        "本轮已执行知识库检索。你必须遵守以下规则:\n"
+                        "1. 仅使用下方知识库结果回答,严禁使用训练数据中的任何知识\n"
+                        "2. 若知识库结果不足以完整回答,必须返回: NO_TRUSTED_ANSWER\n"
+                        "3. 不要尝试'补充'、'推测'或'结合常识'\n"
+                        "4. 纯闲聊/情绪回复不受此限制\n"
+                        "5. 优先使用HIGH_CONFIDENCE条目,谨慎使用MEDIUM_CONFIDENCE条目"
                     ),
                 }
             )

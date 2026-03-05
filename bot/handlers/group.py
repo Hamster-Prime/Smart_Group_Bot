@@ -20,6 +20,7 @@ from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.knowledge import KnowledgeService
+from bot.services.kb_metrics import KBMetricsCollector, KBSearchMetrics
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.skills import SkillService
@@ -112,34 +113,96 @@ def _truncate_text(text: str, max_len: int) -> str:
     return cleaned[:max_len] + "..."
 
 
-def _format_mandatory_kb_context(query: str, results: list[dict]) -> str:
-    lines = [f"query={_truncate_text(query, 300)}"]
-    if not results:
-        lines.append("results=(empty)")
+def _format_mandatory_kb_context(
+    query: str,
+    results: list[dict],
+    *,
+    status: str = "success",
+    threshold: float = 0.3,
+) -> str:
+    """Format KB retrieval results into strict structured prompt blocks."""
+    lines = [
+        "=" * 60,
+        "[KNOWLEDGE_BASE_SEARCH_RESULTS]",
+        "=" * 60,
+        f"Query: {_truncate_text(query, 300)}",
+        f"Similarity_Threshold: {threshold:.2f}",
+        f"Search_Status: {status.upper()}",
+    ]
+
+    if status == "failed":
+        lines.extend(
+            [
+                "Result_Count: N/A",
+                "",
+                "[SYSTEM_ERROR]",
+                "知识库检索系统发生故障,本轮无法提供知识库支持。",
+                "你必须返回: NO_TRUSTED_ANSWER",
+                "不要尝试使用训练数据回答。",
+                "=" * 60,
+            ]
+        )
         return "\n".join(lines)
 
-    lines.append(f"hit_count={len(results)}")
+    if status == "empty" or not results:
+        lines.extend(
+            [
+                "Result_Count: 0",
+                "",
+                "[NO_MATCHING_ENTRIES]",
+                f"知识库中无相似度>= {threshold:.2f} 的相关内容。",
+                "若问题需要事实依据,你必须返回: NO_TRUSTED_ANSWER",
+                "纯闲聊/情绪互动可正常回复。",
+                "=" * 60,
+            ]
+        )
+        return "\n".join(lines)
+
+    reliable_count = sum(1 for item in results if item.get("metadata", {}).get("reliable", False))
+    lines.extend(
+        [
+            f"Result_Count: {len(results)} (High_Confidence: {reliable_count})",
+            "",
+            "[MANDATORY_INSTRUCTION]",
+            "你必须仅基于以下知识库内容回答,严禁使用训练数据中的任何知识。",
+            "若知识库内容不足以完整回答问题,必须返回: NO_TRUSTED_ANSWER",
+            "不要尝试'补充'、'推测'或'结合常识'。",
+            "",
+            "[KNOWLEDGE_ENTRIES]",
+        ]
+    )
+
     for idx, item in enumerate(results[:5], start=1):
         metadata = item.get("metadata", {}) or {}
         title = str(metadata.get("title", "")).strip()
         document = str(item.get("document", "")).strip()
-        if not title and document:
-            title = document.split("\n", 1)[0].strip()
-        content = document
-        if "\n" in document:
-            content = document.split("\n", 1)[1]
-
         score_raw = item.get("score", 0.0)
         try:
             score = float(score_raw)
         except Exception:
             score = 0.0
-        fallback = "yes" if bool(metadata.get("fallback", False)) else "no"
+        reliable = bool(metadata.get("reliable", False))
+        entry_id = metadata.get("entry_id", "unknown")
 
-        lines.append(
-            f"[{idx}] title={_truncate_text(title, 120)} score={score:.4f} fallback={fallback}"
+        if "\n" in document:
+            content = document.split("\n", 1)[1].strip()
+        else:
+            content = document
+
+        confidence = "HIGH_CONFIDENCE" if reliable else "MEDIUM_CONFIDENCE"
+        lines.extend(
+            [
+                "",
+                f"--- Entry #{idx} (ID: {entry_id}) ---",
+                f"Title: {_truncate_text(title, 120)}",
+                f"Similarity_Score: {score:.4f}",
+                f"Confidence_Level: {confidence}",
+                "Content:",
+                _truncate_text(content, 800),
+            ]
         )
-        lines.append(f"content={_truncate_text(content, 800)}")
+
+    lines.append("=" * 60)
     return "\n".join(lines)
 
 
@@ -598,6 +661,7 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     reply_source = "none"
+    reply_for_metrics = ""
     sticker_decision_send = False
     sticker_decision_reason = ""
     sticker_decision_file = ""
@@ -623,21 +687,38 @@ async def on_group_message(
         int((time.perf_counter() - decision_started) * 1000),
     )
 
+    kb_search_started = time.perf_counter()
+    kb_elapsed_ms = 0
+    kb_results: list[dict] = []
+    kb_search_status = "not_run"
+    kb_context = ""
+
     if action != "skip":
         history = await memory.get_history_for_llm(group_id, query=input_text)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
         kb_search_started = time.perf_counter()
-        kb_results: list[dict] = []
+        kb_search_status = "success"
         try:
             kb_results = await kb.search(session, group_id, input_text)
+            if not kb_results:
+                kb_search_status = "empty"
         except Exception:
             log.exception("[%s] mandatory kb search failed", group_id)
-        kb_context = _format_mandatory_kb_context(input_text, kb_results)
+            kb_search_status = "failed"
+            kb_results = []
+        kb_elapsed_ms = int((time.perf_counter() - kb_search_started) * 1000)
+        kb_context = _format_mandatory_kb_context(
+            input_text,
+            kb_results,
+            status=kb_search_status,
+            threshold=settings.knowledge.similarity_threshold,
+        )
         log.info(
-            "[%s] mandatory kb search done | hit=%d | elapsed=%dms",
+            "[%s] mandatory kb search done | status=%s hit=%d | elapsed=%dms",
             group_id,
+            kb_search_status,
             len(kb_results),
-            int((time.perf_counter() - kb_search_started) * 1000),
+            kb_elapsed_ms,
         )
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
@@ -678,6 +759,7 @@ async def on_group_message(
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
                 reply = normalized_reply
 
+        reply_for_metrics = reply or ""
         silence_reply, silence_reason = _should_silence_generated_reply(reply)
         if silence_reply:
             preview = _truncate_text(reply, 80) if reply else "-"
@@ -745,6 +827,27 @@ async def on_group_message(
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_minutes=settings.bot.auto_delete_minutes,
         )
+    if kb_search_status != "not_run":
+        metrics_reply_text = reply_for_metrics or reply or ""
+        metrics = KBSearchMetrics(
+            group_id=group_id,
+            query=input_text[:200],
+            search_status=kb_search_status,
+            hit_count=len(kb_results),
+            reliable_count=sum(
+                1 for item in kb_results if item.get("metadata", {}).get("reliable", False)
+            ),
+            max_score=max((float(item.get("score", 0.0)) for item in kb_results), default=0.0),
+            reply_generated=bool(metrics_reply_text),
+            reply_is_no_answer="NO_TRUSTED_ANSWER" in metrics_reply_text.upper(),
+            reply_length=len(metrics_reply_text),
+            elapsed_ms=kb_elapsed_ms,
+        )
+        try:
+            kb_metrics = KBMetricsCollector()
+            await kb_metrics.record_search(session, metrics)
+        except Exception:
+            log.exception("[%s] kb metrics recording failed", group_id)
 
     if action == "skip":
         log.info(
