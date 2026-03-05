@@ -680,7 +680,7 @@ class AVSearchService:
                 code=code,
                 title=title,
             )
-        genres = self._extract_javbus_field_list(content, ["\u985e\u5225", "\u7c7b\u522b", "Genre", "\u30b8\u30e3\u30f3\u30eb"])
+        genres = self._extract_javbus_genres(content)
 
         score = _clean_text(
             _extract_first(r"(?:\u8a55\u5206|\u8bc4\u5206|Rating)\s*[:\uFF1A]?\s*([0-9.]{1,4})", content),
@@ -789,6 +789,48 @@ class AVSearchService:
             if guessed:
                 names.append(guessed)
         return [x for x in _dedupe_keep_order(names) if _looks_like_person_name(x)]
+
+    def _extract_javbus_genres(self, content: str) -> list[str]:
+        genres = self._extract_javbus_field_list(
+            content,
+            ["\u985e\u5225", "\u7c7b\u522b", "Genre", "\u30b8\u30e3\u30f3\u30eb"],
+        )
+        if genres:
+            return genres
+
+        # Stable fallback: JAVBUS genre block uses checkbox name="gr_sel".
+        by_selector = [
+            _clean_text(_strip_tags(inner), max_len=40)
+            for inner in re.findall(
+                r'name=["\']gr_sel["\'][^>]*>\s*<a[^>]*>(.*?)</a>',
+                content or "",
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        ]
+        by_selector = [x for x in by_selector if x]
+        if by_selector:
+            return _dedupe_keep_order(by_selector)
+
+        block = _extract_first(
+            r'<p[^>]+class=["\']header["\'][^>]*>\s*(?:\u985e\u5225|\u7c7b\u522b|Genre)[^<]*</p>\s*<p[^>]*>(.*?)</p>\s*<p[^>]+class=["\']star-show["\']',
+            content,
+        )
+        if not block:
+            return []
+
+        out: list[str] = []
+        for href, inner in re.findall(
+            r'<a[^>]+href=["\'](.*?)["\'][^>]*>(.*?)</a>',
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            if "/genre/" not in (href or "").lower():
+                continue
+            text = _clean_text(_strip_tags(inner), max_len=40)
+            if not text:
+                continue
+            out.append(text)
+        return _dedupe_keep_order(out)
 
     @staticmethod
     def _extract_javbus_star_ids(content: str) -> list[str]:

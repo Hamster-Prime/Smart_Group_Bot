@@ -17,10 +17,13 @@ from aiogram.types import (
     InputMediaPhoto,
     Message,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
+from bot.db.models import Group
 from bot.services.authz import ensure_group_admin_permission, ensure_group_authorized
+from bot.services.authz import ensure_super_admin
 from bot.services.av_search import (
     AVDetail,
     AVQuerySession,
@@ -39,6 +42,7 @@ log = logging.getLogger(__name__)
 _AV_SEARCH_PAGE_SIZE = 6
 _AV_SEED_PAGE_SIZE = 1
 _AV_SESSION_STORE = AVQuerySessionStore(ttl_seconds=15 * 60, max_sessions=256)
+_AV_GROUP_ENABLE_KEY = "av_enabled"
 
 
 async def _answer(message: Message, settings: Settings, text: str) -> None:
@@ -47,6 +51,53 @@ async def _answer(message: Message, settings: Settings, text: str) -> None:
         text,
         auto_delete_minutes=settings.bot.auto_delete_minutes,
     )
+
+
+async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
+    row = await session.get(Group, group_id)
+    if row:
+        if title and row.title != title:
+            row.title = title
+        if row.settings is None:
+            row.settings = {}
+        return row
+
+    try:
+        async with session.begin_nested():
+            row = Group(id=group_id, title=title or "", settings={})
+            session.add(row)
+            await session.flush()
+            return row
+    except IntegrityError:
+        row = await session.get(Group, group_id)
+        if row:
+            if title and row.title != title:
+                row.title = title
+            if row.settings is None:
+                row.settings = {}
+            return row
+
+    row = Group(id=group_id, title=title or "", settings={})
+    session.add(row)
+    return row
+
+
+def _is_group_av_enabled(group_settings: dict | None) -> bool:
+    settings_dict = group_settings if isinstance(group_settings, dict) else {}
+    value = settings_dict.get(_AV_GROUP_ENABLE_KEY)
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return bool(value)
 
 
 def _parse_json_payload(raw: str) -> dict | None:
@@ -211,7 +262,7 @@ def _build_av_detail_caption(detail: AVDetail) -> str:
     if detail.actors:
         lines.append(f"<b>演员</b>: {html.escape(_truncate_text(' / '.join(detail.actors), 80))}")
     if detail.genres:
-        lines.append(f"<b>类别</b>: {html.escape(_truncate_text(' / '.join(detail.genres), 80))}")
+        lines.append(f"<b>类型</b>: {html.escape(_truncate_text(' / '.join(detail.genres), 80))}")
     if detail.seeds:
         lines.append(f"<b>种子</b>: {len(detail.seeds)} 条（可翻页）")
     else:
@@ -246,7 +297,7 @@ def _build_av_detail_text(detail: AVDetail) -> str:
     if detail.actors:
         lines.append(f"<b>演员</b>: {html.escape(' / '.join(detail.actors))}")
     if detail.genres:
-        lines.append(f"<b>类别</b>: {html.escape(' / '.join(detail.genres))}")
+        lines.append(f"<b>类型</b>: {html.escape(' / '.join(detail.genres))}")
     if detail.summary:
         lines.append(f"<b>简介</b>: {html.escape(_truncate_text(detail.summary, 360))}")
 
@@ -585,7 +636,9 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/authlist 授权群组列表\n"
         "/authadmin 授权群管理\n"
         "/unauthadmin 撤销授权群管理\n"
-        "/adminlist 群管理列表"
+        "/adminlist 群管理列表\n"
+        "/av enable（在当前群启用 AV 查询）\n"
+        "/av disable（在当前群停用 AV 查询）"
     )
 
 
@@ -602,9 +655,58 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 查询用法</b>\n"
             "1. /av WANZ-530（按番号直查并展示详情+种子）\n"
             "2. /av 推川悠里（按演员名查询并弹出可选列表）\n"
-            "3. /av 人妻 NTR（按关键词查询并弹出可选列表）",
+            "3. /av 人妻 NTR（按关键词查询并弹出可选列表）\n\n"
+            "默认状态：<b>关闭</b>（每个群独立）\n"
+            "需最高管理员在目标群发送 /av enable 后可使用\n\n"
+            "<b>最高管理员命令（群内）</b>\n"
+            "4. /av enable（启用本群 AV 查询）\n"
+            "5. /av disable（停用本群 AV 查询）",
         )
         return
+
+    args_norm = args.strip().lower()
+    if args_norm in {"enable", "disable"}:
+        if not message.chat or message.chat.type not in ("group", "supergroup"):
+            await _answer(
+                message,
+                settings,
+                "<b>AV 开关</b>\n请在目标群内发送：/av enable 或 /av disable",
+            )
+            return
+        if not await ensure_super_admin(message, settings):
+            return
+
+        group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+        group_settings = dict(group_row.settings or {})
+        target_enabled = args_norm == "enable"
+        previous = _is_group_av_enabled(group_settings)
+        group_settings[_AV_GROUP_ENABLE_KEY] = target_enabled
+        group_row.settings = group_settings
+        await session.flush()
+
+        if previous == target_enabled:
+            status_line = "状态未变化"
+        else:
+            status_line = "已更新"
+        state_text = "已启用" if target_enabled else "已停用"
+        await _answer(
+            message,
+            settings,
+            "<b>AV 开关</b>\n"
+            f"<b>群ID</b>: {message.chat.id}\n"
+            f"<b>结果</b>: {state_text}（{status_line}）",
+        )
+        return
+
+    if message.chat and message.chat.type in ("group", "supergroup"):
+        group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+        if not _is_group_av_enabled(group_row.settings):
+            await _answer(
+                message,
+                settings,
+                "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
+            )
+            return
 
     svc = AVSearchService(settings)
     if not svc.enabled:
@@ -686,6 +788,11 @@ async def on_av_search_paging(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
+    if msg.chat and msg.chat.type in ("group", "supergroup"):
+        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
+        if not _is_group_av_enabled(group_row.settings):
+            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
+            return
 
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -731,6 +838,11 @@ async def on_av_detail_select(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
+    if msg.chat and msg.chat.type in ("group", "supergroup"):
+        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
+        if not _is_group_av_enabled(group_row.settings):
+            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
+            return
 
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -796,6 +908,11 @@ async def on_av_seed_paging(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
+    if msg.chat and msg.chat.type in ("group", "supergroup"):
+        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
+        if not _is_group_av_enabled(group_row.settings):
+            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
+            return
 
     parts = callback.data.split(":")
     if len(parts) != 4:
