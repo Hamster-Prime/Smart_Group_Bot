@@ -5,9 +5,10 @@ import json
 import logging
 import re
 
-from aiogram import Router
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,8 @@ from bot.services.authz import (
     ensure_group_admin_permission,
     ensure_group_authorized,
     ensure_super_admin,
+    is_group_admin_authorized,
+    is_super_admin_user_id,
     list_group_admins,
     list_authorized_groups,
 )
@@ -36,6 +39,7 @@ log = logging.getLogger(__name__)
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
 _ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
 _MUTE_ALL_REPLIES_KEY = "mute_all_replies"
+_LIST_PAGE_SIZE = 5
 _MUTE_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /mute\n"
@@ -48,11 +52,17 @@ _UNMUTE_USAGE = (
 )
 
 
-async def _answer(message: Message, settings: Settings, text: str) -> None:
+async def _answer(
+    message: Message,
+    settings: Settings,
+    text: str,
+    **kwargs: object,
+) -> None:
     await answer_with_auto_delete(
         message,
         text,
         auto_delete_minutes=settings.bot.auto_delete_minutes,
+        **kwargs,
     )
 
 
@@ -173,6 +183,236 @@ def _safe_user_label(user_id: int, full_name: str | None = None) -> str:
     return str(user_id)
 
 
+def _parse_int(value: str, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_auth_group_list_page(
+    rows: list,
+    *,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = len(rows)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    start = page * _LIST_PAGE_SIZE
+    end = min(start + _LIST_PAGE_SIZE, total)
+
+    lines = [
+        "<b>已授权群组</b>",
+        f"共 {total} 个 | 页码: {page + 1}/{total_pages}",
+        "",
+    ]
+    for idx, row in enumerate(rows[start:end], start=start + 1):
+        lines.append(f"{idx}. <b>群ID</b>: {row.group_id} | 授权人: {row.authorized_by or 0}")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"atl:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="下一页 ➡️",
+                callback_data=f"atl:{page + 1}",
+            )
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+    return "\n".join(lines), keyboard
+
+
+def _build_admin_list_page(
+    rows: list,
+    *,
+    group_id: int,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = len(rows)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    start = page * _LIST_PAGE_SIZE
+    end = min(start + _LIST_PAGE_SIZE, total)
+
+    lines = [
+        "<b>群管理授权列表</b>",
+        f"群ID: {group_id} | 共 {total} 人 | 页码: {page + 1}/{total_pages}",
+        "",
+    ]
+    for idx, row in enumerate(rows[start:end], start=start + 1):
+        lines.append(f"{idx}. <b>用户ID</b>: {row.user_id} | 角色: {html.escape(row.role)}")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"adl:{group_id}:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="下一页 ➡️",
+                callback_data=f"adl:{group_id}:{page + 1}",
+            )
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+    return "\n".join(lines), keyboard
+
+
+def _build_warning_list_page(
+    rows: list[UserWarning],
+    *,
+    threshold: int,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = len(rows)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    start = page * _LIST_PAGE_SIZE
+    end = min(start + _LIST_PAGE_SIZE, total)
+    banned_count = sum(1 for row in rows if row.is_banned)
+
+    lines = [
+        "<b>当前群组警告/封禁名单</b>",
+        f"<b>总人数</b>: {total} | 页码: {page + 1}/{total_pages}",
+        f"<b>已封禁</b>: {banned_count}",
+        f"<b>警告中</b>: {total - banned_count}",
+        "",
+    ]
+    for idx, row in enumerate(rows[start:end], start=start + 1):
+        status = "已封禁" if row.is_banned else "警告中"
+        lines.append(f"{idx}. 用户ID: {row.user_id} | 次数: {row.count}/{threshold} | 状态: {status}")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"wpl:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="下一页 ➡️",
+                callback_data=f"wpl:{page + 1}",
+            )
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
+    return "\n".join(lines), keyboard
+
+
+def _build_rule_list_page(
+    rules: list[ModerationRule],
+    *,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    total = len(rules)
+    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    start = page * _LIST_PAGE_SIZE
+    end = min(start + _LIST_PAGE_SIZE, total)
+
+    lines = [
+        "<b>群审核规则</b>",
+        f"共 {total} 条 | 页码: {page + 1}/{total_pages}",
+        "",
+        "点击下方按钮可删除对应规则：",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for idx, rule in enumerate(rules[start:end], start=start + 1):
+        status = "启用" if rule.enabled else "关闭"
+        pattern_preview = html.escape(_truncate_text(rule.pattern or "", 120))
+        lines.append(
+            f"{idx}. <b>#{rule.id}</b> [{_rule_type_label(rule.rule_type)}] {_action_label(rule.action)} | {status}"
+        )
+        lines.append(f"规则: {pattern_preview}")
+        lines.append("")
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 删除规则 #{rule.id}",
+                    callback_data=f"rud:{rule.id}:{page}",
+                )
+            ]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ 上一页",
+                callback_data=f"rul:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="下一页 ➡️",
+                callback_data=f"rul:{page + 1}",
+            )
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+
+    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+async def _callback_user_can_manage_rules(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    msg = callback.message
+    if not msg or not msg.chat or msg.chat.type not in ("group", "supergroup"):
+        await callback.answer("消息已失效", show_alert=True)
+        return False
+    if not await ensure_group_authorized(msg, session, settings):
+        await callback.answer("当前群组未授权", show_alert=True)
+        return False
+
+    user = callback.from_user
+    if user and is_super_admin_user_id(user.id, settings):
+        return True
+    if not user:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return False
+    if await is_group_admin_authorized(session, msg.chat.id, user.id):
+        return True
+
+    await callback.answer("仅群管理可操作该列表", show_alert=True)
+    return False
+
+
+async def _callback_user_is_super_admin(
+    callback: CallbackQuery,
+    settings: Settings,
+) -> bool:
+    user = callback.from_user
+    if user and is_super_admin_user_id(user.id, settings):
+        return True
+    await callback.answer("仅最高管理员可操作该列表", show_alert=True)
+    return False
+
+
 async def _reply_rules(message: Message, session: AsyncSession, settings: Settings) -> None:
     stmt = (
         select(ModerationRule)
@@ -186,19 +426,14 @@ async def _reply_rules(message: Message, session: AsyncSession, settings: Settin
         await _answer(message, settings, "<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。")
         return
 
-    lines = [f"<b>群审核规则</b>\n共 {len(rules)} 条"]
-    for r in rules:
-        status = "启用" if r.enabled else "关闭"
-        pattern_preview = html.escape(_truncate_text(r.pattern or "", 120))
-        lines.append(
-            "\n".join(
-                [
-                    f"<b>#{r.id}</b> [{_rule_type_label(r.rule_type)}] {_action_label(r.action)} | {status}",
-                    f"规则: {pattern_preview}",
-                ]
-            )
-        )
-    await _answer(message, settings, "\n\n".join(lines))
+    text, keyboard = _build_rule_list_page(list(rules), page=0)
+    await _answer(
+        message,
+        settings,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("authgroup"))
@@ -271,10 +506,14 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
         await _answer(message, settings, "<b>已授权群组</b>\n当前为空。")
         return
 
-    lines = [f"<b>已授权群组</b>\n共 {len(rows)} 个"]
-    for idx, r in enumerate(rows[:100], start=1):
-        lines.append(f"{idx}. <b>群ID</b>: {r.group_id} | 授权人: {r.authorized_by or 0}")
-    await _answer(message, settings, "\n".join(lines))
+    text, keyboard = _build_auth_group_list_page(rows, page=0)
+    await _answer(
+        message,
+        settings,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("authadmin"))
@@ -367,10 +606,14 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
         )
         return
 
-    lines = [f"<b>群管理授权列表</b>\n群ID: {group_id} | 共 {len(rows)} 人"]
-    for idx, row in enumerate(rows[:200], start=1):
-        lines.append(f"{idx}. <b>用户ID</b>: {row.user_id} | 角色: {html.escape(row.role)}")
-    await _answer(message, settings, "\n".join(lines))
+    text, keyboard = _build_admin_list_page(rows, group_id=group_id, page=0)
+    await _answer(
+        message,
+        settings,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("addrule"))
@@ -503,6 +746,278 @@ async def cmd_rules(message: Message, session: AsyncSession, settings: Settings)
     if not await ensure_group_admin_permission(message, session, settings):
         return
     await _reply_rules(message, session, settings)
+
+
+@router.callback_query(F.data.startswith("rul:"))
+async def on_rule_list_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /rules", show_alert=True)
+        return
+    if not await _callback_user_can_manage_rules(callback, session, settings):
+        return
+
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer("参数错误", show_alert=True)
+        return
+    page = _parse_int(parts[1], default=0)
+
+    stmt = (
+        select(ModerationRule)
+        .where(ModerationRule.group_id == msg.chat.id)
+        .order_by(ModerationRule.id)
+    )
+    result = await session.execute(stmt)
+    rules = list(result.scalars().all())
+    if not rules:
+        await msg.edit_text("<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。", reply_markup=None)
+        await callback.answer("列表已空")
+        return
+
+    text, keyboard = _build_rule_list_page(rules, page=page)
+    try:
+        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("列表刷新失败，请重试 /rules", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("列表刷新失败，请重试 /rules", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rud:"))
+async def on_rule_delete(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /rules", show_alert=True)
+        return
+    if not await _callback_user_can_manage_rules(callback, session, settings):
+        return
+
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("参数错误", show_alert=True)
+        return
+
+    rid = _parse_int(parts[1], default=0)
+    page_hint = _parse_int(parts[2], default=0)
+    if rid <= 0:
+        await callback.answer("参数错误", show_alert=True)
+        return
+
+    rule = await session.get(ModerationRule, rid)
+    if not rule or rule.group_id != msg.chat.id:
+        await callback.answer("规则不存在或已删除", show_alert=True)
+        return
+
+    pattern_label = _truncate_text(rule.pattern or "", 24) or f"#{rule.id}"
+    await session.delete(rule)
+    await session.flush()
+
+    stmt = (
+        select(ModerationRule)
+        .where(ModerationRule.group_id == msg.chat.id)
+        .order_by(ModerationRule.id)
+    )
+    result = await session.execute(stmt)
+    rules = list(result.scalars().all())
+    if not rules:
+        await msg.edit_text("<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。", reply_markup=None)
+        await callback.answer(f"已删除: {pattern_label}")
+        return
+
+    total_pages = max(1, (len(rules) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
+    page = min(max(page_hint, 0), total_pages - 1)
+    text, keyboard = _build_rule_list_page(rules, page=page)
+    try:
+        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except Exception:
+        await callback.answer("删除成功，但列表刷新失败，请重试 /rules", show_alert=True)
+        return
+    await callback.answer(f"已删除: {pattern_label}")
+
+
+@router.callback_query(F.data.startswith("atl:"))
+async def on_authlist_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /authlist", show_alert=True)
+        return
+    if not await _callback_user_is_super_admin(callback, settings):
+        return
+
+    msg = callback.message
+    if not msg:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer("参数错误", show_alert=True)
+        return
+    page = _parse_int(parts[1], default=0)
+
+    rows = await list_authorized_groups(session)
+    if not rows:
+        await msg.edit_text("<b>已授权群组</b>\n当前为空。", reply_markup=None)
+        await callback.answer("列表已空")
+        return
+
+    text, keyboard = _build_auth_group_list_page(rows, page=page)
+    try:
+        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("列表刷新失败，请重试 /authlist", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("列表刷新失败，请重试 /authlist", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adl:"))
+async def on_adminlist_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /adminlist", show_alert=True)
+        return
+    if not await _callback_user_is_super_admin(callback, settings):
+        return
+
+    msg = callback.message
+    if not msg:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("参数错误", show_alert=True)
+        return
+    group_id = _parse_int(parts[1], default=0)
+    page = _parse_int(parts[2], default=0)
+    if group_id == 0:
+        await callback.answer("参数错误", show_alert=True)
+        return
+
+    rows = await list_group_admins(session, group_id)
+    if not rows:
+        await msg.edit_text(
+            "<b>群管理授权列表</b>\n"
+            f"<b>群ID</b>: {group_id}\n"
+            "<b>结果</b>: 当前无已授权群管理",
+            reply_markup=None,
+        )
+        await callback.answer("列表已空")
+        return
+
+    text, keyboard = _build_admin_list_page(rows, group_id=group_id, page=page)
+    try:
+        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("列表刷新失败，请重试 /adminlist", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("列表刷新失败，请重试 /adminlist", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wpl:"))
+async def on_warnings_paging(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请重新 /warnings", show_alert=True)
+        return
+    if not await _callback_user_can_manage_rules(callback, session, settings):
+        return
+
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer("参数错误", show_alert=True)
+        return
+    page = _parse_int(parts[1], default=0)
+
+    stmt = (
+        select(UserWarning)
+        .where(
+            UserWarning.group_id == msg.chat.id,
+            UserWarning.count > 0,
+        )
+        .order_by(UserWarning.is_banned.desc(), UserWarning.count.desc(), UserWarning.user_id.asc())
+    )
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    if not rows:
+        await msg.edit_text(
+            "<b>当前群组警告/封禁名单</b>\n"
+            "<b>结果</b>: 暂无被警告或封禁用户",
+            reply_markup=None,
+        )
+        await callback.answer("列表已空")
+        return
+
+    threshold = max(1, settings.moderation.warn_threshold)
+    text, keyboard = _build_warning_list_page(rows, threshold=threshold, page=page)
+    try:
+        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            await callback.answer("列表刷新失败，请重试 /warnings", show_alert=True)
+            return
+    except Exception:
+        await callback.answer("列表刷新失败，请重试 /warnings", show_alert=True)
+        return
+    await callback.answer()
 
 
 @router.message(Command("mute"))
@@ -697,19 +1212,14 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
         return
 
     threshold = max(1, settings.moderation.warn_threshold)
-    banned_count = sum(1 for row in rows if row.is_banned)
-    lines = [
-        "<b>当前群组警告/封禁名单</b>",
-        f"<b>总人数</b>: {len(rows)}",
-        f"<b>已封禁</b>: {banned_count}",
-        f"<b>警告中</b>: {len(rows) - banned_count}",
-        "",
-    ]
-    for idx, row in enumerate(rows[:100], start=1):
-        status = "已封禁" if row.is_banned else "警告中"
-        lines.append(f"{idx}. 用户ID: {row.user_id} | 次数: {row.count}/{threshold} | 状态: {status}")
-
-    await _answer(message, settings, "\n".join(lines))
+    text, keyboard = _build_warning_list_page(list(rows), threshold=threshold, page=0)
+    await _answer(
+        message,
+        settings,
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("aiexempt"))
