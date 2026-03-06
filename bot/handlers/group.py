@@ -505,10 +505,20 @@ async def on_group_message(
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
-        exempt = await mod.is_user_exempt(session, group_id, user_id)
-        if exempt:
-            log.info("[%s]【流程】审核 | 豁免用户=%s", group_id, user_id)
+        auto_exempt_tg_admin = sender_is_tg_admin
+        manual_exempt = False
+        if auto_exempt_tg_admin:
+            log.info(
+                "[%s] moderation skipped | reason=tg_admin_auto_exempt user=%s",
+                group_id,
+                user_id,
+            )
         else:
+            manual_exempt = await mod.is_user_exempt(session, group_id, user_id)
+            if manual_exempt:
+                log.info("[%s] moderation skipped | reason=manual_exempt user=%s", group_id, user_id)
+
+        if not auto_exempt_tg_admin and not manual_exempt:
             violated, reason, rule = await mod.check_rules(session, group_id, input_text)
             log.info(
                 "[%s]【流程】审核 | 完成 | 违规=%s | 原因=%s | 耗时=%dms",
