@@ -344,6 +344,84 @@ def _split_for_telegram(text: str, limit: int) -> list[str]:
     return parts
 
 
+def _compact_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
+
+
+def _truncate_for_context(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[:max_len] + "..."
+
+
+def _format_user_identity(prefix: str, user: object | None) -> str:
+    if not user:
+        return ""
+
+    uid = getattr(user, "id", None)
+    username = _compact_ws(getattr(user, "username", None) or "")
+    display_name = _compact_ws(getattr(user, "full_name", None) or "")
+
+    parts: list[str] = []
+    if uid is not None:
+        parts.append(f"id:{uid}")
+    if username:
+        parts.append(f"username:@{username}")
+    if display_name:
+        parts.append(f"name:{display_name}")
+
+    if not parts:
+        return ""
+    return f"[{prefix}] {' '.join(parts)}"
+
+
+def _format_chat_identity(prefix: str, chat: object | None) -> str:
+    if not chat:
+        return ""
+
+    cid = getattr(chat, "id", None)
+    username = _compact_ws(getattr(chat, "username", None) or "")
+    title = _compact_ws(getattr(chat, "title", None) or "")
+
+    parts: list[str] = []
+    if cid is not None:
+        parts.append(f"id:{cid}")
+    if username:
+        parts.append(f"username:@{username}")
+    if title:
+        parts.append(f"title:{title}")
+
+    if not parts:
+        return ""
+    return f"[{prefix}] {' '.join(parts)}"
+
+
+def _format_contact_text(message: Message) -> str:
+    contact = getattr(message, "contact", None)
+    if not contact:
+        return "[contact]"
+
+    first_name = _compact_ws(getattr(contact, "first_name", None) or "")
+    last_name = _compact_ws(getattr(contact, "last_name", None) or "")
+    phone = _compact_ws(getattr(contact, "phone_number", None) or "")
+    vcard = _compact_ws(getattr(contact, "vcard", None) or "")
+    contact_uid = getattr(contact, "user_id", None)
+
+    name = _compact_ws(" ".join(part for part in (first_name, last_name) if part))
+
+    lines = ["[contact]"]
+    if name:
+        lines.append(f"name: {name}")
+    if phone:
+        lines.append(f"phone: {phone}")
+    if contact_uid is not None:
+        lines.append(f"user_id: {contact_uid}")
+    if vcard:
+        lines.append(f"vcard: {_truncate_for_context(vcard, 200)}")
+
+    return "\n".join(lines)
+
+
 @asynccontextmanager
 async def typing_action(
     message: Message, *, enabled: bool, interval: float = 4.0
@@ -586,6 +664,8 @@ def extract_message_text(message: Message) -> tuple[str, str]:
         if message.caption:
             return f"[audio]\n{message.caption}", "audio_caption"
         return "[audio]", "audio"
+    if message.contact:
+        return _format_contact_text(message), "contact"
     if message.caption:
         return message.caption, "caption"
     if message.sticker:
@@ -595,8 +675,6 @@ def extract_message_text(message: Message) -> tuple[str, str]:
         return "[voice]", "voice"
     if message.video_note:
         return "[video_note]", "video_note"
-    if message.contact:
-        return "[contact]", "contact"
     if message.location:
         return "[location]", "location"
     return "", "unknown"
@@ -608,24 +686,36 @@ def extract_reply_context(message: Message, max_len: int = 320) -> str:
 
     reply = getattr(message, "reply_to_message", None)
     if reply:
+        reply_user_line = _format_user_identity("reply_to_user", getattr(reply, "from_user", None))
+        if reply_user_line:
+            lines.append(reply_user_line)
+
+        reply_chat_line = _format_chat_identity("reply_to_chat", getattr(reply, "sender_chat", None))
+        if reply_chat_line and reply_chat_line not in lines:
+            lines.append(reply_chat_line)
+
         reply_text, reply_type = extract_message_text(reply)
-        reply_text = re.sub(r"\s+", " ", (reply_text or "")).strip()
+        reply_text = _compact_ws(reply_text or "")
         if reply_text:
-            if len(reply_text) > max_len:
-                reply_text = reply_text[:max_len] + "..."
+            reply_text = _truncate_for_context(reply_text, max_len)
             lines.append(f"[reply_to:{reply_type}] {reply_text}")
 
     external_reply = getattr(message, "external_reply", None)
     if external_reply:
+        origin = getattr(external_reply, "origin", None)
+        if origin:
+            ext_user_line = _format_user_identity("external_reply_user", getattr(origin, "sender_user", None))
+            if ext_user_line and ext_user_line not in lines:
+                lines.append(ext_user_line)
+
+            ext_chat_line = _format_chat_identity("external_reply_chat", getattr(origin, "chat", None))
+            if ext_chat_line and ext_chat_line not in lines:
+                lines.append(ext_chat_line)
+
         # External replies can omit full text/caption; keep best-effort signal.
-        ext_text = re.sub(
-            r"\s+",
-            " ",
-            (getattr(external_reply, "text", None) or getattr(external_reply, "caption", None) or ""),
-        ).strip()
+        ext_text = _compact_ws(getattr(external_reply, "text", None) or getattr(external_reply, "caption", None) or "")
         if ext_text:
-            if len(ext_text) > max_len:
-                ext_text = ext_text[:max_len] + "..."
+            ext_text = _truncate_for_context(ext_text, max_len)
             ext_line = f"[external_reply:text] {ext_text}"
         else:
             media_markers: tuple[tuple[str, str], ...] = (
@@ -651,10 +741,9 @@ def extract_reply_context(message: Message, max_len: int = 320) -> str:
             lines.append(ext_line)
 
     quote = getattr(message, "quote", None)
-    quote_text = re.sub(r"\s+", " ", (getattr(quote, "text", None) or "")).strip()
+    quote_text = _compact_ws(getattr(quote, "text", None) or "")
     if quote_text:
-        if len(quote_text) > max_len:
-            quote_text = quote_text[:max_len] + "..."
+        quote_text = _truncate_for_context(quote_text, max_len)
         quote_line = f"[reply_quote] {quote_text}"
         if quote_line not in lines:
             lines.append(quote_line)

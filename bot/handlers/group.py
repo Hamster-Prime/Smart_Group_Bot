@@ -405,6 +405,7 @@ async def _append_image_context(
     | F.document
     | F.audio
     | F.video_note
+    | F.contact
 )
 async def on_group_message(
     message: Message, session: AsyncSession, settings: Settings
@@ -637,16 +638,25 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
-    memory.add_message(
-        group_id,
-        "user",
-        f"[{user_tag}] {input_text}",
-        user_id=user_id,
-        message_type=msg_type,
-        message_id=str(message.message_id),
-    )
-    decision_history = memory.get_history(group_id)[:-1]
-    assistant_reply_count = sum(1 for item in memory.get_history(group_id) if item.get("role") == "assistant")
+    should_index_user_memory = msg_type != "contact"
+    if should_index_user_memory:
+        memory.add_message(
+            group_id,
+            "user",
+            f"[{user_tag}] {input_text}",
+            user_id=user_id,
+            message_type=msg_type,
+            message_id=str(message.message_id),
+        )
+        history_for_decision = memory.get_history(group_id)
+        decision_history = history_for_decision[:-1]
+    else:
+        # Contact cards are useful for moderation, but noisy for long-term memory indexing.
+        history_for_decision = memory.get_history(group_id)
+        decision_history = history_for_decision
+        log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
+
+    assistant_reply_count = sum(1 for item in history_for_decision if item.get("role") == "assistant")
 
     bot_me = await message.bot.me()
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
