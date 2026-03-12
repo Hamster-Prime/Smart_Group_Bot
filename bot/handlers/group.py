@@ -883,7 +883,7 @@ async def on_group_message(
             await reply_sticker_with_auto_delete(
                 message,
                 sticker=sticker_decision_file,
-                auto_delete_minutes=settings.bot.auto_delete_minutes,
+                auto_delete_minutes=0,
             )
             await sticker_library.mark_sent(session, group_id, sticker_decision_file)
             sticker_sent_ok = True
@@ -903,7 +903,7 @@ async def on_group_message(
             stream=settings.bot.enable_streaming,
             stream_chunk_size=settings.bot.stream_chunk_size,
             stream_interval=settings.bot.stream_edit_interval_sec,
-            auto_delete_minutes=settings.bot.auto_delete_minutes,
+            auto_delete_minutes=0,
         )
     if kb_search_status != "not_run":
         metrics_reply_text = reply_for_metrics or reply or ""
