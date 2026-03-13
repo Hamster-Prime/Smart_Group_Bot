@@ -35,6 +35,12 @@ _CODE_SPAN_RE = re.compile(
     r"```[\s\S]*?```|`[^`\n]*`|<code>[\s\S]*?</code>|<pre>[\s\S]*?</pre>",
     flags=re.IGNORECASE,
 )
+_LLM_INTERNAL_BLOCK_RE = re.compile(
+    r"(?is)<\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>[\s\S]*?</\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*\s*>"
+)
+_LLM_INTERNAL_TAG_RE = re.compile(
+    r"(?is)</?\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>"
+)
 
 
 def sanitize_outgoing_mentions(text: str) -> str:
@@ -73,6 +79,19 @@ def sanitize_outgoing_mentions(text: str) -> str:
     if cursor < len(cleaned):
         result_parts.append(_replace_mentions(cleaned[cursor:]))
     return "".join(result_parts)
+
+
+def sanitize_outgoing_text(text: str) -> str:
+    """Remove model-internal markup that can break Telegram entity parsing."""
+    if not text:
+        return ""
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = _LLM_INTERNAL_BLOCK_RE.sub(" ", cleaned)
+    cleaned = _LLM_INTERNAL_TAG_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
 
 
 def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int) -> None:
@@ -503,6 +522,19 @@ async def send_reply(
                 log.warning("telegram flood control on reply, waiting %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
                 attempt += 1
+            except TelegramBadRequest as exc:
+                detail = str(exc).lower()
+                if "can't parse entities" in detail:
+                    return None
+                if attempt >= retries:
+                    log.exception(
+                        "reply bad request chat_id=%s retries=%d",
+                        message.chat.id,
+                        retries,
+                    )
+                    return None
+                attempt += 1
+                await asyncio.sleep(retry_delay * attempt)
             except Exception:
                 if attempt >= retries:
                     log.exception(
@@ -601,7 +633,8 @@ async def send_reply(
 
         return await _finalize_stream_format(sent, segment)
 
-    payload = sanitize_outgoing_mentions((text or "").strip())
+    payload = sanitize_outgoing_text((text or "").strip())
+    payload = sanitize_outgoing_mentions(payload)
     if not payload:
         return False
 

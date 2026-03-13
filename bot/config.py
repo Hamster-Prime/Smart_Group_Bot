@@ -69,47 +69,9 @@ class BotConfig(BaseModel):
     max_output_tokens: int = 2048
 
 
-class KnowledgeConfig(BaseModel):
-    top_k: int = 3
-    similarity_threshold: float = 0.55
-    enable_fallback: bool = False
-    enable_relaxed: bool = False
-    min_reliable_score: float = 0.60
-
-
 class ModerationConfig(BaseModel):
     enabled: bool = True
     warn_threshold: int = 3
-
-
-class MemoryV2Config(BaseModel):
-    enabled: bool = True
-    working_recent_items: int = 50
-    vector_backend: str = "qdrant"  # qdrant
-    qdrant_host: str = "localhost"
-    qdrant_port: int = 6333
-    qdrant_collection_prefix: str = "chat_memory"
-    hybrid_top_k: int = 20
-    retrieval_candidate_multiplier: int = 3
-    similarity_weight: float = 0.4
-    time_weight: float = 0.3
-    importance_weight: float = 0.3
-    time_decay_factor: float = 0.95
-    importance_llm_enabled: bool = True
-    importance_llm_min: float = 0.3
-    importance_llm_max: float = 0.7
-    consolidation_enabled: bool = True
-    consolidation_min_importance: float = 0.7
-    prune_enabled: bool = True
-    prune_days: int = 30
-    max_concurrent_index_tasks: int = 2
-    migrate_legacy_on_start: bool = True
-    legacy_memory_dir: str = "memory"
-    legacy_migration_marker: str = "data/memory_v2_legacy_migrated.flag"
-    kg_enabled: bool = False
-    kg_uri: str = ""
-    kg_user: str = ""
-    kg_password: str = ""
 
 
 class Settings(BaseSettings):
@@ -148,40 +110,7 @@ class Settings(BaseSettings):
     bot_auto_delete_minutes: int = 0
     bot_decision_context_items: int = 5
     skill_sticker_file_ids: str = ""
-    knowledge_top_k: int | None = None
-    knowledge_similarity_threshold: float | None = None
-    knowledge_enable_fallback: bool | None = None
-    knowledge_enable_relaxed: bool | None = None
-    knowledge_min_reliable_score: float | None = None
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
-
-    memory_v2_enabled: bool = True
-    memory_working_recent_items: int = 50
-    memory_vector_backend: str = "qdrant"
-    memory_qdrant_host: str = "localhost"
-    memory_qdrant_port: int = 6333
-    memory_qdrant_collection_prefix: str = "chat_memory"
-    memory_hybrid_top_k: int = 20
-    memory_retrieval_candidate_multiplier: int = 3
-    memory_similarity_weight: float = 0.4
-    memory_time_weight: float = 0.3
-    memory_importance_weight: float = 0.3
-    memory_time_decay_factor: float = 0.95
-    memory_importance_llm_enabled: bool = True
-    memory_importance_llm_min: float = 0.3
-    memory_importance_llm_max: float = 0.7
-    memory_consolidation_enabled: bool = True
-    memory_consolidation_min_importance: float = 0.7
-    memory_prune_enabled: bool = True
-    memory_prune_days: int = 30
-    memory_max_concurrent_index_tasks: int = 2
-    memory_migrate_legacy_on_start: bool = True
-    memory_legacy_memory_dir: str = "memory"
-    memory_legacy_migration_marker: str = "data/memory_v2_legacy_migrated.flag"
-    memory_kg_enabled: bool = False
-    memory_kg_uri: str = ""
-    memory_kg_user: str = ""
-    memory_kg_password: str = ""
 
     av_enabled: bool = True
     av_http_timeout_sec: float = 15.0
@@ -190,9 +119,7 @@ class Settings(BaseSettings):
     av_madouqu_base_url: str = "https://madouqu.com"
 
     bot: BotConfig = BotConfig()
-    knowledge: KnowledgeConfig = KnowledgeConfig()
     moderation: ModerationConfig = ModerationConfig()
-    memory_v2: MemoryV2Config = MemoryV2Config()
 
 
 def _build_litellm_model(provider: str, model: str) -> str:
@@ -382,8 +309,6 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         if "drop_pending_updates" in bot_data:
             settings.bot.drop_pending_updates = bot_data["drop_pending_updates"]
 
-    if "knowledge" in toml_data:
-        settings.knowledge = KnowledgeConfig(**toml_data["knowledge"])
     if "moderation" in toml_data:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
 
@@ -394,28 +319,6 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
     settings.bot.auto_delete_minutes = max(0, settings.bot_auto_delete_minutes)
     settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
-    if settings.knowledge_top_k is not None:
-        settings.knowledge.top_k = settings.knowledge_top_k
-    if settings.knowledge_similarity_threshold is not None:
-        settings.knowledge.similarity_threshold = settings.knowledge_similarity_threshold
-    if settings.knowledge_enable_fallback is not None:
-        settings.knowledge.enable_fallback = settings.knowledge_enable_fallback
-    if settings.knowledge_enable_relaxed is not None:
-        settings.knowledge.enable_relaxed = settings.knowledge_enable_relaxed
-    if settings.knowledge_min_reliable_score is not None:
-        settings.knowledge.min_reliable_score = settings.knowledge_min_reliable_score
-
-    settings.knowledge.top_k = max(1, settings.knowledge.top_k)
-    settings.knowledge.similarity_threshold = min(
-        1.0,
-        max(-1.0, settings.knowledge.similarity_threshold),
-    )
-    settings.knowledge.min_reliable_score = min(
-        1.0,
-        max(-1.0, settings.knowledge.min_reliable_score),
-    )
-    if settings.knowledge.min_reliable_score < settings.knowledge.similarity_threshold:
-        settings.knowledge.min_reliable_score = settings.knowledge.similarity_threshold
 
     # New provider registry + role binding.
     raw_env = _load_raw_env()
@@ -486,51 +389,5 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.max_context_tokens = settings.max_context_tokens
     settings.bot.max_output_tokens = settings.max_output_tokens
     settings.bot.main_model.max_tokens = max(1, settings.max_output_tokens)
-
-    settings.memory_v2.enabled = settings.memory_v2_enabled
-    settings.memory_v2.working_recent_items = max(10, settings.memory_working_recent_items)
-    settings.memory_v2.vector_backend = settings.memory_vector_backend.strip().lower() or "qdrant"
-    if settings.memory_v2.vector_backend != "qdrant":
-        raise ValueError("MEMORY_VECTOR_BACKEND must be qdrant in Memory v2 architecture")
-    settings.memory_v2.qdrant_host = settings.memory_qdrant_host.strip() or "localhost"
-    settings.memory_v2.qdrant_port = max(1, settings.memory_qdrant_port)
-    settings.memory_v2.qdrant_collection_prefix = (
-        settings.memory_qdrant_collection_prefix.strip() or "chat_memory"
-    )
-    settings.memory_v2.hybrid_top_k = max(1, settings.memory_hybrid_top_k)
-    settings.memory_v2.retrieval_candidate_multiplier = max(
-        1,
-        settings.memory_retrieval_candidate_multiplier,
-    )
-    settings.memory_v2.similarity_weight = max(0.0, settings.memory_similarity_weight)
-    settings.memory_v2.time_weight = max(0.0, settings.memory_time_weight)
-    settings.memory_v2.importance_weight = max(0.0, settings.memory_importance_weight)
-    settings.memory_v2.time_decay_factor = min(1.0, max(0.0, settings.memory_time_decay_factor))
-    settings.memory_v2.importance_llm_enabled = settings.memory_importance_llm_enabled
-    settings.memory_v2.importance_llm_min = min(1.0, max(0.0, settings.memory_importance_llm_min))
-    settings.memory_v2.importance_llm_max = min(1.0, max(0.0, settings.memory_importance_llm_max))
-    settings.memory_v2.consolidation_enabled = settings.memory_consolidation_enabled
-    settings.memory_v2.consolidation_min_importance = min(
-        1.0,
-        max(0.0, settings.memory_consolidation_min_importance),
-    )
-    settings.memory_v2.prune_enabled = settings.memory_prune_enabled
-    settings.memory_v2.prune_days = max(1, settings.memory_prune_days)
-    settings.memory_v2.max_concurrent_index_tasks = max(
-        1,
-        settings.memory_max_concurrent_index_tasks,
-    )
-    settings.memory_v2.migrate_legacy_on_start = settings.memory_migrate_legacy_on_start
-    settings.memory_v2.legacy_memory_dir = (
-        settings.memory_legacy_memory_dir.strip() or "memory"
-    )
-    settings.memory_v2.legacy_migration_marker = (
-        settings.memory_legacy_migration_marker.strip()
-        or "data/memory_v2_legacy_migrated.flag"
-    )
-    settings.memory_v2.kg_enabled = settings.memory_kg_enabled
-    settings.memory_v2.kg_uri = settings.memory_kg_uri.strip()
-    settings.memory_v2.kg_user = settings.memory_kg_user.strip()
-    settings.memory_v2.kg_password = settings.memory_kg_password.strip()
 
     return settings

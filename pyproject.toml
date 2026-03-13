@@ -13,8 +13,6 @@ dependencies = [
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
     "ddgs>=9.0",
-    "qdrant-client>=1.10",
-    "neo4j>=5.20",
 ]
 
 [build-system]

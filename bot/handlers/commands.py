@@ -1,9 +1,7 @@
 ﻿from __future__ import annotations
 
 import html
-import json
 import logging
-import re
 
 import aiohttp
 from aiogram import F, Router
@@ -23,11 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Group
 from bot.services.authz import (
-    ensure_group_admin_permission,
     ensure_group_authorized,
     ensure_super_admin,
-    is_group_admin_authorized,
-    is_super_admin_user_id,
 )
 from bot.services.av_search import (
     AVDetail,
@@ -37,9 +32,6 @@ from bot.services.av_search import (
     AVSearchService,
     is_av_code_query,
 )
-from bot.services.knowledge import KnowledgeService
-from bot.services.llm import LLMService
-from bot.utils.prompts import KB_MANAGE_SYSTEM
 from bot.utils.telegram import answer_with_auto_delete, schedule_message_auto_delete, typing_action
 
 router = Router()
@@ -48,7 +40,6 @@ _AV_SEARCH_PAGE_SIZE = 6
 _AV_SEED_PAGE_SIZE = 1
 _AV_SESSION_STORE = AVQuerySessionStore(ttl_seconds=15 * 60, max_sessions=256)
 _AV_GROUP_ENABLE_KEY = "av_enabled"
-_KB_LIST_PAGE_SIZE = 5
 
 
 async def _answer(
@@ -112,140 +103,11 @@ def _is_group_av_enabled(group_settings: dict | None) -> bool:
     return bool(value)
 
 
-def _parse_json_payload(raw: str) -> dict | None:
-    payload = (raw or "").strip()
-
-    if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json)?", "", payload).strip()
-        payload = re.sub(r"```$", "", payload).strip()
-
-    if not payload.startswith("{"):
-        match = re.search(r"\{[\s\S]*\}", payload)
-        if match:
-            payload = match.group(0)
-
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
 def _truncate_text(text: str, max_len: int) -> str:
     cleaned = (text or "").replace("\n", " ").strip()
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[:max_len] + "..."
-
-
-def _build_kb_service(settings: Settings) -> KnowledgeService:
-    llm = LLMService(
-        settings.bot.main_model,
-        settings.bot.decision_model,
-        moderation=settings.bot.moderation_model,
-        embed=settings.bot.embed_model,
-    )
-    return KnowledgeService(settings.knowledge, llm)
-
-
-def _build_kb_list_page(
-    entries: list,
-    *,
-    page: int,
-) -> tuple[str, InlineKeyboardMarkup]:
-    total = len(entries)
-    total_pages = max(1, (total + _KB_LIST_PAGE_SIZE - 1) // _KB_LIST_PAGE_SIZE)
-    page = min(max(page, 0), total_pages - 1)
-    start = page * _KB_LIST_PAGE_SIZE
-    end = min(start + _KB_LIST_PAGE_SIZE, total)
-
-    lines = [
-        "<b>知识库条目</b>",
-        f"共 {total} 条 | 页码: {page + 1}/{total_pages}",
-        "",
-        "点击下方按钮可删除对应条目：",
-        "",
-    ]
-    keyboard_rows: list[list[InlineKeyboardButton]] = []
-    for idx, entry in enumerate(entries[start:end], start=start + 1):
-        title = html.escape((entry.title or "未命名").strip())
-        summary = html.escape(_truncate_text(entry.content or "", 90) or "(空)")
-        lines.append(f"{idx}. <b>#{entry.id}</b> {title}")
-        lines.append(f"摘要: {summary}")
-        lines.append("")
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"🗑 删除 #{entry.id}",
-                    callback_data=f"kbd:{entry.id}:{page}",
-                )
-            ]
-        )
-
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="⬅️ 上一页",
-                callback_data=f"kbl:{page - 1}",
-            )
-        )
-    if page < total_pages - 1:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="下一页 ➡️",
-                callback_data=f"kbl:{page + 1}",
-            )
-        )
-    if nav_row:
-        keyboard_rows.append(nav_row)
-
-    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-
-async def _callback_user_can_manage_group(
-    callback: CallbackQuery,
-    session: AsyncSession,
-    settings: Settings,
-) -> bool:
-    msg = callback.message
-    if not msg or not msg.chat or msg.chat.type not in ("group", "supergroup"):
-        await callback.answer("消息已失效", show_alert=True)
-        return False
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer("当前群组未授权", show_alert=True)
-        return False
-
-    user = callback.from_user
-    if user and is_super_admin_user_id(user.id, settings):
-        return True
-    if not user:
-        await callback.answer("无法识别操作者", show_alert=True)
-        return False
-
-    if await is_group_admin_authorized(session, msg.chat.id, user.id):
-        return True
-
-    await callback.answer("仅群管理可操作该列表", show_alert=True)
-    return False
-
-
-def _format_kb_search_results(query: str, results: list[dict]) -> str:
-    lines = [
-        "<b>知识库搜索结果</b>",
-        f"关键词: {html.escape(_truncate_text(query, 60))}",
-        f"命中: {len(results[:5])} 条",
-    ]
-    for idx, item in enumerate(results[:5], start=1):
-        meta = item.get("metadata", {}) if isinstance(item, dict) else {}
-        title = html.escape(str(meta.get("title") or "未命名"))
-        score = item.get("score") if isinstance(item, dict) else None
-        score_text = f"{float(score):.2f}" if isinstance(score, (float, int)) else "-"
-        lines.append(f"{idx}. <b>{title}</b>（相关度: {score_text}）")
-    return "\n".join(lines)
 
 
 def _source_name(source: str) -> str:
@@ -711,7 +573,7 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
         "<b>智能群管机器人</b>\n"
         "欢迎使用。\n\n"
         "<b>核心功能</b>\n"
-        "知识库问答\n"
+        "永久记忆（管理员自然语言维护）\n"
         "内容审核\n"
         "智能闲聊\n\n"
         "<b>快速开始</b>\n"
@@ -729,9 +591,9 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/start：开始使用\n"
         "/help：查看帮助\n"
         "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU\n\n"
-        "<b>知识库管理（已授权群管理）</b>\n"
-        "/kb &lt;自然语言指令&gt;\n"
-        "/kb list 知识库列表\n\n"
+        "<b>自然语言管理（群管理员）</b>\n"
+        "直接发送：记住xxx / 把xxx写入永久记忆 / 删除永久记忆#12 / 永久记忆列表\n"
+        "直接发送：新增群规xxx / 删除第N条群规 / 群规列表\n\n"
         "<b>群审核管理（需已授权）</b>\n"
         "/addrule &lt;自然语言指令&gt;\n"
         "/rules 审核规则列表\n"
@@ -1080,209 +942,4 @@ async def on_av_seed_paging(
         return
     await callback.answer()
 
-
-@router.message(Command("kb"))
-async def cmd_kb(
-    message: Message, session: AsyncSession, settings: Settings
-) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not await ensure_group_admin_permission(message, session, settings):
-        return
-
-    args = (message.text or "").partition(" ")[2].strip()
-    if not args:
-        await _answer(message, settings, 
-            "<b>知识库指令格式</b>\n"
-            "用法: /kb &lt;自然语言指令&gt;\n"
-            "示例: /kb 添加 标题:问候语 内容:你好世界"
-        )
-        return
-
-    group_id = message.chat.id
-    kb = _build_kb_service(settings)
-    llm = kb.llm
-
-    if args.lower() == "list":
-        entries = await kb.list_entries(session, group_id)
-        if not entries:
-            await _answer(message, settings, "<b>知识库条目</b>\n当前为空。")
-            return
-        text, keyboard = _build_kb_list_page(entries, page=0)
-        await _answer(
-            message,
-            settings,
-            text,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-        return
-
-    result = await llm.generate(KB_MANAGE_SYSTEM, args)
-    data = _parse_json_payload(result)
-    if not data:
-        await _answer(message, settings, "<b>知识库操作失败</b>\n无法理解指令，请重试。")
-        return
-
-    action = str(data.get("action", "unknown")).strip().lower()
-
-    if action == "add":
-        title = str(data.get("title", "未命名")).strip() or "未命名"
-        content = str(data.get("content", "")).strip()
-        await kb.add(session, group_id, title, content)
-        await _answer(message, settings, 
-            "<b>知识库新增成功</b>\n"
-            f"<b>标题</b>: {html.escape(title)}\n"
-            f"<b>内容预览</b>: {html.escape(_truncate_text(content, 90) or '(空)')}"
-        )
-
-    elif action == "delete":
-        title = str(data.get("title", "")).strip()
-        if not title:
-            await _answer(message, settings, "<b>知识库删除失败</b>\n请提供要删除的标题。")
-            return
-        ok = await kb.remove(session, group_id, title)
-        if ok:
-            await _answer(message, settings, 
-                "<b>知识库删除成功</b>\n"
-                f"<b>标题</b>: {html.escape(title)}"
-            )
-        else:
-            await _answer(message, settings, 
-                "<b>知识库删除失败</b>\n"
-                f"未找到标题: {html.escape(title)}"
-            )
-
-    elif action == "search":
-        query = str(data.get("query", args)).strip() or args
-        results = await kb.search(session, group_id, query)
-        if not results:
-            await _answer(message, settings, 
-                "<b>知识库搜索结果</b>\n"
-                f"关键词: {html.escape(_truncate_text(query, 60))}\n"
-                "命中: 0 条"
-            )
-        else:
-            await _answer(message, settings, _format_kb_search_results(query, results))
-
-    elif action == "list":
-        entries = await kb.list_entries(session, group_id)
-        if not entries:
-            await _answer(message, settings, "<b>知识库条目</b>\n当前为空。")
-            return
-        text, keyboard = _build_kb_list_page(entries, page=0)
-        await _answer(
-            message,
-            settings,
-            text,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-
-    else:
-        await _answer(message, settings, "<b>知识库操作失败</b>\n无法理解指令，请重试。")
-
-
-@router.callback_query(F.data.startswith("kbl:"))
-async def on_kb_list_paging(
-    callback: CallbackQuery,
-    settings: Settings,
-    session: AsyncSession | None = None,
-) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
-    if session is None:
-        await callback.answer("会话未就绪，请重新 /kb list", show_alert=True)
-        return
-    if not await _callback_user_can_manage_group(callback, session, settings):
-        return
-
-    msg = callback.message
-    if not msg or not msg.chat:
-        await callback.answer("消息已失效", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) != 2:
-        await callback.answer("参数错误", show_alert=True)
-        return
-    page = _parse_int(parts[1], default=0)
-
-    kb = _build_kb_service(settings)
-    entries = await kb.list_entries(session, msg.chat.id)
-    if not entries:
-        await msg.edit_text("<b>知识库条目</b>\n当前为空。", reply_markup=None)
-        await callback.answer("列表已空")
-        return
-
-    text, keyboard = _build_kb_list_page(entries, page=page)
-    try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            await callback.answer("列表刷新失败，请重试 /kb list", show_alert=True)
-            return
-    except Exception:
-        await callback.answer("列表刷新失败，请重试 /kb list", show_alert=True)
-        return
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("kbd:"))
-async def on_kb_entry_delete(
-    callback: CallbackQuery,
-    settings: Settings,
-    session: AsyncSession | None = None,
-) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
-    if session is None:
-        await callback.answer("会话未就绪，请重新 /kb list", show_alert=True)
-        return
-    if not await _callback_user_can_manage_group(callback, session, settings):
-        return
-
-    msg = callback.message
-    if not msg or not msg.chat:
-        await callback.answer("消息已失效", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("参数错误", show_alert=True)
-        return
-
-    entry_id = _parse_int(parts[1], default=0)
-    page_hint = _parse_int(parts[2], default=0)
-    if entry_id <= 0:
-        await callback.answer("参数错误", show_alert=True)
-        return
-
-    kb = _build_kb_service(settings)
-    entry = await kb.get_by_id(session, entry_id)
-    if not entry or entry.group_id != msg.chat.id:
-        await callback.answer("条目不存在或已删除", show_alert=True)
-        return
-
-    entry_label = _truncate_text(entry.title or "未命名", 24)
-    await session.delete(entry)
-    await session.flush()
-
-    entries = await kb.list_entries(session, msg.chat.id)
-    if not entries:
-        await msg.edit_text("<b>知识库条目</b>\n当前为空。", reply_markup=None)
-        await callback.answer(f"已删除: {entry_label}")
-        return
-
-    total_pages = max(1, (len(entries) + _KB_LIST_PAGE_SIZE - 1) // _KB_LIST_PAGE_SIZE)
-    page = min(max(page_hint, 0), total_pages - 1)
-    text, keyboard = _build_kb_list_page(entries, page=page)
-    try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
-    except Exception:
-        await callback.answer("删除成功，但列表刷新失败，请重试 /kb list", show_alert=True)
-        return
-    await callback.answer(f"已删除: {entry_label}")
 

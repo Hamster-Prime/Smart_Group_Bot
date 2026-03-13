@@ -115,7 +115,7 @@ class DecisionService:
         msg_type: str = "text",
         history: list[dict[str, str]] | None = None,
     ) -> str:
-        """Return one of: skip / question / casual."""
+        """Return one of: skip / casual."""
         normalized = clean_text(re.sub(r"\s+", " ", text).strip(), max_len=1200)
 
         if contains_prompt_injection(normalized):
@@ -135,21 +135,19 @@ class DecisionService:
             history,
         )
 
-        # 兼容旧版输出
-        if result == "knowledge":
-            log.info("decision normalized legacy output: knowledge -> question")
-            result = "question"
+        # 兼容旧提示词输出，将 question 归一为 casual。
+        if result == "question":
+            result = "casual"
 
-        # 被@时，如果模型返回了有效的 question/casual，保持原样
-        # 否则默认为 casual（保持向后兼容）
+        # 被@时，如果模型返回有效输出，保持原样；否则默认为 casual。
         if is_mentioned:
-            if result not in ("question", "casual"):
+            if result not in ("casual",):
                 log.info("decision @mentioned fallback to casual")
                 return "casual"
             return result
 
         # 验证输出
-        if result in ("skip", "question", "casual"):
+        if result in ("skip", "casual"):
             return result
 
         log.info("decision fallback=skip reason=invalid_output actual=%s", result)

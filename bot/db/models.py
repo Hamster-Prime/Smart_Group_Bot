@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
@@ -11,7 +11,6 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
-    LargeBinary,
     String,
     Text,
     func,
@@ -31,53 +30,41 @@ class Group(Base):
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    knowledge_entries: Mapped[list[KnowledgeEntry]] = relationship(back_populates="group")
     moderation_rules: Mapped[list[ModerationRule]] = relationship(back_populates="group")
     violations: Mapped[list[Violation]] = relationship(back_populates="group")
+    context_summary: Mapped[GroupContextSummary | None] = relationship(back_populates="group", uselist=False)
+    permanent_memories: Mapped[list[GroupPermanentMemory]] = relationship(back_populates="group")
 
 
-class KnowledgeEntry(Base):
-    __tablename__ = "knowledge_entries"
+class GroupContextSummary(Base):
+    __tablename__ = "group_context_summaries"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"), primary_key=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    group: Mapped[Group] = relationship(back_populates="context_summary")
+
+
+class GroupPermanentMemory(Base):
+    __tablename__ = "group_permanent_memories"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"))
-    title: Mapped[str] = mapped_column(String(255), default="")
+    group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"), index=True)
     content: Mapped[str] = mapped_column(Text, default="")
-    embedding: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
-    )
-
-    group: Mapped[Group] = relationship(back_populates="knowledge_entries")
-
-
-class KBUsageMetric(Base):
-    """Knowledge-base usage metrics for observability."""
-
-    __tablename__ = "kb_usage_metrics"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    query: Mapped[str] = mapped_column(String(200), default="")
-    search_status: Mapped[str] = mapped_column(String(20), default="success")
-    hit_count: Mapped[int] = mapped_column(Integer, default=0)
-    reliable_count: Mapped[int] = mapped_column(Integer, default=0)
-    max_score: Mapped[float] = mapped_column(Float, default=0.0)
-    reply_generated: Mapped[bool] = mapped_column(Boolean, default=False)
-    reply_is_no_answer: Mapped[bool] = mapped_column(Boolean, default=False)
-    reply_length: Mapped[int] = mapped_column(Integer, default=0)
-    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.now(timezone.utc),
         server_default=func.now(),
+        onupdate=func.now(),
     )
 
-    __table_args__ = (
-        Index("ix_kb_usage_group_created", "group_id", "created_at"),
-        Index("ix_kb_usage_group_status", "group_id", "search_status"),
-    )
+    group: Mapped[Group] = relationship(back_populates="permanent_memories")
 
 
 class ModerationRule(Base):
@@ -174,7 +161,7 @@ class MessageLog(Base):
 
 
 class MessageVector(Base):
-    """Long-term episodic message index. Vectors are stored in external vector DB."""
+    """Conversation archive row (kept for historical schema compatibility)."""
 
     __tablename__ = "message_vectors"
 
@@ -187,7 +174,7 @@ class MessageVector(Base):
     importance_score: Mapped[float] = mapped_column(Float, default=0.5)
     access_count: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Vector is stored in external vector DB (e.g. qdrant), table stores metadata/reference.
+    # Legacy field, currently reused as a local marker string.
     vector_id: Mapped[str] = mapped_column(String(64), default="")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

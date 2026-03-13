@@ -52,16 +52,7 @@ async def init_db(
             await conn.execute(text("PRAGMA journal_mode=WAL"))
             await conn.execute(text("PRAGMA busy_timeout=60000"))
             await conn.execute(text("PRAGMA synchronous=NORMAL"))
-            # Migrate: add embedding column if missing
-            result = await conn.execute(text("PRAGMA table_info(knowledge_entries)"))
-            columns = [row[1] for row in result.fetchall()]
-            if "embedding" not in columns:
-                await conn.execute(text(
-                    "ALTER TABLE knowledge_entries ADD COLUMN embedding BLOB"
-                ))
-                log.info("Migrated: added embedding column to knowledge_entries")
-
-            # Memory v2 compatibility migration for old message_vectors schema.
+            # Ensure message_vectors schema keeps compatibility with previous versions.
             await _sqlite_ensure_column(
                 conn,
                 "message_vectors",
@@ -123,11 +114,6 @@ async def init_db(
                     "ON message_vectors (message_id)"
                 )
             )
-        # Create FTS5 virtual table for knowledge search
-        await conn.execute(text(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts "
-            "USING fts5(title, content, content=knowledge_entries, content_rowid=id)"
-        ))
 
     session_factory = async_sessionmaker(
         engine,

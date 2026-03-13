@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import html
 import io
+import json
 import logging
 import re
 import time
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.types import Message
@@ -19,13 +21,13 @@ from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
-from bot.services.knowledge import KnowledgeService
-from bot.services.kb_metrics import KBMetricsCollector, KBSearchMetrics
+from bot.services.group_intent import GroupIntent, GroupIntentService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.skills import SkillService
 from bot.services.sticker_decision import StickerDecisionService
 from bot.services.sticker_library import sticker_library
+from bot.utils.prompts import RULE_MANAGE_SYSTEM
 from bot.utils.telegram import (
     answer_with_auto_delete,
     extract_reply_context,
@@ -37,6 +39,7 @@ from bot.utils.telegram import (
     is_reply_message,
     mentions_other_user,
     reply_sticker_with_auto_delete,
+    sanitize_outgoing_text,
     send_reply,
     typing_action,
 )
@@ -56,6 +59,8 @@ _SILENT_REPLY_MARKERS = {
 _SHORT_UNCERTAIN_REPLY_RE = re.compile(
     r"^(?:我)?(?:不知道|不确定|无法(?:确定|判断|回答)|信息不足|暂无可信来源|无可信来源|无法根据可信来源(?:回答|解释))(?:[，,。.!！?？].*)?$"
 )
+_SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
+_ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
 
 
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
@@ -113,97 +118,272 @@ def _truncate_text(text: str, max_len: int) -> str:
     return cleaned[:max_len] + "..."
 
 
-def _format_mandatory_kb_context(
-    query: str,
-    results: list[dict],
-    *,
-    status: str = "success",
-    threshold: float = 0.3,
-) -> str:
-    """Format KB retrieval results into strict structured prompt blocks."""
-    lines = [
-        "=" * 60,
-        "[KNOWLEDGE_BASE_SEARCH_RESULTS]",
-        "=" * 60,
-        f"Query: {_truncate_text(query, 300)}",
-        f"Similarity_Threshold: {threshold:.2f}",
-        f"Search_Status: {status.upper()}",
-    ]
+def _parse_json_payload(raw: str) -> dict | None:
+    payload = (raw or "").strip()
+    if payload.startswith("```"):
+        payload = re.sub(r"^```(?:json)?", "", payload).strip()
+        payload = re.sub(r"```$", "", payload).strip()
+    if not payload.startswith("{"):
+        match = re.search(r"\{[\s\S]*\}", payload)
+        if match:
+            payload = match.group(0)
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
-    if status == "failed":
-        lines.extend(
-            [
-                "Result_Count: N/A",
-                "",
-                "[SYSTEM_ERROR]",
-                "知识库检索系统发生故障,本轮无法提供知识库支持。",
-                "你必须返回: NO_TRUSTED_ANSWER",
-                "不要尝试使用训练数据回答。",
-                "=" * 60,
-            ]
-        )
-        return "\n".join(lines)
 
-    if status == "empty" or not results:
-        lines.extend(
-            [
-                "Result_Count: 0",
-                "",
-                "[NO_MATCHING_ENTRIES]",
-                f"知识库中无相似度>= {threshold:.2f} 的相关内容。",
-                "若问题需要事实依据,你必须返回: NO_TRUSTED_ANSWER",
-                "纯闲聊/情绪互动可正常回复。",
-                "=" * 60,
-            ]
-        )
-        return "\n".join(lines)
+def _rule_type_label(rule_type: str) -> str:
+    return {
+        "keyword": "关键词",
+        "regex": "正则",
+        "llm": "语义",
+    }.get((rule_type or "").lower(), rule_type or "未知")
 
-    reliable_count = sum(1 for item in results if item.get("metadata", {}).get("reliable", False))
-    lines.extend(
-        [
-            f"Result_Count: {len(results)} (High_Confidence: {reliable_count})",
-            "",
-            "[MANDATORY_INSTRUCTION]",
-            "你必须仅基于以下知识库内容回答,严禁使用训练数据中的任何知识。",
-            "若知识库内容不足以完整回答问题,必须返回: NO_TRUSTED_ANSWER",
-            "不要尝试'补充'、'推测'或'结合常识'。",
-            "",
-            "[KNOWLEDGE_ENTRIES]",
-        ]
+
+def _action_label(action: str) -> str:
+    return {
+        "warn": "警告",
+        "delete": "删消息",
+        "ban": "封禁",
+    }.get((action or "").lower(), action or "未知")
+
+
+async def _render_rules_text(session: AsyncSession, group_id: int) -> str:
+    stmt = (
+        select(ModerationRule)
+        .where(ModerationRule.group_id == group_id)
+        .order_by(ModerationRule.id.asc())
     )
+    rows = list((await session.execute(stmt)).scalars().all())
+    if not rows:
+        return "<b>群审核规则</b>\n当前没有规则。"
 
-    for idx, item in enumerate(results[:5], start=1):
-        metadata = item.get("metadata", {}) or {}
-        title = str(metadata.get("title", "")).strip()
-        document = str(item.get("document", "")).strip()
-        score_raw = item.get("score", 0.0)
-        try:
-            score = float(score_raw)
-        except Exception:
-            score = 0.0
-        reliable = bool(metadata.get("reliable", False))
-        entry_id = metadata.get("entry_id", "unknown")
+    lines = [
+        "<b>群审核规则</b>",
+        f"共 {len(rows)} 条",
+        "",
+    ]
+    for idx, rule in enumerate(rows[:30], start=1):
+        status = "启用" if rule.enabled else "关闭"
+        pattern = html.escape(_truncate_text(rule.pattern or "", 120))
+        lines.append(
+            f"{idx}. <b>#{rule.id}</b> [{_rule_type_label(rule.rule_type)}] {_action_label(rule.action)} | {status}"
+        )
+        lines.append(f"规则: {pattern}")
+        lines.append("")
+    if len(rows) > 30:
+        lines.append(f"... 其余 {len(rows) - 30} 条未展示")
+    return "\n".join(lines).rstrip()
 
-        if "\n" in document:
-            content = document.split("\n", 1)[1].strip()
-        else:
-            content = document
 
-        confidence = "HIGH_CONFIDENCE" if reliable else "MEDIUM_CONFIDENCE"
-        lines.extend(
-            [
-                "",
-                f"--- Entry #{idx} (ID: {entry_id}) ---",
-                f"Title: {_truncate_text(title, 120)}",
-                f"Similarity_Score: {score:.4f}",
-                f"Confidence_Level: {confidence}",
-                "Content:",
-                _truncate_text(content, 800),
-            ]
+async def _apply_natural_rule_instruction(
+    *,
+    session: AsyncSession,
+    llm: LLMService,
+    group_id: int,
+    instruction: str,
+) -> str:
+    parsed = _parse_json_payload(await llm.generate(RULE_MANAGE_SYSTEM, instruction))
+    if not parsed:
+        return "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。"
+
+    action = str(parsed.get("action", "unknown")).strip().lower()
+    if action == "list":
+        return await _render_rules_text(session, group_id)
+
+    if action == "add":
+        rule_type = str(parsed.get("rule_type", "keyword")).strip().lower()
+        pattern = str(parsed.get("pattern", "")).strip()
+        hit_action = str(parsed.get("hit_action", "warn")).strip().lower()
+        if rule_type not in {"keyword", "regex", "llm"}:
+            return "<b>规则添加失败</b>\nrule_type 必须是 keyword、regex 或 llm。"
+        if hit_action not in {"warn", "delete", "ban"}:
+            hit_action = "warn"
+        if not pattern:
+            return "<b>规则添加失败</b>\npattern 不能为空。"
+
+        if rule_type == "keyword" and pattern.lower() in _SEMANTIC_ABUSE_HINTS:
+            rule_type = "llm"
+            pattern = _ABUSE_LLM_PATTERN
+
+        rule = ModerationRule(
+            group_id=group_id,
+            rule_type=rule_type,
+            pattern=pattern,
+            action=hit_action,
+        )
+        session.add(rule)
+        await session.flush()
+        return (
+            "<b>规则添加成功</b>\n"
+            f"<b>规则编号</b>: #{rule.id}\n"
+            f"<b>规则类型</b>: {_rule_type_label(rule_type)}\n"
+            f"<b>命中动作</b>: {_action_label(hit_action)}\n"
+            f"<b>规则内容</b>: {html.escape(_truncate_text(pattern, 160))}"
         )
 
-    lines.append("=" * 60)
-    return "\n".join(lines)
+    if action == "delete":
+        target: ModerationRule | None = None
+        if parsed.get("rule_id") is not None:
+            try:
+                rid = int(parsed["rule_id"])
+            except (TypeError, ValueError):
+                return "<b>规则删除失败</b>\nrule_id 必须是整数。"
+            candidate = await session.get(ModerationRule, rid)
+            if candidate and candidate.group_id == group_id:
+                target = candidate
+        else:
+            pattern = str(parsed.get("pattern", "")).strip()
+            rule_type = str(parsed.get("rule_type", "")).strip().lower()
+            if not pattern:
+                return "<b>规则删除失败</b>\n删除时请提供 rule_id 或 pattern。"
+            stmt = select(ModerationRule).where(
+                ModerationRule.group_id == group_id,
+                ModerationRule.pattern == pattern,
+            )
+            if rule_type:
+                stmt = stmt.where(ModerationRule.rule_type == rule_type)
+            stmt = stmt.order_by(ModerationRule.id.desc())
+            target = (await session.execute(stmt)).scalars().first()
+
+        if not target:
+            return "<b>规则删除失败</b>\n未找到对应规则。"
+
+        rid = target.id
+        content = html.escape(_truncate_text(target.pattern or "", 160))
+        rtype = _rule_type_label(target.rule_type or "")
+        await session.delete(target)
+        return (
+            "<b>规则删除成功</b>\n"
+            f"<b>规则编号</b>: #{rid}\n"
+            f"<b>规则类型</b>: {rtype}\n"
+            f"<b>规则内容</b>: {content}"
+        )
+
+    return "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。"
+
+
+def _format_permanent_memory_list(items: list[Any]) -> str:
+    if not items:
+        return "<b>永久记忆</b>\n当前为空。"
+    lines = [
+        "<b>永久记忆</b>",
+        f"共 {len(items)} 条",
+        "",
+    ]
+    for item in items[:40]:
+        text = html.escape(_truncate_text(str(getattr(item, "content", "") or ""), 140))
+        lines.append(f"#{getattr(item, 'id', 0)} {text}")
+    if len(items) > 40:
+        lines.append(f"... 其余 {len(items) - 40} 条未展示")
+    return "\n".join(lines).rstrip()
+
+
+async def _handle_management_intent(
+    *,
+    intent: GroupIntent,
+    input_text: str,
+    session: AsyncSession,
+    llm: LLMService,
+    memory: Any,
+    group_id: int,
+    user_id: int,
+) -> tuple[bool, str]:
+    if intent.intent == "memory_manage":
+        action = (intent.memory_action or "unknown").strip().lower()
+        if action == "add":
+            content = (intent.memory_content or "").strip()
+            row, created = await memory.add_permanent_memory(
+                group_id,
+                content,
+                created_by=user_id,
+            )
+            if not row:
+                return True, "<b>永久记忆写入失败</b>\n内容为空或无效。"
+            if created:
+                return (
+                    True,
+                    "<b>永久记忆已写入</b>\n"
+                    f"<b>ID</b>: #{row.id}\n"
+                    f"<b>内容</b>: {html.escape(_truncate_text(row.content, 180))}",
+                )
+            return (
+                True,
+                "<b>永久记忆已存在</b>\n"
+                f"<b>ID</b>: #{row.id}\n"
+                f"<b>内容</b>: {html.escape(_truncate_text(row.content, 180))}",
+            )
+
+        if action == "replace":
+            target = (intent.memory_target or "").strip()
+            new_content = (intent.memory_content or "").strip()
+            if not target or not new_content:
+                return True, "<b>永久记忆修改失败</b>\n请明确“要改哪条”以及“改成什么”。"
+            deleted, created_row, created_new = await memory.replace_permanent_memory(
+                group_id,
+                target=target,
+                new_content=new_content,
+                created_by=user_id,
+            )
+            if not created_row:
+                return True, "<b>永久记忆修改失败</b>\n新内容为空或无效。"
+            deleted_count = len(deleted)
+            action_text = "已更新" if deleted_count > 0 else "未命中旧记忆，已新增"
+            status_text = "新增" if created_new else "复用"
+            return (
+                True,
+                "<b>永久记忆修改结果</b>\n"
+                f"<b>状态</b>: {action_text}\n"
+                f"<b>删除数量</b>: {deleted_count}\n"
+                f"<b>写入方式</b>: {status_text}\n"
+                f"<b>新ID</b>: #{created_row.id}\n"
+                f"<b>内容</b>: {html.escape(_truncate_text(created_row.content, 180))}",
+            )
+
+        if action == "delete":
+            target = (intent.memory_target or "").strip()
+            if not target:
+                return True, "<b>永久记忆删除失败</b>\n请提供删除目标（关键词或 #ID）。"
+            deleted = await memory.delete_permanent_memory(group_id, target)
+            if not deleted:
+                return True, "<b>永久记忆删除失败</b>\n未找到匹配条目。"
+            lines = [
+                "<b>永久记忆删除成功</b>",
+                f"<b>删除数量</b>: {len(deleted)}",
+                "",
+            ]
+            for item in deleted[:10]:
+                lines.append(
+                    f"#{item.id} {html.escape(_truncate_text(item.content or '', 120))}"
+                )
+            if len(deleted) > 10:
+                lines.append(f"... 其余 {len(deleted) - 10} 条未展示")
+            return True, "\n".join(lines).rstrip()
+
+        if action == "clear":
+            count = await memory.clear_permanent_memory(group_id)
+            return True, f"<b>永久记忆已清空</b>\n共删除 {count} 条。"
+
+        if action == "list":
+            items = await memory.list_permanent_memories(group_id)
+            return True, _format_permanent_memory_list(items)
+
+        return True, "<b>未识别的永久记忆指令</b>\n请换个说法，例如：记住xxx / 删除永久记忆#12 / 永久记忆列表。"
+
+    if intent.intent == "rule_manage":
+        instruction = (intent.rule_instruction or input_text).strip()
+        if not instruction:
+            instruction = input_text
+        return True, await _apply_natural_rule_instruction(
+            session=session,
+            llm=llm,
+            group_id=group_id,
+            instruction=instruction,
+        )
+
+    return False, ""
 
 
 def _build_moderation_notice(
@@ -469,13 +649,13 @@ async def on_group_message(
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
     )
-    kb = KnowledgeService(settings.knowledge, llm)
+    intent_svc = GroupIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
     sticker_pool = [
         x.strip()
         for x in (settings.skill_sticker_file_ids or "").split(",")
         if x and x.strip()
     ]
-    skill = SkillService(llm, knowledge=kb, default_sticker_file_ids=sticker_pool)
+    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
     sticker_decider = StickerDecisionService(llm)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
@@ -638,6 +818,43 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
+    intent = await intent_svc.detect(input_text, history=memory.get_history(group_id))
+    if intent.intent in {"memory_manage", "rule_manage"}:
+        if not sender_is_tg_admin:
+            await answer_with_auto_delete(
+                message,
+                "<b>权限不足</b>\n仅群管理员可通过自然语言修改永久记忆或群规。",
+                auto_delete_minutes=settings.bot.auto_delete_minutes,
+            )
+            return
+
+        handled, manage_reply = await _handle_management_intent(
+            intent=intent,
+            input_text=input_text,
+            session=session,
+            llm=llm,
+            memory=memory,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        if handled:
+            memory.add_message(
+                group_id,
+                "user",
+                f"[{user_tag}] {input_text}",
+                user_id=user_id,
+                message_type=msg_type,
+                message_id=str(message.message_id),
+            )
+            await answer_with_auto_delete(
+                message,
+                manage_reply,
+                auto_delete_minutes=settings.bot.auto_delete_minutes,
+            )
+            memory.add_message(group_id, "assistant", manage_reply, message_type="assistant_reply")
+            log.info("[%s] management intent handled | intent=%s", group_id, intent.intent)
+            return
+
     should_index_user_memory = msg_type != "contact"
     if should_index_user_memory:
         memory.add_message(
@@ -681,7 +898,6 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     reply_source = "none"
-    reply_for_metrics = ""
     sticker_decision_send = False
     sticker_decision_reason = ""
     sticker_decision_file = ""
@@ -707,48 +923,9 @@ async def on_group_message(
         int((time.perf_counter() - decision_started) * 1000),
     )
 
-    kb_search_started = time.perf_counter()
-    kb_elapsed_ms = 0
-    kb_results: list[dict] = []
-    kb_search_status = "not_run"
-    kb_context = ""
-
     if action != "skip":
         history = await memory.get_history_for_llm(group_id, query=input_text)
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
-        # 根据决策类型决定是否执行知识库搜索
-        should_search_kb = action == "question"  # 只有问题才搜索知识库
-
-        if should_search_kb:
-            kb_search_started = time.perf_counter()
-            kb_search_status = "success"
-            try:
-                kb_results = await kb.search(session, group_id, input_text)
-                if not kb_results:
-                    kb_search_status = "empty"
-            except Exception:
-                log.exception("[%s] mandatory kb search failed", group_id)
-                kb_search_status = "failed"
-                kb_results = []
-            kb_elapsed_ms = int((time.perf_counter() - kb_search_started) * 1000)
-            kb_context = _format_mandatory_kb_context(
-                input_text,
-                kb_results,
-                status=kb_search_status,
-                threshold=settings.knowledge.similarity_threshold,
-            )
-            log.info(
-                "[%s] mandatory kb search done | status=%s hit=%d | elapsed=%dms",
-                group_id,
-                kb_search_status,
-                len(kb_results),
-                kb_elapsed_ms,
-            )
-        else:
-            # 闲聊场景，不搜索知识库
-            kb_search_status = "not_run"
-            kb_context = ""
-            log.info("[%s] kb search skipped | reason=casual_chat", group_id)
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
             skill_reply = await skill.answer_with_skill(
@@ -760,7 +937,6 @@ async def on_group_message(
                 sender_is_owner=sender_is_owner,
                 sender_is_tg_admin=sender_is_tg_admin,
                 message=message,
-                mandatory_kb_context=kb_context,
                 intent_type=action,
             )
             if skill_reply:
@@ -777,7 +953,6 @@ async def on_group_message(
                     sender_username=sender_username,
                     sender_is_owner=sender_is_owner,
                     sender_is_tg_admin=sender_is_tg_admin,
-                    mandatory_kb_context=kb_context,
                     intent_type=action,
                 )
                 log.info(
@@ -790,12 +965,15 @@ async def on_group_message(
                     reply_source = "casual"
 
             if reply:
+                cleaned_reply = sanitize_outgoing_text(reply)
+                if cleaned_reply != reply:
+                    log.warning("[%s] reply sanitized: removed internal markup", group_id)
+                reply = cleaned_reply
                 normalized_reply = _normalize_owner_address(reply, sender_is_owner)
                 if normalized_reply != reply:
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
                 reply = normalized_reply
 
-        reply_for_metrics = reply or ""
         silence_reply, silence_reason = _should_silence_generated_reply(reply)
         if silence_reply:
             # 根据决策类型和静默原因决定是否真的要静默
@@ -807,37 +985,6 @@ async def on_group_message(
                 reply = "嗯嗯，我在听~"
                 should_really_silence = False
                 reply_source = "fallback"
-            elif action == "question" and silence_reason == "silent_marker":
-                # 问题场景返回 NO_TRUSTED_ANSWER：强制联网搜索并降级为 casual
-                log.info("[%s] question returned NO_TRUSTED_ANSWER, forcing websearch fallback", group_id)
-                forced_reply = ""
-                async with typing_action(message, enabled=settings.bot.enable_typing):
-                    forced_reply = await skill.answer_with_forced_websearch(
-                        input_text,
-                        session=session,
-                        history=history,
-                        sender_user_id=user_id,
-                        sender_username=sender_username,
-                        sender_is_owner=sender_is_owner,
-                        sender_is_tg_admin=sender_is_tg_admin,
-                        message=message,
-                    )
-                forced_reply = _normalize_owner_address(forced_reply, sender_is_owner).strip()
-                if forced_reply and not _is_silent_marker_reply(forced_reply):
-                    reply = forced_reply
-                    reply_for_metrics = forced_reply
-                    action = "casual"
-                    should_really_silence = False
-                    reply_source = "forced_websearch"
-                    log.info(
-                        "[%s] forced websearch fallback success | action=%s source=%s",
-                        group_id,
-                        action,
-                        reply_source,
-                    )
-                else:
-                    log.warning("[%s] forced websearch fallback empty, keep silent", group_id)
-                    should_really_silence = True
             if should_really_silence:
                 preview = _truncate_text(reply, 80) if reply else "-"
                 log.info(
@@ -905,27 +1052,6 @@ async def on_group_message(
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_minutes=0,
         )
-    if kb_search_status != "not_run":
-        metrics_reply_text = reply_for_metrics or reply or ""
-        metrics = KBSearchMetrics(
-            group_id=group_id,
-            query=input_text[:200],
-            search_status=kb_search_status,
-            hit_count=len(kb_results),
-            reliable_count=sum(
-                1 for item in kb_results if item.get("metadata", {}).get("reliable", False)
-            ),
-            max_score=max((float(item.get("score", 0.0)) for item in kb_results), default=0.0),
-            reply_generated=bool(metrics_reply_text),
-            reply_is_no_answer="NO_TRUSTED_ANSWER" in metrics_reply_text.upper(),
-            reply_length=len(metrics_reply_text),
-            elapsed_ms=kb_elapsed_ms,
-        )
-        try:
-            kb_metrics = KBMetricsCollector()
-            await kb_metrics.record_search(session, metrics)
-        except Exception:
-            log.exception("[%s] kb metrics recording failed", group_id)
 
     if action == "skip":
         log.info(

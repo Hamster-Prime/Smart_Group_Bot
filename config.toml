@@ -15,13 +15,6 @@ max_tokens = 512
 temperature = 0.1
 max_tokens = 1024
 
-[knowledge]
-top_k = 3
-similarity_threshold = 0.55
-enable_fallback = false
-enable_relaxed = false
-min_reliable_score = 0.60
-
 [moderation]
 enabled = true
 warn_threshold = 3

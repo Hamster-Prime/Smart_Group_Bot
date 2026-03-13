@@ -22,10 +22,9 @@ def with_persona(task_prompt: str) -> str:
 
 DECISION_SYSTEM: str = _load("decision.md")
 MODERATION_SYSTEM: str = _load("moderation.md")
-RAG_SYSTEM: str = _load("rag.md")
 CASUAL_SYSTEM: str = _load("casual.md")
-KB_MANAGE_SYSTEM: str = _load("kb_manage.md")
 RULE_MANAGE_SYSTEM: str = _load("rule_manage.md")
+GROUP_INTENT_SYSTEM: str = _load("group_intent.md")
 COMPRESS_SYSTEM: str = _load("compress.md")
 SKILL_TOOL_SYSTEM: str = _load("skill_tools.md")
 STICKER_DECISION_SYSTEM: str = _load("sticker_decision.md")

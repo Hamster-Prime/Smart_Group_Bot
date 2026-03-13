@@ -8,7 +8,7 @@
 
 **基于 LLM 的智能群聊管理机器人**
 
-🎯 智能决策 · 📚 知识库 · 🛡️ 内容审查 · 🔍 联网搜索
+🎯 智能决策 · 🧠 永久记忆 · 🛡️ 内容审查 · 🔍 联网搜索
 
 </div>
 
@@ -18,17 +18,16 @@
 
 ### 🧠 智能决策系统
 - **LLM 驱动决策**：由大模型判断何时回复、回复什么内容
-- **三级响应策略**：
+- **两级响应策略**：
   - `skip` - 忽略消息（闲聊场景）
-  - `knowledge` - 调用知识库回复（问题场景）
   - `casual` - 自由闲聊（互动场景）
 - **强制触发机制**：被 @ 时强制响应
 
-### 📚 知识库系统
-- **自然语言录入**：无需复杂命令，直接描述即可添加知识
-- **自动向量化**：每小时自动整理和嵌入记忆
-- **上下文感知**：基于群聊上下文智能检索相关信息
-- **持久化存储**：本地存储，重启不丢失
+### 🧠 永久记忆与上下文压缩
+- **永久记忆**：管理员可直接自然语言写入/修改/删除群组永久记忆
+- **自动压缩**：上下文达到预算上限后，自动归纳为摘要并持续滚动更新
+- **持久化存储**：永久记忆和摘要都写入本地数据库，重启不丢失
+- **上下文注入**：回复时自动带入 `[permanent-memory]` 与 `[context-summary]`
 
 ### 🛡️ 群规与审查
 - **动态群规**：支持自然语言添加群规则
@@ -47,11 +46,10 @@
 |------|------|
 | `websearch` | 联网搜索实时信息 |
 | `webfetch` | 获取网页详细内容 |
-| `send_sticker` | 在群里发送贴纸（支持自动学习贴纸库 + 默认贴纸池） |
 
 贴纸学习机制：
 - 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入数据库表 `sticker_library`。
-- 后续调用 `send_sticker` 时会优先按语义描述匹配已学习贴纸，实现“边聊边学”的贴纸选择。
+- 贴纸回复由独立贴纸决策模块控制，会优先按语义从已学习贴纸中选择，实现“边聊边学”。
 
 ---
 
@@ -77,7 +75,7 @@ cp .env.example .env
 # 编辑 .env 文件填写配置
 
 # 启动机器人
-python main.py
+python start.py
 ```
 
 ### Docker 部署（可选）
@@ -119,7 +117,7 @@ MODEL_PROVIDER_ARK_PROVIDER=openai_compatible
 MODEL_PROVIDER_ARK_API_KEY=
 MODEL_PROVIDER_ARK_API_BASE=
 
-# ---- 主模型 (知识库问答、闲聊) ----
+# ---- 主模型 (聊天、工具调用) ----
 MAIN_PROVIDER_NAME=ARK
 MAIN_MODEL=
 # fallback 格式: provider_name:model,provider_name2:model2
@@ -143,7 +141,7 @@ COMPRESS_PROVIDER_NAME=
 COMPRESS_MODEL=
 COMPRESS_FALLBACKS=
 
-# ---- 嵌入模型 (知识库语义搜索) ----
+# ---- 嵌入模型 (保留，可选) ----
 # 留空则复用主模型 provider_name
 EMBED_PROVIDER_NAME=
 EMBED_MODEL=text-embedding-004
@@ -162,7 +160,7 @@ BOT_AUTO_DELETE_MINUTES=0
 BOT_DECISION_CONTEXT_ITEMS=5
 
 # ---- 技能配置 ----
-# 贴纸 file_id 列表，逗号分隔（供 send_sticker 默认使用）
+# 贴纸 file_id 列表，逗号分隔（供贴纸决策模块回退使用）
 # 已学习贴纸会保存到数据库表 sticker_library（首次会自动导入 memory/stickers/<group_id>.json）
 SKILL_STICKER_FILE_IDS=
 
@@ -194,7 +192,6 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 | 命令 | 说明 | 示例 |
 |------|------|------|
 | `/help` | 显示帮助信息 | `/help` |
-| `/kb <内容>` | 添加知识库条目 | `/kb 白菜是 LongEmby 的服主` |
 | `/addrule <规则>` | 添加群规 | `/addrule 禁止骂人` |
 | `/rules` | 查看当前群规 | `/rules` |
 | `/aiexempt` | 回复用户消息，设置 AI 审查豁免（已授权群管理） | `回复某人后发送 /aiexempt` |
@@ -210,10 +207,13 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 无需记忆命令，直接用自然语言与机器人交互：
 
 ```
-用户：白菜是谁？
-Bot：白菜是 LongEmby 的服主和主理人。
+管理员：记住“白菜是 LongEmby 的服主和主理人”
+Bot：已写入永久记忆 #12。
 
-用户：增加一条规则，禁止发广告
+管理员：把“白菜是 LongEmby 的服主和主理人”改成“白菜是 LongEmby 的主理人”
+Bot：已更新永久记忆。
+
+管理员：增加一条规则，禁止发广告
 Bot：已添加群规：禁止发广告
 
 用户：@Bot 今天的天气怎么样？
@@ -230,17 +230,15 @@ Bot：[调用 websearch 查询天气并回复]
 输入区块：
 - [是否@机器人]：是/否
 - [消息类型]
-- [知识库标题]
-- [知识库条目摘要]
 - [消息正文]
 
 决策规则：
 1. 如果 [是否@机器人]=是，必须回复
-2. 如果消息是"问题"且知识库有答案，输出 knowledge
-3. 普通闲聊、寒暄：优先 skip
+2. 如果消息对机器人有交流意图，输出 casual
+3. 普通群友互聊、无关内容：输出 skip
 4. 不要因为"有问号"就一律回复
 
-仅输出一个词（小写）：skip / knowledge / casual
+仅输出一个词（小写）：skip / casual
 ```
 
 ---
@@ -255,8 +253,9 @@ Bot：[调用 websearch 查询天气并回复]
 ┌──────────────▼──────────────────────────┐
 │         Smart Group Bot                 │
 │  ┌──────────────┐  ┌──────────────┐    │
-│  │   Decision   │  │   Knowledge  │    │
-│  │     LLM      │  │     Base     │    │
+│  │   Decision   │  │   Memory     │    │
+│  │     LLM      │  │(permanent +  │    │
+│  │              │  │  summary)    │    │
 │  └──────────────┘  └──────────────┘    │
 │  ┌──────────────┐  ┌──────────────┐    │
 │  │   Content    │  │    Skills    │    │
