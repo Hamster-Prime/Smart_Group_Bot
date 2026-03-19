@@ -56,8 +56,10 @@ class CasualService:
         sender_is_owner: bool = False,
         sender_is_tg_admin: bool = False,
         intent_type: str = "casual",
+        merged_count: int = 1,
     ) -> str:
-        q = clean_text(text, max_len=1000)
+        input_limit = 1600 if merged_count > 1 else 1000
+        q = clean_text(text, max_len=input_limit)
         if contains_prompt_injection(q):
             log.warning("casual input may contain prompt injection")
 
@@ -75,7 +77,6 @@ class CasualService:
             },
         ]
 
-        # Keep single response mode: decision layer now only routes to skip/casual.
         _ = intent_type
         messages.append(
             {
@@ -83,12 +84,24 @@ class CasualService:
                 "content": "[CASUAL_MODE]\n这是闲聊/回复场景，保持自然、简洁、友好。",
             }
         )
+        if merged_count > 1:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[MERGED_USER_MESSAGES]\n"
+                        f"本轮输入来自同一用户在当前抖动窗口内连续发送的 {merged_count} 条消息。\n"
+                        "请把它们当成一次完整输入理解，只回复一次，不要逐条编号或逐条复述。\n"
+                        "优先回应最后一条里的明确诉求，前面的内容通常是补充说明。"
+                    ),
+                }
+            )
 
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
-        messages.append({"role": "user", "content": wrap_untrusted("user_message", q, max_len=1000)})
+        messages.append({"role": "user", "content": wrap_untrusted("user_message", q, max_len=input_limit)})
 
-        log.info("casual request: history=%d", len(history) if history else 0)
+        log.info("casual request: history=%d merged=%d", len(history) if history else 0, merged_count)
         result = await self.llm.chat(messages)
         log.info("casual reply len=%d", len(result or ""))
         return result

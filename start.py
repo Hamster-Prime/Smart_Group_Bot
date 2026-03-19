@@ -137,6 +137,11 @@ async def start_bot(settings, session_factory) -> None:
         )
     finally:
         try:
+            await group.flush_pending_inbound_batches()
+            log.info("pending inbound batches flushed")
+        except Exception:
+            log.exception("pending inbound batch flush failed")
+        try:
             await memory.flush_background_tasks(timeout_sec=8.0)
             log.info("memory background tasks flushed")
         except Exception:

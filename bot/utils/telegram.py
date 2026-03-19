@@ -153,6 +153,22 @@ async def reply_sticker_with_auto_delete(
     return sent
 
 
+async def send_sticker_with_auto_delete(
+    message: Message,
+    *,
+    sticker: str,
+    delivery_mode: str = "reply",
+    auto_delete_minutes: int = 0,
+    **kwargs: object,
+) -> Message:
+    if (delivery_mode or "").strip().lower() == "message":
+        sent = await message.answer_sticker(sticker=sticker, **kwargs)
+    else:
+        sent = await message.reply_sticker(sticker=sticker, **kwargs)
+    schedule_message_auto_delete(sent, auto_delete_minutes)
+    return sent
+
+
 def get_display_name(msg: Message) -> str:
     if msg.from_user:
         return msg.from_user.username or msg.from_user.full_name
@@ -491,6 +507,7 @@ async def send_reply(
     message: Message,
     text: str,
     *,
+    delivery_mode: str = "reply",
     stream: bool = False,
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
@@ -504,7 +521,10 @@ async def send_reply(
     - fallback keeps editing the same message (no delete-and-resend)
     """
 
-    async def _safe_reply(
+    mode = (delivery_mode or "reply").strip().lower()
+    send_as_reply = mode != "message"
+
+    async def _safe_send(
         body: str,
         *,
         parse_mode: str | None,
@@ -514,12 +534,15 @@ async def send_reply(
         attempt = 0
         while attempt <= retries:
             try:
-                sent = await message.reply(body, parse_mode=parse_mode)
+                if send_as_reply:
+                    sent = await message.reply(body, parse_mode=parse_mode)
+                else:
+                    sent = await message.answer(body, parse_mode=parse_mode)
                 schedule_message_auto_delete(sent, auto_delete_minutes)
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
-                log.warning("telegram flood control on reply, waiting %.2fs", wait_s)
+                log.warning("telegram flood control on send, waiting %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
                 attempt += 1
             except TelegramBadRequest as exc:
@@ -528,7 +551,7 @@ async def send_reply(
                     return None
                 if attempt >= retries:
                     log.exception(
-                        "reply bad request chat_id=%s retries=%d",
+                        "send bad request chat_id=%s retries=%d",
                         message.chat.id,
                         retries,
                     )
@@ -538,7 +561,7 @@ async def send_reply(
             except Exception:
                 if attempt >= retries:
                     log.exception(
-                        "reply failed chat_id=%s retries=%d",
+                        "send failed chat_id=%s retries=%d",
                         message.chat.id,
                         retries,
                     )
@@ -604,12 +627,12 @@ async def send_reply(
             chunks = [segment[:mid], segment[mid:]]
 
         if len(chunks) <= 1:
-            sent = await _safe_reply(segment, parse_mode=None, retries=3)
+            sent = await _safe_send(segment, parse_mode=None, retries=3)
             if not sent:
                 return False
             return await _finalize_stream_format(sent, segment)
 
-        sent = await _safe_reply(chunks[0], parse_mode=None, retries=3)
+        sent = await _safe_send(chunks[0], parse_mode=None, retries=3)
         if not sent:
             return False
 
@@ -645,11 +668,11 @@ async def send_reply(
             ok = True
             for part in parts:
                 html = md_to_html(part)
-                sent = await _safe_reply(html, parse_mode="HTML", retries=3)
+                sent = await _safe_send(html, parse_mode="HTML", retries=3)
                 if not sent:
-                    sent = await _safe_reply(part, parse_mode="Markdown", retries=2)
+                    sent = await _safe_send(part, parse_mode="Markdown", retries=2)
                 if not sent:
-                    sent = await _safe_reply(part, parse_mode=None, retries=2)
+                    sent = await _safe_send(part, parse_mode=None, retries=2)
                 ok = ok and bool(sent)
             return ok
 

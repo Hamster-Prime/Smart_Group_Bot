@@ -107,6 +107,10 @@ class MemoryService:
     def get_history(self, group_id: int) -> list[dict[str, str]]:
         return list(self._working(group_id))
 
+    @property
+    def session_factory(self) -> async_sessionmaker[AsyncSession]:
+        return self._session_factory
+
     def add_message(
         self,
         group_id: int,

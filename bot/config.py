@@ -42,6 +42,7 @@ class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
     drop_pending_updates: bool = True
+    inbound_debounce_seconds: float = 5.0
     enable_typing: bool = True
     enable_streaming: bool = True
     stream_chunk_size: int = 36
@@ -103,6 +104,7 @@ class Settings(BaseSettings):
 
     max_context_tokens: int = 4096
     max_output_tokens: int = 2048
+    bot_inbound_debounce_seconds: float = 5.0
     bot_enable_typing: bool = True
     bot_enable_streaming: bool = True
     bot_stream_chunk_size: int = 36
@@ -313,6 +315,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
 
     settings.bot.token = settings.bot_token
+    settings.bot.inbound_debounce_seconds = max(0.0, float(settings.bot_inbound_debounce_seconds))
     settings.bot.enable_typing = settings.bot_enable_typing
     settings.bot.enable_streaming = settings.bot_enable_streaming
     settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)

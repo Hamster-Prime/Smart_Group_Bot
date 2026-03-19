@@ -27,9 +27,7 @@ class DecisionService:
         *,
         max_items: int = 5,
     ) -> str:
-        if max_items <= 0:
-            return "[最近上下文]\n(无)"
-        if not history:
+        if max_items <= 0 or not history:
             return "[最近上下文]\n(无)"
 
         role_map = {
@@ -65,6 +63,9 @@ class DecisionService:
         user_tag: str,
         msg_type: str,
         history: list[dict[str, str]] | None,
+        *,
+        merged_count: int,
+        merged_context: str,
     ) -> str:
         sender = f"[发送者]\n{clean_text(user_tag, max_len=120)}\n" if user_tag else ""
         mention_tag = "[是否@机器人]\n是" if is_mentioned else "[是否@机器人]\n否"
@@ -74,7 +75,15 @@ class DecisionService:
         mention_other_tag = "[是否@其他用户]\n是" if mentions_other_user else "[是否@其他用户]\n否"
         owner_tag = "[当前发送者是否主人]\n是" if is_owner else "[当前发送者是否主人]\n否"
         tg_admin_tag = "[当前发送者是否TG群管理员]\n是" if is_tg_admin else "[当前发送者是否TG群管理员]\n否"
+        merged_tag = "[是否合并消息]\n是" if merged_count > 1 else "[是否合并消息]\n否"
+        merged_count_tag = f"[合并消息数]\n{max(1, int(merged_count or 1))}"
         recent_context_tag = self._format_recent_context(history, max_items=self.context_items)
+        merged_context_tag = ""
+        if merged_count > 1 and merged_context.strip():
+            merged_context_tag = (
+                "[合并消息明细]\n"
+                f"{wrap_untrusted('合并消息明细', merged_context, max_len=1800)}\n"
+            )
 
         context = (
             f"{build_current_time_context()}\n"
@@ -86,18 +95,22 @@ class DecisionService:
             f"{mention_other_tag}\n"
             f"{owner_tag}\n"
             f"{tg_admin_tag}\n"
+            f"{merged_tag}\n"
+            f"{merged_count_tag}\n"
             f"{recent_context_tag}\n"
             f"[消息类型]\n{clean_text(msg_type, max_len=40)}\n"
-            f"[消息正文]\n{wrap_untrusted('消息正文', normalized, max_len=1000)}"
+            f"{merged_context_tag}"
+            f"[消息正文]\n{wrap_untrusted('消息正文', normalized, max_len=1800)}"
         )
 
         result = await self.llm.decision(build_defended_system(DECISION_SYSTEM), context)
         result = result.strip().lower()
         log.info(
-            "decision llm returned=%s mention=%s msg_type=%s",
+            "decision llm returned=%s mention=%s msg_type=%s merged=%s",
             result,
             is_mentioned,
             msg_type,
+            merged_count > 1,
         )
         return result
 
@@ -114,9 +127,12 @@ class DecisionService:
         user_tag: str = "",
         msg_type: str = "text",
         history: list[dict[str, str]] | None = None,
+        merged_count: int = 1,
+        merged_context: str = "",
     ) -> str:
         """Return one of: skip / casual."""
-        normalized = clean_text(re.sub(r"\s+", " ", text).strip(), max_len=1200)
+        max_len = 1800 if merged_count > 1 else 1200
+        normalized = clean_text(re.sub(r"\s+", " ", text).strip(), max_len=max_len)
 
         if contains_prompt_injection(normalized):
             log.warning("decision input may contain prompt injection")
@@ -133,20 +149,19 @@ class DecisionService:
             user_tag,
             msg_type,
             history,
+            merged_count=max(1, int(merged_count or 1)),
+            merged_context=clean_text(merged_context, max_len=1800),
         )
 
-        # 兼容旧提示词输出，将 question 归一为 casual。
         if result == "question":
             result = "casual"
 
-        # 被@时，如果模型返回有效输出，保持原样；否则默认为 casual。
         if is_mentioned:
             if result not in ("casual",):
                 log.info("decision @mentioned fallback to casual")
                 return "casual"
             return result
 
-        # 验证输出
         if result in ("skip", "casual"):
             return result
 

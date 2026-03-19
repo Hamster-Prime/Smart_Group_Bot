@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import io
@@ -7,6 +8,8 @@ import json
 import logging
 import re
 import time
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiogram import F, Router
@@ -24,6 +27,7 @@ from bot.services.decision import DecisionService
 from bot.services.group_intent import GroupIntent, GroupIntentService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
+from bot.services.reply_mode import ReplyModeService
 from bot.services.skills import SkillService
 from bot.services.sticker_decision import StickerDecisionService
 from bot.services.sticker_library import sticker_library
@@ -38,9 +42,9 @@ from bot.utils.telegram import (
     is_group,
     is_reply_message,
     mentions_other_user,
-    reply_sticker_with_auto_delete,
     sanitize_outgoing_text,
     send_reply,
+    send_sticker_with_auto_delete,
     typing_action,
 )
 
@@ -574,6 +578,474 @@ async def _append_image_context(
     return f"{text}\n[image-vision]\n{vision_text}", vision_text
 
 
+@dataclass(slots=True)
+class _PendingReplyItem:
+    message: Message
+    group_id: int
+    user_id: int
+    input_text: str
+    msg_type: str
+    sender_username: str
+    sender_is_owner: bool
+    sender_is_tg_admin: bool
+    user_tag: str
+    mentioned: bool
+    is_reply: bool
+    reply_to_bot: bool
+    reply_to_other: bool
+    mention_other: bool
+    memory_entry: str = ""
+
+
+@dataclass(slots=True)
+class _PendingReplyBatch:
+    items: list[_PendingReplyItem] = field(default_factory=list)
+    version: int = 0
+    task: asyncio.Task[None] | None = None
+    settings: Settings | None = None
+
+
+_PENDING_REPLY_LOCK = asyncio.Lock()
+_PENDING_REPLY_BATCHES: dict[tuple[int, int], _PendingReplyBatch] = {}
+
+
+def _pending_batch_key(group_id: int, user_id: int) -> tuple[int, int]:
+    return group_id, user_id
+
+
+def _build_merged_user_text(items: list[_PendingReplyItem]) -> str:
+    texts = [(item.input_text or "").strip() for item in items if (item.input_text or "").strip()]
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return texts[0]
+    return "\n".join(texts)
+
+
+def _build_merged_context(items: list[_PendingReplyItem]) -> str:
+    if not items:
+        return ""
+
+    lines = [f"count={len(items)}", "以下是同一用户在当前抖动窗口内连续发送的消息，按时间顺序排列："]
+    for idx, item in enumerate(items, start=1):
+        meta = (
+            f"type={item.msg_type} "
+            f"mention_bot={'yes' if item.mentioned else 'no'} "
+            f"reply={'yes' if item.is_reply else 'no'} "
+            f"reply_bot={'yes' if item.reply_to_bot else 'no'} "
+            f"reply_other={'yes' if item.reply_to_other else 'no'} "
+            f"mention_other={'yes' if item.mention_other else 'no'}"
+        )
+        text = _truncate_text((item.input_text or "").replace("\n", " ").strip(), 280)
+        lines.append(f"[{idx}] {meta}")
+        lines.append(text or "(empty)")
+    return "\n".join(lines)
+
+
+def _exclude_batch_messages(
+    history: list[dict[str, Any]] | None,
+    batch_memory_entries: list[str],
+) -> list[dict[str, Any]]:
+    if not history:
+        return []
+
+    pending = Counter(entry for entry in batch_memory_entries if entry)
+    if not pending:
+        return list(history)
+
+    kept_reversed: list[dict[str, Any]] = []
+    for item in reversed(history):
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", ""))
+        if role == "user" and pending.get(content, 0) > 0:
+            pending[content] -= 1
+            continue
+        kept_reversed.append(item)
+    kept_reversed.reverse()
+    return kept_reversed
+
+
+def _effective_batch_flags(
+    items: list[_PendingReplyItem],
+) -> tuple[bool, bool, bool, bool, bool, str]:
+    latest = items[-1]
+    mentioned = any(item.mentioned for item in items)
+    reply_to_bot = any(item.reply_to_bot for item in items)
+    is_reply = latest.is_reply or reply_to_bot
+    reply_to_other = latest.reply_to_other and not (mentioned or reply_to_bot)
+    mention_other = latest.mention_other and not (mentioned or reply_to_bot)
+    return mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, latest.msg_type
+
+
+async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings: Settings) -> None:
+    if not items:
+        return
+
+    latest = items[-1]
+    group_id = latest.group_id
+    user_id = latest.user_id
+    flow_started = time.perf_counter()
+    merged_count = len(items)
+    merged_input_text = _build_merged_user_text(items)
+    merged_context = _build_merged_context(items)
+    memory_entries = [item.memory_entry for item in items if item.memory_entry]
+    memory = memory_holder.get()
+    session_factory = memory.session_factory
+
+    llm = LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        embed=settings.bot.embed_model,
+    )
+    decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
+    reply_mode_svc = ReplyModeService(llm)
+    sticker_decider = StickerDecisionService(llm)
+    sticker_pool = [
+        x.strip()
+        for x in (settings.skill_sticker_file_ids or "").split(",")
+        if x and x.strip()
+    ]
+    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
+
+    mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, msg_type = _effective_batch_flags(items)
+
+    log.info(
+        "[%s] pending batch flush started | user=%s messages=%d debounce=%.2fs",
+        group_id,
+        user_id,
+        merged_count,
+        float(settings.bot.inbound_debounce_seconds or 0.0),
+    )
+
+    async with session_factory() as session:
+        try:
+            group_row = await session.get(Group, group_id)
+            group_settings = (group_row.settings if group_row and group_row.settings else {})
+            if bool(group_settings.get("mute_all_replies", False)):
+                log.info("[%s] pending batch skipped | reason=mute_all_replies user=%s", group_id, user_id)
+                return
+
+            mute_stmt = select(ReplyMute.id).where(
+                ReplyMute.group_id == group_id,
+                ReplyMute.user_id == user_id,
+            )
+            mute_result = await session.execute(mute_stmt)
+            if mute_result.scalar_one_or_none() is not None:
+                log.info("[%s] pending batch skipped | reason=user_muted user=%s", group_id, user_id)
+                return
+
+            decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
+            assistant_reply_count = sum(1 for item in decision_history if item.get("role") == "assistant")
+
+            decision_started = time.perf_counter()
+            action = await decision_svc.decide(
+                merged_input_text,
+                is_mentioned=mentioned,
+                is_reply=is_reply,
+                is_reply_to_bot=reply_to_bot,
+                is_reply_to_other=reply_to_other,
+                mentions_other_user=mention_other,
+                is_owner=latest.sender_is_owner,
+                is_tg_admin=latest.sender_is_tg_admin,
+                user_tag=latest.user_tag,
+                msg_type=msg_type,
+                history=decision_history,
+                merged_count=merged_count,
+                merged_context=merged_context,
+            )
+            log.info(
+                "[%s] pending batch decision done | action=%s elapsed=%dms",
+                group_id,
+                action,
+                int((time.perf_counter() - decision_started) * 1000),
+            )
+
+            reply = ""
+            reply_source = "none"
+            sent_ok = False
+            sticker_decision_send = False
+            sticker_decision_reason = ""
+            sticker_decision_file = ""
+            sticker_sent_ok = False
+            delivery_mode = "reply"
+
+            if action != "skip":
+                history = await memory.get_history_for_llm(group_id, query=merged_input_text)
+                history = _exclude_batch_messages(history, memory_entries)
+                log.info(
+                    "[%s] pending batch reply generation started | action=%s history=%d",
+                    group_id,
+                    action,
+                    len(history),
+                )
+
+                async with typing_action(latest.message, enabled=settings.bot.enable_typing):
+                    skill_reply = await skill.answer_with_skill(
+                        merged_input_text,
+                        session=session,
+                        history=history,
+                        sender_user_id=user_id,
+                        sender_username=latest.sender_username,
+                        sender_is_owner=latest.sender_is_owner,
+                        sender_is_tg_admin=latest.sender_is_tg_admin,
+                        message=latest.message,
+                        intent_type=action,
+                    )
+                    if skill_reply:
+                        reply = skill_reply
+                        reply_source = "skill"
+                        log.info("[%s] pending batch reply via skill | %s", group_id, reply[:80])
+
+                    if not reply:
+                        casual = CasualService(llm)
+                        reply = await casual.reply(
+                            merged_input_text,
+                            history=history,
+                            sender_user_id=user_id,
+                            sender_username=latest.sender_username,
+                            sender_is_owner=latest.sender_is_owner,
+                            sender_is_tg_admin=latest.sender_is_tg_admin,
+                            intent_type=action,
+                            merged_count=merged_count,
+                        )
+                        if reply:
+                            reply_source = "casual"
+                        log.info(
+                            "[%s] pending batch reply via casual | intent=%s | %s",
+                            group_id,
+                            action,
+                            reply[:80] if reply else "(empty)",
+                        )
+
+                    if reply:
+                        cleaned_reply = sanitize_outgoing_text(reply)
+                        if cleaned_reply != reply:
+                            log.warning("[%s] pending batch reply sanitized", group_id)
+                        reply = cleaned_reply
+                        normalized_reply = _normalize_owner_address(reply, latest.sender_is_owner)
+                        if normalized_reply != reply:
+                            log.info("[%s] pending batch owner-address normalized", group_id)
+                        reply = normalized_reply
+
+                silence_reply, silence_reason = _should_silence_generated_reply(reply)
+                if silence_reply:
+                    should_really_silence = True
+                    if action == "casual" and silence_reason == "silent_marker":
+                        log.warning("[%s] pending batch casual returned silent marker, using fallback", group_id)
+                        reply = "嗯哼，我在听~"
+                        should_really_silence = False
+                        reply_source = "fallback"
+                    if should_really_silence:
+                        preview = _truncate_text(reply, 80) if reply else "-"
+                        log.info(
+                            "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
+                            group_id,
+                            silence_reason,
+                            reply_source,
+                            action,
+                            preview,
+                        )
+                        reply = ""
+                        reply_source = "none"
+                        action = "skip"
+
+            if action != "skip" and reply:
+                delivery_mode = await reply_mode_svc.decide(
+                    user_text=merged_input_text,
+                    assistant_reply=reply,
+                    msg_type=msg_type,
+                    is_mentioned=mentioned,
+                    is_reply_to_bot=reply_to_bot,
+                    is_reply_to_other=reply_to_other,
+                    merged_count=merged_count,
+                    merged_context=merged_context,
+                )
+
+            sticker_decision_started = time.perf_counter()
+            sticker_decision = await sticker_decider.decide(
+                session=session,
+                group_id=group_id,
+                action=action,
+                msg_type=msg_type,
+                is_mentioned=mentioned,
+                is_reply_to_bot=reply_to_bot,
+                user_text=merged_input_text,
+                assistant_reply=reply,
+                reply_source=reply_source,
+                assistant_reply_count=assistant_reply_count,
+                default_sticker_file_ids=sticker_pool,
+            )
+            sticker_decision_send = bool(sticker_decision.send)
+            sticker_decision_reason = sticker_decision.reason or ""
+            sticker_decision_file = sticker_decision.sticker_file_id or ""
+            log.info(
+                "[%s] pending batch sticker decision done | send=%s file=%s reason=%s elapsed=%dms",
+                group_id,
+                sticker_decision_send,
+                sticker_decision_file[:32] if sticker_decision_file else "-",
+                sticker_decision_reason or "-",
+                int((time.perf_counter() - sticker_decision_started) * 1000),
+            )
+
+            if action != "skip" and reply and sticker_decision_send and sticker_decision_file:
+                try:
+                    await send_sticker_with_auto_delete(
+                        latest.message,
+                        sticker=sticker_decision_file,
+                        delivery_mode=delivery_mode,
+                        auto_delete_minutes=0,
+                    )
+                    await sticker_library.mark_sent(session, group_id, sticker_decision_file)
+                    sticker_sent_ok = True
+                    log.info(
+                        "[%s] pending batch sticker sent | mode=%s file=%s reason=%s",
+                        group_id,
+                        delivery_mode,
+                        sticker_decision_file[:32],
+                        sticker_decision_reason or "-",
+                    )
+                except Exception:
+                    log.exception("[%s] pending batch sticker send failed", group_id)
+
+            if action != "skip" and reply:
+                sent_ok = await send_reply(
+                    latest.message,
+                    reply,
+                    delivery_mode=delivery_mode,
+                    stream=settings.bot.enable_streaming,
+                    stream_chunk_size=settings.bot.stream_chunk_size,
+                    stream_interval=settings.bot.stream_edit_interval_sec,
+                    auto_delete_minutes=0,
+                )
+
+            if action == "skip":
+                log.info(
+                    "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s sticker=%s elapsed=%dms",
+                    group_id,
+                    mentioned,
+                    mention_other,
+                    is_reply,
+                    reply_to_bot,
+                    reply_to_other,
+                    sticker_decision_send,
+                    int((time.perf_counter() - flow_started) * 1000),
+                )
+                return
+
+            if reply and sent_ok:
+                memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
+
+            await session.commit()
+            log.info(
+                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s sticker=%s sticker_sent=%s len=%d elapsed=%dms",
+                group_id,
+                action,
+                reply_source,
+                bool(reply),
+                sent_ok,
+                delivery_mode,
+                sticker_decision_send,
+                sticker_sent_ok,
+                len(reply or ""),
+                int((time.perf_counter() - flow_started) * 1000),
+            )
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def _flush_pending_reply_batch(
+    key: tuple[int, int],
+    *,
+    expected_version: int | None = None,
+) -> None:
+    current_task = asyncio.current_task()
+    async with _PENDING_REPLY_LOCK:
+        state = _PENDING_REPLY_BATCHES.get(key)
+        if state is None:
+            return
+        if expected_version is not None and state.version != expected_version:
+            return
+        _PENDING_REPLY_BATCHES.pop(key, None)
+
+    if state.task and state.task is not current_task and not state.task.done():
+        state.task.cancel()
+        await asyncio.gather(state.task, return_exceptions=True)
+
+    if state.settings is None:
+        return
+    await _process_pending_reply_batch(list(state.items), state.settings)
+
+
+async def _wait_and_flush_pending_reply_batch(
+    key: tuple[int, int],
+    *,
+    expected_version: int,
+    delay_seconds: float,
+) -> None:
+    try:
+        await asyncio.sleep(max(0.0, delay_seconds))
+        await _flush_pending_reply_batch(key, expected_version=expected_version)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("pending batch flush failed | key=%s", key)
+
+
+async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) -> int:
+    key = _pending_batch_key(item.group_id, item.user_id)
+    delay_seconds = float(settings.bot.inbound_debounce_seconds or 0.0)
+
+    async with _PENDING_REPLY_LOCK:
+        state = _PENDING_REPLY_BATCHES.get(key)
+        if state is None:
+            state = _PendingReplyBatch()
+            _PENDING_REPLY_BATCHES[key] = state
+        state.settings = settings
+        state.items.append(item)
+        state.version += 1
+        queued_count = len(state.items)
+
+        if state.task and not state.task.done():
+            state.task.cancel()
+
+        state.task = asyncio.create_task(
+            _wait_and_flush_pending_reply_batch(
+                key,
+                expected_version=state.version,
+                delay_seconds=delay_seconds,
+            ),
+            name=f"pending-reply:{item.group_id}:{item.user_id}",
+        )
+
+    return queued_count
+
+
+async def flush_pending_inbound_batches() -> None:
+    current_task = asyncio.current_task()
+    async with _PENDING_REPLY_LOCK:
+        pending = list(_PENDING_REPLY_BATCHES.items())
+        _PENDING_REPLY_BATCHES.clear()
+
+    tasks_to_cancel: list[asyncio.Task[None]] = []
+    for _, state in pending:
+        if state.task and state.task is not current_task and not state.task.done():
+            state.task.cancel()
+            tasks_to_cancel.append(state.task)
+    if tasks_to_cancel:
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+    for key, state in pending:
+        if not state.items or state.settings is None:
+            continue
+        try:
+            await _process_pending_reply_batch(list(state.items), state.settings)
+        except Exception:
+            log.exception("pending batch flush_all failed | key=%s", key)
+
+
 @router.message(
     F.text
     | F.caption
@@ -856,6 +1328,62 @@ async def on_group_message(
             return
 
     should_index_user_memory = msg_type != "contact"
+    memory_entry = ""
+    if should_index_user_memory:
+        memory_entry = f"[{user_tag}] {input_text}"
+        memory.add_message(
+            group_id,
+            "user",
+            memory_entry,
+            user_id=user_id,
+            message_type=msg_type,
+            message_id=str(message.message_id),
+        )
+    else:
+        log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
+
+    bot_me = await message.bot.me()
+    mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
+    is_reply = is_reply_message(message)
+    reply_to_bot = is_reply_to_bot(message, bot_me.username or "", bot_me.id)
+    reply_to_other = is_reply and not reply_to_bot
+    mention_other = mentions_other_user(message, bot_me.username or "", bot_me.id)
+
+    queued_count = await _enqueue_pending_reply(
+        _PendingReplyItem(
+            message=message,
+            group_id=group_id,
+            user_id=user_id,
+            input_text=input_text,
+            msg_type=msg_type,
+            sender_username=sender_username,
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+            user_tag=user_tag,
+            mentioned=mentioned,
+            is_reply=is_reply,
+            reply_to_bot=reply_to_bot,
+            reply_to_other=reply_to_other,
+            mention_other=mention_other,
+            memory_entry=memory_entry,
+        ),
+        settings,
+    )
+    log.info(
+        "[%s] pending batch queued | user=%s size=%d mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s type=%s elapsed=%dms",
+        group_id,
+        user_id,
+        queued_count,
+        mentioned,
+        mention_other,
+        is_reply,
+        reply_to_bot,
+        reply_to_other,
+        msg_type,
+        int((time.perf_counter() - flow_started) * 1000),
+    )
+    return
+
     if should_index_user_memory:
         memory.add_message(
             group_id,

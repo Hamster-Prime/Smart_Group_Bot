@@ -63,7 +63,14 @@ async def main() -> None:
             tasks_concurrency_limit=8,
         )
     finally:
-        await memory.flush_background_tasks(timeout_sec=5.0)
+        try:
+            await group.flush_pending_inbound_batches()
+        except Exception:
+            log.exception("pending inbound batch flush failed")
+        try:
+            await memory.flush_background_tasks(timeout_sec=5.0)
+        except Exception:
+            log.exception("memory background flush failed")
         await engine.dispose()
 
 
