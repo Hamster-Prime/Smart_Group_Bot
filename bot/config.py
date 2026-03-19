@@ -133,6 +133,8 @@ class Settings(BaseSettings):
     av_max_results: int = 18
     av_javbus_base_url: str = "https://www.javbus.com"
     av_madouqu_base_url: str = "https://madouqu.com"
+    av_dmm_base_url: str = "https://www.dmm.co.jp"
+    av_fc2_base_url: str = "https://adult.contents.fc2.com"
 
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()

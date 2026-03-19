@@ -125,6 +125,10 @@ def _source_name(source: str) -> str:
         return "JAVBUS"
     if val == "madouqu":
         return "MADOUQU"
+    if val == "dmm":
+        return "DMM"
+    if val == "fc2":
+        return "FC2"
     return val.upper() or "UNKNOWN"
 
 
@@ -173,7 +177,17 @@ def _build_av_search_page(
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     for idx, item in enumerate(session.results[start:end], start=start):
-        source_short = "J" if (item.source or "").lower() == "javbus" else "M"
+        source_key = (item.source or "").lower()
+        if source_key == "javbus":
+            source_short = "J"
+        elif source_key == "madouqu":
+            source_short = "M"
+        elif source_key == "dmm":
+            source_short = "D"
+        elif source_key == "fc2":
+            source_short = "F"
+        else:
+            source_short = "?"
         label = item.code or _truncate_text(item.title, 20)
         btn_text = _truncate_text(f"{idx + 1}. [{source_short}] {label}", 60)
         keyboard_rows.append(
@@ -595,7 +609,7 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "<b>基础命令</b>\n"
         "/start：开始使用\n"
         "/help：查看帮助\n"
-        "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU\n\n"
+        "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU + DMM + FC2\n\n"
         "/tasks：查看当前群待执行定时任务\n"
         "/canceltask &lt;任务ID&gt;：取消自己创建的定时任务\n\n"
         "<b>自然语言管理（群管理员）</b>\n"
@@ -711,6 +725,8 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "1. /av WANZ-530（按番号直查并展示详情+种子）\n"
             "2. /av 推川悠里（按演员名查询并弹出可选列表）\n"
             "3. /av 人妻 NTR（按关键词查询并弹出可选列表）\n\n"
+            "支持来源：JAVBUS / MADOUQU / DMM / FC2\n"
+            "支持 FC2 编号：/av FC2-PPV-4863846\n\n"
             "默认状态：<b>关闭</b>（每个群独立）\n"
             "需最高管理员在目标群发送 /av enable 后可使用\n\n"
             "<b>最高管理员命令（群内）</b>\n"

@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from urllib.parse import quote, quote_plus, urljoin
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 
 import aiohttp
 
@@ -21,6 +21,8 @@ _SPACE_RE = re.compile(r"\s+")
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _SIZE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:TB|GB|MB|KB)\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"\b([A-Za-z]{2,10})[-_ ]?(\d{2,5})\b")
+_FC2_CODE_RE = re.compile(r"\bFC2[-_ ]?(?:PPV[-_ ]?)?(\d{5,9})\b", re.IGNORECASE)
+_FC2_ARTICLE_RE = re.compile(r"/article/(\d{5,9})", re.IGNORECASE)
 _STAR_ID_RE = re.compile(r"/star/([A-Za-z0-9]+)", re.IGNORECASE)
 _STAR_NAME_CACHE: dict[str, str] = {}
 
@@ -33,10 +35,23 @@ def normalize_av_code(raw: str) -> str:
     return f"{matched.group(1).upper()}-{matched.group(2)}"
 
 
+def normalize_fc2_code(raw: str) -> str:
+    text = (raw or "").strip()
+    matched = _FC2_CODE_RE.search(text)
+    if not matched:
+        return ""
+    return f"FC2-PPV-{matched.group(1)}"
+
+
 def is_av_code_query(query: str) -> bool:
     text = (query or "").strip()
     if not text:
         return False
+    fc2_norm = normalize_fc2_code(text)
+    if fc2_norm:
+        cleaned = re.sub(r"[\s_]+", "-", text).upper()
+        cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+        return cleaned == fc2_norm
     norm = normalize_av_code(text)
     if not norm:
         return False
@@ -87,6 +102,16 @@ def _abs_url(base_url: str, maybe_relative: str) -> str:
     if not value:
         return ""
     return urljoin(base_url, value)
+
+
+def _strip_url_query(raw_url: str) -> str:
+    value = (raw_url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value.split("?", 1)[0]
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
@@ -166,6 +191,58 @@ def _guess_actor_from_title_text(raw: str, *, code: str = "") -> str:
     if _looks_like_person_name(name):
         return name
     return ""
+
+
+def _extract_fc2_article_id(raw: str) -> str:
+    value = html.unescape((raw or "").strip())
+    if not value:
+        return ""
+    matched = _FC2_ARTICLE_RE.search(value)
+    if matched:
+        return matched.group(1)
+    matched = _FC2_CODE_RE.search(value)
+    if matched:
+        return matched.group(1)
+    if re.fullmatch(r"\d{5,9}", value):
+        return value
+    return ""
+
+
+def _normalize_relaxed_av_code(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    direct = normalize_av_code(value)
+    if direct:
+        return direct
+
+    compact = re.sub(r"[^A-Za-z0-9]+", "", value)
+    if not compact:
+        return ""
+
+    candidates = [
+        compact,
+        compact.lstrip("0123456789"),
+        re.sub(r"^[A-Za-z]_\d+", "", compact, flags=re.IGNORECASE),
+    ]
+    for candidate in candidates:
+        matched = re.search(r"([A-Za-z]{2,10})(\d{2,5})(?:[A-Za-z]{0,4})$", candidate, re.IGNORECASE)
+        if matched:
+            return f"{matched.group(1).upper()}-{matched.group(2)}"
+    return ""
+
+
+def _split_text_tokens(raw: str, *, max_len: int, keep_spaces: bool = False) -> list[str]:
+    text = _clean_text(raw, max_len=0)
+    if not text:
+        return []
+    pattern = r"[\u3001,/|]" if keep_spaces else r"[\u3001,/|\s]+"
+    items: list[str] = []
+    for token in re.split(pattern, text):
+        cleaned = _clean_text(token, max_len=max_len)
+        if cleaned and cleaned not in {"-", "--", "----", "N/A", "n/a"}:
+            items.append(cleaned)
+    return _dedupe_keep_order(items)
 
 
 @dataclass(slots=True)
@@ -275,6 +352,12 @@ class AVSearchService:
         self.madouqu_base = str(
             getattr(settings, "av_madouqu_base_url", "https://madouqu.com")
         ).rstrip("/")
+        self.dmm_base = str(
+            getattr(settings, "av_dmm_base_url", "https://www.dmm.co.jp")
+        ).rstrip("/")
+        self.fc2_base = str(
+            getattr(settings, "av_fc2_base_url", "https://adult.contents.fc2.com")
+        ).rstrip("/")
         self.enabled = bool(getattr(settings, "av_enabled", True))
 
     @staticmethod
@@ -299,13 +382,14 @@ class AVSearchService:
         url: str,
         *,
         referer: str = "",
+        cookies: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         try:
             async with session.get(
                 url,
                 headers=self._headers(referer=referer),
                 allow_redirects=True,
-                cookies={"existmag": "all"},
+                cookies=dict(cookies or {}),
             ) as response:
                 status = int(response.status)
                 final_url = str(response.url)
@@ -330,22 +414,32 @@ class AVSearchService:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             jav_task = self._search_javbus(session, cleaned_query, max_results=per_source)
             mad_task = self._search_madouqu(session, cleaned_query, max_results=per_source)
-            jav_result, mad_result = await asyncio.gather(
+            dmm_task = self._search_dmm(session, cleaned_query, max_results=per_source)
+            fc2_task = self._search_fc2(session, cleaned_query, max_results=per_source)
+            jav_result, mad_result, dmm_result, fc2_result = await asyncio.gather(
                 jav_task,
                 mad_task,
+                dmm_task,
+                fc2_task,
                 return_exceptions=True,
             )
 
         jav_items = jav_result if isinstance(jav_result, list) else []
         mad_items = mad_result if isinstance(mad_result, list) else []
+        dmm_items = dmm_result if isinstance(dmm_result, list) else []
+        fc2_items = fc2_result if isinstance(fc2_result, list) else []
         if isinstance(jav_result, Exception):
             log.warning("javbus search failed: %s", jav_result)
         if isinstance(mad_result, Exception):
             log.warning("madouqu search failed: %s", mad_result)
+        if isinstance(dmm_result, Exception):
+            log.warning("dmm search failed: %s", dmm_result)
+        if isinstance(fc2_result, Exception):
+            log.warning("fc2 search failed: %s", fc2_result)
 
         merged: list[AVSearchItem] = []
         seen: set[str] = set()
-        for item in [*jav_items, *mad_items]:
+        for item in [*jav_items, *mad_items, *dmm_items, *fc2_items]:
             key = (item.url or "").strip().lower()
             if not key or key in seen:
                 continue
@@ -358,6 +452,18 @@ class AVSearchService:
     async def lookup_by_code(self, code_or_query: str) -> AVDetail | None:
         if not self.enabled:
             return None
+        fc2_code = normalize_fc2_code(code_or_query)
+        if fc2_code:
+            article_id = _extract_fc2_article_id(fc2_code)
+            if not article_id:
+                return None
+            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                detail = await self._fetch_fc2_detail(session, f"{self.fc2_base}/article/{article_id}/")
+                if detail:
+                    return detail
+            return None
+
         code = normalize_av_code(code_or_query)
         if not code:
             return None
@@ -385,6 +491,18 @@ class AVSearchService:
                     if not first.code:
                         first.code = code
                     return first
+
+            dmm_items = await self._search_dmm(session, code, max_results=8)
+            for item in dmm_items:
+                if normalize_av_code(item.code) != code:
+                    continue
+                exact = await self._fetch_dmm_detail(session, item.url)
+                if exact:
+                    return await self._enrich_with_javbus(session, exact)
+            if dmm_items:
+                first = await self._fetch_dmm_detail(session, dmm_items[0].url)
+                if first:
+                    return await self._enrich_with_javbus(session, first)
         return None
 
     async def fetch_detail(self, item: AVSearchItem) -> AVDetail | None:
@@ -403,24 +521,14 @@ class AVSearchService:
                 detail = await self._fetch_madouqu_detail(session, url)
                 if not detail:
                     return None
-                # Best-effort: enrich madouqu detail with javbus magnets by AV code.
-                if detail.code:
-                    jav_url = f"{self.javbus_base}/{quote(detail.code, safe='')}"
-                    jav_detail = await self._fetch_javbus_detail(session, jav_url)
-                    if jav_detail:
-                        if jav_detail.seeds:
-                            detail.seeds = jav_detail.seeds
-                        if not detail.cover_url:
-                            detail.cover_url = jav_detail.cover_url
-                        if not detail.actors:
-                            detail.actors = jav_detail.actors
-                        if not detail.genres:
-                            detail.genres = jav_detail.genres
-                        if not detail.date:
-                            detail.date = jav_detail.date
-                        if not detail.runtime:
-                            detail.runtime = jav_detail.runtime
-                return detail
+                return await self._enrich_with_javbus(session, detail)
+            if source == "dmm":
+                detail = await self._fetch_dmm_detail(session, url)
+                if not detail:
+                    return None
+                return await self._enrich_with_javbus(session, detail)
+            if source == "fc2":
+                return await self._fetch_fc2_detail(session, url)
         return None
 
     async def _search_javbus(
@@ -431,7 +539,12 @@ class AVSearchService:
         max_results: int,
     ) -> list[AVSearchItem]:
         search_url = f"{self.javbus_base}/search/{quote(query, safe='')}/1"
-        status, final_url, content = await self._fetch_text(session, search_url, referer=self.javbus_base)
+        status, final_url, content = await self._fetch_text(
+            session,
+            search_url,
+            referer=self.javbus_base,
+            cookies={"existmag": "all"},
+        )
         if status >= 400 or not content:
             return []
 
@@ -467,6 +580,83 @@ class AVSearchService:
         if status >= 400 or not content:
             return []
         return self._parse_madouqu_search(content, base_url=final_url)[:max_results]
+
+    async def _search_dmm(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        *,
+        max_results: int,
+    ) -> list[AVSearchItem]:
+        search_url = f"{self.dmm_base}/search/?redirect=1&enc=UTF-8&category=&searchstr={quote_plus(query)}"
+        status, final_url, content = await self._fetch_text(
+            session,
+            search_url,
+            referer=self.dmm_base,
+            cookies={"ckcy": "1"},
+        )
+        if status >= 400 or not content:
+            return []
+
+        items = self._parse_dmm_search(content, base_url=final_url)
+        if items:
+            return items[:max_results]
+
+        detail = self._parse_dmm_detail(content, final_url)
+        if detail:
+            return [
+                AVSearchItem(
+                    source="dmm",
+                    title=detail.title,
+                    code=detail.code,
+                    url=detail.url,
+                    cover_url=detail.cover_url,
+                    date=detail.date,
+                    summary=detail.summary,
+                )
+            ]
+        return []
+
+    async def _search_fc2(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        *,
+        max_results: int,
+    ) -> list[AVSearchItem]:
+        search_url = f"{self.fc2_base}/search/?q={quote_plus(query)}"
+        status, final_url, content = await self._fetch_text(
+            session,
+            search_url,
+            referer=self.fc2_base,
+            cookies={
+                "GDPRCHECK": "true",
+                "contents_mode": "digital",
+                "contents_func_mode": "buy",
+                "wei6H": "1",
+            },
+        )
+        if status >= 400 or not content:
+            return []
+
+        items = self._parse_fc2_search(content, base_url=final_url)
+        if items:
+            return items[:max_results]
+
+        detail = self._parse_fc2_detail(content, final_url)
+        if detail:
+            return [
+                AVSearchItem(
+                    source="fc2",
+                    title=detail.title,
+                    code=detail.code,
+                    url=detail.url,
+                    cover_url=detail.cover_url,
+                    date=detail.date,
+                    summary=detail.summary,
+                )
+            ]
+        return []
 
     def _parse_javbus_search(self, content: str, *, base_url: str) -> list[AVSearchItem]:
         items: list[AVSearchItem] = []
@@ -585,8 +775,154 @@ class AVSearchService:
                 break
         return items
 
+    def _parse_dmm_search(self, content: str, *, base_url: str) -> list[AVSearchItem]:
+        items: list[AVSearchItem] = []
+        seen: set[str] = set()
+
+        blocks = re.split(r'(?=<div class="flex py-1\.5 pl-3">)', content or "")
+        for block in blocks:
+            href = _extract_first(r'<a[^>]+href=["\'](https?://www\.dmm\.co\.jp/[^"\']*/detail/=/cid=[^"\']+)["\']', block)
+            if not href:
+                href = _extract_first(r'<a[^>]+href=["\'](/[^"\']*/detail/=/cid=[^"\']+)["\']', block)
+            url = _strip_url_query(_abs_url(base_url, href))
+            if not url or url in seen:
+                continue
+
+            title = _clean_text(
+                _strip_tags(
+                    _extract_first(
+                        r'<p[^>]+class=["\'][^"\']*text-sm[^"\']*font-bold[^"\']*line-clamp-2[^"\']*["\'][^>]*>(.*?)</p>',
+                        block,
+                    )
+                ),
+                max_len=300,
+            )
+            if not title:
+                continue
+
+            seen.add(url)
+            cover = _extract_first(r'<img[^>]+src=["\'](.*?)["\']', block)
+            date = _clean_text(
+                _strip_tags(
+                    _extract_first(
+                        r'<p[^>]+class=["\'][^"\']*text-xs[^"\']*text-gray-500[^"\']*["\'][^>]*>\s*(?:発売日|貸出日|配信開始日)\s*[:：]?\s*(.*?)</p>',
+                        block,
+                    )
+                ),
+                max_len=40,
+            )
+            actor_line = _clean_text(
+                _strip_tags(
+                    _extract_first(
+                        r'<p[^>]+class=["\'][^"\']*text-xs[^"\']*text-gray-500[^"\']*line-clamp-1[^"\']*["\'][^>]*>\s*(?:出演者|シリーズ)\s*[:：]?\s*(.*?)</p>',
+                        block,
+                    )
+                ),
+                max_len=220,
+            )
+            code = self._normalize_dmm_code(self._extract_dmm_cid(url))
+            if not code:
+                code = self._normalize_dmm_code(title)
+
+            items.append(
+                AVSearchItem(
+                    source="dmm",
+                    title=title,
+                    code=code,
+                    url=url,
+                    cover_url=_abs_url(base_url, cover),
+                    date=date,
+                    summary=actor_line,
+                )
+            )
+        return items
+
+    def _parse_fc2_search(self, content: str, *, base_url: str) -> list[AVSearchItem]:
+        plain = _strip_tags(content)
+        if re.search(r"(?:搜索结果|搜寻结果|検索結果)\s*0件", plain):
+            return []
+
+        items: list[AVSearchItem] = []
+        seen: set[str] = set()
+        blocks = re.split(r'(?=<div class="c-cntCard-110-f">)', content or "")
+        for block in blocks:
+            href = _extract_first(
+                r'<a[^>]+class=["\']c-cntCard-110-f_thumb_link["\'][^>]+href=["\'](.*?)["\']',
+                block,
+            )
+            if not href:
+                href = _extract_first(
+                    r'<a[^>]+class=["\']c-cntCard-110-f_itemName["\'][^>]+href=["\'](.*?)["\']',
+                    block,
+                )
+            url = _strip_url_query(_abs_url(base_url, href))
+            if not url or url in seen:
+                continue
+
+            title = html.unescape(
+                _extract_first(
+                    r'<a[^>]+class=["\']c-cntCard-110-f_itemName["\'][^>]+title=["\'](.*?)["\']',
+                    block,
+                )
+            )
+            if not title:
+                title = _clean_text(
+                    _strip_tags(
+                        _extract_first(
+                            r'<a[^>]+class=["\']c-cntCard-110-f_itemName["\'][^>]*>(.*?)</a>',
+                            block,
+                        )
+                    ),
+                    max_len=300,
+                )
+            title = _clean_text(title, max_len=300)
+            if not title:
+                continue
+
+            seen.add(url)
+            cover = _extract_first(r'<img[^>]+src=["\'](.*?)["\']', block)
+            runtime = _clean_text(
+                _strip_tags(
+                    _extract_first(
+                        r'c-cntCard-110-f_thumb_num[^>]*>\s*([^<]+)\s*<',
+                        block,
+                    )
+                ),
+                max_len=32,
+            )
+            seller = _clean_text(
+                _strip_tags(
+                    _extract_first(r'by\s*</span>\s*<a[^>]*>(.*?)</a>', block)
+                ),
+                max_len=80,
+            )
+            price = _clean_text(
+                _strip_tags(_extract_first(r'(\d[\d,]*)\s*pt', block)),
+                max_len=32,
+            )
+            summary_parts = [part for part in (runtime, price and f"{price} pt", seller and f"by {seller}") if part]
+            article_id = _extract_fc2_article_id(url)
+            code = f"FC2-PPV-{article_id}" if article_id else ""
+
+            items.append(
+                AVSearchItem(
+                    source="fc2",
+                    title=title,
+                    code=code,
+                    url=url,
+                    cover_url=_abs_url(base_url, cover),
+                    summary=" / ".join(summary_parts),
+                )
+            )
+        return items
+
     async def _fetch_javbus_detail(self, session: aiohttp.ClientSession, url: str) -> AVDetail | None:
-        status, final_url, content = await self._fetch_text(session, url, referer=self.javbus_base)
+        status, final_url, content = await self._fetch_text(
+            session,
+            url,
+            referer=self.javbus_base,
+            cookies={"existmag": "all"},
+        )
         if status >= 400 or not content:
             return None
 
@@ -631,7 +967,12 @@ class AVSearchService:
             f"{self.javbus_base}/ajax/uncledatoolsbyajax.php?"
             f"gid={quote_plus(gid)}&lang=zh&img={quote_plus(img)}&uc={quote_plus(uc)}&floor=1"
         )
-        status, _, content = await self._fetch_text(session, ajax_url, referer=referer)
+        status, _, content = await self._fetch_text(
+            session,
+            ajax_url,
+            referer=referer,
+            cookies={"existmag": "all"},
+        )
         if status >= 400 or not content:
             return []
         return self._parse_magnets(content)
@@ -872,6 +1213,7 @@ class AVSearchService:
                     clean_session,
                     url,
                     referer=referer or self.javbus_base,
+                    cookies={"existmag": "all"},
                 )
         except Exception:
             log.exception("fetch javbus star page failed: %s", sid)
@@ -1062,6 +1404,220 @@ class AVSearchService:
             seeds=[],
         )
 
+    async def _fetch_dmm_detail(self, session: aiohttp.ClientSession, url: str) -> AVDetail | None:
+        status, final_url, content = await self._fetch_text(
+            session,
+            url,
+            referer=self.dmm_base,
+            cookies={"ckcy": "1"},
+        )
+        if status >= 400 or not content:
+            return None
+        return self._parse_dmm_detail(content, final_url)
+
+    def _parse_dmm_detail(self, content: str, page_url: str) -> AVDetail | None:
+        title = _clean_text(_strip_tags(_extract_first(r"<h1[^>]*>(.*?)</h1>", content)), max_len=300)
+        if not title:
+            title = _clean_text(_strip_tags(_extract_first(r"<title[^>]*>(.*?)</title>", content)), max_len=300)
+            if " - " in title:
+                title = _clean_text(title.split(" - ", 1)[0], max_len=300)
+        if not title:
+            return None
+
+        plain = _strip_tags(content)
+        release = self._extract_plain_field(
+            plain,
+            labels=["発売日", "貸出日", "配信開始日"],
+            stop_labels=[
+                "収録時間",
+                "再生時間",
+                "出演者",
+                "監督",
+                "シリーズ",
+                "メーカー",
+                "レーベル",
+                "ジャンル",
+                "品番",
+                "平均評価",
+            ],
+            max_len=40,
+        )
+        runtime = self._extract_plain_field(
+            plain,
+            labels=["収録時間", "再生時間"],
+            stop_labels=[
+                "出演者",
+                "監督",
+                "シリーズ",
+                "メーカー",
+                "レーベル",
+                "ジャンル",
+                "品番",
+                "平均評価",
+            ],
+            max_len=40,
+        )
+        actors_text = self._extract_plain_field(
+            plain,
+            labels=["出演者"],
+            stop_labels=["監督", "シリーズ", "メーカー", "レーベル", "ジャンル", "品番", "平均評価"],
+            max_len=240,
+        )
+        director = self._extract_plain_field(
+            plain,
+            labels=["監督"],
+            stop_labels=["シリーズ", "メーカー", "レーベル", "ジャンル", "品番", "平均評価"],
+            max_len=80,
+        )
+        series = self._extract_plain_field(
+            plain,
+            labels=["シリーズ"],
+            stop_labels=["メーカー", "レーベル", "ジャンル", "品番", "平均評価"],
+            max_len=120,
+        )
+        studio = self._extract_plain_field(
+            plain,
+            labels=["メーカー"],
+            stop_labels=["レーベル", "ジャンル", "品番", "平均評価"],
+            max_len=80,
+        )
+        publisher = self._extract_plain_field(
+            plain,
+            labels=["レーベル"],
+            stop_labels=["ジャンル", "品番", "平均評価"],
+            max_len=80,
+        )
+        genres_text = self._extract_plain_field(
+            plain,
+            labels=["ジャンル"],
+            stop_labels=["品番", "平均評価"],
+            max_len=240,
+        )
+        code_raw = self._extract_plain_field(
+            plain,
+            labels=["品番"],
+            stop_labels=["平均評価"],
+            max_len=80,
+        )
+        code = self._normalize_dmm_code(code_raw or self._extract_dmm_cid(page_url))
+        if not code:
+            fallback_code = _clean_text(code_raw or self._extract_dmm_cid(page_url), max_len=80)
+            code = fallback_code.upper() if fallback_code else ""
+
+        score = _clean_text(_extract_first(r"平均評価[:：]?\s*([0-9.]+)", plain), max_len=16)
+        cover = _extract_meta(content, "og:image")
+        if not cover:
+            cover = _extract_first(r'<img[^>]+src=["\'](https?://pics\.dmm\.co\.jp/[^"\']+)["\']', content)
+
+        summary = _clean_text(_extract_meta(content, "description"), max_len=420)
+        actors = [x for x in _split_text_tokens(actors_text, max_len=50) if _looks_like_person_name(x)]
+        genres = _split_text_tokens(genres_text, max_len=40)
+
+        return AVDetail(
+            source="dmm",
+            title=title,
+            url=_strip_url_query(page_url),
+            code=code,
+            cover_url=_abs_url(page_url, cover),
+            date=release,
+            runtime=runtime,
+            score=score,
+            actors=actors[:12],
+            genres=genres[:16],
+            director=director,
+            studio=studio,
+            publisher=publisher,
+            series=series,
+            summary=summary,
+            seeds=[],
+        )
+
+    async def _fetch_fc2_detail(self, session: aiohttp.ClientSession, url: str) -> AVDetail | None:
+        status, final_url, content = await self._fetch_text(
+            session,
+            url,
+            referer=self.fc2_base,
+            cookies={
+                "GDPRCHECK": "true",
+                "contents_mode": "digital",
+                "contents_func_mode": "buy",
+                "wei6H": "1",
+            },
+        )
+        if status >= 400 or not content:
+            return None
+        return self._parse_fc2_detail(content, final_url)
+
+    def _parse_fc2_detail(self, content: str, page_url: str) -> AVDetail | None:
+        title = _clean_text(_strip_tags(_extract_first(r"<title[^>]*>(.*?)</title>", content)), max_len=320)
+        if not title:
+            title = _clean_text(_strip_tags(_extract_first(r"<h[1-6][^>]*>(.*?)</h[1-6]>", content)), max_len=320)
+        if not title:
+            return None
+        if "|" in title:
+            title = _clean_text(title.split("|", 1)[0], max_len=320)
+        fc2_code = normalize_fc2_code(title) or normalize_fc2_code(page_url)
+        if fc2_code:
+            title = _clean_text(re.sub(re.escape(fc2_code), "", title, count=1, flags=re.IGNORECASE), max_len=320)
+        article_id = _extract_fc2_article_id(fc2_code or page_url)
+        code = f"FC2-PPV-{article_id}" if article_id else fc2_code
+
+        plain = _strip_tags(content)
+        date = self._extract_plain_field(
+            plain,
+            labels=["上架时间", "公開日", "配信開始日"],
+            stop_labels=["商品ID", "販賣期間限定", "商品説明", "商品说明"],
+            max_len=40,
+        )
+        studio = _clean_text(
+            _extract_first(
+                r'\bby\s+(.+?)\s+(?:商品标签|商品タグ|支持的设备|対応デバイス|上架时间|商品ID)',
+                plain,
+            ),
+            max_len=80,
+        )
+        tags_text = _clean_text(
+            _extract_first(
+                r"(?:商品标签|商品タグ)\s+(.+?)\s+(?:支持的设备|対応デバイス|上架时间|商品ID)",
+                plain,
+            ),
+            max_len=240,
+        )
+        score = _clean_text(_extract_first(r"(?:平均评价|平均評価)\s*([0-9.]+)", plain), max_len=16)
+        summary = _clean_text(_extract_meta(content, "description"), max_len=420)
+        cover = _extract_meta(content, "og:image")
+        if not cover:
+            cover = _extract_first(r'<img[^>]+src=["\'](https?://[^"\']*contents-thumbnail2\.fc2\.com/[^"\']+)["\']', content)
+
+        if "商品标签" in plain:
+            head_plain = plain.split("商品标签", 1)[0]
+        elif "商品タグ" in plain:
+            head_plain = plain.split("商品タグ", 1)[0]
+        else:
+            head_plain = plain
+        duration_matches = re.findall(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", head_plain)
+        runtime = ""
+        for matched in duration_matches:
+            if len(matched) == 5 and matched.startswith("00:"):
+                continue
+            runtime = matched
+            break
+
+        return AVDetail(
+            source="fc2",
+            title=title,
+            url=_strip_url_query(page_url),
+            code=code,
+            cover_url=_abs_url(page_url, cover),
+            date=date,
+            runtime=runtime,
+            score=score,
+            genres=_split_text_tokens(tags_text, max_len=40)[:16],
+            studio=studio,
+            summary=summary,
+            seeds=[],
+        )
+
     def _extract_madouqu_entities(self, content: str, *, labels: list[str]) -> list[str]:
         if not content:
             return []
@@ -1085,3 +1641,75 @@ class AVSearchService:
                 if text and text not in found:
                     found.append(text)
         return found
+
+    async def _enrich_with_javbus(
+        self,
+        session: aiohttp.ClientSession,
+        detail: AVDetail,
+    ) -> AVDetail:
+        std_code = normalize_av_code(detail.code) or _normalize_relaxed_av_code(detail.code)
+        if not std_code:
+            return detail
+        jav_url = f"{self.javbus_base}/{quote(std_code, safe='')}"
+        jav_detail = await self._fetch_javbus_detail(session, jav_url)
+        if not jav_detail:
+            return detail
+        if jav_detail.seeds:
+            detail.seeds = jav_detail.seeds
+        if not detail.cover_url:
+            detail.cover_url = jav_detail.cover_url
+        if not detail.actors:
+            detail.actors = jav_detail.actors
+        if not detail.genres:
+            detail.genres = jav_detail.genres
+        if not detail.date:
+            detail.date = jav_detail.date
+        if not detail.runtime:
+            detail.runtime = jav_detail.runtime
+        if not detail.summary:
+            detail.summary = jav_detail.summary
+        if not detail.studio:
+            detail.studio = jav_detail.studio
+        if not detail.publisher:
+            detail.publisher = jav_detail.publisher
+        if not detail.series:
+            detail.series = jav_detail.series
+        if not detail.director:
+            detail.director = jav_detail.director
+        if not detail.code:
+            detail.code = jav_detail.code
+        return detail
+
+    @staticmethod
+    def _extract_plain_field(
+        text: str,
+        *,
+        labels: list[str],
+        stop_labels: list[str],
+        max_len: int,
+    ) -> str:
+        if not text or not labels:
+            return ""
+        escaped = "|".join(re.escape(label) for label in labels)
+        stop = "|".join(re.escape(label) for label in stop_labels)
+        pattern = rf"(?:{escaped})\s*[:：]\s*(.+?)(?=\s*(?:{stop})\s*[:：]|\s*$)"
+        return _clean_text(_extract_first(pattern, text), max_len=max_len)
+
+    @staticmethod
+    def _extract_dmm_cid(raw_url: str) -> str:
+        value = html.unescape((raw_url or "").strip())
+        if not value:
+            return ""
+        matched = re.search(r"/cid=([^/?#]+)/?", value, flags=re.IGNORECASE)
+        if matched:
+            return matched.group(1)
+        parsed = urlparse(value)
+        params = parse_qs(parsed.query)
+        cid = params.get("cid")
+        if cid:
+            return _clean_text(cid[0], max_len=80)
+        return ""
+
+    @staticmethod
+    def _normalize_dmm_code(raw: str) -> str:
+        return _normalize_relaxed_av_code((raw or "").strip())
