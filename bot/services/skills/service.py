@@ -8,7 +8,8 @@ import litellm
 
 from bot.config import ChatEndpointConfig, ModelConfig
 from bot.services.llm import LLMService
-from bot.services.skills.base import Skill, SkillContext, SkillRunResult
+from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
+from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
@@ -39,6 +40,7 @@ class SkillService:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
+        self._register(SendStickerSkill())
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
 
@@ -238,7 +240,7 @@ class SkillService:
         sender_is_tg_admin: bool = False,
         message: Any | None = None,
         intent_type: str = "casual",
-    ) -> str:
+    ) -> SkillAnswerResult:
         user_text = clean_text(text, max_len=1200)
         if contains_prompt_injection(user_text):
             log.warning("skill input may contain prompt injection")
@@ -277,10 +279,18 @@ class SkillService:
         )
         last_success_summary = ""
 
+        def _build_answer_result(text: str = "") -> SkillAnswerResult:
+            return SkillAnswerResult(
+                text=text,
+                handled=context.handled,
+                sticker_sent=context.sticker_sent,
+                sticker_file_id=context.sticker_file_id,
+            )
+
         for step in range(1, self.max_tool_rounds + 1):
             resp = await self._completion_with_fallbacks(messages=messages, tools=tools)
             if not resp:
-                return ""
+                return _build_answer_result()
 
             msg = resp.choices[0].message
             content = self._normalize_content_text(getattr(msg, "content", "")).strip()
@@ -301,8 +311,8 @@ class SkillService:
             if not tool_calls:
                 if content:
                     log.info("skill tool loop finished: step=%d no_tool_call", step)
-                    return content
-                return last_success_summary
+                    return _build_answer_result(content)
+                return _build_answer_result(last_success_summary)
 
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
             for tc in tool_calls:
@@ -321,4 +331,4 @@ class SkillService:
                 )
 
         log.info("skill tool loop reached max steps: %d", self.max_tool_rounds)
-        return last_success_summary
+        return _build_answer_result(last_success_summary)

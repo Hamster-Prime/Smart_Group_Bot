@@ -19,6 +19,9 @@ class SkillContext:
     sender_is_tg_admin: bool = False
     current_user_text: str = ""
     default_sticker_file_ids: list[str] = field(default_factory=list)
+    handled: bool = False
+    sticker_sent: bool = False
+    sticker_file_id: str = ""
 
 
 @dataclass(slots=True)
@@ -28,6 +31,14 @@ class SkillRunResult:
     summary: str
     payload: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+
+
+@dataclass(slots=True)
+class SkillAnswerResult:
+    text: str = ""
+    handled: bool = False
+    sticker_sent: bool = False
+    sticker_file_id: str = ""
 
 
 class Skill(Protocol):

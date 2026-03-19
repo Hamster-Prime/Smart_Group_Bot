@@ -29,7 +29,6 @@ from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.skills import SkillService
-from bot.services.sticker_decision import StickerDecisionService
 from bot.services.sticker_library import sticker_library
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
 from bot.utils.telegram import (
@@ -44,7 +43,6 @@ from bot.utils.telegram import (
     mentions_other_user,
     sanitize_outgoing_text,
     send_reply,
-    send_sticker_with_auto_delete,
     typing_action,
 )
 
@@ -701,7 +699,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
     )
     decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
     reply_mode_svc = ReplyModeService(llm)
-    sticker_decider = StickerDecisionService(llm)
     sticker_pool = [
         x.strip()
         for x in (settings.skill_sticker_file_ids or "").split(",")
@@ -737,8 +734,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 return
 
             decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
-            assistant_reply_count = sum(1 for item in decision_history if item.get("role") == "assistant")
-
             decision_started = time.perf_counter()
             action = await decision_svc.decide(
                 merged_input_text,
@@ -765,10 +760,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             reply = ""
             reply_source = "none"
             sent_ok = False
-            sticker_decision_send = False
-            sticker_decision_reason = ""
-            sticker_decision_file = ""
+            skill_handled = False
             sticker_sent_ok = False
+            sticker_file = ""
             delivery_mode = "reply"
 
             if action != "skip":
@@ -782,7 +776,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 )
 
                 async with typing_action(latest.message, enabled=settings.bot.enable_typing):
-                    skill_reply = await skill.answer_with_skill(
+                    skill_result = await skill.answer_with_skill(
                         merged_input_text,
                         session=session,
                         history=history,
@@ -793,12 +787,23 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         message=latest.message,
                         intent_type=action,
                     )
-                    if skill_reply:
-                        reply = skill_reply
+                    skill_handled = bool(skill_result.handled)
+                    sticker_sent_ok = bool(skill_result.sticker_sent)
+                    sticker_file = skill_result.sticker_file_id or ""
+                    if skill_result.text:
+                        reply = skill_result.text
                         reply_source = "skill"
                         log.info("[%s] pending batch reply via skill | %s", group_id, reply[:80])
+                    elif skill_handled:
+                        reply_source = "skill"
+                        log.info(
+                            "[%s] pending batch handled by skill | sticker_sent=%s file=%s",
+                            group_id,
+                            sticker_sent_ok,
+                            sticker_file[:32] if sticker_file else "-",
+                        )
 
-                    if not reply:
+                    if not reply and not skill_handled:
                         casual = CasualService(llm)
                         reply = await casual.reply(
                             merged_input_text,
@@ -829,27 +834,41 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             log.info("[%s] pending batch owner-address normalized", group_id)
                         reply = normalized_reply
 
-                silence_reply, silence_reason = _should_silence_generated_reply(reply)
-                if silence_reply:
-                    should_really_silence = True
-                    if action == "casual" and silence_reason == "silent_marker":
-                        log.warning("[%s] pending batch casual returned silent marker, using fallback", group_id)
-                        reply = "嗯哼，我在听~"
-                        should_really_silence = False
-                        reply_source = "fallback"
-                    if should_really_silence:
-                        preview = _truncate_text(reply, 80) if reply else "-"
-                        log.info(
+                if reply or not skill_handled:
+                    silence_reply, silence_reason = _should_silence_generated_reply(reply)
+                    if silence_reply and not (action == "casual" and silence_reason == "silent_marker"):
+                            preview = _truncate_text(reply, 80) if reply else "-"
+                            log.info(
                             "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
                             group_id,
                             silence_reason,
                             reply_source,
                             action,
                             preview,
-                        )
-                        reply = ""
-                        reply_source = "none"
-                        action = "skip"
+                            )
+                            reply = ""
+                            reply_source = "none"
+                            action = "skip"
+                    if silence_reply and action == "casual" and silence_reason == "silent_marker":
+                        should_really_silence = True
+                        if action == "casual" and silence_reason == "silent_marker":
+                            log.warning("[%s] pending batch casual returned silent marker, using fallback", group_id)
+                        reply = "嗯哼，我在听~"
+                        should_really_silence = False
+                        reply_source = "fallback"
+                        if should_really_silence:
+                            preview = _truncate_text(reply, 80) if reply else "-"
+                            log.info(
+                            "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
+                            group_id,
+                            silence_reason,
+                            reply_source,
+                            action,
+                            preview,
+                            )
+                            reply = ""
+                            reply_source = "none"
+                            action = "skip"
 
             if action != "skip" and reply:
                 delivery_mode = await reply_mode_svc.decide(
@@ -862,52 +881,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     merged_count=merged_count,
                     merged_context=merged_context,
                 )
-
-            sticker_decision_started = time.perf_counter()
-            sticker_decision = await sticker_decider.decide(
-                session=session,
-                group_id=group_id,
-                action=action,
-                msg_type=msg_type,
-                is_mentioned=mentioned,
-                is_reply_to_bot=reply_to_bot,
-                user_text=merged_input_text,
-                assistant_reply=reply,
-                reply_source=reply_source,
-                assistant_reply_count=assistant_reply_count,
-                default_sticker_file_ids=sticker_pool,
-            )
-            sticker_decision_send = bool(sticker_decision.send)
-            sticker_decision_reason = sticker_decision.reason or ""
-            sticker_decision_file = sticker_decision.sticker_file_id or ""
-            log.info(
-                "[%s] pending batch sticker decision done | send=%s file=%s reason=%s elapsed=%dms",
-                group_id,
-                sticker_decision_send,
-                sticker_decision_file[:32] if sticker_decision_file else "-",
-                sticker_decision_reason or "-",
-                int((time.perf_counter() - sticker_decision_started) * 1000),
-            )
-
-            if action != "skip" and reply and sticker_decision_send and sticker_decision_file:
-                try:
-                    await send_sticker_with_auto_delete(
-                        latest.message,
-                        sticker=sticker_decision_file,
-                        delivery_mode=delivery_mode,
-                        auto_delete_minutes=0,
-                    )
-                    await sticker_library.mark_sent(session, group_id, sticker_decision_file)
-                    sticker_sent_ok = True
-                    log.info(
-                        "[%s] pending batch sticker sent | mode=%s file=%s reason=%s",
-                        group_id,
-                        delivery_mode,
-                        sticker_decision_file[:32],
-                        sticker_decision_reason or "-",
-                    )
-                except Exception:
-                    log.exception("[%s] pending batch sticker send failed", group_id)
 
             if action != "skip" and reply:
                 sent_ok = await send_reply(
@@ -922,14 +895,15 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
 
             if action == "skip":
                 log.info(
-                    "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s sticker=%s elapsed=%dms",
+                    "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s skill_handled=%s sticker_sent=%s elapsed=%dms",
                     group_id,
                     mentioned,
                     mention_other,
                     is_reply,
                     reply_to_bot,
                     reply_to_other,
-                    sticker_decision_send,
+                    skill_handled,
+                    sticker_sent_ok,
                     int((time.perf_counter() - flow_started) * 1000),
                 )
                 return
@@ -939,15 +913,16 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
 
             await session.commit()
             log.info(
-                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s sticker=%s sticker_sent=%s len=%d elapsed=%dms",
+                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s file=%s len=%d elapsed=%dms",
                 group_id,
                 action,
                 reply_source,
                 bool(reply),
                 sent_ok,
                 delivery_mode,
-                sticker_decision_send,
+                skill_handled,
                 sticker_sent_ok,
+                sticker_file[:32] if sticker_file else "-",
                 len(reply or ""),
                 int((time.perf_counter() - flow_started) * 1000),
             )
@@ -1128,7 +1103,6 @@ async def on_group_message(
         if x and x.strip()
     ]
     skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
-    sticker_decider = StickerDecisionService(llm)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     reply_context = extract_reply_context(message)
@@ -1401,8 +1375,6 @@ async def on_group_message(
         decision_history = history_for_decision
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
 
-    assistant_reply_count = sum(1 for item in history_for_decision if item.get("role") == "assistant")
-
     bot_me = await message.bot.me()
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
     is_reply = is_reply_message(message)
@@ -1426,10 +1398,9 @@ async def on_group_message(
     reply = ""
     sent_ok = False
     reply_source = "none"
-    sticker_decision_send = False
-    sticker_decision_reason = ""
-    sticker_decision_file = ""
+    skill_handled = False
     sticker_sent_ok = False
+    sticker_file = ""
     decision_started = time.perf_counter()
     action = await decision_svc.decide(
         input_text,
@@ -1456,7 +1427,7 @@ async def on_group_message(
         log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
 
         async with typing_action(message, enabled=settings.bot.enable_typing):
-            skill_reply = await skill.answer_with_skill(
+            skill_result = await skill.answer_with_skill(
                 input_text,
                 session=session,
                 history=history,
@@ -1467,12 +1438,23 @@ async def on_group_message(
                 message=message,
                 intent_type=action,
             )
-            if skill_reply:
-                reply = skill_reply
+            skill_handled = bool(skill_result.handled)
+            sticker_sent_ok = bool(skill_result.sticker_sent)
+            sticker_file = skill_result.sticker_file_id or ""
+            if skill_result.text:
+                reply = skill_result.text
                 log.info("[%s] reply via skill | %s", group_id, reply[:80])
                 reply_source = "skill"
+            elif skill_handled:
+                reply_source = "skill"
+                log.info(
+                    "[%s] handled by skill | sticker_sent=%s file=%s",
+                    group_id,
+                    sticker_sent_ok,
+                    sticker_file[:32] if sticker_file else "-",
+                )
 
-            if not reply:
+            if not reply and not skill_handled:
                 casual = CasualService(llm)
                 reply = await casual.reply(
                     input_text,
@@ -1502,18 +1484,9 @@ async def on_group_message(
                     log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
                 reply = normalized_reply
 
-        silence_reply, silence_reason = _should_silence_generated_reply(reply)
-        if silence_reply:
-            # 根据决策类型和静默原因决定是否真的要静默
-            should_really_silence = True
-            if action == "casual" and silence_reason == "silent_marker":
-                # 闲聊场景返回了 NO_TRUSTED_ANSWER，这不合理
-                # 说明提示词可能没生效，使用默认友好回复
-                log.warning("[%s] casual chat returned NO_TRUSTED_ANSWER, using fallback reply", group_id)
-                reply = "嗯嗯，我在听~"
-                should_really_silence = False
-                reply_source = "fallback"
-            if should_really_silence:
+        if reply or not skill_handled:
+            silence_reply, silence_reason = _should_silence_generated_reply(reply)
+            if silence_reply and not (action == "casual" and silence_reason == "silent_marker"):
                 preview = _truncate_text(reply, 80) if reply else "-"
                 log.info(
                     "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
@@ -1526,50 +1499,29 @@ async def on_group_message(
                 reply = ""
                 reply_source = "none"
                 action = "skip"
-
-    sticker_decision_started = time.perf_counter()
-    sticker_decision = await sticker_decider.decide(
-        session=session,
-        group_id=group_id,
-        action=action,
-        msg_type=msg_type,
-        is_mentioned=mentioned,
-        is_reply_to_bot=reply_to_bot,
-        user_text=input_text,
-        assistant_reply=reply,
-        reply_source=reply_source,
-        assistant_reply_count=assistant_reply_count,
-        default_sticker_file_ids=sticker_pool,
-    )
-    sticker_decision_send = bool(sticker_decision.send)
-    sticker_decision_reason = sticker_decision.reason or ""
-    sticker_decision_file = sticker_decision.sticker_file_id or ""
-    log.info(
-        "[%s] sticker decision done | send=%s file=%s reason=%s elapsed=%dms",
-        group_id,
-        sticker_decision_send,
-        sticker_decision_file[:32] if sticker_decision_file else "-",
-        sticker_decision_reason or "-",
-        int((time.perf_counter() - sticker_decision_started) * 1000),
-    )
-
-    if action != "skip" and reply and sticker_decision_send and sticker_decision_file:
-        try:
-            await reply_sticker_with_auto_delete(
-                message,
-                sticker=sticker_decision_file,
-                auto_delete_minutes=0,
-            )
-            await sticker_library.mark_sent(session, group_id, sticker_decision_file)
-            sticker_sent_ok = True
-            log.info(
-                "[%s] sticker sent via decision | file=%s reason=%s",
-                group_id,
-                sticker_decision_file[:32],
-                sticker_decision_reason or "-",
-            )
-        except Exception:
-            log.exception("[%s] sticker send failed via decision", group_id)
+            if silence_reply and action == "casual" and silence_reason == "silent_marker":
+            # 根据决策类型和静默原因决定是否真的要静默
+                should_really_silence = True
+                pass
+                # 闲聊场景返回了 NO_TRUSTED_ANSWER，这不合理
+                # 说明提示词可能没生效，使用默认友好回复
+                log.warning("[%s] casual chat returned NO_TRUSTED_ANSWER, using fallback reply", group_id)
+                reply = "嗯嗯，我在听~"
+                should_really_silence = False
+                reply_source = "fallback"
+                if should_really_silence:
+                    preview = _truncate_text(reply, 80) if reply else "-"
+                    log.info(
+                    "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
+                    group_id,
+                    silence_reason,
+                    reply_source,
+                    action,
+                    preview,
+                    )
+                    reply = ""
+                    reply_source = "none"
+                    action = "skip"
 
     if action != "skip" and reply:
         sent_ok = await send_reply(
@@ -1590,7 +1542,7 @@ async def on_group_message(
             is_reply,
             reply_to_bot,
             reply_to_other,
-            sticker_decision_send,
+            (skill_handled or sticker_sent_ok),
             int((time.perf_counter() - flow_started) * 1000),
         )
         return
@@ -1605,7 +1557,7 @@ async def on_group_message(
         reply_source,
         bool(reply),
         sent_ok,
-        sticker_decision_send,
+        skill_handled,
         sticker_sent_ok,
         len(reply or ""),
         int((time.perf_counter() - flow_started) * 1000),
