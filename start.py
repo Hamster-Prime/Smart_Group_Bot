@@ -121,7 +121,7 @@ async def start_bot(settings, session_factory) -> None:
         for x in (settings.skill_sticker_file_ids or "").split(",")
         if x and x.strip()
     ]
-    scheduler_skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
+    scheduler_skill = SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
 
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(ThrottleMiddleware(rate_limit=0.0))

@@ -28,6 +28,14 @@ from bot.services.authz import (
     list_group_admins,
     list_authorized_groups,
 )
+from bot.services.doubao_tts import (
+    DoubaoTTSService,
+    TTS_MODE_ALWAYS,
+    TTS_MODE_OFF,
+    TTS_MODE_ON,
+    build_tts_status_text,
+    set_tts_mode,
+)
 from bot.services.llm import LLMService
 from bot.services.scheduled_tasks import (
     get_cooldown_status_text,
@@ -59,6 +67,13 @@ _PROACTIVE_USAGE = (
     "1. /proactive on\n"
     "2. /proactive off\n"
     "3. /proactive status"
+)
+_TTS_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. /tts on\n"
+    "2. /tts off\n"
+    "3. /tts always\n"
+    "4. /tts status"
 )
 
 
@@ -1255,6 +1270,67 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
         return
 
     await _answer(message, settings, _PROACTIVE_USAGE)
+
+
+@router.message(Command("tts"))
+async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>TTS 设置</b>\n请在目标群内使用该命令。")
+        return
+
+    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+    group_settings = dict(group_row.settings or {})
+    tts_service = DoubaoTTSService(settings)
+
+    if args in {"", "status"}:
+        await _answer(
+            message,
+            settings,
+            build_tts_status_text(
+                group_id=message.chat.id,
+                group_settings=group_settings,
+                service_ready=tts_service.available,
+            ),
+        )
+        return
+
+    mode_map = {
+        "on": TTS_MODE_ON,
+        "enable": TTS_MODE_ON,
+        "off": TTS_MODE_OFF,
+        "disable": TTS_MODE_OFF,
+        "always": TTS_MODE_ALWAYS,
+    }
+    target_mode = mode_map.get(args)
+    if target_mode is None:
+        await _answer(message, settings, _TTS_USAGE)
+        return
+
+    if target_mode in {TTS_MODE_ON, TTS_MODE_ALWAYS} and not tts_service.available:
+        await _answer(
+            message,
+            settings,
+            "<b>TTS 设置</b>\nDoubao TTS 尚未配置完成，请先补齐 .env 中的 DOUBAO_TTS_* 配置。",
+        )
+        return
+
+    group_row.settings = set_tts_mode(group_settings, target_mode)
+    await session.flush()
+    await _answer(
+        message,
+        settings,
+        build_tts_status_text(
+            group_id=message.chat.id,
+            group_settings=group_row.settings,
+            service_ready=tts_service.available,
+        ),
+    )
 
 
 @router.message(Command("warnings"))

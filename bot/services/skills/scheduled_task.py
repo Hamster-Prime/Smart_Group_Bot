@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from bot.config import Settings
+from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, load_group_tts_mode
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.prompts import SCHEDULED_TASK_SYSTEM, with_persona
 from bot.utils.runtime_context import build_current_time_context
@@ -48,6 +50,10 @@ class ScheduledTaskSkill:
         "required": ["task_name", "task_brief"],
         "additionalProperties": False,
     }
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings
+        self.tts_service = DoubaoTTSService(settings) if settings is not None else None
 
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         llm = context.llm
@@ -117,15 +123,33 @@ class ScheduledTaskSkill:
                 payload={"sent": False, "text": reply, "task_name": task_name},
             )
 
-        sent_ok = await send_chat_message(
-            bot,
-            chat_id,
-            reply,
-            reply_to_message_id=reply_to_message_id,
-            fallback_mention_user_id=fallback_mention_user_id,
-            fallback_mention_name=fallback_mention_name,
-            auto_delete_minutes=0,
-        )
+        sent_ok = False
+        always_tts = False
+        if context.session is not None:
+            tts_mode = await load_group_tts_mode(context.session, chat_id)
+            always_tts = is_tts_always_enabled(tts_mode)
+            if always_tts and self.tts_service and self.tts_service.available:
+                sent_ok = await self.tts_service.send_chat_tts(
+                        bot,
+                        chat_id,
+                        reply,
+                        reply_to_message_id=reply_to_message_id,
+                        fallback_mention_user_id=fallback_mention_user_id,
+                        fallback_mention_name=fallback_mention_name,
+                        auto_delete_minutes=0,
+                        uid=str(context.sender_user_id or chat_id),
+                    )
+
+        if not sent_ok and not always_tts:
+            sent_ok = await send_chat_message(
+                bot,
+                chat_id,
+                reply,
+                reply_to_message_id=reply_to_message_id,
+                fallback_mention_user_id=fallback_mention_user_id,
+                fallback_mention_name=fallback_mention_name,
+                auto_delete_minutes=0,
+            )
         if not sent_ok:
             log.warning("[%s] scheduled_task send failed | task=%s", chat_id, task_name)
             return SkillRunResult(

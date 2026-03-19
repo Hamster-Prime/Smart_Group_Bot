@@ -164,6 +164,24 @@ BOT_DECISION_CONTEXT_ITEMS=5
 # 贴纸 file_id 列表，逗号分隔（供贴纸决策模块回退使用）
 # 已学习贴纸会保存到数据库表 sticker_library（首次会自动导入 memory/stickers/<group_id>.json）
 SKILL_STICKER_FILE_IDS=
+DOUBAO_TTS_ENABLED=false
+DOUBAO_TTS_HTTP_TIMEOUT_SEC=20
+DOUBAO_TTS_MAX_TEXT_LENGTH=500
+DOUBAO_TTS_API_BASE=https://openspeech.bytedance.com
+DOUBAO_TTS_APP_ID=
+DOUBAO_TTS_APP_KEY=
+DOUBAO_TTS_ACCESS_KEY=
+DOUBAO_TTS_RESOURCE_ID=seed-tts-2.0
+DOUBAO_TTS_MODEL=
+DOUBAO_TTS_SPEAKER=
+DOUBAO_TTS_AUDIO_FORMAT=ogg_opus
+DOUBAO_TTS_SAMPLE_RATE=48000
+DOUBAO_TTS_BIT_RATE=96000
+DOUBAO_TTS_EMOTION=
+DOUBAO_TTS_EMOTION_SCALE=4
+DOUBAO_TTS_SPEECH_RATE=0
+DOUBAO_TTS_LOUDNESS_RATE=0
+DOUBAO_TTS_SILENCE_DURATION_MS=0
 
 # 数据库（默认 SQLite）
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
@@ -201,6 +219,7 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 | `/mute all` | 本群开启“只审查不回复”模式 | `/mute all` |
 | `/unmute` | 回复用户消息后执行，将该用户移出“只审查不回复”名单 | `回复某人后发送 /unmute` |
 | `/unmute all` | 本群关闭“只审查不回复”模式，恢复正常回复 | `/unmute all` |
+| `/tts on|off|always` | 群管理员设置 TTS skill 开关，`always` 表示始终用语音输出 | `/tts always` |
 | `/authadmin <群ID> <用户ID>` | 最高管理员授权群管理权限 | `/authadmin -1001234567890 12345678` |
 
 ### 自然语言交互

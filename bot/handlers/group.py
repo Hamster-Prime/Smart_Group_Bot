@@ -24,6 +24,7 @@ from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
+from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, is_tts_tool_enabled, normalize_tts_mode
 from bot.services.group_intent import GroupIntent, GroupIntentService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
@@ -804,7 +805,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
         for x in (settings.skill_sticker_file_ids or "").split(",")
         if x and x.strip()
     ]
-    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
+    skill = SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
 
     mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, msg_type = _effective_batch_flags(items)
 
@@ -823,6 +824,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             if bool(group_settings.get("mute_all_replies", False)):
                 log.info("[%s] pending batch skipped | reason=mute_all_replies user=%s", group_id, user_id)
                 return
+            tts_mode = normalize_tts_mode(group_settings)
 
             mute_stmt = select(ReplyMute.id).where(
                 ReplyMute.group_id == group_id,
@@ -862,8 +864,11 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             sent_ok = False
             skill_handled = False
             sticker_sent_ok = False
+            tts_sent_ok = False
             sticker_file = ""
             delivery_mode = "reply"
+            tts_text = ""
+            tts_service = skill.tts_service or DoubaoTTSService(settings)
 
             if action != "skip":
                 history = await memory.get_history_for_llm(group_id)
@@ -886,10 +891,15 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         sender_is_tg_admin=latest.sender_is_tg_admin,
                         message=latest.message,
                         intent_type=action,
+                        allow_tts=is_tts_tool_enabled(tts_mode),
                     )
                     skill_handled = bool(skill_result.handled)
                     sticker_sent_ok = bool(skill_result.sticker_sent)
+                    tts_sent_ok = bool(skill_result.tts_sent)
                     sticker_file = skill_result.sticker_file_id or ""
+                    tts_text = skill_result.tts_text or ""
+                    if tts_sent_ok:
+                        sent_ok = True
                     if skill_result.text:
                         reply = skill_result.text
                         reply_source = "skill"
@@ -902,6 +912,10 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             sticker_sent_ok,
                             sticker_file[:32] if sticker_file else "-",
                         )
+                    if is_tts_always_enabled(tts_mode) and tts_sent_ok and reply:
+                        log.info("[%s] pending batch suppressing text because TTS already sent", group_id)
+                        reply = ""
+                        reply_source = "skill"
 
                     if not reply and not skill_handled:
                         casual = CasualService(llm)
@@ -991,19 +1005,34 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     )
 
             if action != "skip" and reply:
-                sent_ok = await send_reply(
-                    latest.message,
-                    reply,
-                    delivery_mode=delivery_mode,
-                    stream=settings.bot.enable_streaming,
-                    stream_chunk_size=settings.bot.stream_chunk_size,
-                    stream_interval=settings.bot.stream_edit_interval_sec,
-                    auto_delete_minutes=0,
-                )
+                if is_tts_always_enabled(tts_mode) and tts_service.available:
+                    voice_ok = await tts_service.send_message_tts(
+                        latest.message,
+                        reply,
+                        delivery_mode=delivery_mode,
+                        auto_delete_minutes=0,
+                        uid=str(user_id or group_id),
+                    )
+                    if voice_ok:
+                        tts_sent_ok = True
+                    sent_ok = sent_ok or voice_ok
+                    if not voice_ok:
+                        log.warning("[%s] always-tts send failed; suppressing text fallback", group_id)
+                elif reply and not tts_sent_ok:
+                    text_ok = await send_reply(
+                        latest.message,
+                        reply,
+                        delivery_mode=delivery_mode,
+                        stream=settings.bot.enable_streaming,
+                        stream_chunk_size=settings.bot.stream_chunk_size,
+                        stream_interval=settings.bot.stream_edit_interval_sec,
+                        auto_delete_minutes=0,
+                    )
+                    sent_ok = sent_ok or text_ok
 
             if action == "skip":
                 log.info(
-                    "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s skill_handled=%s sticker_sent=%s elapsed=%dms",
+                    "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s skill_handled=%s sticker_sent=%s tts_sent=%s elapsed=%dms",
                     group_id,
                     mentioned,
                     mention_other,
@@ -1012,17 +1041,19 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     reply_to_other,
                     skill_handled,
                     sticker_sent_ok,
+                    tts_sent_ok,
                     int((time.perf_counter() - flow_started) * 1000),
                 )
                 return
 
-            if reply and sent_ok:
-                await memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
+            stored_reply = reply or tts_text
+            if stored_reply and sent_ok:
+                await memory.add_message(group_id, "assistant", stored_reply, message_type="assistant_reply")
                 await memory.compact_if_needed(group_id)
 
             await session.commit()
             log.info(
-                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s file=%s len=%d elapsed=%dms",
+                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s len=%d elapsed=%dms",
                 group_id,
                 action,
                 reply_source,
@@ -1031,6 +1062,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 delivery_mode,
                 skill_handled,
                 sticker_sent_ok,
+                tts_sent_ok,
                 sticker_file[:32] if sticker_file else "-",
                 len(reply or ""),
                 int((time.perf_counter() - flow_started) * 1000),
@@ -1214,7 +1246,7 @@ async def on_group_message(
         for x in (settings.skill_sticker_file_ids or "").split(",")
         if x and x.strip()
     ]
-    skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
+    skill = SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     reply_context = await _build_reply_context_for_llm(message, llm)

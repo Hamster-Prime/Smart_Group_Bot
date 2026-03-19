@@ -26,6 +26,8 @@ class SkillContext:
     handled: bool = False
     sticker_sent: bool = False
     sticker_file_id: str = ""
+    tts_sent: bool = False
+    tts_text: str = ""
 
 
 @dataclass(slots=True)
@@ -43,6 +45,8 @@ class SkillAnswerResult:
     handled: bool = False
     sticker_sent: bool = False
     sticker_file_id: str = ""
+    tts_sent: bool = False
+    tts_text: str = ""
 
 
 class Skill(Protocol):

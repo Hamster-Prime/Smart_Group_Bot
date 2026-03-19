@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig, Settings
 from bot.db.models import AuthorizedGroup, Group, ScheduledTaskRecord
+from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, load_group_tts_mode
 from bot.services.memory import MemoryService
 from bot.services.skills import SkillService
 from bot.utils.security import clean_multiline_text, clean_text
@@ -378,6 +379,7 @@ class ScheduledTaskService:
         self.memory = memory
         self.session_factory = session_factory
         self.skill_service = skill_service
+        self.tts_service = DoubaoTTSService(settings)
 
     async def run_forever(self) -> None:
         interval = float(self.settings.bot.proactive_check_interval_seconds or 60.0)
@@ -490,15 +492,30 @@ class ScheduledTaskService:
             )
             sent_text = clean_multiline_text(answer.text or "", max_len=2000)
             if sent_text:
-                ok = await send_chat_message(
-                    self.bot,
-                    row.group_id,
-                    sent_text,
-                    reply_to_message_id=reply_to_message_id,
-                    fallback_mention_user_id=int(payload.get("target_user_id", 0) or 0),
-                    fallback_mention_name=target_user_name,
-                    auto_delete_minutes=0,
-                )
+                ok = False
+                tts_mode = await load_group_tts_mode(session, row.group_id)
+                always_tts = is_tts_always_enabled(tts_mode)
+                if always_tts and self.tts_service.available:
+                    ok = await self.tts_service.send_chat_tts(
+                        self.bot,
+                        row.group_id,
+                        sent_text,
+                        reply_to_message_id=reply_to_message_id,
+                        fallback_mention_user_id=int(payload.get("target_user_id", 0) or 0),
+                        fallback_mention_name=target_user_name,
+                        auto_delete_minutes=0,
+                        uid=str(row.creator_user_id or row.group_id),
+                    )
+                if not ok and not always_tts:
+                    ok = await send_chat_message(
+                        self.bot,
+                        row.group_id,
+                        sent_text,
+                        reply_to_message_id=reply_to_message_id,
+                        fallback_mention_user_id=int(payload.get("target_user_id", 0) or 0),
+                        fallback_mention_name=target_user_name,
+                        auto_delete_minutes=0,
+                    )
                 if not ok:
                     error = "send_failed"
             else:

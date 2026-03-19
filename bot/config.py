@@ -136,6 +136,25 @@ class Settings(BaseSettings):
     av_dmm_base_url: str = "https://www.dmm.co.jp"
     av_fc2_base_url: str = "https://adult.contents.fc2.com"
 
+    doubao_tts_enabled: bool = False
+    doubao_tts_http_timeout_sec: float = 20.0
+    doubao_tts_max_text_length: int = 500
+    doubao_tts_api_base: str = "https://openspeech.bytedance.com"
+    doubao_tts_app_id: str = ""
+    doubao_tts_app_key: str = ""
+    doubao_tts_access_key: str = ""
+    doubao_tts_resource_id: str = "seed-tts-2.0"
+    doubao_tts_model: str = ""
+    doubao_tts_speaker: str = ""
+    doubao_tts_audio_format: str = "ogg_opus"
+    doubao_tts_sample_rate: int = 48000
+    doubao_tts_bit_rate: int = 96000
+    doubao_tts_emotion: str = ""
+    doubao_tts_emotion_scale: int = 4
+    doubao_tts_speech_rate: int = 0
+    doubao_tts_loudness_rate: int = 0
+    doubao_tts_silence_duration_ms: int = 0
+
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
 

@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 import litellm
 
-from bot.config import ChatEndpointConfig, ModelConfig
+from bot.config import ChatEndpointConfig, ModelConfig, Settings
+from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
+from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
@@ -34,6 +36,7 @@ class SkillService:
         self,
         llm: LLMService,
         *,
+        settings: Settings | None = None,
         default_sticker_file_ids: list[str] | None = None,
         max_tool_rounds: int = 4,
     ) -> None:
@@ -41,13 +44,26 @@ class SkillService:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
-        self._register(ScheduledTaskSkill())
+        self._register(ScheduledTaskSkill(settings))
         self._register(SendStickerSkill())
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
+        self.tts_skill_name = DoubaoTTSSkill.name
+        self.tts_service = DoubaoTTSService(settings) if settings is not None else None
+        if self.tts_service and self.tts_service.available:
+            self._register(DoubaoTTSSkill(self.tts_service))
 
     def _register(self, skill: Skill) -> None:
         self.skills[skill.name] = skill
+
+    def _selected_skills(self, *, allow_tts: bool) -> dict[str, Skill]:
+        if allow_tts:
+            return dict(self.skills)
+        return {
+            name: skill
+            for name, skill in self.skills.items()
+            if name != self.tts_skill_name
+        }
 
     @staticmethod
     def _build_sender_context(
@@ -217,8 +233,10 @@ class SkillService:
         name: str,
         arguments: dict[str, Any],
         context: SkillContext,
+        skills: dict[str, Skill] | None = None,
     ) -> SkillRunResult:
-        skill = self.skills.get(name)
+        skill_map = skills or self.skills
+        skill = skill_map.get(name)
         if not skill:
             return SkillRunResult(ok=False, skill=name, summary="未知技能", error="unknown_skill")
         return await skill.run(arguments, context)
@@ -277,6 +295,7 @@ class SkillService:
         sender_is_tg_admin: bool = False,
         message: Any | None = None,
         intent_type: str = "casual",
+        allow_tts: bool = True,
     ) -> SkillAnswerResult:
         user_text = clean_text(text, max_len=1200)
         if contains_prompt_injection(user_text):
@@ -303,7 +322,8 @@ class SkillService:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
 
-        tools = self._tool_definitions(self.skills)
+        selected_skills = self._selected_skills(allow_tts=allow_tts)
+        tools = self._tool_definitions(selected_skills)
         context = SkillContext(
             session=session,
             message=message,
@@ -326,6 +346,8 @@ class SkillService:
                 handled=context.handled,
                 sticker_sent=context.sticker_sent,
                 sticker_file_id=context.sticker_file_id,
+                tts_sent=context.tts_sent,
+                tts_text=context.tts_text,
             )
 
         for step in range(1, self.max_tool_rounds + 1):
@@ -361,7 +383,12 @@ class SkillService:
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
             for tool_call in tool_calls:
                 args = self._parse_tool_arguments(tool_call["arguments"])
-                result = await self._run_tool(name=tool_call["name"], arguments=args, context=context)
+                result = await self._run_tool(
+                    name=tool_call["name"],
+                    arguments=args,
+                    context=context,
+                    skills=selected_skills,
+                )
                 if result.ok and result.summary:
                     last_success_summary = result.summary
                 payload = self._tool_result_to_payload(result)
