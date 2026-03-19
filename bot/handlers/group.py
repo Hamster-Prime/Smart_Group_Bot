@@ -576,6 +576,25 @@ async def _append_image_context(
     return f"{text}\n[image-vision]\n{vision_text}", vision_text
 
 
+async def _build_reply_context_for_llm(message: Message, llm: LLMService) -> str:
+    """Build richer reply context, including best-effort vision for replied media."""
+    base_context = extract_reply_context(message)
+    lines = [line for line in (base_context.splitlines() if base_context else []) if line.strip()]
+
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return "\n".join(lines)
+
+    reply_text, reply_type = extract_message_text(reply)
+    enriched_reply_text, vision_text = await _append_image_context(reply, llm, reply_text, reply_type)
+    if vision_text:
+        compact = re.sub(r"\s+", " ", (enriched_reply_text or "").strip())
+        if compact:
+            lines.append(f"[reply_to_enriched:{reply_type}] {_truncate_text(compact, 320)}")
+
+    return "\n".join(lines)
+
+
 @dataclass(slots=True)
 class _PendingReplyItem:
     message: Message
@@ -871,16 +890,24 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             action = "skip"
 
             if action != "skip" and reply:
-                delivery_mode = await reply_mode_svc.decide(
-                    user_text=merged_input_text,
-                    assistant_reply=reply,
-                    msg_type=msg_type,
-                    is_mentioned=mentioned,
-                    is_reply_to_bot=reply_to_bot,
-                    is_reply_to_other=reply_to_other,
-                    merged_count=merged_count,
-                    merged_context=merged_context,
-                )
+                if merged_count > 1:
+                    delivery_mode = "reply"
+                    log.info(
+                        "[%s] pending batch reply mode forced=reply | reason=merged_batch messages=%d",
+                        group_id,
+                        merged_count,
+                    )
+                else:
+                    delivery_mode = await reply_mode_svc.decide(
+                        user_text=merged_input_text,
+                        assistant_reply=reply,
+                        msg_type=msg_type,
+                        is_mentioned=mentioned,
+                        is_reply_to_bot=reply_to_bot,
+                        is_reply_to_other=reply_to_other,
+                        merged_count=merged_count,
+                        merged_context=merged_context,
+                    )
 
             if action != "skip" and reply:
                 sent_ok = await send_reply(
@@ -1105,7 +1132,7 @@ async def on_group_message(
     skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
-    reply_context = extract_reply_context(message)
+    reply_context = await _build_reply_context_for_llm(message, llm)
     if reply_context:
         input_text = f"{input_text}\n{reply_context}"
     if msg_type == "sticker":
