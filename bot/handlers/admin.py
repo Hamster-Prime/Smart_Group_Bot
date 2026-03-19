@@ -70,6 +70,7 @@ _PROACTIVE_USAGE = (
 )
 _TTS_USAGE = (
     "<b>命令用法</b>\n"
+    "0. /tts（查看当前状态）\n"
     "1. /tts enable\n"
     "2. /tts disable\n"
     "3. /tts always\n\n"
@@ -1289,7 +1290,15 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
     tts_service = DoubaoTTSService(settings)
 
     if not args:
-        await _answer(message, settings, _TTS_USAGE)
+        await _answer(
+            message,
+            settings,
+            build_tts_status_text(
+                group_id=message.chat.id,
+                group_settings=group_settings,
+                service_ready=tts_service.available,
+            ),
+        )
         return
 
     mode_map = {

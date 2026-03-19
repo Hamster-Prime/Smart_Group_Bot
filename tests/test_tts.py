@@ -9,6 +9,7 @@ from bot.services.doubao_tts import (
     TTS_MODE_ALWAYS,
     TTS_MODE_OFF,
     TTS_MODE_ON,
+    build_tts_status_text,
     is_tts_always_enabled,
     is_tts_tool_enabled,
     normalize_tts_mode,
@@ -134,6 +135,33 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cmd_tts_without_args_shows_status(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            text="/tts",
+        )
+        session = SimpleNamespace(flush=AsyncMock())
+        group_row = SimpleNamespace(settings={"tts_mode": TTS_MODE_OFF})
+        settings = _settings()
+
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin._ensure_group_row", new=AsyncMock(return_value=group_row)),
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_tts(message, session=session, settings=settings)
+
+        self.assertEqual(
+            answer_mock.await_args.args[2],
+            build_tts_status_text(
+                group_id=message.chat.id,
+                group_settings=group_row.settings,
+                service_ready=False,
+            ),
+        )
+        session.flush.assert_not_awaited()
+
     async def test_cmd_tts_rejects_enable_when_service_not_configured(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
