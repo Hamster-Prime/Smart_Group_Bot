@@ -39,7 +39,7 @@ from bot.services.scheduled_tasks import (
     list_group_scheduled_tasks,
     render_task_list_text,
 )
-from bot.utils.telegram import answer_with_auto_delete, schedule_message_auto_delete, typing_action
+from bot.utils.telegram import answer_with_auto_delete, typing_action
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -53,12 +53,14 @@ async def _answer(
     message: Message,
     settings: Settings,
     text: str,
+    *,
+    auto_delete_minutes: int | None = None,
     **kwargs: object,
 ) -> None:
     await answer_with_auto_delete(
         message,
         text,
-        auto_delete_minutes=settings.bot.auto_delete_minutes,
+        auto_delete_minutes=settings.bot.auto_delete_minutes if auto_delete_minutes is None else auto_delete_minutes,
         **kwargs,
     )
 
@@ -518,7 +520,6 @@ async def _edit_av_seed_in_place(
 async def _send_av_detail(
     *,
     message: Message,
-    settings: Settings,
     session: AVQuerySession,
     result_idx: int,
     detail: AVDetail,
@@ -539,7 +540,6 @@ async def _send_av_detail(
                 caption=caption,
                 reply_markup=keyboard,
             )
-            schedule_message_auto_delete(sent_photo, settings.bot.auto_delete_minutes)
             return True
         except TelegramBadRequest as exc:
             # Some source URLs are blocked for Telegram fetch or return non-image content.
@@ -556,7 +556,6 @@ async def _send_av_detail(
                     caption=caption,
                     reply_markup=keyboard,
                 )
-                schedule_message_auto_delete(sent_photo, settings.bot.auto_delete_minutes)
                 return True
             except Exception:
                 log.exception("failed to send av cover photo by upload")
@@ -567,7 +566,6 @@ async def _send_av_detail(
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
-        schedule_message_auto_delete(sent, settings.bot.auto_delete_minutes)
         return True
     return False
 
@@ -634,11 +632,11 @@ async def cmd_tasks(message: Message, session: AsyncSession, settings: Settings)
     if not await ensure_group_authorized(message, session, settings):
         return
     if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>定时任务列表</b>\n请在群内使用 /tasks。")
+        await _answer(message, settings, "<b>定时任务列表</b>\n请在群内使用 /tasks。", auto_delete_minutes=0)
         return
 
     rows = await list_group_scheduled_tasks(session, group_id=message.chat.id, limit=20)
-    await _answer(message, settings, render_task_list_text(rows))
+    await _answer(message, settings, render_task_list_text(rows), auto_delete_minutes=0)
 
 
 @router.message(Command("canceltask"))
@@ -646,14 +644,24 @@ async def cmd_canceltask(message: Message, session: AsyncSession, settings: Sett
     if not await ensure_group_authorized(message, session, settings):
         return
     if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>取消定时任务</b>\n请在群内使用 /canceltask &lt;任务ID&gt;。")
+        await _answer(
+            message,
+            settings,
+            "<b>取消定时任务</b>\n请在群内使用 /canceltask &lt;任务ID&gt;。",
+            auto_delete_minutes=0,
+        )
         return
 
     args = (message.text or "").partition(" ")[2].strip()
     try:
         task_id = int(args)
     except (TypeError, ValueError):
-        await _answer(message, settings, "<b>取消定时任务</b>\n用法：/canceltask &lt;任务ID&gt;")
+        await _answer(
+            message,
+            settings,
+            "<b>取消定时任务</b>\n用法：/canceltask &lt;任务ID&gt;",
+            auto_delete_minutes=0,
+        )
         return
 
     user_id = message.from_user.id if message.from_user else 0
@@ -675,6 +683,7 @@ async def cmd_canceltask(message: Message, session: AsyncSession, settings: Sett
             message,
             settings,
             "<b>取消定时任务</b>\n未找到可取消的任务，或你没有权限取消该任务。",
+            auto_delete_minutes=0,
         )
         return
 
@@ -684,6 +693,7 @@ async def cmd_canceltask(message: Message, session: AsyncSession, settings: Sett
         "<b>定时任务已取消</b>\n"
         f"<b>ID</b>: #{row.id}\n"
         f"<b>内容</b>: {html.escape(row.content or '-')}",
+        auto_delete_minutes=0,
     )
 
 
@@ -706,6 +716,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>最高管理员命令（群内）</b>\n"
             "4. /av enable（启用本群 AV 查询）\n"
             "5. /av disable（停用本群 AV 查询）",
+            auto_delete_minutes=0,
         )
         return
 
@@ -716,6 +727,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 message,
                 settings,
                 "<b>AV 开关</b>\n请在目标群内发送：/av enable 或 /av disable",
+                auto_delete_minutes=0,
             )
             return
         if not await ensure_super_admin(message, settings):
@@ -740,6 +752,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 开关</b>\n"
             f"<b>群ID</b>: {message.chat.id}\n"
             f"<b>结果</b>: {state_text}（{status_line}）",
+            auto_delete_minutes=0,
         )
         return
 
@@ -750,12 +763,13 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 message,
                 settings,
                 "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
+                auto_delete_minutes=0,
             )
             return
 
     svc = AVSearchService(settings)
     if not svc.enabled:
-        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。")
+        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。", auto_delete_minutes=0)
         return
 
     owner_user_id = message.from_user.id if message.from_user else 0
@@ -783,13 +797,17 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 av_session.details[0] = detail
                 sent_ok = await _send_av_detail(
                     message=message,
-                    settings=settings,
                     session=av_session,
                     result_idx=0,
                     detail=detail,
                 )
                 if not sent_ok:
-                    await _answer(message, settings, "<b>AV 查询</b>\n详情发送失败，请稍后重试。")
+                    await _answer(
+                        message,
+                        settings,
+                        "<b>AV 查询</b>\n详情发送失败，请稍后重试。",
+                        auto_delete_minutes=0,
+                    )
                 return
 
         results = await svc.search(query)
@@ -801,6 +819,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 查询结果</b>\n"
             f"关键词: {html.escape(query)}\n"
             "未找到匹配内容。",
+            auto_delete_minutes=0,
         )
         return
 
@@ -810,8 +829,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         results=results,
     )
     text, keyboard = _build_av_search_page(av_session, page=0)
-    sent = await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
-    schedule_message_auto_delete(sent, settings.bot.auto_delete_minutes)
+    await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
 
 
 @router.callback_query(F.data.startswith("avs:"))
@@ -859,8 +877,7 @@ async def on_av_search_paging(
     try:
         await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
     except Exception:
-        sent = await msg.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
-        schedule_message_auto_delete(sent, settings.bot.auto_delete_minutes)
+        await msg.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
     await callback.answer()
 
 
@@ -922,7 +939,6 @@ async def on_av_detail_select(
 
     ok = await _send_av_detail(
         message=msg,
-        settings=settings,
         session=av_session,
         result_idx=idx,
         detail=detail,

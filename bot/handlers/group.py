@@ -123,6 +123,12 @@ def _truncate_text(text: str, max_len: int) -> str:
     return cleaned[:max_len] + "..."
 
 
+def _management_reply_auto_delete_minutes(intent: GroupIntent, settings: Settings) -> int:
+    if intent.intent == "memory_manage" and (intent.memory_action or "").strip().lower() == "add":
+        return 0
+    return settings.bot.auto_delete_minutes
+
+
 def _extract_scheduled_task_target(message: Message) -> tuple[int, str]:
     source_text = message.text or message.caption or ""
     entities = list(message.entities or []) + list(message.caption_entities or [])
@@ -1408,7 +1414,7 @@ async def on_group_message(
             await answer_with_auto_delete(
                 message,
                 manage_reply,
-                auto_delete_minutes=settings.bot.auto_delete_minutes,
+                auto_delete_minutes=_management_reply_auto_delete_minutes(intent, settings),
             )
             await memory.add_message(group_id, "assistant", manage_reply, message_type="assistant_reply")
             await memory.compact_if_needed(group_id)
@@ -1437,7 +1443,7 @@ async def on_group_message(
             await answer_with_auto_delete(
                 message,
                 task_reply,
-                auto_delete_minutes=settings.bot.auto_delete_minutes,
+                auto_delete_minutes=0,
             )
             await memory.add_message(group_id, "assistant", task_reply, message_type="assistant_reply")
             await memory.compact_if_needed(group_id)
