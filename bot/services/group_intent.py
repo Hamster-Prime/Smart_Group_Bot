@@ -11,6 +11,94 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
 
+_POLITE_PREFIX = r"(?:(?:请|请你|麻烦|麻烦你|帮我|帮忙|bot|@bot)[,，:：\s]*)*"
+
+_MEMORY_NON_COMMAND_PATTERNS = (
+    re.compile(r"^\s*(?:大家|请大家|所有人|你们)\s*记住"),
+    re.compile(r"(?:记不记得|还记得|记住了吗|你记住了吗)"),
+    re.compile(r"(?:永久记忆是什么|什么是永久记忆|永久记忆是什么意思|永久记忆怎么用)"),
+)
+
+_MEMORY_ADD_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:记住|记一下)\s*(?:[:：,，]\s*)?.+\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:把|将).+(?:写入|记到|加入|存到)(?:永久记忆|记忆)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:添加|新增)(?:一条)?永久记忆\s*(?:[:：,，]\s*)?.+\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_MEMORY_REPLACE_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:把|将).+(?:永久记忆|记忆).+(?:改成|改为|更新为|替换为).+\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:把|将)[\"“].+[\"”](?:改成|改为|更新为|替换为)[\"“].+[\"”]\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_MEMORY_DELETE_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:删除|删掉|移除)(?:一下)?(?:永久记忆|记忆)\s*(?:#?\d+|.+)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:忘掉|删掉)(?:刚才那条|这条)(?:永久记忆|记忆).*$",
+        re.IGNORECASE,
+    ),
+)
+
+_MEMORY_CLEAR_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:清空|清掉|删光|删除全部|全部删除)(?:所有)?(?:永久记忆|记忆)\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_MEMORY_LIST_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:查看|列出|显示|看看)(?:一下)?永久记忆(?:列表)?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}永久记忆列表\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_RULE_ADD_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:(?:新增|添加|增加)(?:一条)?|加一条)(?:一下)?(?:群规|规则|审核规则)\s*(?:[:：,，]\s*)?.+\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_RULE_DELETE_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:删除|删掉|移除)(?:一下)?(?:第\s*#?\d+\s*条)?(?:群规|规则|审核规则).*\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+_RULE_LIST_PATTERNS = (
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:查看|列出|显示|看看)(?:一下)?(?:群规|规则|审核规则)(?:列表)?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}(?:群规列表|规则列表|审核规则列表)\s*$",
+        re.IGNORECASE,
+    ),
+)
+
 
 @dataclass(slots=True)
 class GroupIntent:
@@ -54,6 +142,58 @@ class GroupIntentService:
             lines.append(f"[{role}] {content}")
         return "\n".join(lines) if lines else "(empty)"
 
+    @staticmethod
+    def _matches_any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
+        return any(pattern.search(text) for pattern in patterns)
+
+    @classmethod
+    def _is_explicit_memory_command(cls, text: str, action: str | None = None) -> bool:
+        if not text:
+            return False
+        if cls._matches_any(_MEMORY_NON_COMMAND_PATTERNS, text):
+            return False
+
+        action_patterns = {
+            "add": _MEMORY_ADD_PATTERNS,
+            "replace": _MEMORY_REPLACE_PATTERNS,
+            "delete": _MEMORY_DELETE_PATTERNS,
+            "clear": _MEMORY_CLEAR_PATTERNS,
+            "list": _MEMORY_LIST_PATTERNS,
+        }
+        if action:
+            patterns = action_patterns.get(action)
+            return cls._matches_any(patterns, text) if patterns else False
+
+        return any(
+            cls._matches_any(patterns, text)
+            for patterns in action_patterns.values()
+        )
+
+    @classmethod
+    def _is_explicit_rule_command(cls, text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            cls._matches_any(patterns, text)
+            for patterns in (
+                _RULE_ADD_PATTERNS,
+                _RULE_DELETE_PATTERNS,
+                _RULE_LIST_PATTERNS,
+            )
+        )
+
+    @classmethod
+    def _looks_like_management_candidate(cls, text: str) -> bool:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        return cls._is_explicit_memory_command(stripped) or cls._is_explicit_rule_command(
+            stripped
+        )
+
+    def looks_like_management_candidate(self, text: str) -> bool:
+        return self._looks_like_management_candidate(clean_text(text, max_len=1200))
+
     async def detect(
         self,
         text: str,
@@ -61,6 +201,9 @@ class GroupIntentService:
         history: list[dict[str, str]] | None = None,
     ) -> GroupIntent:
         user_text = clean_text(text, max_len=1200)
+        if not self._looks_like_management_candidate(user_text):
+            return GroupIntent()
+
         prompt = (
             "[RECENT_CONTEXT]\n"
             f"{wrap_untrusted('recent_context', self._build_recent_context(history), max_len=1200)}\n\n"
@@ -84,6 +227,17 @@ class GroupIntentService:
         memory_content = clean_text(str(data.get("memory_content", "")), max_len=1200)
         memory_target = clean_text(str(data.get("memory_target", "")), max_len=300)
         rule_instruction = clean_text(str(data.get("rule_instruction", "")), max_len=1200)
+
+        if intent == "memory_manage":
+            if memory_action == "unknown" or not self._is_explicit_memory_command(
+                user_text, memory_action
+            ):
+                log.info("group intent downgraded to chat | reason=memory_not_explicit")
+                return GroupIntent()
+
+        if intent == "rule_manage" and not self._is_explicit_rule_command(user_text):
+            log.info("group intent downgraded to chat | reason=rule_not_explicit")
+            return GroupIntent()
 
         return GroupIntent(
             intent=intent,
