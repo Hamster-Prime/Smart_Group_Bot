@@ -70,10 +70,10 @@ _PROACTIVE_USAGE = (
 )
 _TTS_USAGE = (
     "<b>命令用法</b>\n"
-    "1. /tts on\n"
-    "2. /tts off\n"
-    "3. /tts always\n"
-    "4. /tts status"
+    "1. /tts enable\n"
+    "2. /tts disable\n"
+    "3. /tts always\n\n"
+    "请最高管理员在目标群内使用。"
 )
 
 
@@ -1276,7 +1276,7 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
 async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_group_admin_permission(message, session, settings):
+    if not await ensure_super_admin(message, settings):
         return
 
     args = (message.text or "").partition(" ")[2].strip().lower()
@@ -1288,22 +1288,12 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
     group_settings = dict(group_row.settings or {})
     tts_service = DoubaoTTSService(settings)
 
-    if args in {"", "status"}:
-        await _answer(
-            message,
-            settings,
-            build_tts_status_text(
-                group_id=message.chat.id,
-                group_settings=group_settings,
-                service_ready=tts_service.available,
-            ),
-        )
+    if not args:
+        await _answer(message, settings, _TTS_USAGE)
         return
 
     mode_map = {
-        "on": TTS_MODE_ON,
         "enable": TTS_MODE_ON,
-        "off": TTS_MODE_OFF,
         "disable": TTS_MODE_OFF,
         "always": TTS_MODE_ALWAYS,
     }

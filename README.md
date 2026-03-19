@@ -219,7 +219,7 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 | `/mute all` | 本群开启“只审查不回复”模式 | `/mute all` |
 | `/unmute` | 回复用户消息后执行，将该用户移出“只审查不回复”名单 | `回复某人后发送 /unmute` |
 | `/unmute all` | 本群关闭“只审查不回复”模式，恢复正常回复 | `/unmute all` |
-| `/tts on|off|always` | 群管理员设置 TTS skill 开关，`always` 表示始终用语音输出 | `/tts always` |
+| `/tts enable\|disable\|always` | 最高管理员设置本群 TTS skill 开关，`always` 表示始终用语音输出 | `/tts always` |
 | `/authadmin <群ID> <用户ID>` | 最高管理员授权群管理权限 | `/authadmin -1001234567890 12345678` |
 
 ### 自然语言交互

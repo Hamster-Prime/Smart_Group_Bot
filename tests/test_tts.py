@@ -137,7 +137,7 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_tts_rejects_enable_when_service_not_configured(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
-            text="/tts on",
+            text="/tts enable",
         )
         session = SimpleNamespace(flush=AsyncMock())
         group_row = SimpleNamespace(settings={})
@@ -145,7 +145,7 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
-            patch("bot.handlers.admin.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
             patch("bot.handlers.admin._ensure_group_row", new=AsyncMock(return_value=group_row)),
             patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
         ):
@@ -154,6 +154,48 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(group_row.settings, {})
         session.flush.assert_not_awaited()
         self.assertIn("尚未配置完成", answer_mock.await_args.args[2])
+
+    async def test_cmd_tts_requires_super_admin(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            text="/tts disable",
+        )
+        session = SimpleNamespace(flush=AsyncMock())
+        settings = _settings()
+
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=False)) as super_admin_mock,
+            patch("bot.handlers.admin._ensure_group_row", new=AsyncMock()) as ensure_group_row_mock,
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_tts(message, session=session, settings=settings)
+
+        super_admin_mock.assert_awaited_once()
+        ensure_group_row_mock.assert_not_awaited()
+        session.flush.assert_not_awaited()
+        answer_mock.assert_not_awaited()
+
+    async def test_cmd_tts_rejects_legacy_aliases(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            text="/tts on",
+        )
+        session = SimpleNamespace(flush=AsyncMock())
+        group_row = SimpleNamespace(settings={})
+        settings = _settings()
+
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin._ensure_group_row", new=AsyncMock(return_value=group_row)),
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_tts(message, session=session, settings=settings)
+
+        self.assertEqual(group_row.settings, {})
+        session.flush.assert_not_awaited()
+        self.assertEqual(answer_mock.await_args.args[2], admin._TTS_USAGE)
 
     async def test_cmd_tts_sets_always_mode_when_service_ready(self) -> None:
         message = SimpleNamespace(
@@ -171,7 +213,7 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
-            patch("bot.handlers.admin.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
             patch("bot.handlers.admin._ensure_group_row", new=AsyncMock(return_value=group_row)),
             patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
         ):

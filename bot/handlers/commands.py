@@ -629,7 +629,6 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/mute all（本群仅做审核，不再回复）\n\n"
         "/unmute（回复目标用户消息，恢复其消息回复）\n"
         "/unmute all（恢复本群正常回复）\n\n"
-        "/tts on|off|always（本群 TTS skill 开关 / 始终语音输出）\n"
         "/proactive on|off|status（主动话题定时任务开关/状态）\n\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup 授权群组\n"
@@ -638,6 +637,7 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/authadmin 授权群管理\n"
         "/unauthadmin 撤销授权群管理\n"
         "/adminlist 群管理列表\n"
+        "/tts enable|disable|always（在当前群控制 TTS skill / 始终语音输出）\n"
         "/av enable（在当前群启用 AV 查询）\n"
         "/av disable（在当前群停用 AV 查询）"
     )
