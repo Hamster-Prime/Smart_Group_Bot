@@ -93,6 +93,36 @@ class TaskIntentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent.task_type, "agent_task")
         self.assertEqual(llm.calls, 1)
 
+    async def test_semantic_delete_with_time_and_content_works(self) -> None:
+        llm = _DummyLLM(
+            '{"intent":"task_manage","task_action":"delete","task_id":0,"task_type":"reminder","due_at":"2026-03-19 21:00:00","task_content":"吃饭","ack_text":"好，我把这个提醒取消。"}'
+        )
+        svc = TaskIntentService(llm)
+
+        intent = await svc.detect("取消今晚九点提醒我吃饭")
+
+        self.assertEqual(intent.intent, "task_manage")
+        self.assertEqual(intent.task_action, "delete")
+        self.assertEqual(intent.task_type, "reminder")
+        self.assertEqual(intent.task_content, "吃饭")
+        self.assertIsInstance(intent.due_at, datetime)
+        self.assertEqual(llm.calls, 1)
+
+    async def test_semantic_delete_by_task_id_works(self) -> None:
+        llm = _DummyLLM(
+            '{"intent":"task_manage","task_action":"delete","task_id":12,"task_type":"unknown","due_at":"","task_content":"","ack_text":"好，我把这个任务取消。"}'
+        )
+        svc = TaskIntentService(llm)
+
+        intent = await svc.detect("把 #12 那个定时任务删了")
+
+        self.assertEqual(intent.intent, "task_manage")
+        self.assertEqual(intent.task_action, "delete")
+        self.assertEqual(intent.task_id, 12)
+        self.assertEqual(intent.task_type, "unknown")
+        self.assertIsNone(intent.due_at)
+        self.assertEqual(llm.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

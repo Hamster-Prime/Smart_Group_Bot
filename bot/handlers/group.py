@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Group, ModerationRule, ReplyMute
 from bot.services import memory_holder
-from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
+from bot.services.authz import ensure_group_authorized, is_group_admin_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, is_tts_tool_enabled, normalize_tts_mode
@@ -29,7 +29,14 @@ from bot.services.group_intent import GroupIntent, GroupIntentService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
-from bot.services.scheduled_tasks import create_scheduled_task, format_due_at_local, record_group_activity
+from bot.services.scheduled_tasks import (
+    cancel_scheduled_task,
+    create_scheduled_task,
+    format_due_at_local,
+    format_task_summary,
+    match_scheduled_task_for_cancel,
+    record_group_activity,
+)
 from bot.services.task_intent import TaskIntent
 from bot.services.task_intent import TaskIntentService
 from bot.services.skills import SkillService
@@ -424,8 +431,64 @@ async def _handle_task_intent(
     group_id: int,
     user_id: int,
     user_display_name: str,
+    settings: Settings,
 ) -> tuple[bool, str]:
-    if intent.intent != "task_manage" or intent.task_action != "add":
+    if intent.intent != "task_manage":
+        return False, ""
+
+    if intent.task_action == "delete":
+        allow_any = False
+        if user_id and is_super_admin_user_id(user_id, settings):
+            allow_any = True
+        elif user_id:
+            allow_any = await is_group_admin_authorized(session, group_id, user_id)
+
+        matched_row, candidates = await match_scheduled_task_for_cancel(
+            session,
+            group_id=group_id,
+            operator_user_id=user_id,
+            allow_any=allow_any,
+            task_id=int(intent.task_id or 0),
+            task_type=intent.task_type,
+            due_at=intent.due_at,
+            task_content=intent.task_content,
+        )
+        if matched_row is None:
+            if candidates:
+                lines = [
+                    "<b>取消定时任务</b>",
+                    "我匹配到多个待执行任务，请说得更具体一点，或直接使用 /canceltask &lt;任务ID&gt;：",
+                    "",
+                ]
+                for row in candidates:
+                    lines.append(format_task_summary(row))
+                    lines.append("")
+                return True, "\n".join(lines).rstrip()
+            return (
+                True,
+                "<b>取消定时任务</b>\n"
+                "没找到匹配的待执行任务。你可以说得更具体一点，或者直接用 /canceltask &lt;任务ID&gt;。",
+            )
+
+        row = await cancel_scheduled_task(
+            session,
+            group_id=group_id,
+            task_id=matched_row.id,
+            operator_user_id=user_id,
+            allow_any=allow_any,
+        )
+        if row is None:
+            return (
+                True,
+                "<b>取消定时任务</b>\n未找到可取消的任务，或你没有权限取消该任务。",
+            )
+
+        reply = "<b>定时任务已取消</b>\n" + format_task_summary(row)
+        if intent.ack_text:
+            reply = f"{html.escape(intent.ack_text)}\n\n{reply}"
+        return True, reply
+
+    if intent.task_action != "add":
         return False, ""
     if intent.due_at is None or not intent.task_content:
         return False, ""
@@ -1461,6 +1524,7 @@ async def on_group_message(
             group_id=group_id,
             user_id=user_id,
             user_display_name=display_name if user else str(user_id),
+            settings=settings,
         )
         if handled:
             await session.commit()
@@ -1479,7 +1543,13 @@ async def on_group_message(
             )
             await memory.add_message(group_id, "assistant", task_reply, message_type="assistant_reply")
             await memory.compact_if_needed(group_id)
-            log.info("[%s] task intent handled | type=%s", group_id, task_intent.task_type)
+            log.info(
+                "[%s] task intent handled | action=%s type=%s task_id=%s",
+                group_id,
+                task_intent.task_action,
+                task_intent.task_type,
+                task_intent.task_id,
+            )
             return
 
     should_index_user_memory = msg_type != "contact"

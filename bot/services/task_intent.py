@@ -21,6 +21,18 @@ _TASK_COMMAND_RE = re.compile(
     r"(查找|查询|搜索|搜一下|找一下|概述|总结|整理|汇总|收集|统计|生成|提醒|通知|告诉我|发我|整理下|看一下)",
     re.IGNORECASE,
 )
+_TASK_DELETE_RE = re.compile(
+    r"(取消|删掉|删除|去掉|撤销|不用了|不要了|算了|取消掉|删了)",
+    re.IGNORECASE,
+)
+_TASK_REFERENCE_RE = re.compile(
+    r"(提醒|定时任务|定时|任务|安排)",
+    re.IGNORECASE,
+)
+_TASK_ID_RE = re.compile(
+    r"(?:#|任务\s*#?|提醒\s*#?)(\d{1,9})",
+    re.IGNORECASE,
+)
 _SCHEDULE_KEYWORD_RE = re.compile(
     r"(定时|到时候|到时|到了|到点)",
     re.IGNORECASE,
@@ -37,6 +49,7 @@ class TaskIntent:
     task_action: str = "unknown"
     task_type: str = "unknown"
     due_at: datetime | None = None
+    task_id: int = 0
     task_content: str = ""
     ack_text: str = ""
 
@@ -78,6 +91,11 @@ class TaskIntentService:
         normalized = clean_text(text, max_len=1200)
         if not normalized:
             return False
+        if _TASK_DELETE_RE.search(normalized):
+            return any(
+                pattern.search(normalized)
+                for pattern in (_TASK_REFERENCE_RE, _TASK_ID_RE, _TIME_HINT_RE, _TASK_COMMAND_RE)
+            )
         if not _TIME_HINT_RE.search(normalized):
             return False
         if _TASK_REQUEST_RE.search(normalized):
@@ -102,6 +120,34 @@ class TaskIntentService:
             return None
         local_tz = datetime.now().astimezone().tzinfo
         return naive.replace(tzinfo=local_tz)
+
+    @staticmethod
+    def _parse_task_id(value: object) -> int:
+        if value is None:
+            return 0
+        text = clean_text(str(value), max_len=32)
+        if not text:
+            return 0
+        match = re.search(r"\d{1,9}", text)
+        if not match:
+            return 0
+        try:
+            return max(0, int(match.group(0)))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _extract_task_id(text: str) -> int:
+        normalized = clean_text(text, max_len=1200)
+        if not normalized:
+            return 0
+        match = _TASK_ID_RE.search(normalized)
+        if not match:
+            return 0
+        try:
+            return max(0, int(match.group(1)))
+        except ValueError:
+            return 0
 
     async def detect(
         self,
@@ -130,21 +176,41 @@ class TaskIntentService:
         action = clean_text(str(data.get("task_action", "unknown")).lower(), max_len=24)
         task_type = clean_text(str(data.get("task_type", "unknown")).lower(), max_len=24)
         due_at = self._parse_due_at(str(data.get("due_at", "")))
+        task_id = self._parse_task_id(data.get("task_id")) or self._extract_task_id(user_text)
         task_content = clean_text(str(data.get("task_content", "")), max_len=300)
         ack_text = clean_text(str(data.get("ack_text", "")), max_len=120)
 
-        if intent != "task_manage" or action != "add" or task_type not in {"reminder", "agent_task"}:
+        if intent != "task_manage":
             return TaskIntent()
-        if due_at is None or not task_content:
-            return TaskIntent()
-        if not ack_text:
-            ack_text = "好，到时间我会处理。"
+        if action == "add":
+            if task_type not in {"reminder", "agent_task"}:
+                return TaskIntent()
+            if due_at is None or not task_content:
+                return TaskIntent()
+            if not ack_text:
+                ack_text = "好，到时间我会处理。"
+            return TaskIntent(
+                intent="task_manage",
+                task_action="add",
+                task_type=task_type,
+                due_at=due_at,
+                task_id=0,
+                task_content=task_content,
+                ack_text=ack_text,
+            )
 
+        if action != "delete":
+            return TaskIntent()
+        if task_type not in {"reminder", "agent_task"}:
+            task_type = "unknown"
+        if not ack_text:
+            ack_text = "好，我来取消这个定时任务。"
         return TaskIntent(
             intent="task_manage",
-            task_action="add",
+            task_action="delete",
             task_type=task_type,
             due_at=due_at,
+            task_id=task_id,
             task_content=task_content,
             ack_text=ack_text,
         )

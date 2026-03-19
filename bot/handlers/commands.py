@@ -618,6 +618,7 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "<b>自然语言定时任务（所有群成员）</b>\n"
         "直接发送：记得今晚9点提醒我吃饭\n\n"
         "直接发送：3点帮我查询今天的科技新闻并概述\n\n"
+        "直接发送：取消今晚9点提醒我吃饭 / 把刚才那个提醒删了\n\n"
         "<b>群审核管理（需已授权）</b>\n"
         "/addrule &lt;自然语言指令&gt;\n"
         "/rules 审核规则列表\n"

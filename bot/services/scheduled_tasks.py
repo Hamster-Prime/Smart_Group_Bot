@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 from aiogram import Bot
@@ -67,6 +70,44 @@ def _isoformat_local(value: datetime) -> str:
 
 def format_due_at_local(value: datetime) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_task_match_text(text: str) -> str:
+    normalized = clean_text(text, max_len=300).lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\s+", "", normalized)
+    return re.sub(r"[^\w\u4e00-\u9fff]", "", normalized)
+
+
+def _task_content_match_score(query: str, content: str) -> float:
+    normalized_query = _normalize_task_match_text(query)
+    normalized_content = _normalize_task_match_text(content)
+    if not normalized_query or not normalized_content:
+        return 0.0
+    if normalized_query == normalized_content:
+        return 1.0
+    if normalized_query in normalized_content or normalized_content in normalized_query:
+        return 0.92
+    ratio = SequenceMatcher(None, normalized_query, normalized_content).ratio()
+    return ratio if ratio >= 0.55 else 0.0
+
+
+def _task_due_at_matches(candidate_due_at: datetime | None, expected_due_at: datetime) -> bool:
+    due_local = _from_utc_naive(candidate_due_at)
+    if due_local is None:
+        return False
+    delta_seconds = abs(int((due_local - expected_due_at.astimezone()).total_seconds()))
+    return delta_seconds <= 120
+
+
+def format_task_summary(row: ScheduledTaskRecord) -> str:
+    due_local = _from_utc_naive(row.due_at)
+    due_text = due_local.strftime("%Y-%m-%d %H:%M:%S") if due_local else "-"
+    creator = html.escape(clean_text(row.creator_name or str(row.creator_user_id), max_len=60) or "-")
+    task_type = html.escape(clean_text(row.task_type or "", max_len=32) or "unknown")
+    content = html.escape(clean_text(row.content or "", max_len=80) or "-")
+    return f"#{row.id} [{task_type}] {due_text}\n发起人: {creator}\n内容: {content}"
 
 
 def _is_quiet_hours(now: datetime, config: BotConfig) -> bool:
@@ -344,6 +385,81 @@ async def cancel_scheduled_task(
     return row
 
 
+async def match_scheduled_task_for_cancel(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    operator_user_id: int,
+    allow_any: bool = False,
+    task_id: int = 0,
+    task_type: str = "",
+    due_at: datetime | None = None,
+    task_content: str = "",
+) -> tuple[ScheduledTaskRecord | None, list[ScheduledTaskRecord]]:
+    if task_id > 0:
+        row = await session.get(ScheduledTaskRecord, task_id)
+        if row is None or row.group_id != group_id:
+            return None, []
+        if row.status not in {"pending", "failed"}:
+            return None, []
+        if not allow_any and row.creator_user_id != operator_user_id:
+            return None, []
+        return row, []
+
+    rows = await list_group_scheduled_tasks(session, group_id=group_id, limit=100)
+    if not allow_any:
+        rows = [row for row in rows if row.creator_user_id == operator_user_id]
+    if not rows:
+        return None, []
+
+    task_type_norm = clean_text(task_type, max_len=32).lower()
+    if task_type_norm not in {"reminder", "agent_task"}:
+        task_type_norm = ""
+    task_content_norm = clean_text(task_content, max_len=300)
+    has_due_at = due_at is not None
+    has_task_content = bool(task_content_norm)
+
+    if not task_type_norm and not has_due_at and not has_task_content:
+        if len(rows) == 1:
+            return rows[0], []
+        return None, rows[:5]
+
+    scored: list[tuple[int, ScheduledTaskRecord]] = []
+    for row in rows:
+        if task_type_norm and row.task_type != task_type_norm:
+            continue
+        if has_due_at and not _task_due_at_matches(row.due_at, due_at):
+            continue
+
+        score = 0
+        if task_type_norm and row.task_type == task_type_norm:
+            score += 15
+        if has_due_at:
+            score += 120
+        if has_task_content:
+            content_score = _task_content_match_score(task_content_norm, row.content or "")
+            min_score = 0.48 if has_due_at else 0.58
+            if content_score < min_score:
+                continue
+            score += int(content_score * 100)
+
+        scored.append((score, row))
+
+    if not scored:
+        return None, []
+
+    scored.sort(key=lambda item: (-item[0], item[1].due_at, item[1].id))
+    if len(scored) == 1:
+        return scored[0][1], []
+
+    top_score = scored[0][0]
+    second_score = scored[1][0]
+    if top_score >= second_score + 25:
+        return scored[0][1], []
+
+    return None, [row for _, row in scored[:5]]
+
+
 def render_task_list_text(rows: list[ScheduledTaskRecord]) -> str:
     if not rows:
         return "<b>定时任务列表</b>\n当前没有待执行任务。"
@@ -353,13 +469,7 @@ def render_task_list_text(rows: list[ScheduledTaskRecord]) -> str:
         "",
     ]
     for row in rows:
-        due_local = _from_utc_naive(row.due_at)
-        due_text = due_local.strftime("%Y-%m-%d %H:%M:%S") if due_local else "-"
-        creator = clean_text(row.creator_name or str(row.creator_user_id), max_len=60)
-        content = clean_text(row.content or "", max_len=80)
-        lines.append(
-            f"#{row.id} [{row.task_type}] {due_text}\n发起人: {creator}\n内容: {content}"
-        )
+        lines.append(format_task_summary(row))
         lines.append("")
     return "\n".join(lines).rstrip()
 
