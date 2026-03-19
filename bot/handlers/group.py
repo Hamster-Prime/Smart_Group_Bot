@@ -785,7 +785,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             delivery_mode = "reply"
 
             if action != "skip":
-                history = await memory.get_history_for_llm(group_id, query=merged_input_text)
+                history = await memory.get_history_for_llm(group_id)
                 history = _exclude_batch_messages(history, memory_entries)
                 log.info(
                     "[%s] pending batch reply generation started | action=%s history=%d",
@@ -936,7 +936,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 return
 
             if reply and sent_ok:
-                memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
+                await memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
+                await memory.compact_if_needed(group_id)
 
             await session.commit()
             log.info(
@@ -1311,7 +1312,7 @@ async def on_group_message(
             user_id=user_id,
         )
         if handled:
-            memory.add_message(
+            await memory.add_message(
                 group_id,
                 "user",
                 f"[{user_tag}] {input_text}",
@@ -1324,7 +1325,8 @@ async def on_group_message(
                 manage_reply,
                 auto_delete_minutes=settings.bot.auto_delete_minutes,
             )
-            memory.add_message(group_id, "assistant", manage_reply, message_type="assistant_reply")
+            await memory.add_message(group_id, "assistant", manage_reply, message_type="assistant_reply")
+            await memory.compact_if_needed(group_id)
             log.info("[%s] management intent handled | intent=%s", group_id, intent.intent)
             return
 
@@ -1332,7 +1334,7 @@ async def on_group_message(
     memory_entry = ""
     if should_index_user_memory:
         memory_entry = f"[{user_tag}] {input_text}"
-        memory.add_message(
+        await memory.add_message(
             group_id,
             "user",
             memory_entry,
@@ -1340,6 +1342,7 @@ async def on_group_message(
             message_type=msg_type,
             message_id=str(message.message_id),
         )
+        await memory.compact_if_needed(group_id)
     else:
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
 
@@ -1384,209 +1387,3 @@ async def on_group_message(
         int((time.perf_counter() - flow_started) * 1000),
     )
     return
-
-    if should_index_user_memory:
-        memory.add_message(
-            group_id,
-            "user",
-            f"[{user_tag}] {input_text}",
-            user_id=user_id,
-            message_type=msg_type,
-            message_id=str(message.message_id),
-        )
-        history_for_decision = memory.get_history(group_id)
-        decision_history = history_for_decision[:-1]
-    else:
-        # Contact cards are useful for moderation, but noisy for long-term memory indexing.
-        history_for_decision = memory.get_history(group_id)
-        decision_history = history_for_decision
-        log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
-
-    bot_me = await message.bot.me()
-    mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
-    is_reply = is_reply_message(message)
-    reply_to_bot = is_reply_to_bot(message, bot_me.username or "", bot_me.id)
-    reply_to_other = is_reply and not reply_to_bot
-    mention_other = mentions_other_user(message, bot_me.username or "", bot_me.id)
-
-    log.info(
-        "[%s]【决策】输入 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 类型=%s",
-        group_id,
-        mentioned,
-        mention_other,
-        is_reply,
-        reply_to_bot,
-        reply_to_other,
-        msg_type,
-    )
-
-    decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
-    action = "skip"
-    reply = ""
-    sent_ok = False
-    reply_source = "none"
-    skill_handled = False
-    sticker_sent_ok = False
-    sticker_file = ""
-    decision_started = time.perf_counter()
-    action = await decision_svc.decide(
-        input_text,
-        is_mentioned=mentioned,
-        is_reply=is_reply,
-        is_reply_to_bot=reply_to_bot,
-        is_reply_to_other=reply_to_other,
-        mentions_other_user=mention_other,
-        is_owner=sender_is_owner,
-        is_tg_admin=sender_is_tg_admin,
-        user_tag=user_tag,
-        msg_type=msg_type,
-        history=decision_history,
-    )
-    log.info(
-        "[%s]【决策】完成 | 动作=%s | 耗时=%dms",
-        group_id,
-        action,
-        int((time.perf_counter() - decision_started) * 1000),
-    )
-
-    if action != "skip":
-        history = await memory.get_history_for_llm(group_id, query=input_text)
-        log.info("[%s] flow reply generation started | action=%s | history=%d", group_id, action, len(history))
-
-        async with typing_action(message, enabled=settings.bot.enable_typing):
-            skill_result = await skill.answer_with_skill(
-                input_text,
-                session=session,
-                history=history,
-                sender_user_id=user_id,
-                sender_username=sender_username,
-                sender_is_owner=sender_is_owner,
-                sender_is_tg_admin=sender_is_tg_admin,
-                message=message,
-                intent_type=action,
-            )
-            skill_handled = bool(skill_result.handled)
-            sticker_sent_ok = bool(skill_result.sticker_sent)
-            sticker_file = skill_result.sticker_file_id or ""
-            if skill_result.text:
-                reply = skill_result.text
-                log.info("[%s] reply via skill | %s", group_id, reply[:80])
-                reply_source = "skill"
-            elif skill_handled:
-                reply_source = "skill"
-                log.info(
-                    "[%s] handled by skill | sticker_sent=%s file=%s",
-                    group_id,
-                    sticker_sent_ok,
-                    sticker_file[:32] if sticker_file else "-",
-                )
-
-            if not reply and not skill_handled:
-                casual = CasualService(llm)
-                reply = await casual.reply(
-                    input_text,
-                    history=history,
-                    sender_user_id=user_id,
-                    sender_username=sender_username,
-                    sender_is_owner=sender_is_owner,
-                    sender_is_tg_admin=sender_is_tg_admin,
-                    intent_type=action,
-                )
-                log.info(
-                    "[%s] reply via casual | intent=%s | %s",
-                    group_id,
-                    action,
-                    reply[:80] if reply else "(empty)",
-                )
-                if reply:
-                    reply_source = "casual"
-
-            if reply:
-                cleaned_reply = sanitize_outgoing_text(reply)
-                if cleaned_reply != reply:
-                    log.warning("[%s] reply sanitized: removed internal markup", group_id)
-                reply = cleaned_reply
-                normalized_reply = _normalize_owner_address(reply, sender_is_owner)
-                if normalized_reply != reply:
-                    log.info("[%s] reply owner-address normalized for non-owner sender", group_id)
-                reply = normalized_reply
-
-        if reply or not skill_handled:
-            silence_reply, silence_reason = _should_silence_generated_reply(reply)
-            if silence_reply and not (action == "casual" and silence_reason == "silent_marker"):
-                preview = _truncate_text(reply, 80) if reply else "-"
-                log.info(
-                    "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
-                    group_id,
-                    silence_reason,
-                    reply_source,
-                    action,
-                    preview,
-                )
-                reply = ""
-                reply_source = "none"
-                action = "skip"
-            if silence_reply and action == "casual" and silence_reason == "silent_marker":
-            # 根据决策类型和静默原因决定是否真的要静默
-                should_really_silence = True
-                pass
-                # 闲聊场景返回了 NO_TRUSTED_ANSWER，这不合理
-                # 说明提示词可能没生效，使用默认友好回复
-                log.warning("[%s] casual chat returned NO_TRUSTED_ANSWER, using fallback reply", group_id)
-                reply = "嗯嗯，我在听~"
-                should_really_silence = False
-                reply_source = "fallback"
-                if should_really_silence:
-                    preview = _truncate_text(reply, 80) if reply else "-"
-                    log.info(
-                    "[%s] reply suppressed -> silent | reason=%s source=%s intent=%s preview=%s",
-                    group_id,
-                    silence_reason,
-                    reply_source,
-                    action,
-                    preview,
-                    )
-                    reply = ""
-                    reply_source = "none"
-                    action = "skip"
-
-    if action != "skip" and reply:
-        sent_ok = await send_reply(
-            message,
-            reply,
-            stream=settings.bot.enable_streaming,
-            stream_chunk_size=settings.bot.stream_chunk_size,
-            stream_interval=settings.bot.stream_edit_interval_sec,
-            auto_delete_minutes=0,
-        )
-
-    if action == "skip":
-        log.info(
-            "[%s]【结束】跳过 | @机=%s @他=%s 回=%s 回机=%s 回他=%s 贴纸决策=%s | 耗时=%dms",
-            group_id,
-            mentioned,
-            mention_other,
-            is_reply,
-            reply_to_bot,
-            reply_to_other,
-            (skill_handled or sticker_sent_ok),
-            int((time.perf_counter() - flow_started) * 1000),
-        )
-        return
-
-    if reply and sent_ok:
-        memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
-
-    log.info(
-        "[%s]【结束】完成 | 动作=%s 来源=%s 已生成=%s 发送=%s 贴纸决策=%s 贴纸发送=%s 长度=%d 耗时=%dms",
-        group_id,
-        action,
-        reply_source,
-        bool(reply),
-        sent_ok,
-        skill_handled,
-        sticker_sent_ok,
-        len(reply or ""),
-        int((time.perf_counter() - flow_started) * 1000),
-    )
-

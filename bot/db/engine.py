@@ -65,47 +65,10 @@ async def init_db(
                 "content",
                 "content TEXT NOT NULL DEFAULT ''",
             )
-            await _sqlite_ensure_column(
-                conn,
-                "message_vectors",
-                "importance_score",
-                "importance_score FLOAT NOT NULL DEFAULT 0.5",
-            )
-            await _sqlite_ensure_column(
-                conn,
-                "message_vectors",
-                "access_count",
-                "access_count INTEGER NOT NULL DEFAULT 0",
-            )
-            await _sqlite_ensure_column(
-                conn,
-                "message_vectors",
-                "vector_id",
-                "vector_id VARCHAR(64) NOT NULL DEFAULT ''",
-            )
-            await _sqlite_ensure_column(
-                conn,
-                "message_vectors",
-                "last_accessed",
-                "last_accessed DATETIME",
-            )
-            await conn.execute(
-                text(
-                    "UPDATE message_vectors "
-                    "SET vector_id = message_id "
-                    "WHERE vector_id IS NULL OR vector_id = ''"
-                )
-            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_created "
                     "ON message_vectors (group_id, created_at)"
-                )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_importance "
-                    "ON message_vectors (group_id, importance_score)"
                 )
             )
             await conn.execute(
