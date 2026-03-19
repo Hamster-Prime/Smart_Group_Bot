@@ -185,3 +185,32 @@ class StickerLibraryRecord(Base):
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (Index("ix_sticker_group_file", "group_id", "file_id", unique=True),)
+
+
+class ScheduledTaskRecord(Base):
+    __tablename__ = "scheduled_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    creator_user_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    creator_name: Mapped[str] = mapped_column(String(255), default="")
+    task_type: Mapped[str] = mapped_column(String(32), default="reminder")
+    content: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    source: Mapped[str] = mapped_column(String(64), default="natural_language")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+    __table_args__ = (
+        Index("ix_scheduled_tasks_group_status_due", "group_id", "status", "due_at"),
+        Index("ix_scheduled_tasks_status_due", "status", "due_at"),
+    )

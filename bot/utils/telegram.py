@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
+from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message
@@ -690,6 +692,95 @@ async def send_reply(
                 seg_ok = await _send_stream_segment(segment)
                 all_ok = all_ok and seg_ok
         return all_ok
+
+
+async def send_chat_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    *,
+    reply_to_message_id: int | None = None,
+    fallback_mention_user_id: int = 0,
+    fallback_mention_name: str = "",
+    auto_delete_minutes: int = 0,
+) -> bool:
+    payload = sanitize_outgoing_text((text or "").strip())
+    payload = sanitize_outgoing_mentions(payload)
+    if not payload:
+        return False
+
+    fallback_prefix_html = ""
+    if fallback_mention_user_id:
+        shown = html.escape((fallback_mention_name or str(fallback_mention_user_id)).strip())
+        fallback_prefix_html = f'<a href="tg://user?id={fallback_mention_user_id}">@{shown}</a> '
+
+    async def _safe_send(
+        body: str,
+        *,
+        parse_mode: str | None,
+        reply_id: int | None,
+        retries: int = 1,
+        retry_delay: float = 0.8,
+    ) -> Message | None:
+        attempt = 0
+        current_reply_id = reply_id
+        current_body = body
+        current_parse_mode = parse_mode
+        while attempt <= retries:
+            try:
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=current_body,
+                    parse_mode=current_parse_mode,
+                    reply_to_message_id=current_reply_id,
+                )
+                schedule_message_auto_delete(sent, auto_delete_minutes)
+                return sent
+            except TelegramRetryAfter as exc:
+                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                log.warning("telegram flood control on scheduled send, waiting %.2fs", wait_s)
+                await asyncio.sleep(wait_s)
+                attempt += 1
+            except TelegramBadRequest as exc:
+                detail = str(exc).lower()
+                if "can't parse entities" in detail:
+                    return None
+                if current_reply_id and ("reply message not found" in detail or "message to reply not found" in detail):
+                    current_reply_id = None
+                    if fallback_prefix_html and current_parse_mode == "HTML":
+                        current_body = f"{fallback_prefix_html}{body}"
+                    attempt += 1
+                    continue
+                if attempt >= retries:
+                    log.exception("scheduled send bad request chat_id=%s retries=%d", chat_id, retries)
+                    return None
+                attempt += 1
+                await asyncio.sleep(retry_delay * attempt)
+            except Exception:
+                if attempt >= retries:
+                    log.exception("scheduled send failed chat_id=%s retries=%d", chat_id, retries)
+                    return None
+                attempt += 1
+                await asyncio.sleep(retry_delay * attempt)
+        return None
+
+    semaphore = _SEND_SEMAPHORES.setdefault(chat_id, asyncio.Semaphore(CHAT_SEND_PARALLEL))
+    async with semaphore:
+        ok = True
+        for part in _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT):
+            html_body = md_to_html(part)
+            sent = await _safe_send(html_body, parse_mode="HTML", reply_id=reply_to_message_id, retries=3)
+            if not sent:
+                sent = await _safe_send(
+                    part,
+                    parse_mode="Markdown",
+                    reply_id=reply_to_message_id,
+                    retries=2,
+                )
+            if not sent:
+                sent = await _safe_send(part, parse_mode=None, reply_id=reply_to_message_id, retries=2)
+            ok = ok and bool(sent)
+        return ok
 
 
 def extract_message_text(message: Message) -> tuple[str, str]:

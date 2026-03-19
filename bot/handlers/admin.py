@@ -29,6 +29,10 @@ from bot.services.authz import (
     list_authorized_groups,
 )
 from bot.services.llm import LLMService
+from bot.services.scheduled_tasks import (
+    get_cooldown_status_text,
+    set_cooldown_task_enabled,
+)
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
 from bot.utils.telegram import answer_with_auto_delete, is_group
 
@@ -49,6 +53,12 @@ _UNMUTE_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /unmute\n"
     "2. 发送 /unmute all（恢复本群正常回复）"
+)
+_PROACTIVE_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. /proactive on\n"
+    "2. /proactive off\n"
+    "3. /proactive status"
 )
 
 
@@ -1184,6 +1194,67 @@ async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings
         f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
         "<b>状态</b>: 已移出静默名单（恢复回复）",
     )
+
+
+@router.message(Command("proactive"))
+async def cmd_proactive(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>主动话题定时任务</b>\n请在目标群内使用该命令。")
+        return
+
+    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+    group_settings = dict(group_row.settings or {})
+
+    if args in {"", "status"}:
+        await _answer(
+            message,
+            settings,
+            get_cooldown_status_text(
+                group_settings,
+                default_enabled=settings.bot.proactive_default_enabled,
+            ),
+        )
+        return
+
+    if args in {"on", "enable"}:
+        group_row.settings = set_cooldown_task_enabled(
+            group_settings,
+            enabled=True,
+            config=settings.bot,
+        )
+        await _answer(
+            message,
+            settings,
+            get_cooldown_status_text(
+                group_row.settings,
+                default_enabled=settings.bot.proactive_default_enabled,
+            ),
+        )
+        return
+
+    if args in {"off", "disable"}:
+        group_row.settings = set_cooldown_task_enabled(
+            group_settings,
+            enabled=False,
+            config=settings.bot,
+        )
+        await _answer(
+            message,
+            settings,
+            get_cooldown_status_text(
+                group_row.settings,
+                default_enabled=settings.bot.proactive_default_enabled,
+            ),
+        )
+        return
+
+    await _answer(message, settings, _PROACTIVE_USAGE)
 
 
 @router.message(Command("warnings"))

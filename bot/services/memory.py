@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import litellm
 from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig
@@ -150,19 +150,27 @@ class MemoryService:
         del user_id, message_type
 
         scoped_id = self._scoped_message_id(group_id, message_id)
-        async with self._session_factory() as session:
-            row = MessageVector(
-                group_id=group_id,
-                message_id=scoped_id,
-                role=(role or "user")[:16],
-                content=content,
-            )
-            session.add(row)
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-                return False
+        for attempt in range(3):
+            async with self._session_factory() as session:
+                row = MessageVector(
+                    group_id=group_id,
+                    message_id=scoped_id,
+                    role=(role or "user")[:16],
+                    content=content,
+                )
+                session.add(row)
+                try:
+                    await session.commit()
+                    return True
+                except IntegrityError:
+                    await session.rollback()
+                    return False
+                except OperationalError as exc:
+                    await session.rollback()
+                    detail = str(getattr(exc, "orig", exc)).lower()
+                    if "database is locked" not in detail or attempt >= 2:
+                        raise
+                    await asyncio.sleep(0.2 * (attempt + 1))
         return True
 
     def _count_tokens(self, messages: list[dict[str, str]]) -> int:

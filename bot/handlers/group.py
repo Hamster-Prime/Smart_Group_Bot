@@ -28,6 +28,9 @@ from bot.services.group_intent import GroupIntent, GroupIntentService
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
+from bot.services.scheduled_tasks import create_scheduled_task, format_due_at_local, record_group_activity
+from bot.services.task_intent import TaskIntent
+from bot.services.task_intent import TaskIntentService
 from bot.services.skills import SkillService
 from bot.services.sticker_library import sticker_library
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
@@ -118,6 +121,24 @@ def _truncate_text(text: str, max_len: int) -> str:
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[:max_len] + "..."
+
+
+def _extract_scheduled_task_target(message: Message) -> tuple[int, str]:
+    source_text = message.text or message.caption or ""
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for entity in entities:
+        et = str(getattr(entity, "type", "") or "")
+        if et == "text_mention":
+            user = getattr(entity, "user", None)
+            if user is not None:
+                return int(getattr(user, "id", 0) or 0), (user.full_name or user.username or "").strip()
+        if et == "mention":
+            offset = int(getattr(entity, "offset", 0) or 0)
+            length = int(getattr(entity, "length", 0) or 0)
+            mention = source_text[offset : offset + length].strip().lstrip("@")
+            if mention:
+                return 0, mention
+    return 0, ""
 
 
 def _parse_json_payload(raw: str) -> dict | None:
@@ -386,6 +407,60 @@ async def _handle_management_intent(
         )
 
     return False, ""
+
+
+async def _handle_task_intent(
+    *,
+    intent: TaskIntent,
+    session: AsyncSession,
+    message: Message,
+    group_id: int,
+    user_id: int,
+    user_display_name: str,
+) -> tuple[bool, str]:
+    if intent.intent != "task_manage" or intent.task_action != "add":
+        return False, ""
+    if intent.due_at is None or not intent.task_content:
+        return False, ""
+
+    reply_target = getattr(message, "reply_to_message", None)
+    target_user = getattr(reply_target, "from_user", None) if reply_target else None
+    target_name = ""
+    target_user_id = 0
+    reply_to_message_id = message.message_id
+    if reply_target is not None:
+        reply_to_message_id = int(getattr(reply_target, "message_id", 0) or message.message_id)
+        if target_user is not None:
+            target_name = (target_user.full_name or target_user.username or "").strip()
+            target_user_id = int(getattr(target_user, "id", 0) or 0)
+    if not target_name:
+        target_user_id, target_name = _extract_scheduled_task_target(message)
+    if not target_name:
+        target_name = user_display_name
+        target_user_id = user_id
+
+    row = await create_scheduled_task(
+        session,
+        group_id=group_id,
+        creator_user_id=user_id,
+        creator_name=user_display_name,
+        due_at=intent.due_at,
+        task_type=intent.task_type,
+        content=intent.task_content,
+        reply_to_message_id=reply_to_message_id,
+        target_user_id=target_user_id,
+        target_user_name=target_name,
+    )
+    reply = (
+        "<b>定时任务已创建</b>\n"
+        f"<b>ID</b>: #{row.id}\n"
+        f"<b>类型</b>: {html.escape(intent.task_type)}\n"
+        f"<b>时间</b>: {format_due_at_local(intent.due_at)}\n"
+        f"<b>内容</b>: {html.escape(_truncate_text(intent.task_content, 160))}"
+    )
+    if intent.ack_text:
+        reply = f"{html.escape(intent.ack_text)}\n\n{reply}"
+    return True, reply
 
 
 def _build_moderation_notice(
@@ -1072,22 +1147,24 @@ async def on_group_message(
     if not await ensure_group_authorized(message, session, settings):
         return
 
+    group_id = message.chat.id
+    user = message.from_user
+    user_id = user.id if user else 0
+    group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
+    group_row.settings = record_group_activity(group_row.settings, settings.bot)
+
     text, msg_type = extract_message_text(message)
     if not text:
         return
     input_text = text
     flow_started = time.perf_counter()
 
-    group_id = message.chat.id
-    user = message.from_user
-    user_id = user.id if user else 0
     warn_target = (
         f"@{user.username}"
         if user and user.username
         else f'<a href="tg://user?id={user_id}">{html.escape((user.full_name if user else str(user_id)) or str(user_id))}</a>'
     )
 
-    group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
     group_settings = group_row.settings or {}
     mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 
@@ -1125,6 +1202,7 @@ async def on_group_message(
         embed=settings.bot.embed_model,
     )
     intent_svc = GroupIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
+    task_intent_svc = TaskIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
     sticker_pool = [
         x.strip()
         for x in (settings.skill_sticker_file_ids or "").split(",")
@@ -1292,6 +1370,10 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
+    task_intent = TaskIntent()
+    if task_intent_svc.looks_like_task_candidate(text):
+        task_intent = await task_intent_svc.detect(text, history=memory.get_history(group_id))
+
     intent = GroupIntent()
     if sender_is_tg_admin:
         intent = await intent_svc.detect(input_text, history=memory.get_history(group_id))
@@ -1314,6 +1396,7 @@ async def on_group_message(
             user_id=user_id,
         )
         if handled:
+            await session.commit()
             await memory.add_message(
                 group_id,
                 "user",
@@ -1330,6 +1413,35 @@ async def on_group_message(
             await memory.add_message(group_id, "assistant", manage_reply, message_type="assistant_reply")
             await memory.compact_if_needed(group_id)
             log.info("[%s] management intent handled | intent=%s", group_id, intent.intent)
+            return
+
+    if task_intent.intent == "task_manage":
+        handled, task_reply = await _handle_task_intent(
+            intent=task_intent,
+            session=session,
+            message=message,
+            group_id=group_id,
+            user_id=user_id,
+            user_display_name=display_name if user else str(user_id),
+        )
+        if handled:
+            await session.commit()
+            await memory.add_message(
+                group_id,
+                "user",
+                f"[{user_tag}] {input_text}",
+                user_id=user_id,
+                message_type=msg_type,
+                message_id=str(message.message_id),
+            )
+            await answer_with_auto_delete(
+                message,
+                task_reply,
+                auto_delete_minutes=settings.bot.auto_delete_minutes,
+            )
+            await memory.add_message(group_id, "assistant", task_reply, message_type="assistant_reply")
+            await memory.compact_if_needed(group_id)
+            log.info("[%s] task intent handled | type=%s", group_id, task_intent.task_type)
             return
 
     should_index_user_memory = msg_type != "contact"

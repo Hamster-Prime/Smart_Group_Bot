@@ -23,6 +23,8 @@ from bot.db.models import Group
 from bot.services.authz import (
     ensure_group_authorized,
     ensure_super_admin,
+    is_group_admin_authorized,
+    is_super_admin_user_id,
 )
 from bot.services.av_search import (
     AVDetail,
@@ -31,6 +33,11 @@ from bot.services.av_search import (
     AVSearchItem,
     AVSearchService,
     is_av_code_query,
+)
+from bot.services.scheduled_tasks import (
+    cancel_scheduled_task,
+    list_group_scheduled_tasks,
+    render_task_list_text,
 )
 from bot.utils.telegram import answer_with_auto_delete, schedule_message_auto_delete, typing_action
 
@@ -591,9 +598,14 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/start：开始使用\n"
         "/help：查看帮助\n"
         "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU\n\n"
+        "/tasks：查看当前群待执行定时任务\n"
+        "/canceltask &lt;任务ID&gt;：取消自己创建的定时任务\n\n"
         "<b>自然语言管理（群管理员）</b>\n"
         "直接发送：记住xxx / 把xxx写入永久记忆 / 删除永久记忆#12 / 永久记忆列表\n"
         "直接发送：新增群规xxx / 删除第N条群规 / 群规列表\n\n"
+        "<b>自然语言定时任务（所有群成员）</b>\n"
+        "直接发送：记得今晚9点提醒我吃饭\n\n"
+        "直接发送：3点帮我查询今天的科技新闻并概述\n\n"
         "<b>群审核管理（需已授权）</b>\n"
         "/addrule &lt;自然语言指令&gt;\n"
         "/rules 审核规则列表\n"
@@ -604,6 +616,7 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/mute all（本群仅做审核，不再回复）\n\n"
         "/unmute（回复目标用户消息，恢复其消息回复）\n"
         "/unmute all（恢复本群正常回复）\n\n"
+        "/proactive on|off|status（主动话题定时任务开关/状态）\n\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup 授权群组\n"
         "/unauthgroup 撤销授权群组\n"
@@ -613,6 +626,64 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/adminlist 群管理列表\n"
         "/av enable（在当前群启用 AV 查询）\n"
         "/av disable（在当前群停用 AV 查询）"
+    )
+
+
+@router.message(Command("tasks"))
+async def cmd_tasks(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>定时任务列表</b>\n请在群内使用 /tasks。")
+        return
+
+    rows = await list_group_scheduled_tasks(session, group_id=message.chat.id, limit=20)
+    await _answer(message, settings, render_task_list_text(rows))
+
+
+@router.message(Command("canceltask"))
+async def cmd_canceltask(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>取消定时任务</b>\n请在群内使用 /canceltask &lt;任务ID&gt;。")
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    try:
+        task_id = int(args)
+    except (TypeError, ValueError):
+        await _answer(message, settings, "<b>取消定时任务</b>\n用法：/canceltask &lt;任务ID&gt;")
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    allow_any = False
+    if user_id and is_super_admin_user_id(user_id, settings):
+        allow_any = True
+    elif user_id:
+        allow_any = await is_group_admin_authorized(session, message.chat.id, user_id)
+
+    row = await cancel_scheduled_task(
+        session,
+        group_id=message.chat.id,
+        task_id=task_id,
+        operator_user_id=user_id,
+        allow_any=allow_any,
+    )
+    if row is None:
+        await _answer(
+            message,
+            settings,
+            "<b>取消定时任务</b>\n未找到可取消的任务，或你没有权限取消该任务。",
+        )
+        return
+
+    await _answer(
+        message,
+        settings,
+        "<b>定时任务已取消</b>\n"
+        f"<b>ID</b>: #{row.id}\n"
+        f"<b>内容</b>: {html.escape(row.content or '-')}",
     )
 
 

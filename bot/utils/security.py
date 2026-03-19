@@ -35,6 +35,19 @@ def clean_text(text: str, max_len: int = 4000) -> str:
     return s
 
 
+def clean_multiline_text(text: str, max_len: int = 4000) -> str:
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = _CONTROL_CHAR_RE.sub(" ", s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n[ \t]+", "\n", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = "\n".join(line.rstrip() for line in s.split("\n")).strip()
+    if len(s) > max_len:
+        return s[:max_len].rstrip() + " ..."
+    return s
+
+
 def contains_prompt_injection(text: str) -> bool:
     return bool(_INJECTION_RE.search(text or ""))
 

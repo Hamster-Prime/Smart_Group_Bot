@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 class SkillContext:
     session: AsyncSession | None = None
     message: Message | None = None
+    bot: Any | None = None
+    chat_id: int = 0
+    llm: Any | None = None
+    history: list[dict[str, str]] = field(default_factory=list)
     sender_user_id: int = 0
     sender_username: str = ""
     sender_is_owner: bool = False

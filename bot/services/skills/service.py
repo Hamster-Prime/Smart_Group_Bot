@@ -9,6 +9,7 @@ import litellm
 from bot.config import ChatEndpointConfig, ModelConfig
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
+from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
@@ -40,6 +41,7 @@ class SkillService:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
+        self._register(ScheduledTaskSkill())
         self._register(SendStickerSkill())
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
@@ -116,14 +118,16 @@ class SkillService:
     @staticmethod
     def _tool_definitions(skills: dict[str, Skill]) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
-        for s in skills.values():
+        for skill in skills.values():
+            if skill.name == "scheduled_task":
+                continue
             tools.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": s.name,
-                        "description": s.description,
-                        "parameters": s.parameters_schema,
+                        "name": skill.name,
+                        "description": skill.description,
+                        "parameters": skill.parameters_schema,
                     },
                 }
             )
@@ -137,7 +141,6 @@ class SkillService:
     ) -> Any | None:
         candidates = self._candidate_models(self.llm.main)
         total = len(candidates)
-
         for idx, cfg in enumerate(candidates, start=1):
             kwargs = self._build_chat_kwargs(cfg)
             log.info(
@@ -189,10 +192,12 @@ class SkillService:
                 fn = getattr(call, "function", None)
                 name = str(getattr(fn, "name", "") if fn else "").strip()
                 raw_args = getattr(fn, "arguments", "") if fn else ""
+
             if isinstance(raw_args, dict):
                 arguments = json.dumps(raw_args, ensure_ascii=False)
             else:
                 arguments = str(raw_args or "").strip()
+
             if call_id and name:
                 parsed.append({"id": call_id, "name": name, "arguments": arguments or "{}"})
         return parsed
@@ -227,6 +232,38 @@ class SkillService:
             "error": result.error,
             "payload": result.payload,
         }
+
+    async def run_skill(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        session: AsyncSession | None = None,
+        history: list[dict[str, str]] | None = None,
+        sender_user_id: int = 0,
+        sender_username: str = "",
+        sender_is_owner: bool = False,
+        sender_is_tg_admin: bool = False,
+        message: Any | None = None,
+        bot: Any | None = None,
+        chat_id: int = 0,
+        current_user_text: str = "",
+    ) -> SkillRunResult:
+        context = SkillContext(
+            session=session,
+            message=message,
+            bot=bot,
+            chat_id=chat_id,
+            llm=self.llm,
+            history=list(history or []),
+            sender_user_id=sender_user_id,
+            sender_username=sender_username,
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+            current_user_text=current_user_text,
+            default_sticker_file_ids=self.default_sticker_file_ids,
+        )
+        return await self._run_tool(name=name, arguments=arguments or {}, context=context)
 
     async def answer_with_skill(
         self,
@@ -270,6 +307,10 @@ class SkillService:
         context = SkillContext(
             session=session,
             message=message,
+            bot=getattr(message, "bot", None) if message is not None else None,
+            chat_id=int(getattr(getattr(message, "chat", None), "id", 0) or 0) if message is not None else 0,
+            llm=self.llm,
+            history=list(history or []),
             sender_user_id=sender_user_id,
             sender_username=sender_username,
             sender_is_owner=sender_is_owner,
@@ -300,11 +341,14 @@ class SkillService:
             if tool_calls:
                 assistant_message["tool_calls"] = [
                     {
-                        "id": tc["id"],
+                        "id": tool_call["id"],
                         "type": "function",
-                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
                     }
-                    for tc in tool_calls
+                    for tool_call in tool_calls
                 ]
             messages.append(assistant_message)
 
@@ -315,17 +359,17 @@ class SkillService:
                 return _build_answer_result(last_success_summary)
 
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
-            for tc in tool_calls:
-                args = self._parse_tool_arguments(tc["arguments"])
-                result = await self._run_tool(name=tc["name"], arguments=args, context=context)
+            for tool_call in tool_calls:
+                args = self._parse_tool_arguments(tool_call["arguments"])
+                result = await self._run_tool(name=tool_call["name"], arguments=args, context=context)
                 if result.ok and result.summary:
                     last_success_summary = result.summary
                 payload = self._tool_result_to_payload(result)
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["name"],
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_call["name"],
                         "content": json.dumps(payload, ensure_ascii=False),
                     }
                 )

@@ -95,6 +95,8 @@ async def start_bot(settings, session_factory) -> None:
     from bot.services import memory_holder
     from bot.services.llm import LLMService
     from bot.services.memory import MemoryService
+    from bot.services.scheduled_tasks import ScheduledTaskService
+    from bot.services.skills import SkillService
 
     dp["settings"] = settings
     dp["session_factory"] = session_factory
@@ -114,6 +116,12 @@ async def start_bot(settings, session_factory) -> None:
     )
     await memory.bootstrap()
     memory_holder.init(memory)
+    sticker_pool = [
+        x.strip()
+        for x in (settings.skill_sticker_file_ids or "").split(",")
+        if x and x.strip()
+    ]
+    scheduler_skill = SkillService(llm, default_sticker_file_ids=sticker_pool)
 
     dp.message.middleware(LoggingMiddleware())
     dp.message.middleware(ThrottleMiddleware(rate_limit=0.0))
@@ -125,6 +133,17 @@ async def start_bot(settings, session_factory) -> None:
     dp.include_router(group.router)
 
     bot = create_bot(settings)
+    scheduled_tasks = ScheduledTaskService(
+        settings=settings,
+        bot=bot,
+        memory=memory,
+        session_factory=session_factory,
+        skill_service=scheduler_skill,
+    )
+    scheduled_task_runner = asyncio.create_task(
+        scheduled_tasks.run_forever(),
+        name="scheduled-task-runner",
+    )
     log.info("Bot starting in polling mode")
 
     try:
@@ -136,6 +155,8 @@ async def start_bot(settings, session_factory) -> None:
             tasks_concurrency_limit=8,
         )
     finally:
+        scheduled_task_runner.cancel()
+        await asyncio.gather(scheduled_task_runner, return_exceptions=True)
         try:
             await group.flush_pending_inbound_batches()
             log.info("pending inbound batches flushed")

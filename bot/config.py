@@ -49,6 +49,13 @@ class BotConfig(BaseModel):
     stream_edit_interval_sec: float = 1.0
     auto_delete_minutes: int = 0
     decision_context_items: int = 5
+    proactive_default_enabled: bool = False
+    proactive_idle_minutes: int = 180
+    proactive_jitter_minutes: int = 60
+    proactive_check_interval_seconds: float = 60.0
+    proactive_quiet_hours_start: int = 0
+    proactive_quiet_hours_end: int = 9
+    proactive_retry_minutes: int = 30
     main_model: ModelConfig = ModelConfig()
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
@@ -111,6 +118,13 @@ class Settings(BaseSettings):
     bot_stream_edit_interval_sec: float = 1.0
     bot_auto_delete_minutes: int = 0
     bot_decision_context_items: int = 5
+    bot_proactive_default_enabled: bool = False
+    bot_proactive_idle_minutes: int = 180
+    bot_proactive_jitter_minutes: int = 60
+    bot_proactive_check_interval_seconds: float = 60.0
+    bot_proactive_quiet_hours_start: int = 0
+    bot_proactive_quiet_hours_end: int = 9
+    bot_proactive_retry_minutes: int = 30
     skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
@@ -322,6 +336,15 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
     settings.bot.auto_delete_minutes = max(0, settings.bot_auto_delete_minutes)
     settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
+    settings.bot.proactive_default_enabled = settings.bot_proactive_default_enabled
+    settings.bot.proactive_idle_minutes = max(180, int(settings.bot_proactive_idle_minutes))
+    settings.bot.proactive_jitter_minutes = max(0, int(settings.bot_proactive_jitter_minutes))
+    settings.bot.proactive_check_interval_seconds = max(
+        15.0, float(settings.bot_proactive_check_interval_seconds)
+    )
+    settings.bot.proactive_quiet_hours_start = min(23, max(0, int(settings.bot_proactive_quiet_hours_start)))
+    settings.bot.proactive_quiet_hours_end = min(23, max(0, int(settings.bot_proactive_quiet_hours_end)))
+    settings.bot.proactive_retry_minutes = max(5, int(settings.bot_proactive_retry_minutes))
 
     # New provider registry + role binding.
     raw_env = _load_raw_env()
