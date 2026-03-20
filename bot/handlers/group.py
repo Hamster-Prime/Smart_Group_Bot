@@ -1600,6 +1600,7 @@ async def on_group_message(
                 sender_name=display_name if user else "",
                 message_type=msg_type,
                 message_id=str(message.message_id),
+                created_at=message.date,
             )
             await answer_with_auto_delete(
                 message,
@@ -1631,6 +1632,7 @@ async def on_group_message(
                 sender_name=display_name if user else "",
                 message_type=msg_type,
                 message_id=str(message.message_id),
+                created_at=message.date,
             )
             await answer_with_auto_delete(
                 message,
@@ -1666,6 +1668,7 @@ async def on_group_message(
             sender_name=display_name if user else "",
             message_type=msg_type,
             message_id=str(message.message_id),
+            created_at=message.date,
         )
         await memory.compact_if_needed(group_id)
     else:

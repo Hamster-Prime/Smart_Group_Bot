@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
 import re
 from typing import Any
+
+from bot.utils.timezone import format_shanghai_timestamp
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
 _INJECTION_RE = re.compile(
@@ -85,10 +86,10 @@ def _is_trusted_history_source(content: str) -> bool:
 
 
 def _stringify_history_timestamp(value: Any) -> str:
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    text = clean_text(str(value or ""), max_len=64)
-    return text or "unknown"
+    rendered = format_shanghai_timestamp(value)
+    if rendered == "unknown":
+        return rendered
+    return clean_text(rendered, max_len=64) or "unknown"
 
 
 def _extract_legacy_history_metadata(content: str) -> dict[str, str]:

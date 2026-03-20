@@ -16,6 +16,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from bot.utils.timezone import now_shanghai_naive
+
 
 class Base(DeclarativeBase):
     pass
@@ -167,7 +169,11 @@ class MessageVector(Base):
     message_type: Mapped[str] = mapped_column(String(64), default="text")
     content: Mapped[str] = mapped_column(Text, default="")
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
     last_accessed: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (

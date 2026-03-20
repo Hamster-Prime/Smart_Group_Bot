@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import re
 from typing import Any
@@ -18,6 +18,7 @@ from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVect
 from bot.services.llm import LLMService
 from bot.utils.prompts import COMPRESS_SYSTEM
 from bot.utils.security import format_history_message_line
+from bot.utils.timezone import format_shanghai_timestamp, now_shanghai_naive, to_shanghai_naive
 
 log = logging.getLogger(__name__)
 
@@ -103,10 +104,7 @@ class MemoryService:
 
     @staticmethod
     def _stringify_created_at(value: Any) -> str:
-        if hasattr(value, "strftime"):
-            return value.strftime("%Y-%m-%d %H:%M:%S")
-        text = str(value or "").strip()
-        return text or "unknown"
+        return format_shanghai_timestamp(value)
 
     @staticmethod
     def _default_sender_name(role: str, sender_name: str | None = None) -> str:
@@ -163,10 +161,17 @@ class MemoryService:
         sender_name: str = "",
         message_type: str = "text",
         message_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> None:
         text = (content or "").strip()
         if not text:
             return
+
+        normalized_created_at = (
+            to_shanghai_naive(created_at, assume_naive_tz=timezone.utc)
+            if created_at is not None
+            else now_shanghai_naive()
+        )
 
         inserted = await self._persist_message(
             group_id=group_id,
@@ -176,13 +181,14 @@ class MemoryService:
             sender_name=sender_name,
             message_type=message_type,
             message_id=message_id,
+            created_at=normalized_created_at,
         )
         if inserted is not False:
             self._working(group_id).append(
                 self._history_item(
                     role=role,
                     content=text,
-                    created_at=datetime.now(),
+                    created_at=normalized_created_at,
                     sender_id=user_id,
                     sender_name=sender_name,
                     message_type=message_type,
@@ -207,6 +213,7 @@ class MemoryService:
         sender_name: str,
         message_type: str,
         message_id: str | None,
+        created_at: datetime,
     ) -> bool | None:
         scoped_id = self._scoped_message_id(group_id, message_id)
         normalized_role = (role or "user")[:16]
@@ -227,6 +234,7 @@ class MemoryService:
                     sender_name=normalized_sender_name,
                     message_type=normalized_message_type,
                     content=content,
+                    created_at=created_at,
                 )
                 session.add(row)
                 try:

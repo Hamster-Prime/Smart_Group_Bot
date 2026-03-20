@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 _SQLITE_TIMEOUT_SECONDS = 5
 _SQLITE_BUSY_TIMEOUT_MS = _SQLITE_TIMEOUT_SECONDS * 1000
+_SQLITE_SCHEMA_VERSION = 1
 
 
 async def _sqlite_table_columns(conn, table: str) -> set[str]:
@@ -32,6 +33,50 @@ async def _sqlite_ensure_column(conn, table: str, column: str, column_def_sql: s
     await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_def_sql}"))
     log.info("Migrated: added %s.%s", table, column)
     return True
+
+
+async def _sqlite_get_user_version(conn) -> int:
+    result = await conn.execute(text("PRAGMA user_version"))
+    row = result.first()
+    return int(row[0] or 0) if row else 0
+
+
+async def _sqlite_set_user_version(conn, version: int) -> None:
+    await conn.execute(text(f"PRAGMA user_version = {int(version)}"))
+
+
+async def _sqlite_migrate_message_vector_timestamps(conn) -> bool:
+    user_version = await _sqlite_get_user_version(conn)
+    if user_version >= _SQLITE_SCHEMA_VERSION:
+        return False
+
+    columns = await _sqlite_table_columns(conn, "message_vectors")
+    changed = False
+
+    # Legacy SQLite rows were stored via CURRENT_TIMESTAMP (UTC). Shift them once to Asia/Shanghai.
+    if "created_at" in columns:
+        await conn.execute(
+            text(
+                "UPDATE message_vectors "
+                "SET created_at = datetime(created_at, '+8 hours') "
+                "WHERE created_at IS NOT NULL"
+            )
+        )
+        changed = True
+    if "last_accessed" in columns:
+        await conn.execute(
+            text(
+                "UPDATE message_vectors "
+                "SET last_accessed = datetime(last_accessed, '+8 hours') "
+                "WHERE last_accessed IS NOT NULL"
+            )
+        )
+        changed = True
+
+    await _sqlite_set_user_version(conn, _SQLITE_SCHEMA_VERSION)
+    if changed:
+        log.info("Migrated: normalized message_vectors timestamps to Asia/Shanghai")
+    return changed
 
 
 async def init_db(
@@ -79,6 +124,12 @@ async def init_db(
             await _sqlite_ensure_column(
                 conn,
                 "message_vectors",
+                "embedding",
+                "embedding BLOB",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
                 "sender_id",
                 "sender_id BIGINT",
             )
@@ -106,6 +157,7 @@ async def init_db(
                     "ON message_vectors (message_id)"
                 )
             )
+            await _sqlite_migrate_message_vector_timestamps(conn)
 
     session_factory = async_sessionmaker(
         engine,

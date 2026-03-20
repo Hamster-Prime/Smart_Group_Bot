@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import unittest
 
 from bot.utils.security import clean_multiline_text, sanitize_history_for_llm
@@ -41,6 +42,23 @@ class SecurityUtilsTests(unittest.TestCase):
         self.assertIn("content:\nhello there", messages[0]["content"])
         self.assertIn("message_type: assistant_reply", messages[1]["content"])
         self.assertIn("sender: bot", messages[1]["content"])
+
+    def test_sanitize_history_converts_aware_timestamps_to_shanghai(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": "hello there",
+                "created_at": datetime(2026, 3, 20, 15, 30, tzinfo=timezone.utc),
+                "sender_id": 42,
+                "sender_name": "Alice",
+                "message_type": "text",
+            }
+        ]
+
+        messages = sanitize_history_for_llm(history, max_items=1, max_item_chars=200)
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("sent_at: 2026-03-20 23:30:00", messages[0]["content"])
 
 
 if __name__ == "__main__":
