@@ -972,6 +972,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         message=latest.message,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
+                        merged_count=merged_count,
+                        merged_context=merged_context,
                     )
                     skill_handled = bool(skill_result.handled)
                     sticker_sent_ok = bool(skill_result.sticker_sent)
@@ -1014,6 +1016,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             sender_is_tg_admin=latest.sender_is_tg_admin,
                             intent_type=action,
                             merged_count=merged_count,
+                            merged_context=merged_context,
                         )
                         if reply:
                             reply_source = "casual"

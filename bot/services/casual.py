@@ -5,14 +5,18 @@ import logging
 from typing import Any
 
 from bot.services.llm import LLMService
+from bot.utils.conversation_context import (
+    build_current_turn_focus_context,
+    format_recent_group_context,
+)
 from bot.utils.prompts import CASUAL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
-    clean_text,
+    clean_multiline_text,
     contains_prompt_injection,
     sanitize_history_for_llm,
-    wrap_untrusted,
+    wrap_untrusted_multiline,
 )
 
 log = logging.getLogger(__name__)
@@ -67,9 +71,10 @@ class CasualService:
         sender_is_tg_admin: bool = False,
         intent_type: str = "casual",
         merged_count: int = 1,
+        merged_context: str = "",
     ) -> str:
         input_limit = 1600 if merged_count > 1 else 1000
-        q = clean_text(text, max_len=input_limit)
+        q = clean_multiline_text(text, max_len=input_limit)
         if contains_prompt_injection(q):
             log.warning("casual input may contain prompt injection")
 
@@ -80,6 +85,9 @@ class CasualService:
         _ = intent_type
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        recent_context = format_recent_group_context(history, max_items=8)
+        if recent_context:
+            messages.append({"role": "system", "content": recent_context})
         messages.append({"role": "system", "content": build_current_time_context()})
         messages.append(
             {
@@ -108,19 +116,24 @@ class CasualService:
                 "content": "[CASUAL_MODE]\n这是闲聊/回复场景，保持自然、简洁、友好。",
             }
         )
-        if merged_count > 1:
+        focus_context = build_current_turn_focus_context(
+            q,
+            merged_count=merged_count,
+            merged_context=merged_context,
+        )
+        if focus_context:
             messages.append(
                 {
                     "role": "system",
-                    "content": (
-                        "[MERGED_USER_MESSAGES]\n"
-                        f"本轮输入来自同一用户在当前抖动窗口内连续发送的 {merged_count} 条消息。\n"
-                        "请把它们当成一次完整输入理解，只回复一次，不要逐条编号或逐条复述。\n"
-                        "优先回应最后一条里的明确诉求，前面的内容通常是补充说明。"
-                    ),
+                    "content": focus_context,
                 }
             )
-        messages.append({"role": "user", "content": wrap_untrusted("user_message", q, max_len=input_limit)})
+        messages.append(
+            {
+                "role": "user",
+                "content": wrap_untrusted_multiline("user_message", q, max_len=input_limit),
+            }
+        )
 
         log.info("casual request: history=%d merged=%d", len(history) if history else 0, merged_count)
         result = await self.llm.chat(messages)

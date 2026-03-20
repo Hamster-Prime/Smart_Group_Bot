@@ -57,6 +57,11 @@ def wrap_untrusted(label: str, text: str, max_len: int = 4000) -> str:
     return f"<不可信{label}>\n{content}\n</不可信{label}>"
 
 
+def wrap_untrusted_multiline(label: str, text: str, max_len: int = 4000) -> str:
+    content = clean_multiline_text(text, max_len=max_len)
+    return f"<不可信{label}>\n{content}\n</不可信{label}>"
+
+
 def wrap_trusted(label: str, text: str, max_len: int = 4000) -> str:
     content = clean_text(text, max_len=max_len)
     return f"<可信{label}>\n{content}\n</可信{label}>"

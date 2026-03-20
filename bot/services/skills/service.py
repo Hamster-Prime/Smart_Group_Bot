@@ -15,14 +15,19 @@ from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
+from bot.utils.conversation_context import (
+    build_current_turn_focus_context,
+    format_recent_group_context,
+)
 from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
+    clean_multiline_text,
     clean_text,
     contains_prompt_injection,
     sanitize_history_for_llm,
-    wrap_untrusted,
+    wrap_untrusted_multiline,
 )
 
 log = logging.getLogger(__name__)
@@ -300,8 +305,10 @@ class SkillService:
         message: Any | None = None,
         intent_type: str = "casual",
         allow_tts: bool = True,
+        merged_count: int = 1,
+        merged_context: str = "",
     ) -> SkillAnswerResult:
-        user_text = clean_text(text, max_len=1200)
+        user_text = clean_multiline_text(text, max_len=1600 if merged_count > 1 else 1200)
         if contains_prompt_injection(user_text):
             log.warning("skill input may contain prompt injection")
 
@@ -312,6 +319,9 @@ class SkillService:
         ]
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        recent_context = format_recent_group_context(history, max_items=8)
+        if recent_context:
+            messages.append({"role": "system", "content": recent_context})
         messages.append({"role": "system", "content": build_current_time_context()})
         messages.append(
             {
@@ -337,7 +347,19 @@ class SkillService:
         normalized_intent = clean_text((intent_type or "casual").strip().lower(), max_len=16)
         if normalized_intent:
             messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
-        messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
+        focus_context = build_current_turn_focus_context(
+            user_text,
+            merged_count=merged_count,
+            merged_context=merged_context,
+        )
+        if focus_context:
+            messages.append({"role": "system", "content": focus_context})
+        messages.append(
+            {
+                "role": "user",
+                "content": wrap_untrusted_multiline("user_message", user_text, max_len=1600),
+            }
+        )
 
         tools = self._tool_definitions(selected_skills)
         context = SkillContext(
