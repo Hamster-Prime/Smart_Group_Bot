@@ -652,6 +652,8 @@ def _extract_image_file_info(message: Message) -> tuple[str, str] | None:
 
     if message.animation:
         mime = message.animation.mime_type or "image/gif"
+        if mime.lower().startswith("video/"):
+            return None
         return message.animation.file_id, mime
 
     if message.sticker:

@@ -810,6 +810,11 @@ def extract_message_text(message: Message) -> tuple[str, str]:
             return f"[video]\n{message.caption}", "video_caption"
         return "[video]", "video"
     if message.animation:
+        mime = (message.animation.mime_type or "").lower()
+        if mime.startswith("video/"):
+            if message.caption:
+                return f"[video]\n{message.caption}", "video_caption"
+            return "[video]", "video"
         if message.caption:
             return f"[gif]\n{message.caption}", "animation_caption"
         return "[gif]", "animation"
