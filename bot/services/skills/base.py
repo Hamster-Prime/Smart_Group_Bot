@@ -28,6 +28,8 @@ class SkillContext:
     sticker_file_id: str = ""
     tts_sent: bool = False
     tts_text: str = ""
+    embedded_reply_sent: bool = False
+    embedded_reply_text: str = ""
 
 
 @dataclass(slots=True)

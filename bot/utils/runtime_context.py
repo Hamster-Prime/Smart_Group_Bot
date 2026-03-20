@@ -58,7 +58,7 @@ def build_bot_runtime_profile_context(
     skill_labels = {
         "scheduled_task": "定时任务创建与取消",
         "send_sticker": "按语义发送贴纸",
-        "music_search": "音乐搜索、播放链接、封面与歌词",
+        "music_search": "音乐搜索、歌曲发送、播放链接、封面与歌词",
         "websearch": "联网搜索实时信息",
         "webfetch": "抓取网页正文",
         "doubao_tts": "文字转语音",

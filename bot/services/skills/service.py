@@ -415,6 +415,9 @@ class SkillService:
             messages.append(assistant_message)
 
             if not tool_calls:
+                if context.handled and context.embedded_reply_sent:
+                    log.info("skill tool loop finished: step=%d embedded_reply_already_sent", step)
+                    return _build_answer_result()
                 if content:
                     log.info("skill tool loop finished: step=%d no_tool_call", step)
                     return _build_answer_result(content)

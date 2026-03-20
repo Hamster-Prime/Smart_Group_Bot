@@ -158,8 +158,8 @@ class Settings(BaseSettings):
     music_api_enabled: bool = True
     music_api_http_timeout_sec: float = 15.0
     music_api_base_url: str = "https://music-api.gdstudio.xyz/api.php"
-    music_api_default_source: str = "netease"
-    music_api_stable_sources: str = "netease,kuwo,joox,bilibili"
+    music_api_default_source: str = "kuwo"
+    music_api_stable_sources: str = "kuwo,netease,joox,bilibili"
 
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
