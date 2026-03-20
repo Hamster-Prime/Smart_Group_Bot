@@ -11,6 +11,7 @@ from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
+from bot.services.skills.music_search import MusicSearchSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
@@ -52,6 +53,7 @@ class SkillService:
         self.skills: dict[str, Skill] = {}
         self._register(ScheduledTaskSkill(settings))
         self._register(SendStickerSkill())
+        self._register(MusicSearchSkill(settings))
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
         self.tts_skill_name = DoubaoTTSSkill.name

@@ -155,6 +155,12 @@ class Settings(BaseSettings):
     doubao_tts_loudness_rate: int = 0
     doubao_tts_silence_duration_ms: int = 0
 
+    music_api_enabled: bool = True
+    music_api_http_timeout_sec: float = 15.0
+    music_api_base_url: str = "https://music-api.gdstudio.xyz/api.php"
+    music_api_default_source: str = "netease"
+    music_api_stable_sources: str = "netease,kuwo,joox,bilibili"
+
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
 

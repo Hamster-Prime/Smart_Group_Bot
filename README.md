@@ -46,6 +46,7 @@
 |------|------|
 | `websearch` | 联网搜索实时信息 |
 | `webfetch` | 获取网页详细内容 |
+| `music_search` | 搜索歌曲，或获取播放链接、专辑图、歌词 |
 
 贴纸学习机制：
 - 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入数据库表 `sticker_library`。
@@ -183,6 +184,13 @@ DOUBAO_TTS_EMOTION_SCALE=4
 DOUBAO_TTS_SPEECH_RATE=0
 DOUBAO_TTS_LOUDNESS_RATE=0
 DOUBAO_TTS_SILENCE_DURATION_MS=0
+
+# ---- GD Studio 音乐 API skill ----
+MUSIC_API_ENABLED=true
+MUSIC_API_HTTP_TIMEOUT_SEC=15
+MUSIC_API_BASE_URL=https://music-api.gdstudio.xyz/api.php
+MUSIC_API_DEFAULT_SOURCE=netease
+MUSIC_API_STABLE_SOURCES=netease,kuwo,joox,bilibili
 
 # 数据库（默认 SQLite）
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
