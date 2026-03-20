@@ -1597,6 +1597,7 @@ async def on_group_message(
                 "user",
                 f"[{user_tag}] {input_text}",
                 user_id=user_id,
+                sender_name=display_name if user else "",
                 message_type=msg_type,
                 message_id=str(message.message_id),
             )
@@ -1627,6 +1628,7 @@ async def on_group_message(
                 "user",
                 f"[{user_tag}] {input_text}",
                 user_id=user_id,
+                sender_name=display_name if user else "",
                 message_type=msg_type,
                 message_id=str(message.message_id),
             )
@@ -1661,6 +1663,7 @@ async def on_group_message(
             "user",
             memory_entry,
             user_id=user_id,
+            sender_name=display_name if user else "",
             message_type=msg_type,
             message_id=str(message.message_id),
         )

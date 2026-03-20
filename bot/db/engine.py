@@ -76,6 +76,24 @@ async def init_db(
                 "content",
                 "content TEXT NOT NULL DEFAULT ''",
             )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "sender_id",
+                "sender_id BIGINT",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "sender_name",
+                "sender_name TEXT NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "message_vectors",
+                "message_type",
+                "message_type VARCHAR(64) NOT NULL DEFAULT 'text'",
+            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_created "

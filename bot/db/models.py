@@ -158,9 +158,17 @@ class MessageVector(Base):
     message_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
 
     role: Mapped[str] = mapped_column(String(16), default="user")
+    importance_score: Mapped[float] = mapped_column(default=0.0)
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+    vector_id: Mapped[str] = mapped_column(String(64), default="")
+    embedding: Mapped[bytes | None] = mapped_column(nullable=True)
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sender_name: Mapped[str] = mapped_column(String(255), default="")
+    message_type: Mapped[str] = mapped_column(String(64), default="text")
     content: Mapped[str] = mapped_column(Text, default="")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_accessed: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         Index("ix_message_vectors_group_created", "group_id", "created_at"),

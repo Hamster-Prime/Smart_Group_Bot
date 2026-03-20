@@ -7,42 +7,66 @@ from bot.utils.conversation_context import (
 
 
 class ConversationContextTests(unittest.TestCase):
-    def test_recent_group_context_uses_latest_non_system_messages(self) -> None:
+    def test_recent_group_context_uses_latest_non_system_messages_with_metadata(self) -> None:
         history = [
-            {"role": "system", "content": "[context-summary]\n之前在聊播放器"},
-            {"role": "user", "content": "A：iOS 上看电影用啥"},
-            {"role": "assistant", "content": "B：你是想找播放器还是网盘"},
-            {"role": "user", "content": "C：主要是播放器，想要稳定点"},
+            {"role": "system", "content": "[context-summary]\nprevious topic"},
+            {
+                "role": "user",
+                "content": "[id:11 username:@alice is_owner:no is_tg_admin:no trusted_source:none name:Alice] first question",
+                "created_at": "2026-03-20 10:00:00",
+                "sender_id": 11,
+                "sender_name": "Alice",
+                "message_type": "text",
+            },
+            {
+                "role": "assistant",
+                "content": "follow-up question",
+                "created_at": "2026-03-20 10:00:02",
+                "sender_name": "bot",
+                "message_type": "assistant_reply",
+            },
+            {
+                "role": "user",
+                "content": "[id:11 username:@alice is_owner:no is_tg_admin:no trusted_source:none name:Alice] latest detail",
+                "created_at": "2026-03-20 10:00:05",
+                "sender_id": 11,
+                "sender_name": "Alice",
+                "message_type": "text",
+            },
         ]
 
         context = format_recent_group_context(history, max_items=2, max_item_chars=120)
 
-        self.assertIn("[assistant] B：你是想找播放器还是网盘", context)
-        self.assertIn("[user] C：主要是播放器，想要稳定点", context)
-        self.assertNotIn("之前在聊播放器", context)
-        self.assertNotIn("[user] A：iOS 上看电影用啥", context)
+        self.assertIn("[RECENT_GROUP_CONTEXT]", context)
+        self.assertIn("sent_at=2026-03-20 10:00:02", context)
+        self.assertIn("sender=bot", context)
+        self.assertIn("sender=Alice", context)
+        self.assertIn("sender_id=11", context)
+        self.assertIn("latest detail", context)
+        self.assertNotIn("first question", context)
+        self.assertNotIn("previous topic", context)
 
     def test_current_turn_focus_keeps_merged_structure(self) -> None:
         merged_context = (
             "count=2\n"
-            "以下是同一用户在当前抖动窗口内连续发送的消息，按时间顺序排列：\n"
+            "messages sent by the same user in the debounce window:\n"
             "[1] type=text\n"
-            "ios上最好用的是啥啊\n"
+            "best ios player?\n"
             "[2] type=text\n"
-            "sen吗"
+            "vlc?"
         )
 
         context = build_current_turn_focus_context(
-            "ios上最好用的是啥啊\nsen吗",
+            "best ios player?\nvlc?",
             merged_count=2,
             merged_context=merged_context,
         )
 
         self.assertIn("[CURRENT_TURN_MESSAGE_COUNT]\n2", context)
         self.assertIn("[CURRENT_TURN_MESSAGES]", context)
-        self.assertIn("ios上最好用的是啥啊", context)
-        self.assertIn("sen吗", context)
-        self.assertIn("不要把“最好用的是啥”这类问法自动扩展成别的品类", context)
+        self.assertIn("best ios player?", context)
+        self.assertIn("vlc?", context)
+        self.assertIn("Do not expand the topic into a different product category", context)
 
 
 if __name__ == "__main__":
