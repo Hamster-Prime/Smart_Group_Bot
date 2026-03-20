@@ -275,8 +275,6 @@ class StickerLibrary:
                 last_seen_at=now,
             )
             session.add(row)
-            await session.flush()
-            await self._trim_group_records(session, group_id)
             return self._row_to_dict(row)
 
         row.emoji = emoji or row.emoji
@@ -291,7 +289,6 @@ class StickerLibrary:
             row.aliases = aliases
             row.description = description
 
-        await session.flush()
         return self._row_to_dict(row)
 
     async def mark_sent(self, session: AsyncSession, group_id: int, file_id: str) -> None:
@@ -327,13 +324,10 @@ class StickerLibrary:
                 last_sent_at=now,
             )
             session.add(row)
-            await session.flush()
-            await self._trim_group_records(session, group_id)
             return
         else:
             row.sent_count = max(0, int(row.sent_count or 0)) + 1
             row.last_sent_at = now
-        await session.flush()
 
     async def pick_sticker(
         self,

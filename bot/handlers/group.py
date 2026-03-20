@@ -15,11 +15,12 @@ from typing import Any
 from aiogram import F, Router
 from aiogram.types import Message
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Group, ModerationRule, ReplyMute
+from bot.db.sqlite_session import is_database_locked_error
 from bot.services import memory_holder
 from bot.services.authz import ensure_group_authorized, is_group_admin_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
@@ -620,6 +621,22 @@ async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) ->
     return Group(id=group_id, title=title or "", settings={})
 
 
+async def _best_effort_commit(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    context: str,
+) -> None:
+    if not session.in_transaction():
+        return
+    try:
+        await session.commit()
+    except OperationalError as exc:
+        if not is_database_locked_error(exc):
+            raise
+        log.warning("[%s] skipped noncritical db commit | context=%s", group_id, context)
+
+
 def _extract_image_file_info(message: Message) -> tuple[str, str] | None:
     """Return (file_id, mime) for image-like messages."""
     if message.photo:
@@ -1067,6 +1084,12 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         merged_context=merged_context,
                     )
 
+            await _best_effort_commit(
+                session,
+                group_id=group_id,
+                context="pending_reply_pre_delivery",
+            )
+
             if action != "skip" and reply:
                 if is_tts_always_enabled(tts_mode) and tts_service.available:
                     voice_ok = await tts_service.send_message_tts(
@@ -1113,8 +1136,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             if stored_reply and sent_ok:
                 await memory.add_message(group_id, "assistant", stored_reply, message_type="assistant_reply")
                 await memory.compact_if_needed(group_id)
-
-            await session.commit()
             log.info(
                 "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s len=%d elapsed=%dms",
                 group_id,
@@ -1332,10 +1353,16 @@ async def on_group_message(
                     learned.get("seen_count", 1),
                 )
         except Exception:
+            await session.rollback()
             log.exception("[%s] sticker learning failed", group_id)
 
 
     log.info("[%s]【流程】审核 | 开始", group_id)
+    await _best_effort_commit(
+        session,
+        group_id=group_id,
+        context="group_activity_and_sticker_learning",
+    )
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
@@ -1551,6 +1578,12 @@ async def on_group_message(
                 task_intent.task_id,
             )
             return
+
+    await _best_effort_commit(
+        session,
+        group_id=group_id,
+        context="pre_memory_index",
+    )
 
     should_index_user_memory = msg_type != "contact"
     memory_entry = ""

@@ -381,7 +381,6 @@ async def cancel_scheduled_task(
         return None
     row.status = "cancelled"
     row.cancelled_at = _now_utc_naive()
-    await session.flush()
     return row
 
 
@@ -671,13 +670,14 @@ class ScheduledTaskService:
         )
         rows = list((await session.execute(stmt)).scalars().all())
         for row in rows:
+            row_id = int(row.id)
             try:
                 await self._run_group_cooldown_task(session, row, now=now)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 await session.rollback()
-                log.exception("[%s] scheduled cooldown task failed", row.id)
+                log.exception("[%s] scheduled cooldown task failed", row_id)
 
     async def _run_group_cooldown_task(self, session: AsyncSession, row: Group, *, now: datetime) -> None:
         group_settings = dict(row.settings or {})

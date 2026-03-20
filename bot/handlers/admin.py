@@ -705,7 +705,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
             action=hit_action,
         )
         session.add(rule)
-        await session.flush()
+        await session.commit()
         await _answer(message, settings, 
             "<b>规则添加成功</b>\n"
             f"<b>规则编号</b>: #{rule.id}\n"
@@ -863,7 +863,7 @@ async def on_rule_delete(
 
     pattern_label = _truncate_text(rule.pattern or "", 24) or f"#{rule.id}"
     await session.delete(rule)
-    await session.flush()
+    await session.commit()
 
     stmt = (
         select(ModerationRule)
@@ -1320,7 +1320,6 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
         return
 
     group_row.settings = set_tts_mode(group_settings, target_mode)
-    await session.flush()
     await _answer(
         message,
         settings,

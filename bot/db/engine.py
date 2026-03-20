@@ -3,17 +3,21 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import text
 
 from bot.db.models import Base
+from bot.db.sqlite_session import SQLiteSafeAsyncSession
 
 log = logging.getLogger(__name__)
+
+_SQLITE_TIMEOUT_SECONDS = 5
+_SQLITE_BUSY_TIMEOUT_MS = _SQLITE_TIMEOUT_SECONDS * 1000
 
 
 async def _sqlite_table_columns(conn, table: str) -> set[str]:
@@ -42,16 +46,23 @@ async def init_db(
     engine = create_async_engine(
         url,
         echo=False,
-        connect_args={"timeout": 60} if "sqlite" in url else {},
+        connect_args={"timeout": _SQLITE_TIMEOUT_SECONDS} if "sqlite" in url else {},
     )
+
+    if "sqlite" in url:
+        @event.listens_for(engine.sync_engine, "connect")
+        def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Enable WAL mode for concurrent read/write
         if "sqlite" in url:
-            await conn.execute(text("PRAGMA journal_mode=WAL"))
-            await conn.execute(text("PRAGMA busy_timeout=60000"))
-            await conn.execute(text("PRAGMA synchronous=NORMAL"))
             # Ensure message_vectors schema keeps compatibility with previous versions.
             await _sqlite_ensure_column(
                 conn,
@@ -80,6 +91,7 @@ async def init_db(
 
     session_factory = async_sessionmaker(
         engine,
+        class_=SQLiteSafeAsyncSession,
         expire_on_commit=False,
         autoflush=False,
     )

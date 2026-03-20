@@ -758,7 +758,6 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         previous = _is_group_av_enabled(group_settings)
         group_settings[_AV_GROUP_ENABLE_KEY] = target_enabled
         group_row.settings = group_settings
-        await session.flush()
 
         if previous == target_enabled:
             status_line = "状态未变化"

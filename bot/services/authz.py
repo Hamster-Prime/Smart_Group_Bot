@@ -51,7 +51,6 @@ async def authorize_group(session: AsyncSession, group_id: int, operator_id: int
     if row:
         return False
     session.add(AuthorizedGroup(group_id=group_id, authorized_by=operator_id or None))
-    await session.flush()
     return True
 
 
@@ -60,7 +59,6 @@ async def deauthorize_group(session: AsyncSession, group_id: int) -> bool:
     if not row:
         return False
     await session.delete(row)
-    await session.flush()
     return True
 
 
@@ -91,11 +89,9 @@ async def authorize_group_admin(
     if row:
         if row.role != role:
             row.role = role
-            await session.flush()
         return False
 
     session.add(Admin(group_id=group_id, user_id=user_id, role=role))
-    await session.flush()
     return True
 
 
@@ -109,7 +105,6 @@ async def deauthorize_group_admin(session: AsyncSession, group_id: int, user_id:
     if not row:
         return False
     await session.delete(row)
-    await session.flush()
     return True
 
 

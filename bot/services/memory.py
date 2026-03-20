@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig
+from bot.db.sqlite_session import is_database_locked_error
 from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVector
 from bot.services.llm import LLMService
 from bot.utils.prompts import COMPRESS_SYSTEM
@@ -121,7 +122,7 @@ class MemoryService:
             message_type=message_type,
             message_id=message_id,
         )
-        if inserted:
+        if inserted is not False:
             self._working(group_id).append(
                 {
                     "role": (role or "user")[:16],
@@ -146,11 +147,11 @@ class MemoryService:
         user_id: int | None,
         message_type: str,
         message_id: str | None,
-    ) -> bool:
+    ) -> bool | None:
         del user_id, message_type
 
         scoped_id = self._scoped_message_id(group_id, message_id)
-        for attempt in range(3):
+        for attempt in range(2):
             async with self._session_factory() as session:
                 row = MessageVector(
                     group_id=group_id,
@@ -167,11 +168,17 @@ class MemoryService:
                     return False
                 except OperationalError as exc:
                     await session.rollback()
-                    detail = str(getattr(exc, "orig", exc)).lower()
-                    if "database is locked" not in detail or attempt >= 2:
+                    if not is_database_locked_error(exc):
                         raise
-                    await asyncio.sleep(0.2 * (attempt + 1))
-        return True
+                    if attempt >= 1:
+                        log.warning(
+                            "memory persist skipped due sqlite lock: group=%s message_id=%s",
+                            group_id,
+                            scoped_id,
+                        )
+                        return None
+                    await asyncio.sleep(0.15 * (attempt + 1))
+        return None
 
     def _count_tokens(self, messages: list[dict[str, str]]) -> int:
         try:
@@ -398,8 +405,14 @@ class MemoryService:
                 if len(compressed) > 2000:
                     compressed = compressed[-2000:]
 
-            await self._save_summary(group_id, compressed)
-            await self._clear_group_history_records(group_id)
+            try:
+                await self._save_summary(group_id, compressed)
+                await self._clear_group_history_records(group_id)
+            except OperationalError as exc:
+                if not is_database_locked_error(exc):
+                    raise
+                log.warning("memory compact skipped due sqlite lock: group=%s", group_id)
+                return False
             self._history[group_id] = []
             log.info(
                 "memory context compacted: group=%s cleared_messages=%d summary_chars=%d",
