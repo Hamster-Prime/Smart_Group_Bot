@@ -50,6 +50,22 @@ class GroupIntentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent.memory_content, "白菜是主理人")
         self.assertEqual(llm.calls, 1)
 
+    async def test_reply_style_memory_add_is_allowed(self) -> None:
+        llm = _DummyLLM(
+            '{"intent":"memory_manage","memory_action":"add","memory_content":"Sanite&Ava | Resting","memory_target":"","rule_instruction":""}'
+        )
+        svc = GroupIntentService(llm)
+
+        intent = await svc.detect(
+            "这个写入永久记忆\n[reply_to:text] Sanite&Ava | Resting",
+            surface_text="这个写入永久记忆",
+        )
+
+        self.assertEqual(intent.intent, "memory_manage")
+        self.assertEqual(intent.memory_action, "add")
+        self.assertEqual(intent.memory_content, "Sanite&Ava | Resting")
+        self.assertEqual(llm.calls, 1)
+
     async def test_explicit_rule_add_still_works(self) -> None:
         llm = _DummyLLM(
             '{"intent":"rule_manage","memory_action":"unknown","memory_content":"","memory_target":"","rule_instruction":"增加一条规则，禁止发广告"}'
@@ -72,6 +88,17 @@ class GroupIntentServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(intent.intent, "chat")
         self.assertEqual(llm.calls, 1)
+
+    async def test_how_to_write_memory_is_not_command(self) -> None:
+        llm = _DummyLLM(
+            '{"intent":"memory_manage","memory_action":"add","memory_content":"x","memory_target":"","rule_instruction":""}'
+        )
+        svc = GroupIntentService(llm)
+
+        intent = await svc.detect("永久记忆怎么写入")
+
+        self.assertEqual(intent.intent, "chat")
+        self.assertEqual(llm.calls, 0)
 
 
 if __name__ == "__main__":

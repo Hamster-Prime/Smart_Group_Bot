@@ -12,11 +12,13 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 log = logging.getLogger(__name__)
 
 _POLITE_PREFIX = r"(?:(?:请|请你|麻烦|麻烦你|帮我|帮忙|bot|@bot)[,，:：\s]*)*"
+_MEMORY_REF = r"(?:这个|这条|这句|这段|这一条|上一条|上面那条|上面这句|前面那条|前面这句|刚才那条|刚刚那条)"
 
 _MEMORY_NON_COMMAND_PATTERNS = (
     re.compile(r"^\s*(?:大家|请大家|所有人|你们)\s*记住"),
     re.compile(r"(?:记不记得|还记得|记住了吗|你记住了吗)"),
     re.compile(r"(?:永久记忆是什么|什么是永久记忆|永久记忆是什么意思|永久记忆怎么用)"),
+    re.compile(r"(?:怎么|如何|怎样|为啥|为什么).*(?:写入|写进|加入|删除|清空|查看|修改|更新).*(?:永久记忆|记忆)"),
 )
 
 _MEMORY_ADD_PATTERNS = (
@@ -32,6 +34,14 @@ _MEMORY_ADD_PATTERNS = (
         rf"^\s*{_POLITE_PREFIX}(?:添加|新增)(?:一条)?永久记忆\s*(?:[:：,，]\s*)?.+\s*$",
         re.IGNORECASE,
     ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}.*?{_MEMORY_REF}.{0,12}(?:写入|写进|记到|记进|加入|加到|存到|存入|保存|收录|录入)(?:永久记忆|记忆).*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}.*?(?:写入|写进|记到|记进|加入|加到|存到|存入|保存|收录|录入)(?:永久记忆|记忆).*$",
+        re.IGNORECASE,
+    ),
 )
 
 _MEMORY_REPLACE_PATTERNS = (
@@ -43,6 +53,10 @@ _MEMORY_REPLACE_PATTERNS = (
         rf"^\s*{_POLITE_PREFIX}(?:把|将)[\"“].+[\"”](?:改成|改为|更新为|替换为)[\"“].+[\"”]\s*$",
         re.IGNORECASE,
     ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}.*?(?:永久记忆|记忆).*(?:改成|改为|更新为|替换为).+\s*$",
+        re.IGNORECASE,
+    ),
 )
 
 _MEMORY_DELETE_PATTERNS = (
@@ -52,6 +66,10 @@ _MEMORY_DELETE_PATTERNS = (
     ),
     re.compile(
         rf"^\s*{_POLITE_PREFIX}(?:忘掉|删掉)(?:刚才那条|这条)(?:永久记忆|记忆).*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*{_POLITE_PREFIX}.*?(?:永久记忆|记忆).*(?:删除|删掉|移除|去掉).*$",
         re.IGNORECASE,
     ),
 )
@@ -199,9 +217,11 @@ class GroupIntentService:
         text: str,
         *,
         history: list[dict[str, str]] | None = None,
+        surface_text: str | None = None,
     ) -> GroupIntent:
         user_text = clean_text(text, max_len=1200)
-        if not self._looks_like_management_candidate(user_text):
+        surface = clean_text(surface_text or text, max_len=400)
+        if not self._looks_like_management_candidate(surface):
             return GroupIntent()
 
         prompt = (
@@ -229,13 +249,11 @@ class GroupIntentService:
         rule_instruction = clean_text(str(data.get("rule_instruction", "")), max_len=1200)
 
         if intent == "memory_manage":
-            if memory_action == "unknown" or not self._is_explicit_memory_command(
-                user_text, memory_action
-            ):
+            if memory_action == "unknown" or not self._is_explicit_memory_command(surface, memory_action):
                 log.info("group intent downgraded to chat | reason=memory_not_explicit")
                 return GroupIntent()
 
-        if intent == "rule_manage" and not self._is_explicit_rule_command(user_text):
+        if intent == "rule_manage" and not self._is_explicit_rule_command(surface):
             log.info("group intent downgraded to chat | reason=rule_not_explicit")
             return GroupIntent()
 

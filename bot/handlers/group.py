@@ -1565,9 +1565,14 @@ async def on_group_message(
         task_intent = await task_intent_svc.detect(text, history=memory.get_history(group_id))
 
     intent = GroupIntent()
-    if sender_is_tg_admin:
-        intent = await intent_svc.detect(input_text, history=memory.get_history(group_id))
-    elif intent_svc.looks_like_management_candidate(input_text):
+    management_candidate = intent_svc.looks_like_management_candidate(text)
+    if management_candidate:
+        intent = await intent_svc.detect(
+            input_text,
+            history=memory.get_history(group_id),
+            surface_text=text,
+        )
+    if intent.intent in {"memory_manage", "rule_manage"} and not sender_is_tg_admin:
         await answer_with_auto_delete(
             message,
             "<b>权限不足</b>\n仅群管理员可通过自然语言修改永久记忆或群规。",
