@@ -75,6 +75,10 @@ _SHORT_UNCERTAIN_REPLY_RE = re.compile(
 )
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
 _ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
+_PENDING_REPLY_QUESTION_RE = re.compile(
+    r"[?？]|什么|哪个|哪款|怎么|咋|如何|为什么|为啥|推荐|求推荐|帮我|有没有|是不是|行不行|可不可以|能不能|最好用|值不值得|吗|呢|么|嘛",
+    re.IGNORECASE,
+)
 
 
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
@@ -782,6 +786,7 @@ class _PendingReplyBatch:
     version: int = 0
     task: asyncio.Task[None] | None = None
     settings: Settings | None = None
+    flush_at: float = 0.0
 
 
 _PENDING_REPLY_LOCK = asyncio.Lock()
@@ -819,6 +824,46 @@ def _build_merged_context(items: list[_PendingReplyItem]) -> str:
         lines.append(f"[{idx}] {meta}")
         lines.append(text or "(empty)")
     return "\n".join(lines)
+
+
+def _is_strong_pending_reply_signal(item: _PendingReplyItem) -> bool:
+    return bool(item.mentioned or item.reply_to_bot or item.sender_is_owner)
+
+
+def _pending_reply_has_question_signal(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    return bool(_PENDING_REPLY_QUESTION_RE.search(compact))
+
+
+def _next_pending_reply_flush_at(
+    *,
+    item: _PendingReplyItem,
+    batch_size: int,
+    settings: Settings,
+    now: float,
+    current_flush_at: float = 0.0,
+) -> float:
+    base_delay = max(0.0, float(settings.bot.inbound_debounce_seconds or 0.0))
+    if base_delay <= 0.0:
+        return now
+
+    if _is_strong_pending_reply_signal(item):
+        delay_seconds = min(base_delay, 0.8)
+    elif batch_size >= 3:
+        delay_seconds = min(base_delay, 0.9)
+    elif batch_size == 2:
+        delay_seconds = min(base_delay, 1.1)
+    elif item.is_reply or _pending_reply_has_question_signal(item.input_text):
+        delay_seconds = min(base_delay, 1.4)
+    else:
+        delay_seconds = min(base_delay, 1.8)
+
+    target_flush_at = now + delay_seconds
+    if current_flush_at > 0.0:
+        target_flush_at = min(target_flush_at, current_flush_at)
+    return target_flush_at
 
 
 def _exclude_batch_messages(
@@ -1203,9 +1248,9 @@ async def _wait_and_flush_pending_reply_batch(
         log.exception("pending batch flush failed | key=%s", key)
 
 
-async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) -> int:
+async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) -> tuple[int, float]:
     key = _pending_batch_key(item.group_id, item.user_id)
-    delay_seconds = float(settings.bot.inbound_debounce_seconds or 0.0)
+    now = time.monotonic()
 
     async with _PENDING_REPLY_LOCK:
         state = _PENDING_REPLY_BATCHES.get(key)
@@ -1216,6 +1261,14 @@ async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) ->
         state.items.append(item)
         state.version += 1
         queued_count = len(state.items)
+        state.flush_at = _next_pending_reply_flush_at(
+            item=item,
+            batch_size=queued_count,
+            settings=settings,
+            now=now,
+            current_flush_at=state.flush_at,
+        )
+        delay_seconds = max(0.0, state.flush_at - now)
 
         if state.task and not state.task.done():
             state.task.cancel()
@@ -1229,7 +1282,7 @@ async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) ->
             name=f"pending-reply:{item.group_id}:{item.user_id}",
         )
 
-    return queued_count
+    return queued_count, delay_seconds
 
 
 async def flush_pending_inbound_batches() -> None:
@@ -1617,7 +1670,7 @@ async def on_group_message(
     reply_to_other = is_reply and not reply_to_bot
     mention_other = mentions_other_user(message, bot_me.username or "", bot_me.id)
 
-    queued_count = await _enqueue_pending_reply(
+    queued_count, queued_delay = await _enqueue_pending_reply(
         _PendingReplyItem(
             message=message,
             group_id=group_id,
@@ -1638,10 +1691,11 @@ async def on_group_message(
         settings,
     )
     log.info(
-        "[%s] pending batch queued | user=%s size=%d mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s type=%s elapsed=%dms",
+        "[%s] pending batch queued | user=%s size=%d delay=%.2fs mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s type=%s elapsed=%dms",
         group_id,
         user_id,
         queued_count,
+        queued_delay,
         mentioned,
         mention_other,
         is_reply,
