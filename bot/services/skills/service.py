@@ -303,7 +303,11 @@ class SkillService:
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
-            {"role": "system", "content": build_current_time_context()},
+        ]
+        if history:
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append(
             {
                 "role": "system",
                 "content": self._build_sender_context(
@@ -312,14 +316,11 @@ class SkillService:
                     sender_is_owner,
                     sender_is_tg_admin,
                 ),
-            },
-        ]
+            }
+        )
         normalized_intent = clean_text((intent_type or "casual").strip().lower(), max_len=16)
         if normalized_intent:
             messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
-
-        if history:
-            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
 
         selected_skills = self._selected_skills(allow_tts=allow_tts)

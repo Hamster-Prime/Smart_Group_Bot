@@ -65,7 +65,13 @@ class CasualService:
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": build_defended_system(with_persona(CASUAL_SYSTEM))},
-            {"role": "system", "content": build_current_time_context()},
+        ]
+
+        _ = intent_type
+        if history:
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append(
             {
                 "role": "system",
                 "content": self._build_sender_context(
@@ -74,10 +80,8 @@ class CasualService:
                     sender_is_owner,
                     sender_is_tg_admin,
                 ),
-            },
-        ]
-
-        _ = intent_type
+            }
+        )
         messages.append(
             {
                 "role": "system",
@@ -96,9 +100,6 @@ class CasualService:
                     ),
                 }
             )
-
-        if history:
-            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "user", "content": wrap_untrusted("user_message", q, max_len=input_limit)})
 
         log.info("casual request: history=%d merged=%d", len(history) if history else 0, merged_count)
