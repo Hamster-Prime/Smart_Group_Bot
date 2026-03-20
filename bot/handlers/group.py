@@ -998,7 +998,13 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_source = "skill"
 
                     if not reply and not skill_handled:
-                        casual = CasualService(llm)
+                        casual = CasualService(
+                            llm,
+                            settings=settings,
+                            skill_names=skill.available_skill_names(
+                                allow_tts=is_tts_tool_enabled(tts_mode)
+                            ),
+                        )
                         reply = await casual.reply(
                             merged_input_text,
                             history=history,

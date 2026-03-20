@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramBadRequest
+
 from bot.config import Settings
 from bot.handlers import admin
 from bot.services.doubao_tts import DoubaoTTSService
@@ -282,6 +284,66 @@ class ScheduledTaskTTSModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.ok)
         send_text.assert_not_awaited()
+
+
+class DoubaoTTSReplyFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_chat_tts_mentions_target_when_reply_target_is_missing(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+
+        bot = SimpleNamespace(
+            send_voice=AsyncMock(
+                side_effect=[
+                    TelegramBadRequest(
+                        method=SimpleNamespace(),
+                        message="message to be replied not found",
+                    ),
+                    SimpleNamespace(message_id=88, chat=SimpleNamespace(id=-10001)),
+                ]
+            )
+        )
+
+        with patch.object(
+            service,
+            "synthesize_voice_payload",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    ok=True,
+                    text="测试语音",
+                    audio_bytes=b"ogg-data",
+                    audio_format="ogg_opus",
+                    usage={},
+                    logid="logid",
+                )
+            ),
+        ):
+            ok = await service.send_chat_tts(
+                bot,
+                -10001,
+                "测试语音",
+                reply_to_message_id=123,
+                fallback_mention_user_id=42,
+                fallback_mention_name="Alice",
+                auto_delete_minutes=0,
+                uid="1",
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(bot.send_voice.await_count, 2)
+
+        first_kwargs = bot.send_voice.await_args_list[0].kwargs
+        second_kwargs = bot.send_voice.await_args_list[1].kwargs
+
+        self.assertEqual(first_kwargs["reply_to_message_id"], 123)
+        self.assertEqual(second_kwargs["reply_to_message_id"], None)
+        self.assertEqual(second_kwargs["parse_mode"], "HTML")
+        self.assertIn('tg://user?id=42', second_kwargs["caption"])
+        self.assertIn("@Alice", second_kwargs["caption"])
 
 
 if __name__ == "__main__":

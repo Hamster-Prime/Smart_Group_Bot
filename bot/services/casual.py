@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import logging
+from typing import Any
 
 from bot.services.llm import LLMService
 from bot.utils.prompts import CASUAL_SYSTEM, with_persona
-from bot.utils.runtime_context import build_current_time_context
+from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
     clean_text,
@@ -17,8 +19,16 @@ log = logging.getLogger(__name__)
 
 
 class CasualService:
-    def __init__(self, llm: LLMService) -> None:
+    def __init__(
+        self,
+        llm: LLMService,
+        *,
+        settings: Any | None = None,
+        skill_names: Iterable[str] | None = None,
+    ) -> None:
         self.llm = llm
+        self.settings = settings
+        self.skill_names = [str(name).strip() for name in (skill_names or []) if str(name).strip()]
 
     @staticmethod
     def _build_sender_context(
@@ -71,6 +81,16 @@ class CasualService:
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append(
+            {
+                "role": "system",
+                "content": build_bot_runtime_profile_context(
+                    self.llm,
+                    settings=self.settings,
+                    skill_names=self.skill_names,
+                ),
+            }
+        )
         messages.append(
             {
                 "role": "system",

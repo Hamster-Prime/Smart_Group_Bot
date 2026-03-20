@@ -20,7 +20,11 @@ from aiogram.types import BufferedInputFile, Message
 
 from bot.config import Settings
 from bot.db.models import Group
-from bot.utils.telegram import schedule_message_auto_delete, sanitize_outgoing_text
+from bot.utils.telegram import (
+    is_reply_target_missing_error,
+    sanitize_outgoing_text,
+    schedule_message_auto_delete,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -748,9 +752,7 @@ class DoubaoTTSService:
                     attempt += 1
                 except TelegramBadRequest as exc:
                     detail = str(exc).lower()
-                    if current_reply_to and (
-                        "reply message not found" in detail or "message to reply not found" in detail
-                    ):
+                    if current_reply_to and is_reply_target_missing_error(detail):
                         current_reply_to = None
                         if idx == 0 and fallback_caption_html:
                             current_caption = fallback_caption_html

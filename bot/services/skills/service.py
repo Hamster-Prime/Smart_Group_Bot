@@ -16,7 +16,7 @@ from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
-from bot.utils.runtime_context import build_current_time_context
+from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
     clean_text,
@@ -41,6 +41,7 @@ class SkillService:
         max_tool_rounds: int = 4,
     ) -> None:
         self.llm = llm
+        self.settings = settings
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
@@ -64,6 +65,9 @@ class SkillService:
             for name, skill in self.skills.items()
             if name != self.tts_skill_name
         }
+
+    def available_skill_names(self, *, allow_tts: bool = True) -> list[str]:
+        return list(self._selected_skills(allow_tts=allow_tts).keys())
 
     @staticmethod
     def _build_sender_context(
@@ -301,12 +305,24 @@ class SkillService:
         if contains_prompt_injection(user_text):
             log.warning("skill input may contain prompt injection")
 
+        selected_skills = self._selected_skills(allow_tts=allow_tts)
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
         ]
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
         messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append(
+            {
+                "role": "system",
+                "content": build_bot_runtime_profile_context(
+                    self.llm,
+                    settings=self.settings,
+                    skill_names=selected_skills.keys(),
+                ),
+            }
+        )
         messages.append(
             {
                 "role": "system",
@@ -323,7 +339,6 @@ class SkillService:
             messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
         messages.append({"role": "user", "content": wrap_untrusted("user_message", user_text, max_len=1200)})
 
-        selected_skills = self._selected_skills(allow_tts=allow_tts)
         tools = self._tool_definitions(selected_skills)
         context = SkillContext(
             session=session,

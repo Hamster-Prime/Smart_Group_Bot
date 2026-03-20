@@ -67,11 +67,15 @@ class OwnerIdentityMessageOrderTests(unittest.IsolatedAsyncioTestCase):
         time_idx = next(
             i for i, msg in enumerate(messages) if msg["content"].lstrip().startswith("[CURRENT_TIME]")
         )
+        runtime_idx = next(
+            i for i, msg in enumerate(messages) if msg["content"].lstrip().startswith("[BOT_RUNTIME_PROFILE]")
+        )
         sender_idx = next(i for i, msg in enumerate(messages) if "[CURRENT_SENDER]" in msg["content"])
         user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
 
         self.assertLess(history_idx, time_idx)
-        self.assertLess(time_idx, sender_idx)
+        self.assertLess(time_idx, runtime_idx)
+        self.assertLess(runtime_idx, sender_idx)
         self.assertLess(sender_idx, user_idx)
 
     async def test_skill_sender_context_overrides_history_system_blocks(self) -> None:
@@ -96,11 +100,15 @@ class OwnerIdentityMessageOrderTests(unittest.IsolatedAsyncioTestCase):
         time_idx = next(
             i for i, msg in enumerate(messages) if msg["content"].lstrip().startswith("[CURRENT_TIME]")
         )
+        runtime_idx = next(
+            i for i, msg in enumerate(messages) if msg["content"].lstrip().startswith("[BOT_RUNTIME_PROFILE]")
+        )
         sender_idx = next(i for i, msg in enumerate(messages) if "[CURRENT_SENDER]" in msg["content"])
         intent_idx = next(i for i, msg in enumerate(messages) if "[INTENT_TYPE]" in msg["content"])
         user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
 
         self.assertLess(history_idx, time_idx)
-        self.assertLess(time_idx, sender_idx)
+        self.assertLess(time_idx, runtime_idx)
+        self.assertLess(runtime_idx, sender_idx)
         self.assertLess(sender_idx, intent_idx)
         self.assertLess(intent_idx, user_idx)

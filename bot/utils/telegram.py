@@ -43,6 +43,12 @@ _LLM_INTERNAL_BLOCK_RE = re.compile(
 _LLM_INTERNAL_TAG_RE = re.compile(
     r"(?is)</?\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>"
 )
+_REPLY_TARGET_MISSING_MARKERS = (
+    "reply message not found",
+    "message to reply not found",
+    "message to be replied not found",
+    "replied message not found",
+)
 
 
 def sanitize_outgoing_mentions(text: str) -> str:
@@ -128,6 +134,11 @@ def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int)
             chat_id,
             message_id,
         )
+
+
+def is_reply_target_missing_error(detail: str) -> bool:
+    normalized = str(detail or "").lower()
+    return any(marker in normalized for marker in _REPLY_TARGET_MISSING_MARKERS)
 
 
 async def answer_with_auto_delete(
@@ -745,7 +756,7 @@ async def send_chat_message(
                 detail = str(exc).lower()
                 if "can't parse entities" in detail:
                     return None
-                if current_reply_id and ("reply message not found" in detail or "message to reply not found" in detail):
+                if current_reply_id and is_reply_target_missing_error(detail):
                     current_reply_id = None
                     if fallback_prefix_html and current_parse_mode == "HTML":
                         current_body = f"{fallback_prefix_html}{body}"
