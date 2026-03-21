@@ -35,6 +35,7 @@ async def main() -> None:
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
     )
     memory = MemoryService(
         settings.bot,

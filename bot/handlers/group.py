@@ -924,6 +924,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
     )
     decision_svc = DecisionService(llm, context_items=settings.bot.decision_context_items)
     reply_mode_svc = ReplyModeService(llm)
@@ -998,13 +999,43 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             tts_service = skill.tts_service or DoubaoTTSService(settings)
 
             if action != "skip":
-                history = await memory.get_history_for_llm(group_id)
+                history = await memory.get_history_for_llm(
+                    group_id,
+                    prompt_payload_builder=lambda candidate_history: skill.build_answer_prompt_payload(
+                        merged_input_text,
+                        history=_exclude_batch_messages(candidate_history, memory_entries),
+                        sender_user_id=user_id,
+                        sender_username=latest.sender_username,
+                        sender_is_owner=latest.sender_is_owner,
+                        sender_is_tg_admin=latest.sender_is_tg_admin,
+                        intent_type=action,
+                        allow_tts=is_tts_tool_enabled(tts_mode),
+                        merged_count=merged_count,
+                        merged_context=merged_context,
+                    ),
+                )
                 history = _exclude_batch_messages(history, memory_entries)
+                skill_prompt_payload = skill.build_answer_prompt_payload(
+                    merged_input_text,
+                    history=history,
+                    sender_user_id=user_id,
+                    sender_username=latest.sender_username,
+                    sender_is_owner=latest.sender_is_owner,
+                    sender_is_tg_admin=latest.sender_is_tg_admin,
+                    intent_type=action,
+                    allow_tts=is_tts_tool_enabled(tts_mode),
+                    merged_count=merged_count,
+                    merged_context=merged_context,
+                )
                 log.info(
-                    "[%s] pending batch reply generation started | action=%s history=%d",
+                    "[%s] pending batch reply generation started | action=%s history=%d prompt_tokens=%s",
                     group_id,
                     action,
                     len(history),
+                    llm.prompt_usage_text(
+                        skill_prompt_payload["messages"],
+                        tools=skill_prompt_payload["tools"],
+                    ),
                 )
 
                 async with typing_action(latest.message, enabled=settings.bot.enable_typing):
@@ -1386,6 +1417,7 @@ async def on_group_message(
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
     )
     intent_svc = GroupIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
     task_intent_svc = TaskIntentService(llm, context_items=min(6, settings.bot.decision_context_items))

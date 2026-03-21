@@ -55,6 +55,31 @@ class ScheduledTaskSkill:
         self.settings = settings
         self.tts_service = DoubaoTTSService(settings) if settings is not None else None
 
+    @classmethod
+    def build_prompt_payload(
+        cls,
+        *,
+        task_name: str,
+        task_brief: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, list[dict[str, str]]]:
+        normalized_task_name = clean_text(task_name, max_len=64).lower()
+        normalized_task_brief = clean_text(task_brief, max_len=500)
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": build_defended_system(with_persona(SCHEDULED_TASK_SYSTEM))},
+            {"role": "system", "content": build_current_time_context()},
+            {"role": "system", "content": f"[SCHEDULED_TASK]\nname: {normalized_task_name}"},
+        ]
+        if history:
+            messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+        messages.append(
+            {
+                "role": "user",
+                "content": wrap_untrusted("scheduled_task_brief", normalized_task_brief, max_len=500),
+            }
+        )
+        return {"messages": messages}
+
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         llm = context.llm
         bot = context.bot
@@ -63,14 +88,14 @@ class ScheduledTaskSkill:
             return SkillRunResult(
                 ok=False,
                 skill=self.name,
-                summary="定时任务缺少 LLM 上下文",
+                summary="Scheduled task is missing an LLM context.",
                 error="missing_llm",
             )
         if bot is None or chat_id == 0:
             return SkillRunResult(
                 ok=False,
                 skill=self.name,
-                summary="定时任务缺少群聊上下文",
+                summary="Scheduled task is missing a chat context.",
                 error="missing_chat_context",
             )
 
@@ -87,23 +112,15 @@ class ScheduledTaskSkill:
             return SkillRunResult(
                 ok=False,
                 skill=self.name,
-                summary="定时任务参数不完整或类型不支持",
+                summary="Scheduled task arguments are missing or unsupported.",
                 error="invalid_arguments",
             )
 
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": build_defended_system(with_persona(SCHEDULED_TASK_SYSTEM))},
-            {"role": "system", "content": build_current_time_context()},
-            {"role": "system", "content": f"[SCHEDULED_TASK]\nname: {task_name}"},
-        ]
-        if context.history:
-            messages.extend(sanitize_history_for_llm(context.history, max_items=len(context.history)))
-        messages.append(
-            {
-                "role": "user",
-                "content": wrap_untrusted("scheduled_task_brief", task_brief, max_len=500),
-            }
-        )
+        messages = self.build_prompt_payload(
+            task_name=task_name,
+            task_brief=task_brief,
+            history=context.history,
+        )["messages"]
 
         generated = (await llm.chat(messages)).strip()
         reply = clean_text(generated, max_len=240)
@@ -111,7 +128,7 @@ class ScheduledTaskSkill:
             return SkillRunResult(
                 ok=True,
                 skill=self.name,
-                summary="当前无需发送定时任务消息",
+                summary="No scheduled-task message needs to be sent right now.",
                 payload={"sent": False, "text": "", "task_name": task_name},
             )
 
@@ -130,15 +147,15 @@ class ScheduledTaskSkill:
             always_tts = is_tts_always_enabled(tts_mode)
             if always_tts and self.tts_service and self.tts_service.available:
                 sent_ok = await self.tts_service.send_chat_tts(
-                        bot,
-                        chat_id,
-                        reply,
-                        reply_to_message_id=reply_to_message_id,
-                        fallback_mention_user_id=fallback_mention_user_id,
-                        fallback_mention_name=fallback_mention_name,
-                        auto_delete_minutes=0,
-                        uid=str(context.sender_user_id or chat_id),
-                    )
+                    bot,
+                    chat_id,
+                    reply,
+                    reply_to_message_id=reply_to_message_id,
+                    fallback_mention_user_id=fallback_mention_user_id,
+                    fallback_mention_name=fallback_mention_name,
+                    auto_delete_minutes=0,
+                    uid=str(context.sender_user_id or chat_id),
+                )
 
         if not sent_ok and not always_tts:
             sent_ok = await send_chat_message(
@@ -155,7 +172,7 @@ class ScheduledTaskSkill:
             return SkillRunResult(
                 ok=False,
                 skill=self.name,
-                summary="定时任务消息发送失败",
+                summary="Scheduled task message delivery failed.",
                 error="send_failed",
                 payload={"sent": False, "text": reply, "task_name": task_name},
             )

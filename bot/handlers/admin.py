@@ -667,6 +667,7 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         settings.bot.decision_model,
         moderation=settings.bot.moderation_model,
         embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
     )
     result = await llm.generate(RULE_MANAGE_SYSTEM, args)
     data = _parse_json_payload(result)

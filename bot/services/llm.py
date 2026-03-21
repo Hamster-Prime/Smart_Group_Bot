@@ -25,12 +25,14 @@ class LLMService:
         *,
         moderation: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
+        max_context_tokens: int | None = None,
     ) -> None:
         self.main = main
         self.decision_config = decision
         self.moderation_config = moderation or decision
         self.compress_config = compress or main
         self.embed_config = embed or EmbedConfig()
+        self.max_context_tokens = max(0, int(max_context_tokens or 0))
 
     @staticmethod
     def _build_chat_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
@@ -97,6 +99,55 @@ class LLMService:
             return escaped, False
         return escaped[:limit], True
 
+    def _context_window_total(self, cfg: ChatEndpointConfig | None = None) -> int:
+        if self.max_context_tokens > 0:
+            return self.max_context_tokens
+        try:
+            return int(litellm.get_max_tokens(model=(cfg.model if cfg is not None else self.main.model)) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _format_prompt_usage(used_tokens: int, total_tokens: int) -> str:
+        if total_tokens > 0:
+            return f"{max(0, int(used_tokens))}/{int(total_tokens)}"
+        return f"{max(0, int(used_tokens))}/?"
+
+    def count_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        cfg: ChatEndpointConfig | None = None,
+    ) -> int:
+        kwargs: dict[str, Any] = {
+            "model": (cfg.model if cfg is not None else self.main.model),
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            return int(litellm.token_counter(**kwargs))
+        except Exception:
+            fallback = 0
+            for msg in messages:
+                fallback += len(str(msg.get("content", "")))
+            if tools:
+                fallback += len(str(tools))
+            return fallback
+
+    def prompt_usage_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        cfg: ChatEndpointConfig | None = None,
+        used_tokens: int | None = None,
+    ) -> str:
+        used = self.count_prompt_tokens(messages, tools=tools, cfg=cfg) if used_tokens is None else int(used_tokens)
+        total = self._context_window_total(cfg)
+        return self._format_prompt_usage(used, total)
+
     @staticmethod
     def _label_cn(label: str) -> str:
         mapping = {
@@ -121,12 +172,14 @@ class LLMService:
         total = len(candidates)
         for idx, cfg in enumerate(candidates, start=1):
             kwargs = self._build_chat_kwargs(cfg)
+            prompt_usage = self.prompt_usage_text(messages, cfg=cfg)
             log.info(
-                "【LLM请求】阶段=%s | 尝试=%d/%d | 模型=%s | 消息数=%d | max_tokens=%d",
+                "【LLM请求】阶段=%s | 尝试=%d/%d | 模型=%s | prompt_tokens=%s | 消息数=%d | max_tokens=%d",
                 label_cn,
                 idx,
                 total,
                 cfg.model,
+                prompt_usage,
                 len(messages),
                 cfg.max_tokens,
             )
@@ -147,12 +200,12 @@ class LLMService:
                 tokens_out = getattr(resp.usage, "completion_tokens", 0)
                 preview, truncated = self._preview_for_log(text, limit=preview_limit)
                 log.info(
-                    "【LLM返回】阶段=%s | 尝试=%d/%d | 长度=%d | 输入tokens=%d | 输出tokens=%d | 预览截断=%s | 预览=%s",
+                    "【LLM返回】阶段=%s | 尝试=%d/%d | 长度=%d | prompt_tokens=%s | 输出tokens=%d | 预览截断=%s | 预览=%s",
                     label_cn,
                     idx,
                     total,
                     len(text),
-                    tokens_in,
+                    self.prompt_usage_text(messages, cfg=cfg, used_tokens=tokens_in),
                     tokens_out,
                     truncated,
                     preview,

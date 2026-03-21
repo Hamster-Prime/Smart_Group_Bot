@@ -8,6 +8,7 @@ from uuid import uuid4
 from bot.config import BotConfig
 from bot.db.engine import init_db
 from bot.services.memory import MemoryService
+from bot.utils.security import sanitize_history_for_llm
 
 
 class _StubLLM:
@@ -17,6 +18,12 @@ class _StubLLM:
     async def compress(self, system: str, user_text: str) -> str:
         _ = system, user_text
         return ""
+
+
+class _SummaryStubLLM(_StubLLM):
+    async def compress(self, system: str, user_text: str) -> str:
+        _ = system, user_text
+        return "压缩后摘要"
 
 
 def _create_legacy_message_vectors_table(db_path: Path, *, include_embedding: bool = False) -> None:
@@ -200,6 +207,50 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(user_msgs[0]["sender_id"], 42)
             self.assertEqual(user_msgs[0]["sender_name"], "Alice")
             self.assertEqual(user_msgs[0]["message_type"], "text")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_history_compacts_when_final_prompt_is_near_limit(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=5000, max_output_tokens=512),
+                _SummaryStubLLM(),
+                session_factory=session_factory,
+            )
+
+            for idx in range(3):
+                await memory.add_message(
+                    12345,
+                    "user",
+                    f"[id:42 username:@tester is_owner:no is_tg_admin:no trusted_source:none name:Alice] hi {idx}",
+                    user_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id=f"msg-{idx}",
+                )
+
+            raw_history = await memory.get_history_for_llm(12345, reserve_tokens=0)
+            self.assertTrue(any(msg.get("role") == "user" for msg in raw_history))
+
+            prompt_history = await memory.get_history_for_llm(
+                12345,
+                reserve_tokens=0,
+                prompt_payload_builder=lambda history: {
+                    "messages": [
+                        {"role": "system", "content": "guard " * 5000},
+                        *sanitize_history_for_llm(history, max_items=len(history)),
+                        {"role": "user", "content": "ping"},
+                    ]
+                },
+            )
+            await engine.dispose()
+
+            self.assertEqual(memory.get_history(12345), [])
+            self.assertEqual(await memory._get_summary(12345), "压缩后摘要")
+            self.assertFalse(any(msg.get("role") == "user" for msg in prompt_history))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
 import re
@@ -21,6 +22,8 @@ from bot.utils.security import format_history_message_line
 from bot.utils.timezone import format_shanghai_timestamp, now_shanghai_naive, to_shanghai_naive
 
 log = logging.getLogger(__name__)
+
+PromptPayloadBuilder = Callable[[list[dict[str, Any]]], dict[str, Any]]
 
 
 class MemoryService:
@@ -270,6 +273,55 @@ class MemoryService:
         except Exception:
             return sum(len(str(m.get("content", ""))) for m in normalized)
 
+    def _count_prompt_payload_tokens(
+        self,
+        payload: dict[str, Any] | None,
+    ) -> int:
+        if not payload:
+            return 0
+
+        normalized_messages: list[dict[str, Any]] = []
+        for msg in payload.get("messages", []) or []:
+            normalized: dict[str, Any] = {
+                "role": str(msg.get("role", "user")),
+                "content": msg.get("content", ""),
+            }
+            if "name" in msg:
+                normalized["name"] = str(msg.get("name", ""))
+            if "tool_call_id" in msg:
+                normalized["tool_call_id"] = str(msg.get("tool_call_id", ""))
+            normalized_messages.append(normalized)
+
+        kwargs: dict[str, Any] = {
+            "model": self.llm.main.model,
+            "messages": normalized_messages,
+        }
+        tools = payload.get("tools")
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            return litellm.token_counter(**kwargs)
+        except Exception:
+            fallback = sum(len(str(m.get("content", ""))) for m in normalized_messages)
+            if tools:
+                fallback += len(str(tools))
+            return fallback
+
+    def _soft_budget_tokens(
+        self,
+        budget_tokens: int,
+        *,
+        safety_margin_tokens: int | None = None,
+    ) -> int:
+        if budget_tokens <= 1024:
+            return budget_tokens
+
+        margin = safety_margin_tokens
+        if margin is None:
+            margin = max(2048, min(16384, budget_tokens // 10))
+        margin = max(0, min(margin, budget_tokens - 1024))
+        return max(1024, budget_tokens - margin)
+
     def _llm_input_budget(self, reserve_tokens: int | None = None) -> int:
         reserve = self._llm_reserve_tokens if reserve_tokens is None else max(0, reserve_tokens)
         return max(1024, self.max_context - self.max_output - reserve)
@@ -475,14 +527,21 @@ class MemoryService:
         group_id: int,
         *,
         budget_tokens: int,
+        prompt_payload_builder: PromptPayloadBuilder | None = None,
     ) -> bool:
+        def _count_candidate_tokens(candidate_messages: list[dict[str, Any]]) -> int:
+            if prompt_payload_builder is None:
+                return self._count_tokens(candidate_messages)
+            return self._count_prompt_payload_tokens(prompt_payload_builder(candidate_messages))
+
         history = list(self._working(group_id))
         if not history:
             return False
 
         system_blocks = await self._format_system_memory_blocks(group_id)
         candidate = [*system_blocks, *history]
-        if self._count_tokens(candidate) < budget_tokens:
+        candidate_tokens = _count_candidate_tokens(candidate)
+        if candidate_tokens < budget_tokens:
             return False
 
         lock = self._summary_locks.setdefault(group_id, asyncio.Lock())
@@ -493,20 +552,28 @@ class MemoryService:
 
             system_blocks = await self._format_system_memory_blocks(group_id)
             candidate = [*system_blocks, *history]
-            if self._count_tokens(candidate) < budget_tokens:
+            candidate_tokens = _count_candidate_tokens(candidate)
+            if candidate_tokens < budget_tokens:
                 return False
 
             history_lines = self._render_compact_history(history)
             if not history_lines:
                 return False
 
+            log.info(
+                "memory context nearing limit: group=%s prompt_tokens=%d/%d -> compact",
+                group_id,
+                candidate_tokens,
+                budget_tokens,
+            )
             old_summary = await self._get_summary(group_id)
             payload = (
-                "[已有摘要]\n"
-                f"{old_summary or '(无)'}\n\n"
-                "[新增对话片段]\n"
+                "[EXISTING_SUMMARY]\n"
+                f"{old_summary or '(none)'}\n\n"
+                "[NEW_DIALOGUE_FRAGMENT]\n"
                 f"{chr(10).join(history_lines)}\n\n"
-                "请输出更新后的中文摘要，保留长期有效的事实、偏好、约定、未完成事项和最近仍然重要的上下文。"
+                "Please write an updated Chinese summary that keeps durable facts, preferences, "
+                "agreements, unfinished tasks, and any recent context that still matters."
             )
             compressed = (await self.llm.compress(COMPRESS_SYSTEM, payload)).strip()
             if not compressed:
@@ -540,9 +607,10 @@ class MemoryService:
         *,
         reserve_tokens: int | None = None,
     ) -> bool:
+        budget_tokens = self._soft_budget_tokens(self._llm_input_budget(reserve_tokens))
         return await self._compact_group_context_if_needed(
             group_id,
-            budget_tokens=self._llm_input_budget(reserve_tokens),
+            budget_tokens=budget_tokens,
         )
 
     def _trim_by_token_budget(
@@ -577,17 +645,83 @@ class MemoryService:
         selected_tail.reverse()
         return [*selected_systems, *selected_tail]
 
+    def _trim_by_prompt_budget(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        budget_tokens: int,
+        prompt_payload_builder: PromptPayloadBuilder,
+    ) -> list[dict[str, Any]]:
+        if not messages:
+            return []
+
+        if self._count_prompt_payload_tokens(prompt_payload_builder(messages)) <= budget_tokens:
+            return list(messages)
+
+        systems = [dict(m) for m in messages if m.get("role") == "system"]
+        others = [dict(m) for m in messages if m.get("role") != "system"]
+
+        best_systems: list[dict[str, Any]] = []
+        low, high = 0, len(systems)
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = systems[:mid]
+            if self._count_prompt_payload_tokens(prompt_payload_builder(candidate)) <= budget_tokens:
+                best_systems = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        best = list(best_systems)
+        if self._count_prompt_payload_tokens(prompt_payload_builder(systems)) <= budget_tokens:
+            best = list(systems)
+            low, high = 0, len(others)
+            while low <= high:
+                mid = (low + high) // 2
+                candidate = [*systems, *others[-mid:]]
+                if self._count_prompt_payload_tokens(prompt_payload_builder(candidate)) <= budget_tokens:
+                    best = candidate
+                    low = mid + 1
+                else:
+                    high = mid - 1
+
+        return best
+
     async def get_history_for_llm(
         self,
         group_id: int,
         *,
         reserve_tokens: int | None = None,
+        prompt_payload_builder: PromptPayloadBuilder | None = None,
     ) -> list[dict[str, Any]]:
-        budget_tokens = self._llm_input_budget(reserve_tokens)
-        await self._compact_group_context_if_needed(group_id, budget_tokens=budget_tokens)
+        budget_tokens = self._soft_budget_tokens(self._llm_input_budget(reserve_tokens))
+        await self._compact_group_context_if_needed(
+            group_id,
+            budget_tokens=budget_tokens,
+            prompt_payload_builder=prompt_payload_builder,
+        )
 
         messages = [
             *await self._format_system_memory_blocks(group_id),
             *list(self._working(group_id)),
         ]
-        return self._trim_by_token_budget(messages, budget_tokens=budget_tokens)
+        trimmed = self._trim_by_token_budget(messages, budget_tokens=budget_tokens)
+        if prompt_payload_builder is None:
+            return trimmed
+
+        prompt_trimmed = self._trim_by_prompt_budget(
+            trimmed,
+            budget_tokens=budget_tokens,
+            prompt_payload_builder=prompt_payload_builder,
+        )
+        if len(prompt_trimmed) != len(trimmed):
+            prompt_tokens_after = self._count_prompt_payload_tokens(prompt_payload_builder(prompt_trimmed))
+            log.info(
+                "memory prompt trim applied: group=%s kept_messages=%d dropped_messages=%d prompt_tokens=%d/%d",
+                group_id,
+                len(prompt_trimmed),
+                max(0, len(trimmed) - len(prompt_trimmed)),
+                prompt_tokens_after,
+                budget_tokens,
+            )
+        return prompt_trimmed

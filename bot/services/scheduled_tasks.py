@@ -18,6 +18,7 @@ from bot.db.models import AuthorizedGroup, Group, ScheduledTaskRecord
 from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, load_group_tts_mode
 from bot.services.memory import MemoryService
 from bot.services.skills import SkillService
+from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.utils.security import clean_multiline_text, clean_text
 from bot.utils.telegram import send_chat_message
 
@@ -534,7 +535,6 @@ class ScheduledTaskService:
         if row.status != "pending":
             return
 
-        history = await self.memory.get_history_for_llm(row.group_id, reserve_tokens=768)
         due_local = _from_utc_naive(row.due_at)
         payload = row.payload if isinstance(row.payload, dict) else {}
         creator_name = clean_text(row.creator_name or str(row.creator_user_id), max_len=80)
@@ -544,6 +544,41 @@ class ScheduledTaskService:
         )
         reply_to_message_id = int(payload.get("reply_to_message_id", 0) or 0) or None
         task_content = clean_text(row.content or "", max_len=300)
+        reminder_brief = (
+            f"这是一条到期提醒任务。\n"
+            f"被提醒人: {target_user_name}\n"
+            f"到期时间: {format_due_at_local(due_local or _now_local())}\n"
+            f"提醒内容: {task_content}"
+        )
+        execution_text = task_content
+        if target_user_name:
+            execution_text = (
+                f"这是一个已到时间的群聊定时任务，现在请执行下面这件事，"
+                f"完成后把结果自然回复给 {target_user_name}：\n{task_content}"
+            )
+        history = await self.memory.get_history_for_llm(
+            row.group_id,
+            reserve_tokens=768,
+            prompt_payload_builder=(
+                (lambda candidate_history: ScheduledTaskSkill.build_prompt_payload(
+                    task_name=row.task_type,
+                    task_brief=reminder_brief,
+                    history=candidate_history,
+                ))
+                if row.task_type == "reminder"
+                else (
+                    lambda candidate_history: self.skill_service.build_answer_prompt_payload(
+                        execution_text,
+                        history=candidate_history,
+                        sender_user_id=row.creator_user_id,
+                        sender_username="",
+                        sender_is_owner=False,
+                        sender_is_tg_admin=False,
+                        intent_type="scheduled_task",
+                    )
+                )
+            ),
+        )
 
         finished_at = _now_utc_naive()
         retry_count = int(payload.get("retry_count", 0) or 0)
@@ -552,12 +587,7 @@ class ScheduledTaskService:
         error = ""
 
         if row.task_type == "reminder":
-            task_brief = (
-                f"这是一条到期提醒任务。\n"
-                f"被提醒人: {target_user_name}\n"
-                f"到期时间: {format_due_at_local(due_local or _now_local())}\n"
-                f"提醒内容: {task_content}"
-            )
+            task_brief = reminder_brief
             result = await self.skill_service.run_skill(
                 "scheduled_task",
                 {
@@ -582,12 +612,6 @@ class ScheduledTaskService:
                 else ""
             )
         else:
-            execution_text = task_content
-            if target_user_name:
-                execution_text = (
-                    f"这是一个已到时间的群聊定时任务，现在请执行下面这件事，"
-                    f"完成后把结果自然回复给 {target_user_name}：\n{task_content}"
-                )
             answer = await self.skill_service.answer_with_skill(
                 execution_text,
                 session=session,
@@ -704,8 +728,16 @@ class ScheduledTaskService:
             if now < last_sent_at + min_gap:
                 return
 
-        history = await self.memory.get_history_for_llm(row.id, reserve_tokens=768)
         task_brief = clean_text(str(state.get("task_brief") or _DEFAULT_TASK_BRIEF), max_len=240)
+        history = await self.memory.get_history_for_llm(
+            row.id,
+            reserve_tokens=768,
+            prompt_payload_builder=lambda candidate_history: ScheduledTaskSkill.build_prompt_payload(
+                task_name=_COOLDOWN_TOPIC_TASK,
+                task_brief=task_brief,
+                history=candidate_history,
+            ),
+        )
         result = await self.skill_service.run_skill(
             "scheduled_task",
             {
