@@ -101,6 +101,7 @@ class SendStickerSkill:
         context.handled = True
         context.sticker_sent = True
         context.sticker_file_id = sticker_file_id
+        context.suppress_followup_text = True
         return SkillRunResult(
             ok=True,
             skill=self.name,

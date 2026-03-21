@@ -30,6 +30,7 @@ class SkillContext:
     tts_text: str = ""
     embedded_reply_sent: bool = False
     embedded_reply_text: str = ""
+    suppress_followup_text: bool = False
 
 
 @dataclass(slots=True)

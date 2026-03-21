@@ -454,6 +454,9 @@ class SkillService:
                 tts_text=context.tts_text,
             )
 
+        def _action_reply_completed() -> bool:
+            return context.handled and (context.embedded_reply_sent or context.suppress_followup_text)
+
         for step in range(1, self.max_tool_rounds + 1):
             resp = await self._completion_with_fallbacks(messages=messages, tools=tools)
             if not resp:
@@ -479,8 +482,8 @@ class SkillService:
             messages.append(assistant_message)
 
             if not tool_calls:
-                if context.handled and context.embedded_reply_sent:
-                    log.info("skill tool loop finished: step=%d embedded_reply_already_sent", step)
+                if _action_reply_completed():
+                    log.info("skill tool loop finished: step=%d action_already_delivered", step)
                     return _build_answer_result()
                 if content:
                     log.info("skill tool loop finished: step=%d no_tool_call", step)
@@ -508,5 +511,11 @@ class SkillService:
                     }
                 )
 
+            if _action_reply_completed():
+                log.info("skill tool loop finished: step=%d action_handled_without_followup", step)
+                return _build_answer_result()
+
         log.info("skill tool loop reached max steps: %d", self.max_tool_rounds)
+        if _action_reply_completed():
+            return _build_answer_result()
         return _build_answer_result(last_success_summary)

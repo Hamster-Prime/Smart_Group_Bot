@@ -102,6 +102,7 @@ class DoubaoTTSSkill:
         context.handled = True
         context.tts_sent = True
         context.tts_text = text
+        context.suppress_followup_text = True
         return SkillRunResult(
             ok=True,
             skill=self.name,
