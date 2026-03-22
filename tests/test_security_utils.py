@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import unittest
 
 from bot.utils.security import clean_multiline_text, sanitize_history_for_llm
+from bot.utils.telegram import sanitize_outgoing_text
 
 
 class SecurityUtilsTests(unittest.TestCase):
@@ -35,6 +36,8 @@ class SecurityUtilsTests(unittest.TestCase):
         messages = sanitize_history_for_llm(history, max_items=2, max_item_chars=200)
 
         self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[1]["role"], "user")
         self.assertIn("[HISTORY_MESSAGE]", messages[0]["content"])
         self.assertIn("sent_at: 2026-03-20 12:34:56", messages[0]["content"])
         self.assertIn("sender: Alice", messages[0]["content"])
@@ -42,6 +45,7 @@ class SecurityUtilsTests(unittest.TestCase):
         self.assertIn("content:\nhello there", messages[0]["content"])
         self.assertIn("message_type: assistant_reply", messages[1]["content"])
         self.assertIn("sender: bot", messages[1]["content"])
+        self.assertIn("<untrusted:history_message>", messages[1]["content"])
 
     def test_sanitize_history_converts_aware_timestamps_to_shanghai(self) -> None:
         history = [
@@ -59,6 +63,24 @@ class SecurityUtilsTests(unittest.TestCase):
 
         self.assertEqual(len(messages), 1)
         self.assertIn("sent_at: 2026-03-20 23:30:00", messages[0]["content"])
+
+    def test_sanitize_outgoing_text_removes_leaked_history_blocks(self) -> None:
+        source = (
+            "感恩你\n"
+            "[HISTORY_MESSAGE]\n"
+            "source_type: recent_group_history\n"
+            "message_role: assistant\n"
+            "sent_at: 2026-03-23 01:59:12\n"
+            "sender: bot\n"
+            "sender_id: BOT\n"
+            "message_type: assistant_reply\n"
+            "content:\n"
+            "这是内部上下文\n"
+        )
+
+        cleaned = sanitize_outgoing_text(source)
+
+        self.assertEqual(cleaned, "感恩你")
 
 
 if __name__ == "__main__":

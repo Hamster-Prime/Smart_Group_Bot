@@ -43,6 +43,9 @@ _LLM_INTERNAL_BLOCK_RE = re.compile(
 _LLM_INTERNAL_TAG_RE = re.compile(
     r"(?is)</?\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>"
 )
+_HISTORY_WRAPPER_TAG_RE = re.compile(
+    r"(?im)^\s*</?(?:untrusted|trusted):history_message(?:\(trusted_tg_admin_source\))?>\s*$"
+)
 _REPLY_TARGET_MISSING_MARKERS = (
     "reply message not found",
     "message to reply not found",
@@ -95,6 +98,14 @@ def sanitize_outgoing_text(text: str) -> str:
         return ""
 
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    leak_positions = [
+        pos
+        for marker in ("<untrusted:history_message", "<trusted:history_message", "[HISTORY_MESSAGE]")
+        if (pos := cleaned.find(marker)) != -1
+    ]
+    if leak_positions:
+        cleaned = cleaned[: min(leak_positions)].rstrip()
+    cleaned = _HISTORY_WRAPPER_TAG_RE.sub("", cleaned)
     cleaned = _LLM_INTERNAL_BLOCK_RE.sub(" ", cleaned)
     cleaned = _LLM_INTERNAL_TAG_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)

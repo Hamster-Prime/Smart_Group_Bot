@@ -256,34 +256,26 @@ def sanitize_history_for_llm(
                 }
             )
             continue
-        if role == "user":
-            if _is_trusted_history_source(raw_content):
-                out.append(
-                    {
-                        "role": role,
-                        "content": wrap_trusted_multiline(
-                            "history_message(trusted_tg_admin_source)",
-                            formatted,
-                            max_len=wrapper_limit,
-                        ),
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "role": role,
-                        "content": wrap_untrusted_multiline(
-                            "history_message",
-                            formatted,
-                            max_len=wrapper_limit,
-                        ),
-                    }
-                )
+        if role == "user" and _is_trusted_history_source(raw_content):
+            out.append(
+                {
+                    "role": "user",
+                    "content": wrap_trusted_multiline(
+                        "history_message(trusted_tg_admin_source)",
+                        formatted,
+                        max_len=wrapper_limit,
+                    ),
+                }
+            )
             continue
         out.append(
             {
-                "role": role,
-                "content": clean_multiline_text(formatted, max_len=wrapper_limit),
+                "role": "user",
+                "content": wrap_untrusted_multiline(
+                    "history_message",
+                    formatted,
+                    max_len=wrapper_limit,
+                ),
             }
         )
     return out
