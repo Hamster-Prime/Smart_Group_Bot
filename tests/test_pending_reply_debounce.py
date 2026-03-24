@@ -11,6 +11,7 @@ def _settings(delay: float = 5.0) -> SimpleNamespace:
 def _item(
     text: str,
     *,
+    explicit_mention: bool = False,
     mentioned: bool = False,
     is_reply: bool = False,
     reply_to_bot: bool = False,
@@ -26,6 +27,7 @@ def _item(
         sender_is_owner=sender_is_owner,
         sender_is_tg_admin=False,
         user_tag="id:123",
+        explicit_mention=explicit_mention,
         mentioned=mentioned,
         is_reply=is_reply,
         reply_to_bot=reply_to_bot,

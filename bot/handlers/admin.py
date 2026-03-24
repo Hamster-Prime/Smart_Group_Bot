@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Group, ModerationExemption, ModerationRule, ReplyMute, UserWarning
+from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabled
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
@@ -76,6 +77,13 @@ _TTS_USAGE = (
     "3. /tts always\n\n"
     "请最高管理员在目标群内使用。"
 )
+_AT_REPLY_USAGE = (
+    "<b>命令用法</b>\n"
+    "0. /atreply（查看当前状态）\n"
+    "1. /atreply enable\n"
+    "2. /atreply disable\n\n"
+    "请最高管理员在目标群内使用。"
+)
 
 
 async def _answer(
@@ -90,6 +98,12 @@ async def _answer(
         auto_delete_minutes=settings.bot.auto_delete_minutes,
         **kwargs,
     )
+
+
+async def _maybe_flush(session: AsyncSession) -> None:
+    flush = getattr(session, "flush", None)
+    if flush is not None:
+        await flush()
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
@@ -1073,6 +1087,7 @@ async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) 
 
         settings_data[_MUTE_ALL_REPLIES_KEY] = True
         group_row.settings = settings_data
+        await _maybe_flush(session)
         await _answer(
             message,
             settings,
@@ -1159,6 +1174,7 @@ async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings
 
         settings_data.pop(_MUTE_ALL_REPLIES_KEY, None)
         group_row.settings = settings_data
+        await _maybe_flush(session)
         await _answer(
             message,
             settings,
@@ -1245,6 +1261,7 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
             enabled=True,
             config=settings.bot,
         )
+        await _maybe_flush(session)
         await _answer(
             message,
             settings,
@@ -1261,6 +1278,7 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
             enabled=False,
             config=settings.bot,
         )
+        await _maybe_flush(session)
         await _answer(
             message,
             settings,
@@ -1321,6 +1339,7 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
         return
 
     group_row.settings = set_tts_mode(group_settings, target_mode)
+    await _maybe_flush(session)
     await _answer(
         message,
         settings,
@@ -1328,6 +1347,53 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
             group_id=message.chat.id,
             group_settings=group_row.settings,
             service_ready=tts_service.available,
+        ),
+    )
+
+
+@router.message(Command("atreply"))
+async def cmd_atreply(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>仅@回复设置</b>\n请在目标群内使用该命令。")
+        return
+
+    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+    group_settings = dict(group_row.settings or {})
+
+    if not args:
+        await _answer(
+            message,
+            settings,
+            build_at_reply_status_text(
+                group_id=message.chat.id,
+                group_settings=group_settings,
+            ),
+        )
+        return
+
+    mode_map = {
+        "enable": True,
+        "disable": False,
+    }
+    target_enabled = mode_map.get(args)
+    if target_enabled is None:
+        await _answer(message, settings, _AT_REPLY_USAGE)
+        return
+
+    group_row.settings = set_at_reply_enabled(group_settings, target_enabled)
+    await _maybe_flush(session)
+    await _answer(
+        message,
+        settings,
+        build_at_reply_status_text(
+            group_id=message.chat.id,
+            group_settings=group_row.settings,
         ),
     )
 

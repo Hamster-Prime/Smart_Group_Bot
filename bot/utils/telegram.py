@@ -248,16 +248,37 @@ def is_reply_to_bot(msg: Message, bot_username: str, bot_user_id: int | None = N
     return _reply_origin_is_bot(msg, bot_username, bot_user_id)
 
 
+def has_explicit_bot_mention(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
+    """Check whether the message explicitly @mentions this bot."""
+    text = msg.text or msg.caption or ""
+    username = (bot_username or "").lstrip("@").lower()
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+
+    for entity in entities:
+        et = getattr(entity, "type", None)
+        if et == "mention":
+            offset = int(getattr(entity, "offset", 0) or 0)
+            length = int(getattr(entity, "length", 0) or 0)
+            mention = text[offset : offset + length].strip().lstrip("@").lower()
+            if mention and mention == username:
+                return True
+        elif et == "text_mention":
+            user = getattr(entity, "user", None)
+            uid = getattr(user, "id", None) if user else None
+            if bot_user_id is not None and uid == bot_user_id:
+                return True
+
+    if not username:
+        return False
+    return f"@{username}" in text.lower()
+
+
 def is_bot_mentioned(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:
     """Check if the bot is @mentioned or directly replied to."""
     if _reply_origin_is_bot(msg, bot_username, bot_user_id):
         return True
 
-    text = (msg.text or msg.caption or "").lower()
-    username = (bot_username or "").lstrip("@").lower()
-    if not username:
-        return False
-    return f"@{username}" in text
+    return has_explicit_bot_mention(msg, bot_username, bot_user_id)
 
 
 def mentions_other_user(msg: Message, bot_username: str, bot_user_id: int | None = None) -> bool:

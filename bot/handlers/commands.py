@@ -637,6 +637,8 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
         "/authadmin 授权群管理\n"
         "/unauthadmin 撤销授权群管理\n"
         "/adminlist 群管理列表\n"
+        "/atreply（查看当前群仅@回复状态）\n"
+        "/atreply enable|disable（控制当前群仅在显式@bot时回复）\n"
         "/tts（查看当前群 TTS 状态）\n"
         "/tts enable|disable|always（在当前群控制 TTS skill / 始终语音输出）\n"
         "/av enable（在当前群启用 AV 查询）\n"

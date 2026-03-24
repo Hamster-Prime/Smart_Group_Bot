@@ -22,6 +22,7 @@ from bot.config import Settings
 from bot.db.models import Group, ModerationRule, ReplyMute
 from bot.db.sqlite_session import is_database_locked_error
 from bot.services import memory_holder
+from bot.services.at_reply import is_at_reply_enabled
 from bot.services.authz import ensure_group_authorized, is_group_admin_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
@@ -47,6 +48,7 @@ from bot.utils.telegram import (
     answer_with_auto_delete,
     extract_reply_context,
     extract_message_text,
+    has_explicit_bot_mention,
     is_bot_mentioned,
     is_user_admin,
     is_reply_to_bot,
@@ -774,6 +776,7 @@ class _PendingReplyItem:
     sender_is_owner: bool
     sender_is_tg_admin: bool
     user_tag: str
+    explicit_mention: bool
     mentioned: bool
     is_reply: bool
     reply_to_bot: bool
@@ -816,6 +819,7 @@ def _build_merged_context(items: list[_PendingReplyItem]) -> str:
     for idx, item in enumerate(items, start=1):
         meta = (
             f"type={item.msg_type} "
+            f"explicit_mention_bot={'yes' if item.explicit_mention else 'no'} "
             f"mention_bot={'yes' if item.mentioned else 'no'} "
             f"reply={'yes' if item.is_reply else 'no'} "
             f"reply_bot={'yes' if item.reply_to_bot else 'no'} "
@@ -903,6 +907,46 @@ def _effective_batch_flags(
     return mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, latest.msg_type
 
 
+async def _resolve_pending_reply_action(
+    *,
+    decision_svc: DecisionService,
+    group_settings: dict | None,
+    explicit_mention: bool,
+    input_text: str,
+    is_mentioned: bool,
+    is_reply: bool,
+    is_reply_to_bot: bool,
+    is_reply_to_other: bool,
+    mentions_other_user: bool,
+    is_owner: bool,
+    is_tg_admin: bool,
+    user_tag: str,
+    msg_type: str,
+    history: list[dict[str, Any]] | None,
+    merged_count: int,
+    merged_context: str,
+) -> tuple[str, bool]:
+    if is_at_reply_enabled(group_settings):
+        return ("casual" if explicit_mention else "skip"), True
+
+    action = await decision_svc.decide(
+        input_text,
+        is_mentioned=is_mentioned,
+        is_reply=is_reply,
+        is_reply_to_bot=is_reply_to_bot,
+        is_reply_to_other=is_reply_to_other,
+        mentions_other_user=mentions_other_user,
+        is_owner=is_owner,
+        is_tg_admin=is_tg_admin,
+        user_tag=user_tag,
+        msg_type=msg_type,
+        history=history,
+        merged_count=merged_count,
+        merged_context=merged_context,
+    )
+    return action, False
+
+
 async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings: Settings) -> None:
     if not items:
         return
@@ -936,6 +980,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
     skill = SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
 
     mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, msg_type = _effective_batch_flags(items)
+    explicit_mention = any(item.explicit_mention for item in items)
 
     log.info(
         "[%s] pending batch flush started | user=%s messages=%d debounce=%.2fs",
@@ -965,8 +1010,11 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
 
             decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
             decision_started = time.perf_counter()
-            action = await decision_svc.decide(
-                merged_input_text,
+            action, action_forced = await _resolve_pending_reply_action(
+                decision_svc=decision_svc,
+                group_settings=group_settings,
+                explicit_mention=explicit_mention,
+                input_text=merged_input_text,
                 is_mentioned=mentioned,
                 is_reply=is_reply,
                 is_reply_to_bot=reply_to_bot,
@@ -980,12 +1028,21 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 merged_count=merged_count,
                 merged_context=merged_context,
             )
-            log.info(
-                "[%s] pending batch decision done | action=%s elapsed=%dms",
-                group_id,
-                action,
-                int((time.perf_counter() - decision_started) * 1000),
-            )
+            if action_forced:
+                log.info(
+                    "[%s] pending batch action forced | action=%s explicit_mention=%s elapsed=%dms",
+                    group_id,
+                    action,
+                    explicit_mention,
+                    int((time.perf_counter() - decision_started) * 1000),
+                )
+            else:
+                log.info(
+                    "[%s] pending batch decision done | action=%s elapsed=%dms",
+                    group_id,
+                    action,
+                    int((time.perf_counter() - decision_started) * 1000),
+                )
 
             reply = ""
             reply_source = "none"
@@ -996,6 +1053,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             sticker_file = ""
             delivery_mode = "reply"
             tts_text = ""
+            force_reply = bool(action_forced and action == "casual")
             tts_service = skill.tts_service or DoubaoTTSService(settings)
 
             if action != "skip":
@@ -1117,6 +1175,15 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
 
                 if reply or not skill_handled:
                     silence_reply, silence_reason = _should_silence_generated_reply(reply)
+                    if silence_reply and force_reply:
+                        log.warning(
+                            "[%s] pending batch forced casual produced no usable reply, using fallback | reason=%s",
+                            group_id,
+                            silence_reason,
+                        )
+                        reply = "我在，直接说就好~"
+                        reply_source = "fallback"
+                        silence_reply = False
                     if silence_reply and not (action == "casual" and silence_reason == "silent_marker"):
                             preview = _truncate_text(reply, 80) if reply else "-"
                             log.info(
@@ -1709,6 +1776,7 @@ async def on_group_message(
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
 
     bot_me = await message.bot.me()
+    explicit_mention = has_explicit_bot_mention(message, bot_me.username or "", bot_me.id)
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
     is_reply = is_reply_message(message)
     reply_to_bot = is_reply_to_bot(message, bot_me.username or "", bot_me.id)
@@ -1726,6 +1794,7 @@ async def on_group_message(
             sender_is_owner=sender_is_owner,
             sender_is_tg_admin=sender_is_tg_admin,
             user_tag=user_tag,
+            explicit_mention=explicit_mention,
             mentioned=mentioned,
             is_reply=is_reply,
             reply_to_bot=reply_to_bot,
