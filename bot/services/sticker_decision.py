@@ -208,17 +208,19 @@ class StickerDecisionService:
         )
         candidate_ids = {str(x.get("file_id", "")).strip() for x in candidates if str(x.get("file_id", "")).strip()}
 
-        mention_tag = "是" if is_mentioned else "否"
-        reply_bot_tag = "是" if is_reply_to_bot else "否"
+        mention_tag = "yes" if is_mentioned else "no"
+        reply_bot_tag = "yes" if is_reply_to_bot else "no"
         context = (
-            f"[回复动作]\n{clean_text(normalized_action, max_len=16)}\n"
-            f"[消息类型]\n{clean_text(msg_type, max_len=40)}\n"
-            f"[是否@机器人]\n{mention_tag}\n"
-            f"[是否回复机器人]\n{reply_bot_tag}\n"
-            f"[回复来源]\n{clean_text(reply_source, max_len=32)}\n"
-            f"[用户消息]\n{wrap_untrusted('用户消息', clean_text(user_text, max_len=900), max_len=900)}\n"
-            f"[机器人文字回复]\n{wrap_untrusted('机器人文字回复', clean_text(assistant_reply, max_len=900), max_len=900)}\n"
-            f"[候选贴纸]\n{wrap_untrusted('候选贴纸', self._format_candidates(candidates), max_len=8000)}"
+            f"[REPLY_ACTION]\n{clean_text(normalized_action, max_len=16)}\n"
+            f"[MESSAGE_TYPE]\n{clean_text(msg_type, max_len=40)}\n"
+            f"[IS_MENTIONED]\n{mention_tag}\n"
+            f"[IS_REPLY_TO_BOT]\n{reply_bot_tag}\n"
+            f"[REPLY_SOURCE]\n{clean_text(reply_source, max_len=32)}\n"
+            f"[CURRENT_MESSAGE]\n{wrap_untrusted('current_message', clean_text(user_text, max_len=900), max_len=900)}\n"
+            f"[ASSISTANT_DRAFT_REPLY]\n"
+            f"{wrap_untrusted('assistant_draft_reply', clean_text(assistant_reply, max_len=900), max_len=900)}\n"
+            f"[STICKER_CANDIDATES]\n"
+            f"{wrap_untrusted('sticker_candidates', self._format_candidates(candidates), max_len=8000)}"
         )
 
         raw = await self.llm.generate(build_defended_system(STICKER_DECISION_SYSTEM), context)
