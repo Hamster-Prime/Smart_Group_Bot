@@ -14,6 +14,22 @@ def _settings() -> Settings:
 
 
 class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_help_uses_shared_command_catalog_text(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/help",
+        )
+        settings = _settings()
+
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await commands.cmd_help(message, session=object(), settings=settings)
+
+        self.assertIn("命令总览", answer_mock.await_args.args[2])
+
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),

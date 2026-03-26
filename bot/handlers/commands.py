@@ -735,7 +735,7 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
 async def cmd_help(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    await _answer(message, settings, _build_help_text())
+    await _answer(message, settings, build_help_text())
 
 
 @router.message(Command("lm"))
