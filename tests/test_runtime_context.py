@@ -73,6 +73,10 @@ class RuntimeContextTests(unittest.TestCase):
         self.assertIn("skill_planner_model: same_as_main_reply", text)
         self.assertIn("vision_model: same_as_main_reply", text)
         self.assertIn("tts_model: seed-tts-2.0", text)
+        self.assertIn("[BOT_COMMAND_GUIDE]", text)
+        self.assertIn("command: /lm", text)
+        self.assertIn("usage: /lm add <内容>", text)
+        self.assertIn("command: /rules", text)
 
     def test_runtime_profile_marks_disabled_moderation(self) -> None:
         text = build_bot_runtime_profile_context(

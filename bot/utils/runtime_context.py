@@ -4,6 +4,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
+from bot.utils.command_catalog import build_command_guide_context
+
 
 def build_current_time_context() -> str:
     """Build real-time clock context for LLM prompts."""
@@ -108,6 +110,7 @@ def build_bot_runtime_profile_context(
         tts_model = str(getattr(settings, "doubao_tts_model", "") or "").strip() or "(provider default)"
         lines.append(f"tts_model: {tts_model}")
 
+    lines.append(build_command_guide_context())
     lines.append(
         "When user asks what you can do, how you work, or what model each module uses, answer from this block."
     )

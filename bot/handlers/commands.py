@@ -44,6 +44,7 @@ from bot.services.scheduled_tasks import (
 )
 from bot.services.llm import LLMService
 from bot.services.skills import SkillService
+from bot.utils.command_catalog import build_help_text
 from bot.utils.telegram import answer_with_auto_delete, typing_action
 
 router = Router()
@@ -160,41 +161,6 @@ def _build_skill_service(settings: Settings) -> SkillService:
         if x and x.strip()
     ]
     return SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
-
-
-def _build_help_text() -> str:
-    return (
-        "<b>命令总览</b>\n\n"
-        "<b>核心入口</b>\n"
-        "/help：查看帮助\n"
-        "/lm：永久记忆列表，支持翻页和删除\n"
-        "/lm add &lt;内容&gt;：新增永久记忆\n"
-        "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;：修改永久记忆\n"
-        "/task &lt;自然语言&gt;：创建定时任务\n"
-        "/tasks：定时任务列表，支持翻页和删除\n"
-        "/canceltask &lt;任务ID&gt;：按 ID 取消任务\n"
-        "/addrule &lt;自然语言&gt;：新增群规\n"
-        "/rules：群规列表，支持翻页和删除\n"
-        "/av &lt;番号/演员/关键词&gt;：搜索 JAVBUS + MADOUQU + DMM + FC2\n\n"
-        "<b>语义入口</b>\n"
-        "主模型会自动调用 skill 处理：永久记忆新增/查看/修改、群规新增/查看、定时任务创建/查看。\n"
-        "删除统一走 /lm、/rules、/tasks 这些命令页的内联按钮。\n\n"
-        "<b>群审核管理（需已授权）</b>\n"
-        "/warnings：查看警告/封禁名单\n"
-        "/aiexempt：回复目标用户消息后豁免审核\n"
-        "/unaiexempt：回复目标用户消息后取消豁免\n"
-        "/mute：回复目标用户消息后忽略其后续回复\n"
-        "/mute all：本群仅做审核，不再回复\n"
-        "/unmute：回复目标用户消息后恢复其回复\n"
-        "/unmute all：恢复本群正常回复\n"
-        "/proactive on|off|status：主动话题开关/状态\n\n"
-        "<b>最高管理员命令</b>\n"
-        "/authgroup / unauthgroup / authlist\n"
-        "/authadmin / unauthadmin / adminlist\n"
-        "/atreply / atreply enable|disable\n"
-        "/tts / tts enable|disable|always\n"
-        "/av enable|disable"
-    )
 
 
 def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
