@@ -27,7 +27,7 @@ from bot.services.authz import ensure_group_authorized, is_group_admin_authorize
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, is_tts_tool_enabled, normalize_tts_mode
-from bot.services.group_intent import GroupIntent, GroupIntentService
+from bot.services.group_intent import GroupIntent
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
@@ -40,7 +40,6 @@ from bot.services.scheduled_tasks import (
     record_group_activity,
 )
 from bot.services.task_intent import TaskIntent
-from bot.services.task_intent import TaskIntentService
 from bot.services.skills import SkillService
 from bot.services.sticker_library import sticker_library
 from bot.utils.prompts import RULE_MANAGE_SYSTEM
@@ -538,134 +537,6 @@ async def _handle_task_intent(
     if intent.ack_text:
         reply = f"{html.escape(intent.ack_text)}\n\n{reply}"
     return True, reply
-
-
-def _semantic_command_fallback_text(*, input_text: str) -> str:
-    text = (input_text or "").strip()
-    if "记忆" in text:
-        return (
-            "这条永久记忆指令我没完全吃准。你可以直接重说一次，"
-            "或者用 /lm 查看列表、添加与删除。"
-        )
-    if "规则" in text or "群规" in text:
-        return (
-            "这条群规指令我没完全吃准。你可以重说一次，"
-            "或者用 /addrule 新增、用 /rules 查看和删除。"
-        )
-    if "提醒" in text or "定时" in text or "任务" in text:
-        return (
-            "这条定时任务指令我没完全吃准。你可以重说一次，"
-            "或者用 /task 创建、/tasks 查看删除、/canceltask 取消。"
-        )
-    return "这条管理指令我没完全吃准。你可以换个说法，或直接使用对应的 / 命令入口。"
-
-
-async def _handle_semantic_command_via_skill(
-    *,
-    message: Message,
-    session: AsyncSession,
-    settings: Settings,
-    llm: LLMService,
-    skill: SkillService,
-    memory: Any,
-    input_text: str,
-    group_id: int,
-    user_id: int,
-    display_name: str,
-    user_tag: str,
-    msg_type: str,
-    sender_username: str,
-    sender_is_owner: bool,
-    sender_is_tg_admin: bool,
-    management_candidate: bool,
-    task_candidate: bool,
-) -> bool:
-    intent_type = "management" if management_candidate else "task_manage"
-    history = await memory.get_history_for_llm(
-        group_id,
-        prompt_payload_builder=lambda candidate_history: skill.build_answer_prompt_payload(
-            input_text,
-            history=candidate_history,
-            sender_user_id=user_id,
-            sender_username=sender_username,
-            sender_is_owner=sender_is_owner,
-            sender_is_tg_admin=sender_is_tg_admin,
-            intent_type=intent_type,
-            allow_tts=False,
-        ),
-    )
-    prompt_payload = skill.build_answer_prompt_payload(
-        input_text,
-        history=history,
-        sender_user_id=user_id,
-        sender_username=sender_username,
-        sender_is_owner=sender_is_owner,
-        sender_is_tg_admin=sender_is_tg_admin,
-        intent_type=intent_type,
-        allow_tts=False,
-    )
-    log.info(
-        "[%s] semantic command via skill started | management=%s task=%s prompt_tokens=%s",
-        group_id,
-        management_candidate,
-        task_candidate,
-        llm.prompt_usage_text(prompt_payload["messages"], tools=prompt_payload["tools"]),
-    )
-
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        skill_result = await skill.answer_with_skill(
-            input_text,
-            session=session,
-            history=history,
-            sender_user_id=user_id,
-            sender_username=sender_username,
-            sender_is_owner=sender_is_owner,
-            sender_is_tg_admin=sender_is_tg_admin,
-            message=message,
-            intent_type=intent_type,
-            allow_tts=False,
-        )
-
-    reply = (skill_result.text or "").strip()
-    if not reply:
-        reply = _semantic_command_fallback_text(input_text=input_text)
-
-    cleaned_reply = sanitize_outgoing_text(reply)
-    if cleaned_reply != reply:
-        log.warning("[%s] semantic command reply sanitized", group_id)
-    reply = cleaned_reply
-
-    await _best_effort_commit(
-        session,
-        group_id=group_id,
-        context="semantic_command_pre_memory",
-    )
-    await memory.add_message(
-        group_id,
-        "user",
-        f"[{user_tag}] {input_text}",
-        user_id=user_id,
-        sender_name=display_name,
-        message_type=msg_type,
-        message_id=str(message.message_id),
-        created_at=message.date,
-    )
-    await answer_with_auto_delete(
-        message,
-        reply,
-        auto_delete_minutes=0,
-    )
-    await memory.add_message(group_id, "assistant", reply, message_type="assistant_reply")
-    await memory.compact_if_needed(group_id)
-    log.info(
-        "[%s] semantic command handled via skill | management=%s task=%s handled=%s len=%d",
-        group_id,
-        management_candidate,
-        task_candidate,
-        skill_result.handled,
-        len(reply),
-    )
-    return True
 
 
 def _build_moderation_notice(
@@ -1614,8 +1485,6 @@ async def on_group_message(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
-    intent_svc = GroupIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
-    task_intent_svc = TaskIntentService(llm, context_items=min(6, settings.bot.decision_context_items))
     sticker_pool = [
         x.strip()
         for x in (settings.skill_sticker_file_ids or "").split(",")
@@ -1789,30 +1658,6 @@ async def on_group_message(
         return
 
     memory = memory_holder.get()
-    management_candidate = intent_svc.looks_like_management_candidate(text)
-    task_candidate = task_intent_svc.looks_like_task_candidate(text)
-    if management_candidate or task_candidate:
-        handled = await _handle_semantic_command_via_skill(
-            message=message,
-            session=session,
-            settings=settings,
-            llm=llm,
-            skill=skill,
-            memory=memory,
-            input_text=input_text,
-            group_id=group_id,
-            user_id=user_id,
-            display_name=display_name if user else str(user_id),
-            user_tag=user_tag,
-            msg_type=msg_type,
-            sender_username=sender_username,
-            sender_is_owner=sender_is_owner,
-            sender_is_tg_admin=sender_is_tg_admin,
-            management_candidate=management_candidate,
-            task_candidate=task_candidate,
-        )
-        if handled:
-            return
 
     await _best_effort_commit(
         session,

@@ -159,8 +159,19 @@ async def answer_with_auto_delete(
     auto_delete_minutes: int = 0,
     **kwargs: object,
 ) -> Message:
-    safe_text = sanitize_outgoing_mentions(text or "")
-    sent = await message.answer(safe_text, **kwargs)
+    payload = sanitize_outgoing_text(text or "")
+    safe_text = sanitize_outgoing_mentions(payload)
+    try:
+        sent = await message.answer(safe_text, **kwargs)
+    except TelegramBadRequest as exc:
+        detail = str(exc).lower()
+        if "can't parse entities" not in detail:
+            raise
+        log.warning("answer entity parse failed, retrying as plain text")
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["parse_mode"] = None
+        plain_text = html.escape(payload)
+        sent = await message.answer(plain_text, **fallback_kwargs)
     schedule_message_auto_delete(sent, auto_delete_minutes)
     return sent
 

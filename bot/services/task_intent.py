@@ -41,6 +41,10 @@ _TIME_HINT_RE = re.compile(
     r"(今天|今晚|明天|后天|等会|待会|稍后|分钟后|小时后|早上|上午|中午|下午|傍晚|晚上|凌晨|明晚|周[一二三四五六日天]|星期[一二三四五六日天]|\d+\s*[点时号分])",
     re.IGNORECASE,
 )
+_STRONG_TIME_HINT_RE = re.compile(
+    r"(今晚|等会|待会|稍后|分钟后|小时后|早上|上午|中午|下午|傍晚|晚上|凌晨|明晚|\d+\s*[点时号分])",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -102,7 +106,7 @@ class TaskIntentService:
             return True
         if _SCHEDULE_KEYWORD_RE.search(normalized) and _TASK_COMMAND_RE.search(normalized):
             return True
-        if _TASK_COMMAND_RE.search(normalized):
+        if _STRONG_TIME_HINT_RE.search(normalized) and _TASK_COMMAND_RE.search(normalized):
             return True
         return False
 
@@ -154,9 +158,10 @@ class TaskIntentService:
         text: str,
         *,
         history: list[dict[str, str]] | None = None,
+        force_llm: bool = False,
     ) -> TaskIntent:
         user_text = clean_text(text, max_len=1200)
-        if not self._looks_like_task_candidate(user_text):
+        if not force_llm and not self._looks_like_task_candidate(user_text):
             return TaskIntent()
 
         prompt = (

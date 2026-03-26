@@ -27,6 +27,17 @@ class TaskIntentServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent.intent, "chat")
         self.assertEqual(llm.calls, 0)
 
+    async def test_today_summary_chat_is_not_task_candidate(self) -> None:
+        llm = _DummyLLM(
+            '{"intent":"task_manage","task_action":"add","task_type":"agent_task","due_at":"2026-03-19 21:00:00","task_content":"总结今天群聊","ack_text":"好"}'
+        )
+        svc = TaskIntentService(llm)
+
+        intent = await svc.detect("总结一下今天的群聊")
+
+        self.assertEqual(intent.intent, "chat")
+        self.assertEqual(llm.calls, 0)
+
     async def test_explicit_reminder_add_works(self) -> None:
         llm = _DummyLLM(
             '{"intent":"task_manage","task_action":"add","task_type":"reminder","due_at":"2026-03-19 21:00:00","task_content":"吃饭","ack_text":"好，今晚九点提醒你吃饭。"}'

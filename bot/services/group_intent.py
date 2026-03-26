@@ -218,10 +218,11 @@ class GroupIntentService:
         *,
         history: list[dict[str, str]] | None = None,
         surface_text: str | None = None,
+        force_llm: bool = False,
     ) -> GroupIntent:
         user_text = clean_text(text, max_len=1200)
         surface = clean_text(surface_text or text, max_len=400)
-        if not self._looks_like_management_candidate(surface):
+        if not force_llm and not self._looks_like_management_candidate(surface):
             return GroupIntent()
 
         prompt = (
@@ -248,12 +249,12 @@ class GroupIntentService:
         memory_target = clean_text(str(data.get("memory_target", "")), max_len=300)
         rule_instruction = clean_text(str(data.get("rule_instruction", "")), max_len=1200)
 
-        if intent == "memory_manage":
+        if intent == "memory_manage" and not force_llm:
             if memory_action == "unknown" or not self._is_explicit_memory_command(surface, memory_action):
                 log.info("group intent downgraded to chat | reason=memory_not_explicit")
                 return GroupIntent()
 
-        if intent == "rule_manage" and not self._is_explicit_rule_command(surface):
+        if intent == "rule_manage" and not force_llm and not self._is_explicit_rule_command(surface):
             log.info("group intent downgraded to chat | reason=rule_not_explicit")
             return GroupIntent()
 
