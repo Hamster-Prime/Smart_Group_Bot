@@ -1,9 +1,7 @@
 ﻿from __future__ import annotations
 
 import html
-import json
 import logging
-import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -42,15 +40,12 @@ from bot.services.scheduled_tasks import (
     get_cooldown_status_text,
     set_cooldown_task_enabled,
 )
-from bot.utils.prompts import RULE_MANAGE_SYSTEM
+from bot.services.skills import SkillService
 from bot.utils.telegram import answer_with_auto_delete, is_group
 
 router = Router()
 log = logging.getLogger(__name__)
 
-# 将“禁止骂人”等自然语言规则归一为语义审核模式（llm）
-_SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
-_ABUSE_LLM_PATTERN = "禁止辱骂、脏话、人身攻击（含谐音、缩写、变体、阴阳怪气）"
 _MUTE_ALL_REPLIES_KEY = "mute_all_replies"
 _LIST_PAGE_SIZE = 5
 _MUTE_USAGE = (
@@ -106,6 +101,23 @@ async def _maybe_flush(session: AsyncSession) -> None:
         await flush()
 
 
+def _build_skill_service(settings: Settings) -> SkillService:
+    llm = LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
+    )
+    sticker_pool = [
+        x.strip()
+        for x in (settings.skill_sticker_file_ids or "").split(",")
+        if x and x.strip()
+    ]
+    return SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
+
+
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
     row = await session.get(Group, group_id)
     if row:
@@ -133,28 +145,6 @@ async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) ->
     row = Group(id=group_id, title=title or "", settings={})
     session.add(row)
     return row
-
-
-def _parse_json_payload(raw: str) -> dict | None:
-    payload = (raw or "").strip()
-
-    if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json)?", "", payload).strip()
-        payload = re.sub(r"```$", "", payload).strip()
-
-    if not payload.startswith("{"):
-        match = re.search(r"\{[\s\S]*\}", payload)
-        if match:
-            payload = match.group(0)
-
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-
-    if not isinstance(data, dict):
-        return None
-    return data
 
 
 def _resolve_target_group_id(message: Message, args: str) -> int | None:
@@ -676,108 +666,22 @@ async def cmd_addrule(message: Message, session: AsyncSession, settings: Setting
         await _reply_rules(message, session, settings)
         return
 
-    llm = LLMService(
-        settings.bot.main_model,
-        settings.bot.decision_model,
-        moderation=settings.bot.moderation_model,
-        embed=settings.bot.embed_model,
-        max_context_tokens=settings.bot.max_context_tokens,
+    user_id = int(getattr(message.from_user, "id", 0) or 0)
+    sender_username = (getattr(message.from_user, "username", "") or "").strip()
+    skill = _build_skill_service(settings)
+    result = await skill.run_skill(
+        "rule_manage",
+        {"request_text": args},
+        session=session,
+        sender_user_id=user_id,
+        sender_username=sender_username,
+        sender_is_owner=bool(user_id and is_super_admin_user_id(user_id, settings)),
+        sender_is_tg_admin=True,
+        message=message,
+        chat_id=message.chat.id,
+        current_user_text=args,
     )
-    result = await llm.generate(RULE_MANAGE_SYSTEM, args)
-    data = _parse_json_payload(result)
-    if not data:
-        await _answer(message, settings, "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
-        return
-
-    action = str(data.get("action", "unknown")).strip().lower()
-
-    if action == "add":
-        rule_type = str(data.get("rule_type", "keyword")).strip().lower()
-        pattern = str(data.get("pattern", "")).strip()
-        hit_action = str(data.get("hit_action", "warn")).strip().lower()
-
-        if rule_type not in ("keyword", "regex", "llm"):
-            await _answer(message, settings, 
-                "<b>规则添加失败</b>\n"
-                "rule_type 必须是 keyword、regex 或 llm"
-            )
-            return
-        if not pattern:
-            await _answer(message, settings, "<b>规则添加失败</b>\npattern 不能为空")
-            return
-        if hit_action not in ("warn", "delete", "ban"):
-            hit_action = "warn"
-
-        # 对典型“骂人/辱骂/脏话”语义规则，默认走 llm 语义判定，避免只靠固定词表。
-        if rule_type == "keyword" and pattern.lower() in _SEMANTIC_ABUSE_HINTS:
-            rule_type = "llm"
-            pattern = _ABUSE_LLM_PATTERN
-
-        rule = ModerationRule(
-            group_id=message.chat.id,
-            rule_type=rule_type,
-            pattern=pattern,
-            action=hit_action,
-        )
-        session.add(rule)
-        await session.commit()
-        await _answer(message, settings, 
-            "<b>规则添加成功</b>\n"
-            f"<b>规则编号</b>: #{rule.id}\n"
-            f"<b>规则类型</b>: {_rule_type_label(rule_type)}\n"
-            f"<b>命中动作</b>: {_action_label(hit_action)}\n"
-            f"<b>规则内容</b>: {html.escape(_truncate_text(pattern, 160))}"
-        )
-        return
-
-    if action == "delete":
-        rule: ModerationRule | None = None
-
-        if data.get("rule_id") is not None:
-            try:
-                rid = int(data["rule_id"])
-            except (TypeError, ValueError):
-                await _answer(message, settings, "<b>规则删除失败</b>\nrule_id 必须是整数")
-                return
-            candidate = await session.get(ModerationRule, rid)
-            if candidate and candidate.group_id == message.chat.id:
-                rule = candidate
-        else:
-            pattern = str(data.get("pattern", "")).strip()
-            rule_type = str(data.get("rule_type", "")).strip().lower()
-            if not pattern:
-                await _answer(message, settings, "<b>规则删除失败</b>\n删除时请提供 rule_id 或 pattern")
-                return
-
-            stmt = select(ModerationRule).where(
-                ModerationRule.group_id == message.chat.id,
-                ModerationRule.pattern == pattern,
-            )
-            if rule_type:
-                stmt = stmt.where(ModerationRule.rule_type == rule_type)
-            stmt = stmt.order_by(ModerationRule.id.desc())
-            result = await session.execute(stmt)
-            rule = result.scalars().first()
-
-        if not rule:
-            await _answer(message, settings, "<b>规则删除失败</b>\n未找到对应规则")
-            return
-
-        rid = rule.id
-        await session.delete(rule)
-        await _answer(message, settings, 
-            "<b>规则删除成功</b>\n"
-            f"<b>规则编号</b>: #{rid}\n"
-            f"<b>规则类型</b>: {_rule_type_label(rule.rule_type)}\n"
-            f"<b>规则内容</b>: {html.escape(_truncate_text(rule.pattern or '', 160))}"
-        )
-        return
-
-    if action == "list":
-        await _reply_rules(message, session, settings)
-        return
-
-    await _answer(message, settings, "<b>规则解析失败</b>\n无法理解你的规则意图，请换个说法。")
+    await _answer(message, settings, result.summary)
 
 
 @router.message(Command("rules"))

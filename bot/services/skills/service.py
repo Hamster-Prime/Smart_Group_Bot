@@ -11,9 +11,12 @@ from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
+from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.music_search import MusicSearchSkill
+from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
+from bot.services.skills.task_manage import TaskManageSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.utils.conversation_context import (
@@ -51,6 +54,9 @@ class SkillService:
         self.max_tool_rounds = max(1, max_tool_rounds)
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
+        self._register(MemoryManageSkill())
+        self._register(RuleManageSkill())
+        self._register(TaskManageSkill())
         self._register(ScheduledTaskSkill(settings))
         self._register(SendStickerSkill())
         self._register(MusicSearchSkill(settings))

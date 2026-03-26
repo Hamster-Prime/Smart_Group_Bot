@@ -56,6 +56,9 @@ def build_bot_runtime_profile_context(
     moderation_enabled = bool(getattr(getattr(settings, "moderation", None), "enabled", True))
 
     skill_labels = {
+        "memory_manage": "永久记忆查看、添加与修改",
+        "rule_manage": "群规查看与新增",
+        "task_manage": "定时任务创建与查看",
         "scheduled_task": "定时任务创建与取消",
         "send_sticker": "按语义发送贴纸",
         "music_search": "音乐搜索、歌曲发送、播放链接、封面与歌词",
@@ -83,7 +86,8 @@ def build_bot_runtime_profile_context(
         f"registered_skills: {', '.join(normalized_skills) if normalized_skills else '(none)'}",
         f"user_visible_capabilities: {'；'.join(capabilities)}",
         (
-            "runtime_logic: 先做安全边界和内容审核；管理员可直接用自然语言管理永久记忆和群规；"
+            "runtime_logic: 先做安全边界和内容审核；管理员和成员的语义管理请求会优先交给主回复模型调管理技能；"
+            "永久记忆/群规/定时任务的删除统一走 /lm、/rules、/tasks 等命令页内联按钮；"
             "普通对话会写入记忆并在需要时压缩；决策模型先判断是否回复；"
             "需要外部能力时调用技能；否则由主回复模型生成自然回复。"
         ),
