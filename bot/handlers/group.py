@@ -82,6 +82,74 @@ _PENDING_REPLY_QUESTION_RE = re.compile(
 )
 
 
+@dataclass(slots=True)
+class _SenderIdentity:
+    actor_id: int
+    username: str
+    display_name: str
+    is_chat: bool
+
+
+def _uses_sender_chat_identity(message: Message) -> bool:
+    sender_chat = getattr(message, "sender_chat", None)
+    user = getattr(message, "from_user", None)
+    if sender_chat is None:
+        return False
+    return user is None or bool(getattr(user, "is_bot", False))
+
+
+def _resolve_sender_identity(message: Message) -> _SenderIdentity:
+    user = getattr(message, "from_user", None)
+    if _uses_sender_chat_identity(message):
+        sender_chat = getattr(message, "sender_chat", None)
+        actor_id = int(getattr(sender_chat, "id", 0) or 0)
+        username = (getattr(sender_chat, "username", None) or "").strip()
+        display_name = (
+            (getattr(sender_chat, "title", None) or "").strip()
+            or (getattr(message, "author_signature", None) or "").strip()
+            or (f"@{username}" if username else "")
+            or f"chat:{actor_id}"
+        )
+        return _SenderIdentity(
+            actor_id=actor_id,
+            username=username,
+            display_name=display_name,
+            is_chat=True,
+        )
+
+    actor_id = int(getattr(user, "id", 0) or 0)
+    username = (getattr(user, "username", None) or "").strip()
+    display_name = ((getattr(user, "full_name", None) or "").strip() or "unknown") if user else "unknown"
+    return _SenderIdentity(
+        actor_id=actor_id,
+        username=username,
+        display_name=display_name,
+        is_chat=False,
+    )
+
+
+def _build_warn_target(
+    *,
+    user: object | None,
+    actor_id: int,
+    display_name: str,
+    sender_username: str,
+    sender_is_chat: bool,
+) -> str:
+    if sender_is_chat:
+        safe_name = html.escape((display_name or "该频道").strip() or "该频道")
+        safe_username = html.escape((sender_username or "").strip())
+        if safe_username:
+            return f'<a href="https://t.me/{safe_username}">{safe_name}</a>'
+        return safe_name
+
+    if user and getattr(user, "username", None):
+        return f"@{user.username}"
+
+    label = (getattr(user, "full_name", None) or str(actor_id)).strip() if user else str(actor_id)
+    return f'<a href="tg://user?id={actor_id}">{html.escape(label or str(actor_id))}</a>'
+
+
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
     """Avoid misaddressing non-owner users as '主人'."""
     if sender_is_owner:
@@ -1425,14 +1493,15 @@ async def on_group_message(
 ) -> None:
     if not is_group(message):
         return
-    if message.from_user and message.from_user.is_bot:
+    if message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message):
         return
     if not await ensure_group_authorized(message, session, settings):
         return
 
     group_id = message.chat.id
     user = message.from_user
-    user_id = user.id if user else 0
+    sender_identity = _resolve_sender_identity(message)
+    user_id = sender_identity.actor_id
     group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
     group_row.settings = record_group_activity(group_row.settings, settings.bot)
 
@@ -1442,10 +1511,12 @@ async def on_group_message(
     input_text = text
     flow_started = time.perf_counter()
 
-    warn_target = (
-        f"@{user.username}"
-        if user and user.username
-        else f'<a href="tg://user?id={user_id}">{html.escape((user.full_name if user else str(user_id)) or str(user_id))}</a>'
+    warn_target = _build_warn_target(
+        user=user,
+        actor_id=user_id,
+        display_name=sender_identity.display_name,
+        sender_username=sender_identity.username,
+        sender_is_chat=sender_identity.is_chat,
     )
 
     group_settings = group_row.settings or {}
@@ -1455,27 +1526,24 @@ async def on_group_message(
         log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
         return
 
-    sender_username = (user.username or "").strip() if user else ""
-    sender_is_owner = bool(user and is_super_admin_user_id(user.id, settings))
-    sender_is_tg_admin = await is_user_admin(message)
+    sender_username = sender_identity.username
+    display_name = sender_identity.display_name
+    sender_is_owner = bool(user and not sender_identity.is_chat and is_super_admin_user_id(user.id, settings))
+    sender_chat = getattr(message, "sender_chat", None)
+    sender_is_group_identity = bool(
+        sender_identity.is_chat and sender_chat and getattr(sender_chat, "id", None) == group_id
+    )
+    sender_is_tg_admin = sender_is_group_identity or await is_user_admin(message)
     owner_flag = "yes" if sender_is_owner else "no"
     tg_admin_flag = "yes" if sender_is_tg_admin else "no"
     trusted_source = "tg_admin" if sender_is_tg_admin else "none"
     sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
-    if user:
-        display_name = (user.full_name or "").strip() or "unknown"
-        # Keep id/admin flags at the front so trust metadata survives truncation/compression.
-        user_tag = (
-            f"id:{user_id} username:{sender_username_tag} "
-            f"is_owner:{owner_flag} is_tg_admin:{tg_admin_flag} trusted_source:{trusted_source} "
-            f"name:{display_name}"
-        )
-    else:
-        user_tag = (
-            "id:0 username:(none) "
-            "is_owner:no is_tg_admin:no trusted_source:none "
-            "name:unknown"
-        )
+    # Keep id/admin flags at the front so trust metadata survives truncation/compression.
+    user_tag = (
+        f"id:{user_id} username:{sender_username_tag} "
+        f"is_owner:{owner_flag} is_tg_admin:{tg_admin_flag} trusted_source:{trusted_source} "
+        f"name:{display_name}"
+    )
 
     llm = LLMService(
         settings.bot.main_model,
@@ -1526,12 +1594,14 @@ async def on_group_message(
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
-        auto_exempt_tg_admin = sender_is_tg_admin
+        auto_exempt_moderation = sender_is_tg_admin or sender_identity.is_chat
+        auto_exempt_reason = "tg_admin_auto_exempt" if sender_is_tg_admin else "sender_chat_auto_exempt"
         manual_exempt = False
-        if auto_exempt_tg_admin:
+        if auto_exempt_moderation:
             log.info(
-                "[%s] moderation skipped | reason=tg_admin_auto_exempt user=%s",
+                "[%s] moderation skipped | reason=%s user=%s",
                 group_id,
+                auto_exempt_reason,
                 user_id,
             )
         else:
@@ -1539,7 +1609,7 @@ async def on_group_message(
             if manual_exempt:
                 log.info("[%s] moderation skipped | reason=manual_exempt user=%s", group_id, user_id)
 
-        if not auto_exempt_tg_admin and not manual_exempt:
+        if not auto_exempt_moderation and not manual_exempt:
             violated, reason, rule = await mod.check_rules(session, group_id, input_text)
             log.info(
                 "[%s]【流程】审核 | 完成 | 违规=%s | 原因=%s | 耗时=%dms",
@@ -1674,7 +1744,7 @@ async def on_group_message(
             "user",
             memory_entry,
             user_id=user_id,
-            sender_name=display_name if user else "",
+            sender_name=display_name,
             message_type=msg_type,
             message_id=str(message.message_id),
             created_at=message.date,
