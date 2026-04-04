@@ -31,6 +31,7 @@ class AtReplyModeHelpersTests(unittest.TestCase):
 
         self.assertIn("已开启", text)
         self.assertIn("显式 @bot", text)
+        self.assertIn("回复 bot 消息", text)
 
 
 class AdminAtReplyCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -178,6 +179,32 @@ class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
             is_mentioned=True,
             is_reply=False,
             is_reply_to_bot=False,
+            is_reply_to_other=False,
+            mentions_other_user=False,
+            is_owner=False,
+            is_tg_admin=False,
+            user_tag="id:123",
+            msg_type="text",
+            history=[],
+            merged_count=1,
+            merged_context="",
+        )
+
+        self.assertEqual(action, "casual")
+        self.assertTrue(forced)
+        decision_svc.decide.assert_not_awaited()
+
+    async def test_at_reply_enabled_forces_casual_on_reply_to_bot(self) -> None:
+        decision_svc = SimpleNamespace(decide=AsyncMock(return_value="skip"))
+
+        action, forced = await group._resolve_pending_reply_action(
+            decision_svc=decision_svc,
+            group_settings={"at_reply_mode": True},
+            explicit_mention=False,
+            input_text="继续说",
+            is_mentioned=False,
+            is_reply=True,
+            is_reply_to_bot=True,
             is_reply_to_other=False,
             mentions_other_user=False,
             is_owner=False,

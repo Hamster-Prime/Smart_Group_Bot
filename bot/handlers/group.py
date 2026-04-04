@@ -994,7 +994,7 @@ async def _resolve_pending_reply_action(
     merged_context: str,
 ) -> tuple[str, bool]:
     if is_at_reply_enabled(group_settings):
-        return ("casual" if explicit_mention else "skip"), True
+        return ("casual" if (explicit_mention or is_reply_to_bot) else "skip"), True
 
     action = await decision_svc.decide(
         input_text,
@@ -1097,10 +1097,11 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             )
             if action_forced:
                 log.info(
-                    "[%s] pending batch action forced | action=%s explicit_mention=%s elapsed=%dms",
+                    "[%s] pending batch action forced | action=%s explicit_mention=%s reply_to_bot=%s elapsed=%dms",
                     group_id,
                     action,
                     explicit_mention,
+                    reply_to_bot,
                     int((time.perf_counter() - decision_started) * 1000),
                 )
             else:

@@ -37,7 +37,7 @@ def build_at_reply_status_text(*, group_id: int, group_settings: dict | None) ->
     enabled = is_at_reply_enabled(group_settings)
     state_text = "已开启" if enabled else "已关闭"
     detail_text = (
-        "仅在显式 @bot 时必回复；未 @ 时仍会照常审核、写入记忆，但回复阶段按 skip 跳过。"
+        "仅在显式 @bot 或回复 bot 消息时必回复；未触发时仍会照常审核、写入记忆，但回复阶段按 skip 跳过。"
         if enabled
         else "当前保持默认回复策略，不影响现有决策逻辑。"
     )
