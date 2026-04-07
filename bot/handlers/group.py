@@ -25,6 +25,16 @@ from bot.services import memory_holder
 from bot.services.at_reply import is_at_reply_enabled
 from bot.services.authz import ensure_group_authorized, is_group_admin_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
+from bot.services.chat_bridge import (
+    ChatBridgeService,
+    compose_chat_bridge_message,
+    extract_chat_bridge_target_username,
+    get_chat_bridge_state,
+    is_bot_style_name,
+    normalize_chat_bridge_username,
+    parse_incoming_chat_bridge_message,
+    set_chat_bridge_target,
+)
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import DoubaoTTSService, is_tts_always_enabled, is_tts_tool_enabled, normalize_tts_mode
 from bot.services.group_intent import GroupIntent
@@ -1014,6 +1024,257 @@ async def _resolve_pending_reply_action(
     return action, False
 
 
+def _build_chat_bridge_memory_entry(
+    *,
+    sender_id: int,
+    sender_username: str,
+    display_name: str,
+    text: str,
+) -> str:
+    sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
+    return (
+        f"id:{sender_id} username:{sender_username_tag} "
+        f"is_owner:no is_tg_admin:no trusted_source:none "
+        f"name:{display_name} {text}"
+    )
+
+
+def _chat_bridge_fallback_body(mode: str) -> str:
+    if mode == "start":
+        return "最近群里这个话题你怎么看？"
+    return "你刚才那句展开说说？"
+
+
+async def _generate_chat_bridge_body(
+    *,
+    settings: Settings,
+    group_id: int,
+    peer_username: str,
+    mode: str,
+    current_message: str,
+    message: Message,
+) -> str:
+    memory = memory_holder.get()
+    llm = LLMService(
+        settings.bot.main_model,
+        settings.bot.decision_model,
+        settings.bot.compress_model,
+        moderation=settings.bot.moderation_model,
+        embed=settings.bot.embed_model,
+        max_context_tokens=settings.bot.max_context_tokens,
+    )
+    bridge = ChatBridgeService(llm, settings=settings)
+    history = await memory.get_history_for_llm(
+        group_id,
+        prompt_payload_builder=lambda candidate_history: bridge.build_prompt_payload(
+            mode=mode,
+            peer_username=peer_username,
+            current_message=current_message,
+            history=candidate_history,
+        ),
+    )
+
+    async with typing_action(message, enabled=settings.bot.enable_typing):
+        body = await bridge.reply(
+            mode=mode,
+            peer_username=peer_username,
+            current_message=current_message,
+            history=history,
+        )
+
+    cleaned = sanitize_outgoing_text(body)
+    if cleaned:
+        return cleaned
+    return _chat_bridge_fallback_body(mode)
+
+
+async def _send_chat_bridge_turn(
+    *,
+    settings: Settings,
+    message: Message,
+    group_id: int,
+    peer_username: str,
+    mode: str,
+    current_message: str,
+) -> bool:
+    reply_body = await _generate_chat_bridge_body(
+        settings=settings,
+        group_id=group_id,
+        peer_username=peer_username,
+        mode=mode,
+        current_message=current_message,
+        message=message,
+    )
+    outgoing = compose_chat_bridge_message(peer_username, reply_body)
+    if not outgoing:
+        outgoing = compose_chat_bridge_message(peer_username, _chat_bridge_fallback_body(mode))
+    if not outgoing:
+        return False
+
+    sent_ok = await send_reply(
+        message,
+        outgoing,
+        delivery_mode="message",
+        stream=settings.bot.enable_streaming,
+        stream_chunk_size=settings.bot.stream_chunk_size,
+        stream_interval=settings.bot.stream_edit_interval_sec,
+        auto_delete_minutes=0,
+    )
+    if not sent_ok:
+        return False
+
+    memory = memory_holder.get()
+    await memory.add_message(
+        group_id,
+        "assistant",
+        outgoing,
+        sender_name="bot",
+        message_type="assistant_reply",
+    )
+    await memory.compact_if_needed(group_id)
+    return True
+
+
+async def _maybe_handle_chat_bridge_target_reply(
+    *,
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    group_row: Group,
+    sender_identity: _SenderIdentity,
+    input_text: str,
+    my_username: str,
+) -> bool:
+    state = get_chat_bridge_state(group_row.settings)
+    if not state.waiting_for_target:
+        return False
+    if sender_identity.is_chat:
+        return False
+
+    user = message.from_user
+    if user is None or user.is_bot or not is_super_admin_user_id(user.id, settings):
+        return False
+    if state.pending_admin_id and user.id != state.pending_admin_id:
+        return False
+
+    reply = getattr(message, "reply_to_message", None)
+    prompt_message_id = int(getattr(reply, "message_id", 0) or 0)
+    if state.prompt_message_id and prompt_message_id != state.prompt_message_id:
+        return False
+
+    target_username = extract_chat_bridge_target_username(input_text)
+    if not target_username:
+        await answer_with_auto_delete(
+            message,
+            "<b>/chat 对话设置</b>\n请回复目标 bot 用户名，格式例如：@examplebot",
+            auto_delete_minutes=0,
+        )
+        return True
+
+    if target_username == normalize_chat_bridge_username(my_username):
+        await answer_with_auto_delete(
+            message,
+            "<b>/chat 对话设置</b>\n目标 bot 不能是当前 bot 自己，请换一个用户名。",
+            auto_delete_minutes=0,
+        )
+        return True
+
+    if not is_bot_style_name(target_username):
+        await answer_with_auto_delete(
+            message,
+            "<b>/chat 对话设置</b>\n目标用户名需要明显是 bot 账号，并以 bot 结尾，例如：@examplebot",
+            auto_delete_minutes=0,
+        )
+        return True
+
+    group_row.settings = set_chat_bridge_target(group_row.settings, target_username)
+    await _best_effort_commit(
+        session,
+        group_id=message.chat.id,
+        context="chat_bridge_target_set",
+    )
+
+    sent_ok = await _send_chat_bridge_turn(
+        settings=settings,
+        message=message,
+        group_id=message.chat.id,
+        peer_username=target_username,
+        mode="start",
+        current_message="",
+    )
+    if not sent_ok:
+        await answer_with_auto_delete(
+            message,
+            "<b>/chat 对话设置</b>\n已记录目标 bot，但首条 /chat 消息发送失败，请稍后重试。",
+            auto_delete_minutes=0,
+        )
+    return True
+
+
+async def _maybe_handle_chat_bridge_turn(
+    *,
+    message: Message,
+    settings: Settings,
+    sender_identity: _SenderIdentity,
+    input_text: str,
+    group_row: Group,
+    my_username: str,
+) -> bool:
+    state = get_chat_bridge_state(group_row.settings)
+    incoming = parse_incoming_chat_bridge_message(input_text)
+    if incoming is None or not state.active:
+        return False
+
+    my_username_norm = normalize_chat_bridge_username(my_username)
+    if not my_username_norm or incoming.target_username != my_username_norm:
+        return False
+
+    user = message.from_user
+    sender_username = normalize_chat_bridge_username(sender_identity.username)
+    if user is None or not user.is_bot or not sender_username:
+        return False
+    if sender_username != state.target_username:
+        log.info(
+            "[%s] chat bridge ignored | sender=@%s active_target=@%s",
+            message.chat.id,
+            sender_username or "(none)",
+            state.target_username or "(none)",
+        )
+        return False
+    if not is_bot_style_name(sender_username, sender_identity.display_name, getattr(user, "full_name", "")):
+        return False
+
+    memory = memory_holder.get()
+    await memory.add_message(
+        message.chat.id,
+        "user",
+        _build_chat_bridge_memory_entry(
+            sender_id=sender_identity.actor_id,
+            sender_username=sender_username,
+            display_name=sender_identity.display_name,
+            text=input_text,
+        ),
+        user_id=sender_identity.actor_id,
+        sender_name=sender_identity.display_name,
+        message_type="chat_bridge_inbound",
+        message_id=str(message.message_id),
+        created_at=message.date,
+    )
+    await memory.compact_if_needed(message.chat.id)
+
+    sent_ok = await _send_chat_bridge_turn(
+        settings=settings,
+        message=message,
+        group_id=message.chat.id,
+        peer_username=sender_username,
+        mode="reply",
+        current_message=incoming.body,
+    )
+    if not sent_ok:
+        log.warning("[%s] chat bridge reply send failed | peer=@%s", message.chat.id, sender_username)
+    return True
+
+
 async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings: Settings) -> None:
     if not items:
         return
@@ -1494,8 +1755,6 @@ async def on_group_message(
 ) -> None:
     if not is_group(message):
         return
-    if message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message):
-        return
     if not await ensure_group_authorized(message, session, settings):
         return
 
@@ -1509,8 +1768,43 @@ async def on_group_message(
     text, msg_type = extract_message_text(message)
     if not text:
         return
+    if msg_type in {"video", "video_caption", "video_note"}:
+        log.info("[%s]銆愭祦绋嬨€戝獟浣撴梺璺?| 绫诲瀷=%s", group_id, msg_type)
+        return
     input_text = text
     flow_started = time.perf_counter()
+    group_settings = group_row.settings or {}
+    bot_me = await message.bot.me()
+    my_username = normalize_chat_bridge_username(bot_me.username or "")
+
+    if await _maybe_handle_chat_bridge_target_reply(
+        message=message,
+        session=session,
+        settings=settings,
+        group_row=group_row,
+        sender_identity=sender_identity,
+        input_text=input_text,
+        my_username=my_username,
+    ):
+        return
+
+    raw_bot_sender = bool(message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message))
+    if raw_bot_sender:
+        if await _maybe_handle_chat_bridge_turn(
+            message=message,
+            settings=settings,
+            sender_identity=sender_identity,
+            input_text=input_text,
+            group_row=group_row,
+            my_username=my_username,
+        ):
+            await _best_effort_commit(
+                session,
+                group_id=group_id,
+                context="chat_bridge_turn",
+            )
+            return
+        return
 
     warn_target = _build_warn_target(
         user=user,
@@ -1520,7 +1814,6 @@ async def on_group_message(
         sender_is_chat=sender_identity.is_chat,
     )
 
-    group_settings = group_row.settings or {}
     mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 
     if msg_type in {"video", "video_caption", "video_note"}:
@@ -1754,7 +2047,6 @@ async def on_group_message(
     else:
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
 
-    bot_me = await message.bot.me()
     explicit_mention = has_explicit_bot_mention(message, bot_me.username or "", bot_me.id)
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)
     is_reply = is_reply_message(message)

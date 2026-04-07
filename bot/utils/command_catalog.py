@@ -14,7 +14,7 @@ class CommandEntry:
 
 _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/help", "/help", "查看完整帮助", "用户问你有哪些命令、怎么用、功能总览", "核心入口"),
-    CommandEntry("/lm", "/lm", "查看永久记忆列表，支持翻页和删除", "用户要查看、删除永久记忆，或找不到某条记忆", "核心入口"),
+    CommandEntry("/lm", "/lm", "查看永久记忆列表，支持翻页和删除", "用户想查看、删除永久记忆，或找不到某条记忆", "核心入口"),
     CommandEntry("/lm add", "/lm add <内容>", "新增一条永久记忆", "用户想显式通过命令写入永久记忆", "核心入口"),
     CommandEntry(
         "/lm replace",
@@ -24,10 +24,10 @@ _COMMANDS: tuple[CommandEntry, ...] = (
         "核心入口",
     ),
     CommandEntry("/task", "/task <自然语言>", "创建定时任务", "用户想显式创建提醒或定时查询任务", "核心入口"),
-    CommandEntry("/tasks", "/tasks", "查看定时任务列表，支持翻页和删除", "用户要查看或删除已有定时任务", "核心入口"),
+    CommandEntry("/tasks", "/tasks", "查看定时任务列表，支持翻页和删除", "用户想查看或删除已有定时任务", "核心入口"),
     CommandEntry("/canceltask", "/canceltask <任务ID>", "按任务 ID 取消定时任务", "用户已经知道任务 ID，想直接取消", "核心入口"),
     CommandEntry("/addrule", "/addrule <自然语言>", "新增群规", "用户想显式通过命令新增群规", "核心入口"),
-    CommandEntry("/rules", "/rules", "查看群规列表，支持翻页和删除", "用户要查看或删除群规", "核心入口"),
+    CommandEntry("/rules", "/rules", "查看群规列表，支持翻页和删除", "用户想查看或删除群规", "核心入口"),
     CommandEntry("/av", "/av <番号/演员/关键词>", "搜索 AV 资源", "用户想搜片或查询 AV 详情", "核心入口"),
     CommandEntry("/warnings", "/warnings", "查看当前群警告/封禁名单", "管理员想查看审核处罚情况", "群审核管理"),
     CommandEntry("/aiexempt", "回复目标用户消息后发送 /aiexempt", "豁免某用户的 AI 审核", "管理员想让某用户跳过审核", "群审核管理"),
@@ -44,6 +44,7 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/unauthadmin", "回复用户后 /unauthadmin，或 /unauthadmin <群ID> <用户ID>", "撤销群管理员权限", "最高管理员要取消某人群管理权限", "最高管理员命令"),
     CommandEntry("/adminlist", "/adminlist <群ID> 或群内直接 /adminlist", "查看群管理列表", "最高管理员要查看某群管理列表", "最高管理员命令"),
     CommandEntry("/atreply", "/atreply 或 /atreply enable|disable", "控制仅 @ 才回复", "最高管理员要调整 bot 的 @ 回复模式", "最高管理员命令"),
+    CommandEntry("/chat", "/chat 或 /chat enable|disable", "控制 bot 间 /chat 对话", "最高管理员要让 bot 与另一个 bot 开始互聊", "最高管理员命令"),
     CommandEntry("/tts", "/tts 或 /tts enable|disable|always", "控制 TTS 状态", "最高管理员要查看或调整语音模式", "最高管理员命令"),
     CommandEntry("/av enable", "/av enable", "启用本群 AV 查询", "最高管理员要在当前群打开 AV 查询", "最高管理员命令"),
     CommandEntry("/av disable", "/av disable", "停用本群 AV 查询", "最高管理员要在当前群关闭 AV 查询", "最高管理员命令"),
@@ -80,6 +81,7 @@ def build_help_text() -> str:
         "/authgroup / unauthgroup / authlist\n"
         "/authadmin / unauthadmin / adminlist\n"
         "/atreply / atreply enable|disable\n"
+        "/chat / chat enable|disable\n"
         "/tts / tts enable|disable|always\n"
         "/av enable|disable"
     )

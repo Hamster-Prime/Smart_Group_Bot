@@ -1,6 +1,6 @@
 import unittest
 
-from bot.utils.prompts import REPLY_MODE_SYSTEM, STICKER_DECISION_SYSTEM
+from bot.utils.prompts import CHAT_BRIDGE_SYSTEM, REPLY_MODE_SYSTEM, STICKER_DECISION_SYSTEM
 
 
 class RuntimePromptBlockTests(unittest.TestCase):
@@ -31,3 +31,14 @@ class RuntimePromptBlockTests(unittest.TestCase):
             "[STICKER_CANDIDATES]",
         ):
             self.assertIn(block, STICKER_DECISION_SYSTEM)
+
+    def test_chat_bridge_prompt_lists_runtime_blocks(self) -> None:
+        for block in (
+            "[CURRENT_TIME]",
+            "[CHAT_BRIDGE_MODE]",
+            "[PEER_BOT]",
+            "[RECENT_GROUP_CONTEXT]",
+            "[CURRENT_TURN_FOCUS]",
+            "[CURRENT_BRIDGE_MESSAGE]",
+        ):
+            self.assertIn(block, CHAT_BRIDGE_SYSTEM)

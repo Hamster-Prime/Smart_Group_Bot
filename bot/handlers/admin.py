@@ -27,6 +27,11 @@ from bot.services.authz import (
     list_group_admins,
     list_authorized_groups,
 )
+from bot.services.chat_bridge import (
+    begin_chat_bridge_target_selection,
+    build_chat_bridge_status_text,
+    set_chat_bridge_enabled,
+)
 from bot.services.doubao_tts import (
     DoubaoTTSService,
     TTS_MODE_ALWAYS,
@@ -77,6 +82,13 @@ _AT_REPLY_USAGE = (
     "0. /atreply（查看当前状态）\n"
     "1. /atreply enable\n"
     "2. /atreply disable\n\n"
+    "请最高管理员在目标群内使用。"
+)
+_CHAT_USAGE = (
+    "<b>命令用法</b>\n"
+    "0. /chat（查看当前状态）\n"
+    "1. /chat enable\n"
+    "2. /chat disable\n\n"
     "请最高管理员在目标群内使用。"
 )
 
@@ -1300,6 +1312,74 @@ async def cmd_atreply(message: Message, session: AsyncSession, settings: Setting
             group_settings=group_row.settings,
         ),
     )
+
+
+@router.message(F.text.regexp(r"^/chat(?:@[A-Za-z][A-Za-z0-9_]{4,31})?(?:\s+(?:enable|disable))?\s*$"))
+async def cmd_chat(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip().lower()
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>/chat 对话设置</b>\n请在目标群内使用该命令。")
+        return
+
+    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+    group_settings = dict(group_row.settings or {})
+
+    if not args:
+        await _answer(
+            message,
+            settings,
+            build_chat_bridge_status_text(
+                group_id=message.chat.id,
+                group_settings=group_settings,
+            ),
+        )
+        return
+
+    if args == "disable":
+        group_row.settings = set_chat_bridge_enabled(group_settings, False)
+        await _maybe_flush(session)
+        await _answer(
+            message,
+            settings,
+            build_chat_bridge_status_text(
+                group_id=message.chat.id,
+                group_settings=group_row.settings,
+            ),
+        )
+        return
+
+    if args != "enable":
+        await _answer(message, settings, _CHAT_USAGE)
+        return
+
+    pending_settings = begin_chat_bridge_target_selection(
+        group_settings,
+        admin_id=(message.from_user.id if message.from_user else 0),
+    )
+    group_row.settings = pending_settings
+    await _maybe_flush(session)
+
+    prompt = (
+        "<b>/chat 对话设置</b>\n"
+        "<b>状态</b>: 已开启，等待目标 bot\n"
+        "<b>下一步</b>: 请回复这条消息，发送目标 bot 用户名，例如：@examplebot"
+    )
+    sent = await answer_with_auto_delete(
+        message,
+        prompt,
+        auto_delete_minutes=0,
+    )
+    group_row.settings = begin_chat_bridge_target_selection(
+        group_row.settings,
+        admin_id=(message.from_user.id if message.from_user else 0),
+        prompt_message_id=int(getattr(sent, "message_id", 0) or 0),
+    )
+    await _maybe_flush(session)
 
 
 @router.message(Command("warnings"))
