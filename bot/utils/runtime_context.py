@@ -47,6 +47,20 @@ def _normalize_skill_names(skill_names: Iterable[str] | None) -> list[str]:
     return normalized
 
 
+def _model_value(
+    *,
+    settings: Any | None,
+    llm: Any,
+    settings_attr: str,
+    llm_attr: str,
+) -> Any:
+    bot_cfg = getattr(settings, "bot", None)
+    candidate = getattr(bot_cfg, settings_attr, None) if bot_cfg is not None else None
+    if candidate is not None:
+        return candidate
+    return getattr(llm, llm_attr, None)
+
+
 def build_bot_runtime_profile_context(
     llm: Any,
     *,
@@ -75,6 +89,33 @@ def build_bot_runtime_profile_context(
         "永久记忆读写与上下文摘要",
         "群规审核与违规处理" if moderation_enabled else "群规审核当前关闭",
     ]
+    main_cfg = _model_value(settings=settings, llm=llm, settings_attr="main_model", llm_attr="main")
+    decision_cfg = _model_value(
+        settings=settings,
+        llm=llm,
+        settings_attr="decision_model",
+        llm_attr="decision_config",
+    )
+    moderation_cfg = _model_value(
+        settings=settings,
+        llm=llm,
+        settings_attr="moderation_model",
+        llm_attr="moderation_config",
+    )
+    compress_cfg = _model_value(
+        settings=settings,
+        llm=llm,
+        settings_attr="compress_model",
+        llm_attr="compress_config",
+    )
+    embed_cfg = _model_value(
+        settings=settings,
+        llm=llm,
+        settings_attr="embed_model",
+        llm_attr="embed_config",
+    )
+    chat_bridge_cfg = getattr(getattr(settings, "bot", None), "chat_bridge_model", None)
+
     for name in normalized_skills:
         label = skill_labels.get(name)
         if label and label not in capabilities:
@@ -93,19 +134,22 @@ def build_bot_runtime_profile_context(
             "普通对话会写入记忆并在需要时压缩；决策模型先判断是否回复；"
             "需要外部能力时调用技能；否则由主回复模型生成自然回复。"
         ),
-        f"main_reply_model: {getattr(getattr(llm, 'main', None), 'model', '(unknown)')}",
-        f"main_reply_fallbacks: {_format_fallback_models(getattr(llm, 'main', None))}",
+        f"main_reply_model: {getattr(main_cfg, 'model', '(unknown)')}",
+        f"main_reply_fallbacks: {_format_fallback_models(main_cfg)}",
         "skill_planner_model: same_as_main_reply",
         "vision_model: same_as_main_reply",
-        f"decision_model: {getattr(getattr(llm, 'decision_config', None), 'model', '(unknown)')}",
-        f"decision_fallbacks: {_format_fallback_models(getattr(llm, 'decision_config', None))}",
-        f"moderation_model: {getattr(getattr(llm, 'moderation_config', None), 'model', '(unknown)')}",
-        f"moderation_fallbacks: {_format_fallback_models(getattr(llm, 'moderation_config', None))}",
-        f"compress_model: {getattr(getattr(llm, 'compress_config', None), 'model', '(unknown)')}",
-        f"compress_fallbacks: {_format_fallback_models(getattr(llm, 'compress_config', None))}",
-        f"embed_model: {getattr(getattr(llm, 'embed_config', None), 'model', '(unknown)')}",
-        f"embed_fallbacks: {_format_fallback_models(getattr(llm, 'embed_config', None))}",
+        f"decision_model: {getattr(decision_cfg, 'model', '(unknown)')}",
+        f"decision_fallbacks: {_format_fallback_models(decision_cfg)}",
+        f"moderation_model: {getattr(moderation_cfg, 'model', '(unknown)')}",
+        f"moderation_fallbacks: {_format_fallback_models(moderation_cfg)}",
+        f"compress_model: {getattr(compress_cfg, 'model', '(unknown)')}",
+        f"compress_fallbacks: {_format_fallback_models(compress_cfg)}",
+        f"embed_model: {getattr(embed_cfg, 'model', '(unknown)')}",
+        f"embed_fallbacks: {_format_fallback_models(embed_cfg)}",
     ]
+    if chat_bridge_cfg is not None:
+        lines.append(f"chat_bridge_model: {getattr(chat_bridge_cfg, 'model', '(unknown)')}")
+        lines.append(f"chat_bridge_fallbacks: {_format_fallback_models(chat_bridge_cfg)}")
     if "doubao_tts" in normalized_skills:
         tts_model = str(getattr(settings, "doubao_tts_model", "") or "").strip() or "(provider default)"
         lines.append(f"tts_model: {tts_model}")

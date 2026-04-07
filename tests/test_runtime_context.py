@@ -53,6 +53,18 @@ class RuntimeContextTests(unittest.TestCase):
             settings=SimpleNamespace(
                 moderation=SimpleNamespace(enabled=True),
                 doubao_tts_model="seed-tts-2.0",
+                bot=SimpleNamespace(
+                    chat_bridge_model=ModelConfig(
+                        model="openai/gpt-4.1-nano-bridge",
+                        fallbacks=[
+                            ChatEndpointConfig(
+                                model="gemini/gemini-2.0-flash",
+                                temperature=0.7,
+                                max_tokens=512,
+                            )
+                        ],
+                    )
+                ),
             ),
             skill_names=["websearch", "music_search", "webfetch", "doubao_tts", "websearch"],
         )
@@ -68,6 +80,8 @@ class RuntimeContextTests(unittest.TestCase):
         self.assertIn("moderation_model: openai/gpt-4.1-mini", text)
         self.assertIn("compress_model: openai/gpt-4.1-nano", text)
         self.assertIn("embed_model: gemini/text-embedding-004", text)
+        self.assertIn("chat_bridge_model: openai/gpt-4.1-nano-bridge", text)
+        self.assertIn("chat_bridge_fallbacks: gemini/gemini-2.0-flash", text)
         self.assertIn("main_reply_fallbacks: gemini/gemini-2.0-flash", text)
         self.assertIn("embed_fallbacks: openai/text-embedding-3-small", text)
         self.assertIn("skill_planner_model: same_as_main_reply", text)

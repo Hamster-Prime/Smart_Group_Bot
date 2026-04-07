@@ -1056,7 +1056,7 @@ async def _generate_chat_bridge_body(
 ) -> str:
     memory = memory_holder.get()
     llm = LLMService(
-        settings.bot.main_model,
+        settings.bot.chat_bridge_model,
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
