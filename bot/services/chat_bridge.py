@@ -310,4 +310,4 @@ class ChatBridgeService:
             len(history) if history else 0,
         )
         result = await self.llm.chat(payload["messages"])
-        return clean_multiline_text(strip_chat_bridge_prefix(result), max_len=160)
+        return clean_multiline_text(strip_chat_bridge_prefix(result), max_len=1200)

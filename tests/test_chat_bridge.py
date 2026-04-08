@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from bot.config import Settings
 from bot.handlers import admin, group
 from bot.services.chat_bridge import (
+    ChatBridgeService,
     begin_chat_bridge_target_selection,
     build_chat_bridge_status_text,
     compose_chat_bridge_message,
@@ -148,6 +149,21 @@ class AdminChatCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(group_row.settings, set_chat_bridge_enabled(group_row.settings, False))
         self.assertIn("已关闭", answer_mock.await_args.args[2])
+
+
+class ChatBridgeReplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_does_not_hard_truncate_normal_long_output(self) -> None:
+        llm = SimpleNamespace(chat=AsyncMock(return_value="A" * 300))
+        service = ChatBridgeService(llm, settings=_settings())
+
+        result = await service.reply(
+            mode="reply",
+            peer_username="peerbot",
+            current_message="你好",
+            history=[],
+        )
+
+        self.assertEqual(len(result), 300)
 
 
 class GroupChatBridgeRoutingTests(unittest.IsolatedAsyncioTestCase):
