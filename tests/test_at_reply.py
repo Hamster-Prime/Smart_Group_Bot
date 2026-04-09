@@ -29,9 +29,8 @@ class AtReplyModeHelpersTests(unittest.TestCase):
     def test_status_text_mentions_enabled_behavior(self) -> None:
         text = build_at_reply_status_text(group_id=-10001, group_settings={"at_reply_mode": True})
 
-        self.assertIn("已开启", text)
-        self.assertIn("显式 @bot", text)
-        self.assertIn("回复 bot 消息", text)
+        self.assertIn("@bot", text)
+        self.assertIn("bot", text)
 
 
 class AdminAtReplyCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -118,7 +117,13 @@ class AdminAtReplyCommandTests(unittest.IsolatedAsyncioTestCase):
             await admin.cmd_atreply(message, session=session, settings=settings)
 
         self.assertTrue(group_row.settings["at_reply_mode"])
-        self.assertIn("已开启", answer_mock.await_args.args[2])
+        self.assertEqual(
+            answer_mock.await_args.args[2],
+            build_at_reply_status_text(
+                group_id=message.chat.id,
+                group_settings=group_row.settings,
+            ),
+        )
 
     async def test_cmd_atreply_disable_clears_settings(self) -> None:
         message = SimpleNamespace(
@@ -138,7 +143,13 @@ class AdminAtReplyCommandTests(unittest.IsolatedAsyncioTestCase):
             await admin.cmd_atreply(message, session=session, settings=settings)
 
         self.assertNotIn("at_reply_mode", group_row.settings)
-        self.assertIn("已关闭", answer_mock.await_args.args[2])
+        self.assertEqual(
+            answer_mock.await_args.args[2],
+            build_at_reply_status_text(
+                group_id=message.chat.id,
+                group_settings=group_row.settings,
+            ),
+        )
 
 
 class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
@@ -149,7 +160,7 @@ class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
             decision_svc=decision_svc,
             group_settings={"at_reply_mode": True},
             explicit_mention=False,
-            input_text="你好",
+            input_text="hello",
             is_mentioned=False,
             is_reply=False,
             is_reply_to_bot=False,
@@ -175,7 +186,7 @@ class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
             decision_svc=decision_svc,
             group_settings={"at_reply_mode": True},
             explicit_mention=True,
-            input_text="@bot 帮我看下",
+            input_text="@bot help",
             is_mentioned=True,
             is_reply=False,
             is_reply_to_bot=False,
@@ -201,7 +212,7 @@ class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
             decision_svc=decision_svc,
             group_settings={"at_reply_mode": True},
             explicit_mention=False,
-            input_text="继续说",
+            input_text="continue",
             is_mentioned=False,
             is_reply=True,
             is_reply_to_bot=True,
@@ -220,14 +231,66 @@ class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(forced)
         decision_svc.decide.assert_not_awaited()
 
-    async def test_at_reply_disabled_still_uses_decision_service(self) -> None:
+    async def test_explicit_mention_bypasses_decision_even_when_at_reply_disabled(self) -> None:
+        decision_svc = SimpleNamespace(decide=AsyncMock(return_value="skip"))
+
+        action, forced = await group._resolve_pending_reply_action(
+            decision_svc=decision_svc,
+            group_settings={},
+            explicit_mention=True,
+            input_text="@bot help",
+            is_mentioned=True,
+            is_reply=False,
+            is_reply_to_bot=False,
+            is_reply_to_other=False,
+            mentions_other_user=False,
+            is_owner=False,
+            is_tg_admin=False,
+            user_tag="id:123",
+            msg_type="text",
+            history=[],
+            merged_count=1,
+            merged_context="",
+        )
+
+        self.assertEqual(action, "casual")
+        self.assertTrue(forced)
+        decision_svc.decide.assert_not_awaited()
+
+    async def test_reply_to_bot_bypasses_decision_even_when_at_reply_disabled(self) -> None:
+        decision_svc = SimpleNamespace(decide=AsyncMock(return_value="skip"))
+
+        action, forced = await group._resolve_pending_reply_action(
+            decision_svc=decision_svc,
+            group_settings={},
+            explicit_mention=False,
+            input_text="continue",
+            is_mentioned=False,
+            is_reply=True,
+            is_reply_to_bot=True,
+            is_reply_to_other=False,
+            mentions_other_user=False,
+            is_owner=False,
+            is_tg_admin=False,
+            user_tag="id:123",
+            msg_type="text",
+            history=[],
+            merged_count=1,
+            merged_context="",
+        )
+
+        self.assertEqual(action, "casual")
+        self.assertTrue(forced)
+        decision_svc.decide.assert_not_awaited()
+
+    async def test_non_mention_still_uses_decision_service_when_at_reply_disabled(self) -> None:
         decision_svc = SimpleNamespace(decide=AsyncMock(return_value="casual"))
 
         action, forced = await group._resolve_pending_reply_action(
             decision_svc=decision_svc,
             group_settings={},
             explicit_mention=False,
-            input_text="你好",
+            input_text="hello",
             is_mentioned=False,
             is_reply=False,
             is_reply_to_bot=False,

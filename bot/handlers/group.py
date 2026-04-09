@@ -1174,8 +1174,11 @@ async def _resolve_pending_reply_action(
     merged_count: int,
     merged_context: str,
 ) -> tuple[str, bool]:
+    if explicit_mention or is_reply_to_bot:
+        return "casual", True
+
     if is_at_reply_enabled(group_settings):
-        return ("casual" if (explicit_mention or is_reply_to_bot) else "skip"), True
+        return "skip", True
 
     action = await decision_svc.decide(
         input_text,
