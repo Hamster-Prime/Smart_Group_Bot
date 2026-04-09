@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 import litellm
@@ -37,6 +38,13 @@ from bot.utils.security import (
 
 log = logging.getLogger(__name__)
 
+_INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
+    "websearch": re.compile(r"^找到\s*\d+\s*[条个]\s*搜索结果[。！？!?\. ]*$"),
+    "webfetch": re.compile(r"^(?:网页)?抓取成功[。！？!?\. ]*$"),
+    "music_search": re.compile(r"^找到\s*\d+\s*首相关歌曲[。！？!?\. ]*$"),
+}
+_INFO_FOLLOWUP_SKILLS = frozenset({"websearch", "webfetch", "music_search"})
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,7 +56,7 @@ class SkillService:
         *,
         settings: Settings | None = None,
         default_sticker_file_ids: list[str] | None = None,
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 6,
     ) -> None:
         self.llm = llm
         self.settings = settings
@@ -376,6 +384,154 @@ class SkillService:
             "payload": result.payload,
         }
 
+    @staticmethod
+    def _latest_successful_tool_result(
+        tool_results: list[dict[str, Any]],
+        *,
+        allowed_skills: set[str] | frozenset[str] | None = None,
+    ) -> dict[str, Any] | None:
+        for entry in reversed(tool_results):
+            result = entry.get("result")
+            if not isinstance(result, SkillRunResult) or not result.ok:
+                continue
+            if allowed_skills and result.skill not in allowed_skills:
+                continue
+            return entry
+        return None
+
+    @classmethod
+    def _is_intermediate_tool_reply(
+        cls,
+        content: str,
+        *,
+        recent_tool_results: list[dict[str, Any]],
+        last_success_summary: str,
+    ) -> bool:
+        latest = cls._latest_successful_tool_result(
+            recent_tool_results,
+            allowed_skills=_INFO_FOLLOWUP_SKILLS,
+        )
+        if not latest:
+            return False
+
+        normalized = clean_multiline_text(content, max_len=240).strip()
+        if not normalized:
+            return True
+
+        if last_success_summary:
+            normalized_summary = clean_multiline_text(last_success_summary, max_len=240).strip()
+            if normalized_summary and normalized == normalized_summary:
+                return True
+
+        result = latest["result"]
+        pattern = _INTERMEDIATE_TOOL_REPLY_PATTERNS.get(result.skill)
+        return bool(pattern and pattern.fullmatch(normalized))
+
+    @classmethod
+    def _build_tool_followup_prompt(cls, recent_tool_results: list[dict[str, Any]]) -> str:
+        latest = cls._latest_successful_tool_result(
+            recent_tool_results,
+            allowed_skills=_INFO_FOLLOWUP_SKILLS,
+        )
+        if not latest:
+            return ""
+
+        result = latest["result"]
+        if result.skill == "websearch":
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have websearch results.\n"
+                "Do not stop at only saying how many results were found.\n"
+                "Read the titles, snippets, and URLs, then continue the task.\n"
+                "If the current search results are enough, answer the user directly in Chinese.\n"
+                "If you need more confidence or detail, call webfetch on the most relevant URL first, then answer.\n"
+                "Never use the raw intermediate summary like '找到5条搜索结果' as the final reply."
+            )
+        if result.skill == "webfetch":
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have fetched page content.\n"
+                "Do not stop at an intermediate status like '网页抓取成功'.\n"
+                "Read the fetched content and answer the user's actual request in Chinese now."
+            )
+        if result.skill == "music_search":
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have music search results.\n"
+                "Do not stop at only reporting the number of matches.\n"
+                "Use the returned tracks to answer the user in Chinese now."
+            )
+        return ""
+
+    @staticmethod
+    def _render_websearch_fallback(payload: dict[str, Any]) -> str:
+        rows = payload.get("results")
+        if not isinstance(rows, list):
+            return ""
+
+        lines = ["我先查到这些相关结果："]
+        for idx, row in enumerate(rows[:3], start=1):
+            if not isinstance(row, dict):
+                continue
+            title = clean_multiline_text(str(row.get("title") or ""), max_len=120).strip()
+            snippet = clean_multiline_text(str(row.get("snippet") or ""), max_len=140).strip()
+            url = clean_text(str(row.get("url") or ""), max_len=220).strip()
+
+            block = f"{idx}. {title or url or '未命名结果'}"
+            if snippet:
+                block = f"{block}\n{snippet}"
+            if url:
+                block = f"{block}\n{url}"
+            lines.append(block)
+
+        if len(lines) <= 1:
+            return ""
+        return "\n\n".join(lines).strip()
+
+    @staticmethod
+    def _render_webfetch_fallback(payload: dict[str, Any]) -> str:
+        title = clean_multiline_text(str(payload.get("title") or ""), max_len=160).strip()
+        content = clean_multiline_text(str(payload.get("content") or ""), max_len=520).strip()
+        final_url = clean_text(
+            str(payload.get("final_url") or payload.get("url") or ""),
+            max_len=220,
+        ).strip()
+
+        lines: list[str] = []
+        if title:
+            lines.append(f"我查到的页面是：{title}")
+        if content:
+            lines.append(content)
+        if final_url:
+            lines.append(final_url)
+        return "\n\n".join(lines).strip()
+
+    @classmethod
+    def _build_tool_fallback_text(
+        cls,
+        *,
+        recent_tool_results: list[dict[str, Any]],
+        default_text: str,
+    ) -> str:
+        latest = cls._latest_successful_tool_result(
+            recent_tool_results,
+            allowed_skills=frozenset({"webfetch", "websearch"}),
+        )
+        if not latest:
+            return default_text
+
+        result = latest["result"]
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        if result.skill == "webfetch":
+            rendered = cls._render_webfetch_fallback(payload)
+            if rendered:
+                return rendered
+        if result.skill == "websearch":
+            rendered = cls._render_websearch_fallback(payload)
+            if rendered:
+                return rendered
+        return default_text
+
     async def run_skill(
         self,
         name: str,
@@ -459,6 +615,8 @@ class SkillService:
             default_sticker_file_ids=self.default_sticker_file_ids,
         )
         last_success_summary = ""
+        recent_tool_results: list[dict[str, Any]] = []
+        followup_retry_used = False
 
         def _build_answer_result(text: str = "") -> SkillAnswerResult:
             return SkillAnswerResult(
@@ -476,7 +634,12 @@ class SkillService:
         for step in range(1, self.max_tool_rounds + 1):
             resp = await self._completion_with_fallbacks(messages=messages, tools=tools)
             if not resp:
-                return _build_answer_result()
+                return _build_answer_result(
+                    self._build_tool_fallback_text(
+                        recent_tool_results=recent_tool_results,
+                        default_text=last_success_summary,
+                    )
+                )
 
             msg = resp.choices[0].message
             content = self._normalize_content_text(getattr(msg, "content", "")).strip()
@@ -501,10 +664,37 @@ class SkillService:
                 if _action_reply_completed():
                     log.info("skill tool loop finished: step=%d action_already_delivered", step)
                     return _build_answer_result()
-                if content:
+                if content and not self._is_intermediate_tool_reply(
+                    content,
+                    recent_tool_results=recent_tool_results,
+                    last_success_summary=last_success_summary,
+                ):
                     log.info("skill tool loop finished: step=%d no_tool_call", step)
                     return _build_answer_result(content)
-                return _build_answer_result(last_success_summary)
+                if (
+                    not followup_retry_used
+                    and step < self.max_tool_rounds
+                    and self._is_intermediate_tool_reply(
+                        content,
+                        recent_tool_results=recent_tool_results,
+                        last_success_summary=last_success_summary,
+                    )
+                ):
+                    followup_prompt = self._build_tool_followup_prompt(recent_tool_results)
+                    if followup_prompt:
+                        followup_retry_used = True
+                        messages.append({"role": "system", "content": followup_prompt})
+                        log.info(
+                            "skill tool loop continuing after intermediate tool reply: step=%d",
+                            step,
+                        )
+                        continue
+                return _build_answer_result(
+                    self._build_tool_fallback_text(
+                        recent_tool_results=recent_tool_results,
+                        default_text=content or last_success_summary,
+                    )
+                )
 
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
             for tool_call in tool_calls:
@@ -517,6 +707,14 @@ class SkillService:
                 )
                 if result.ok and result.summary:
                     last_success_summary = result.summary
+                recent_tool_results.append(
+                    {
+                        "name": tool_call["name"],
+                        "arguments": dict(args),
+                        "result": result,
+                    }
+                )
+                recent_tool_results = recent_tool_results[-8:]
                 payload = self._tool_result_to_payload(result)
                 messages.append(
                     {
@@ -534,4 +732,9 @@ class SkillService:
         log.info("skill tool loop reached max steps: %d", self.max_tool_rounds)
         if _action_reply_completed():
             return _build_answer_result()
-        return _build_answer_result(last_success_summary)
+        return _build_answer_result(
+            self._build_tool_fallback_text(
+                recent_tool_results=recent_tool_results,
+                default_text=last_success_summary,
+            )
+        )

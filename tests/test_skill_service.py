@@ -43,6 +43,28 @@ class _PlannedSkillService(SkillService):
             context.suppress_followup_text = True
             return SkillRunResult(ok=True, skill=name, summary="你好呀")
 
+        if name == "websearch":
+            return SkillRunResult(
+                ok=True,
+                skill=name,
+                summary="找到 2 条搜索结果",
+                payload={
+                    "query": arguments.get("query", ""),
+                    "results": [
+                        {
+                            "title": "MosDNS 官方文档",
+                            "url": "https://example.com/mosdns",
+                            "snippet": "包含安装、配置与常见问题说明。",
+                        },
+                        {
+                            "title": "顺便看一下谁更准的对比贴",
+                            "url": "https://example.com/compare",
+                            "snippet": "整理了几种 DNS 方案的命中率与延迟。",
+                        },
+                    ],
+                },
+            )
+
         return SkillRunResult(ok=False, skill=name, summary="", error="unknown_skill")
 
 
@@ -96,6 +118,53 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.tts_sent)
         self.assertEqual(result.tts_text, "你好呀")
         self.assertEqual(result.text, "")
+
+    async def test_websearch_summary_only_reply_triggers_followup_generation(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "websearch",
+                                "arguments": '{"query":"mosdns"}',
+                            },
+                        }
+                    ]
+                ),
+                _resp(content="找到 2 条搜索结果"),
+                _resp(content="我查了下，当前更权威的是官方文档这一条。"),
+            ]
+        )
+
+        result = await service.answer_with_skill("查一下 mosdns", intent_type="casual")
+
+        self.assertEqual(result.text, "我查了下，当前更权威的是官方文档这一条。")
+
+    async def test_websearch_empty_followup_falls_back_to_readable_results(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "websearch",
+                                "arguments": '{"query":"mosdns"}',
+                            },
+                        }
+                    ]
+                ),
+                _resp(content=""),
+            ]
+        )
+
+        result = await service.answer_with_skill("查一下 mosdns", intent_type="casual")
+
+        self.assertIn("我先查到这些相关结果：", result.text)
+        self.assertIn("MosDNS 官方文档", result.text)
+        self.assertIn("https://example.com/mosdns", result.text)
 
 
 if __name__ == "__main__":
