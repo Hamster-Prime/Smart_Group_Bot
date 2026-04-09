@@ -96,6 +96,12 @@ def build_bot_runtime_profile_context(
         settings_attr="decision_model",
         llm_attr="decision_config",
     )
+    vision_cfg = _model_value(
+        settings=settings,
+        llm=llm,
+        settings_attr="vision_model",
+        llm_attr="vision_config",
+    )
     moderation_cfg = _model_value(
         settings=settings,
         llm=llm,
@@ -137,7 +143,8 @@ def build_bot_runtime_profile_context(
         f"main_reply_model: {getattr(main_cfg, 'model', '(unknown)')}",
         f"main_reply_fallbacks: {_format_fallback_models(main_cfg)}",
         "skill_planner_model: same_as_main_reply",
-        "vision_model: same_as_main_reply",
+        f"vision_model: {getattr(vision_cfg, 'model', '(unknown)')}",
+        f"vision_fallbacks: {_format_fallback_models(vision_cfg)}",
         f"decision_model: {getattr(decision_cfg, 'model', '(unknown)')}",
         f"decision_fallbacks: {_format_fallback_models(decision_cfg)}",
         f"moderation_model: {getattr(moderation_cfg, 'model', '(unknown)')}",

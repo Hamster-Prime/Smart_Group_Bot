@@ -57,6 +57,7 @@ class BotConfig(BaseModel):
     proactive_quiet_hours_end: int = 9
     proactive_retry_minutes: int = 30
     main_model: ModelConfig = ModelConfig()
+    vision_model: ModelConfig = ModelConfig()
     chat_bridge_model: ModelConfig = ModelConfig()
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
@@ -93,6 +94,10 @@ class Settings(BaseSettings):
     main_provider_name: str = ""
     main_model: str = "gemini-2.0-flash"
     main_fallbacks: str = ""
+
+    vision_provider_name: str = ""
+    vision_model: str = ""
+    vision_fallbacks: str = ""
 
     chat_bridge_provider_name: str = ""
     chat_bridge_model: str = ""
@@ -344,6 +349,8 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         bot_data = toml_data["bot"]
         if "main_model" in bot_data:
             settings.bot.main_model = ModelConfig(**bot_data["main_model"])
+        if "vision_model" in bot_data:
+            settings.bot.vision_model = ModelConfig(**bot_data["vision_model"])
         if "chat_bridge_model" in bot_data:
             settings.bot.chat_bridge_model = ModelConfig(**bot_data["chat_bridge_model"])
         if "decision_model" in bot_data:
@@ -395,6 +402,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     if not main_model_name:
         raise ValueError("MAIN_MODEL is required")
 
+    vision_provider_name = (settings.vision_provider_name or main_provider_name).strip().lower()
     decision_provider_name = (settings.decision_provider_name or main_provider_name).strip().lower()
     chat_bridge_provider_name = (settings.chat_bridge_provider_name or main_provider_name).strip().lower()
     moderation_provider_name = (
@@ -403,6 +411,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     compress_provider_name = (settings.compress_provider_name or main_provider_name).strip().lower()
     embed_provider_name = (settings.embed_provider_name or main_provider_name).strip().lower()
 
+    vision_model_name = (settings.vision_model or main_model_name).strip()
     chat_bridge_model_name = (settings.chat_bridge_model or main_model_name).strip()
     decision_model_name = (settings.decision_model or main_model_name).strip()
     moderation_model_name = (settings.moderation_model or decision_model_name).strip()
@@ -416,6 +425,14 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         temperature=settings.bot.main_model.temperature,
         max_tokens=max(1, settings.max_output_tokens),
         fallback_spec=settings.main_fallbacks,
+    )
+    settings.bot.vision_model = _build_chat_config(
+        profiles=profiles,
+        provider_name=vision_provider_name,
+        model_name=vision_model_name,
+        temperature=settings.bot.vision_model.temperature,
+        max_tokens=settings.bot.vision_model.max_tokens,
+        fallback_spec=settings.vision_fallbacks,
     )
     settings.bot.chat_bridge_model = _build_chat_config(
         profiles=profiles,

@@ -34,6 +34,7 @@ async def main() -> None:
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )

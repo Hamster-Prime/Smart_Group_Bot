@@ -15,7 +15,7 @@ litellm.set_verbose = False
 
 
 class LLMService:
-    """Unified LLM interface for main/decision/moderation/compress/embed."""
+    """Unified LLM interface for main/vision/decision/moderation/compress/embed."""
 
     def __init__(
         self,
@@ -24,10 +24,12 @@ class LLMService:
         compress: ModelConfig | None = None,
         *,
         moderation: ModelConfig | None = None,
+        vision: ModelConfig | None = None,
         embed: EmbedConfig | None = None,
         max_context_tokens: int | None = None,
     ) -> None:
         self.main = main
+        self.vision_config = vision or main
         self.decision_config = decision
         self.moderation_config = moderation or decision
         self.compress_config = compress or main
@@ -303,7 +305,7 @@ class LLMService:
         return text
 
     async def vision_describe(self, image_url: str, prompt: str) -> str:
-        """Image understanding with the main model."""
+        """Image understanding with the dedicated vision model."""
         messages: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -315,7 +317,7 @@ class LLMService:
         ]
         return await self._chat_with_fallbacks(
             messages=messages,
-            candidates=self._chat_candidates(self.main),
+            candidates=self._chat_candidates(self.vision_config),
             label="vision",
             preview_limit=80,
         )

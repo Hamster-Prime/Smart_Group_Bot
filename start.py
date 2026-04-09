@@ -106,6 +106,7 @@ async def start_bot(settings, session_factory) -> None:
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
     )
 

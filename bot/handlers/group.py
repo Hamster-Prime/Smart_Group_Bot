@@ -1060,6 +1060,7 @@ async def _generate_chat_bridge_body(
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
@@ -1295,6 +1296,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
@@ -1844,6 +1846,7 @@ async def on_group_message(
         settings.bot.decision_model,
         settings.bot.compress_model,
         moderation=settings.bot.moderation_model,
+        vision=settings.bot.vision_model,
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
