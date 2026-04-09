@@ -566,23 +566,41 @@ class DoubaoTTSService:
         audio_bytes: bytes,
         index: int,
         delivery_mode: str,
+        reply_to_message_id: int | None,
         auto_delete_minutes: int,
         caption: str = "",
         parse_mode: str | None = None,
     ) -> bool:
         filename = f"tts_{index + 1}{self.file_extension}"
         send_as_reply = (delivery_mode or "reply").strip().lower() != "message"
+        requested_reply_target = int(reply_to_message_id or 0) or None
+        current_reply_target = requested_reply_target
         attempt = 0
         while attempt <= 2:
             try:
                 file_obj = BufferedInputFile(audio_bytes, filename=filename)
                 if self.audio_format == "ogg_opus":
                     if send_as_reply:
-                        sent = await message.reply_voice(
-                            voice=file_obj,
-                            caption=caption or None,
-                            parse_mode=parse_mode,
-                        )
+                        if current_reply_target:
+                            sent = await message.bot.send_voice(
+                                chat_id=message.chat.id,
+                                voice=file_obj,
+                                reply_to_message_id=current_reply_target,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                            )
+                        elif requested_reply_target:
+                            sent = await message.answer_voice(
+                                voice=file_obj,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                            )
+                        else:
+                            sent = await message.reply_voice(
+                                voice=file_obj,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                            )
                     else:
                         sent = await message.answer_voice(
                             voice=file_obj,
@@ -591,12 +609,29 @@ class DoubaoTTSService:
                         )
                 else:
                     if send_as_reply:
-                        sent = await message.reply_audio(
-                            audio=file_obj,
-                            caption=caption or None,
-                            parse_mode=parse_mode,
-                            title="Doubao TTS",
-                        )
+                        if current_reply_target:
+                            sent = await message.bot.send_audio(
+                                chat_id=message.chat.id,
+                                audio=file_obj,
+                                reply_to_message_id=current_reply_target,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                                title="Doubao TTS",
+                            )
+                        elif requested_reply_target:
+                            sent = await message.answer_audio(
+                                audio=file_obj,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                                title="Doubao TTS",
+                            )
+                        else:
+                            sent = await message.reply_audio(
+                                audio=file_obj,
+                                caption=caption or None,
+                                parse_mode=parse_mode,
+                                title="Doubao TTS",
+                            )
                     else:
                         sent = await message.answer_audio(
                             audio=file_obj,
@@ -611,6 +646,11 @@ class DoubaoTTSService:
                 await asyncio.sleep(wait_s)
                 attempt += 1
             except TelegramBadRequest as exc:
+                detail = str(exc).lower()
+                if send_as_reply and current_reply_target and is_reply_target_missing_error(detail):
+                    current_reply_target = None
+                    attempt += 1
+                    continue
                 log.warning("tts telegram send failed: %s", exc)
                 return False
             except Exception:
@@ -627,6 +667,7 @@ class DoubaoTTSService:
         text: str,
         *,
         delivery_mode: str = "reply",
+        reply_to_message_id: int | None = None,
         auto_delete_minutes: int = 0,
         uid: str = "",
         emotion: str = "",
@@ -664,6 +705,7 @@ class DoubaoTTSService:
                 audio_bytes=result.audio_bytes,
                 index=idx,
                 delivery_mode=delivery_mode,
+                reply_to_message_id=reply_to_message_id if idx == 0 else None,
                 auto_delete_minutes=auto_delete_minutes,
             )
             if not ok:

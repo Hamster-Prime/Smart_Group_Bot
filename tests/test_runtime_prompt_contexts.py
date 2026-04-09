@@ -58,6 +58,23 @@ class RuntimePromptContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[是否@机器人]", llm.prompt)
         self.assertNotIn("[是否回复机器人]", llm.prompt)
 
+    async def test_reply_mode_service_can_choose_message_for_merged_turn(self) -> None:
+        llm = _CaptureDecisionLLM(response="message")
+        service = ReplyModeService(llm)
+
+        result = await service.decide(
+            user_text="不要用回复格式 直接发三条",
+            assistant_reply="第一条",
+            msg_type="text",
+            is_mentioned=True,
+            is_reply_to_bot=False,
+            is_reply_to_other=False,
+            merged_count=3,
+            merged_context="第一句\n第二句\n第三句",
+        )
+
+        self.assertEqual(result, "message")
+
     async def test_sticker_decision_service_uses_english_runtime_blocks(self) -> None:
         llm = _CaptureGenerateLLM(
             '{"send": false, "sticker_file_id": "", "query": "", "reason": "skip"}'
@@ -107,4 +124,3 @@ class RuntimePromptContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[STICKER_CANDIDATES]", llm.prompt)
         self.assertNotIn("[是否@机器人]", llm.prompt)
         self.assertNotIn("[是否回复机器人]", llm.prompt)
-

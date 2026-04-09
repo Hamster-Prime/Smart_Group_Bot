@@ -19,6 +19,7 @@ from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.task_manage import TaskManageSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
+from bot.services.reply_output import REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
@@ -182,6 +183,7 @@ class SkillService:
         intent_type: str,
         merged_count: int,
         merged_context: str,
+        reply_targets_context: str,
         selected_skills: dict[str, Skill],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
@@ -193,6 +195,9 @@ class SkillService:
         if recent_context:
             messages.append({"role": "system", "content": recent_context})
         messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append({"role": "system", "content": REPLY_OUTPUT_PROTOCOL})
+        if reply_targets_context.strip():
+            messages.append({"role": "system", "content": reply_targets_context.strip()})
         messages.append(
             {
                 "role": "system",
@@ -245,6 +250,7 @@ class SkillService:
         allow_tts: bool = True,
         merged_count: int = 1,
         merged_context: str = "",
+        reply_targets_context: str = "",
     ) -> dict[str, Any]:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         selected_skills = self._selected_skills(allow_tts=allow_tts)
@@ -259,6 +265,7 @@ class SkillService:
                 intent_type=intent_type,
                 merged_count=merged_count,
                 merged_context=merged_context,
+                reply_targets_context=reply_targets_context,
                 selected_skills=selected_skills,
             ),
             "tools": self._tool_definitions(selected_skills),
@@ -415,6 +422,7 @@ class SkillService:
         allow_tts: bool = True,
         merged_count: int = 1,
         merged_context: str = "",
+        reply_targets_context: str = "",
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         if contains_prompt_injection(user_text):
@@ -431,6 +439,7 @@ class SkillService:
             intent_type=intent_type,
             merged_count=merged_count,
             merged_context=merged_context,
+            reply_targets_context=reply_targets_context,
             selected_skills=selected_skills,
         )
         tools = self._tool_definitions(selected_skills)

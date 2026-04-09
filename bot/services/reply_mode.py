@@ -53,9 +53,6 @@ class ReplyModeService:
 
         raw = await self.llm.decision(build_defended_system(REPLY_MODE_SYSTEM), context)
         result = (raw or "").strip().lower()
-        if merged_count > 1:
-            log.info("reply mode forced=reply merged=%s raw=%s", merged_count > 1, result or "(empty)")
-            return "reply"
         if result in {"reply", "message"}:
             log.info("reply mode decided=%s merged=%s", result, merged_count > 1)
             return result

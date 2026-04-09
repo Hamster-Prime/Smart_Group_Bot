@@ -41,6 +41,7 @@ from bot.services.group_intent import GroupIntent
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
+from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
 from bot.services.scheduled_tasks import (
     cancel_scheduled_task,
     create_scheduled_task,
@@ -871,6 +872,13 @@ class _PendingReplyBatch:
     flush_at: float = 0.0
 
 
+@dataclass(slots=True)
+class _ReplyDeliveryPlan:
+    text: str
+    delivery_mode: str
+    reply_to_message_id: int | None = None
+
+
 _PENDING_REPLY_LOCK = asyncio.Lock()
 _PENDING_REPLY_BATCHES: dict[tuple[int, int], _PendingReplyBatch] = {}
 
@@ -907,6 +915,169 @@ def _build_merged_context(items: list[_PendingReplyItem]) -> str:
         lines.append(f"[{idx}] {meta}")
         lines.append(text or "(empty)")
     return "\n".join(lines)
+
+
+def _message_sender_label(message: Message | None) -> str:
+    if message is None:
+        return "unknown"
+
+    sender_chat = getattr(message, "sender_chat", None)
+    if sender_chat is not None:
+        return (
+            (getattr(sender_chat, "title", None) or "").strip()
+            or (getattr(sender_chat, "username", None) or "").strip()
+            or f"chat:{int(getattr(sender_chat, 'id', 0) or 0)}"
+        )
+
+    user = getattr(message, "from_user", None)
+    if user is not None:
+        return (
+            (getattr(user, "full_name", None) or "").strip()
+            or (getattr(user, "username", None) or "").strip()
+            or str(int(getattr(user, "id", 0) or 0))
+        )
+
+    return "unknown"
+
+
+def _append_reply_target_candidate(
+    lines: list[str],
+    alias_map: dict[str, int],
+    *,
+    alias: str,
+    target_message: Message | None,
+    relation: str,
+) -> None:
+    if not alias or target_message is None:
+        return
+
+    message_id = int(getattr(target_message, "message_id", 0) or 0)
+    if message_id <= 0:
+        return
+
+    key = alias.strip().lower()
+    if key in alias_map:
+        return
+
+    sender = _truncate_text(_message_sender_label(target_message), 48)
+    preview_text, preview_type = extract_message_text(target_message)
+    preview = _truncate_text((preview_text or "").replace("\n", " ").strip(), 80)
+    alias_map[key] = message_id
+    lines.append(
+        f"- alias={alias} | message_id={message_id} | sender={sender or 'unknown'} | "
+        f"type={preview_type} | relation={relation} | preview={preview or '(empty)'}"
+    )
+
+
+def _build_reply_targets_context(items: list[_PendingReplyItem]) -> tuple[str, dict[str, int]]:
+    if not items:
+        return "", {}
+
+    latest = items[-1]
+    lines = [
+        "[REPLY_TARGET_CANDIDATES]",
+        "Use these aliases in JSON field reply_to when a specific outgoing message should reply to a specific Telegram message.",
+        'If you want the normal default anchor, use "reply_to":"auto".',
+        "default_reply_alias: latest_input",
+    ]
+    alias_map: dict[str, int] = {}
+
+    _append_reply_target_candidate(
+        lines,
+        alias_map,
+        alias="latest_input",
+        target_message=latest.message,
+        relation="latest current-sender input message",
+    )
+    _append_reply_target_candidate(
+        lines,
+        alias_map,
+        alias="current_input",
+        target_message=latest.message,
+        relation="latest current-sender input message",
+    )
+    _append_reply_target_candidate(
+        lines,
+        alias_map,
+        alias="first_input",
+        target_message=items[0].message,
+        relation="first current-sender input message in this batch",
+    )
+
+    for idx, item in enumerate(items, start=1):
+        _append_reply_target_candidate(
+            lines,
+            alias_map,
+            alias=f"input_{idx}",
+            target_message=item.message,
+            relation=f"batch input #{idx}",
+        )
+        reply_target = getattr(item.message, "reply_to_message", None)
+        if reply_target is not None:
+            _append_reply_target_candidate(
+                lines,
+                alias_map,
+                alias=f"input_{idx}_reply_target",
+                target_message=reply_target,
+                relation=f"message that input #{idx} replies to",
+            )
+
+    latest_reply_target = getattr(latest.message, "reply_to_message", None)
+    if latest_reply_target is not None:
+        _append_reply_target_candidate(
+            lines,
+            alias_map,
+            alias="latest_reply_target",
+            target_message=latest_reply_target,
+            relation="message that the latest input replies to",
+        )
+        _append_reply_target_candidate(
+            lines,
+            alias_map,
+            alias="reply_target",
+            target_message=latest_reply_target,
+            relation="message that the latest input replies to",
+        )
+
+    return "\n".join(lines), alias_map
+
+
+def _resolve_reply_target_message_id(
+    value: Any,
+    *,
+    alias_map: dict[str, int],
+) -> int | None:
+    default_reply_id = alias_map.get("latest_input") or alias_map.get("current_input")
+    if value is None:
+        return default_reply_id
+    if isinstance(value, int):
+        return int(value) if int(value) > 0 else None
+
+    text = str(value or "").strip()
+    if not text:
+        return default_reply_id
+
+    normalized = text.lower()
+    if normalized in {"auto", "default", "latest", "latest_input", "current", "current_input"}:
+        return default_reply_id
+    if normalized in {"first", "first_input"}:
+        return alias_map.get("first_input") or default_reply_id
+    if normalized in {"latest_reply_target", "reply_target", "replied_message"}:
+        return alias_map.get("latest_reply_target") or alias_map.get("reply_target")
+    if normalized in {"none", "message", "standalone", "no_reply"}:
+        return None
+    if normalized in alias_map:
+        return alias_map[normalized]
+
+    for prefix in ("message_id:", "msg:", "id:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            break
+
+    if normalized.isdigit():
+        parsed = int(normalized)
+        return parsed if parsed > 0 else None
+    return default_reply_id
 
 
 def _is_strong_pending_reply_signal(item: _PendingReplyItem) -> bool:
@@ -1287,6 +1458,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
     merged_count = len(items)
     merged_input_text = _build_merged_user_text(items)
     merged_context = _build_merged_context(items)
+    reply_targets_context, reply_target_aliases = _build_reply_targets_context(items)
     memory_entries = [item.memory_entry for item in items if item.memory_entry]
     memory = memory_holder.get()
     session_factory = memory.session_factory
@@ -1376,14 +1548,18 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 )
 
             reply = ""
+            reply_specs: list[ReplyMessageSpec] = []
             reply_source = "none"
             sent_ok = False
+            sent_reply_messages: list[str] = []
+            delivery_plans: list[_ReplyDeliveryPlan] = []
             skill_handled = False
             sticker_sent_ok = False
             tts_sent_ok = False
             sticker_file = ""
             delivery_mode = "reply"
             tts_text = ""
+            explicit_no_reply = False
             force_reply = bool(action_forced and action == "casual")
             tts_service = skill.tts_service or DoubaoTTSService(settings)
 
@@ -1401,6 +1577,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         allow_tts=is_tts_tool_enabled(tts_mode),
                         merged_count=merged_count,
                         merged_context=merged_context,
+                        reply_targets_context=reply_targets_context,
                     ),
                 )
                 history = _exclude_batch_messages(history, memory_entries)
@@ -1415,6 +1592,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     allow_tts=is_tts_tool_enabled(tts_mode),
                     merged_count=merged_count,
                     merged_context=merged_context,
+                    reply_targets_context=reply_targets_context,
                 )
                 log.info(
                     "[%s] pending batch reply generation started | action=%s history=%d prompt_tokens=%s",
@@ -1428,6 +1606,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 )
 
                 async with typing_action(latest.message, enabled=settings.bot.enable_typing):
+                    raw_reply = ""
                     skill_result = await skill.answer_with_skill(
                         merged_input_text,
                         session=session,
@@ -1441,6 +1620,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         allow_tts=is_tts_tool_enabled(tts_mode),
                         merged_count=merged_count,
                         merged_context=merged_context,
+                        reply_targets_context=reply_targets_context,
                     )
                     skill_handled = bool(skill_result.handled)
                     sticker_sent_ok = bool(skill_result.sticker_sent)
@@ -1450,9 +1630,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     if tts_sent_ok:
                         sent_ok = True
                     if skill_result.text:
-                        reply = skill_result.text
+                        raw_reply = skill_result.text
                         reply_source = "skill"
-                        log.info("[%s] pending batch reply via skill | %s", group_id, reply[:80])
+                        log.info("[%s] pending batch reply via skill | %s", group_id, raw_reply[:80])
                     elif skill_handled:
                         reply_source = "skill"
                         log.info(
@@ -1461,12 +1641,12 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             sticker_sent_ok,
                             sticker_file[:32] if sticker_file else "-",
                         )
-                    if is_tts_always_enabled(tts_mode) and tts_sent_ok and reply:
+                    if is_tts_always_enabled(tts_mode) and tts_sent_ok and raw_reply:
                         log.info("[%s] pending batch suppressing text because TTS already sent", group_id)
-                        reply = ""
+                        raw_reply = ""
                         reply_source = "skill"
 
-                    if not reply and not skill_handled:
+                    if not raw_reply and not skill_handled:
                         casual = CasualService(
                             llm,
                             settings=settings,
@@ -1474,7 +1654,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                                 allow_tts=is_tts_tool_enabled(tts_mode)
                             ),
                         )
-                        reply = await casual.reply(
+                        raw_reply = await casual.reply(
                             merged_input_text,
                             history=history,
                             sender_user_id=user_id,
@@ -1484,27 +1664,65 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             intent_type=action,
                             merged_count=merged_count,
                             merged_context=merged_context,
+                            reply_targets_context=reply_targets_context,
                         )
-                        if reply:
+                        if raw_reply:
                             reply_source = "casual"
                         log.info(
                             "[%s] pending batch reply via casual | intent=%s | %s",
                             group_id,
                             action,
-                            reply[:80] if reply else "(empty)",
+                            raw_reply[:80] if raw_reply else "(empty)",
                         )
 
-                    if reply:
-                        cleaned_reply = sanitize_outgoing_text(reply)
-                        if cleaned_reply != reply:
-                            log.warning("[%s] pending batch reply sanitized", group_id)
-                        reply = cleaned_reply
-                        normalized_reply = _normalize_owner_address(reply, latest.sender_is_owner)
-                        if normalized_reply != reply:
-                            log.info("[%s] pending batch owner-address normalized", group_id)
-                        reply = normalized_reply
+                    if raw_reply:
+                        parsed_reply = parse_reply_output(raw_reply)
+                        explicit_no_reply = parsed_reply.explicit_no_reply
+                        if parsed_reply.used_json:
+                            log.info(
+                                "[%s] pending batch structured reply parsed | source=%s messages=%d explicit_no_reply=%s",
+                                group_id,
+                                reply_source,
+                                len(parsed_reply.messages),
+                                explicit_no_reply,
+                            )
+                        if explicit_no_reply:
+                            log.info(
+                                "[%s] pending batch reply explicitly skipped by model | source=%s reason=%s",
+                                group_id,
+                                reply_source,
+                                parsed_reply.reason or "model_declined_reply",
+                            )
+                        else:
+                            cleaned_specs: list[ReplyMessageSpec] = []
+                            for candidate_spec in parsed_reply.message_specs:
+                                cleaned_reply = sanitize_outgoing_text(candidate_spec.text)
+                                if cleaned_reply != candidate_spec.text:
+                                    log.warning("[%s] pending batch reply sanitized", group_id)
+                                normalized_reply = _normalize_owner_address(
+                                    cleaned_reply,
+                                    latest.sender_is_owner,
+                                )
+                                if normalized_reply != cleaned_reply:
+                                    log.info("[%s] pending batch owner-address normalized", group_id)
+                                if normalized_reply:
+                                    cleaned_specs.append(
+                                        ReplyMessageSpec(
+                                            text=normalized_reply,
+                                            delivery_mode=candidate_spec.delivery_mode,
+                                            reply_to=candidate_spec.reply_to,
+                                        )
+                                    )
+                            reply_specs = cleaned_specs
+                            reply = "\n\n".join(spec.text for spec in reply_specs).strip()
 
-                if reply or not skill_handled:
+                if explicit_no_reply:
+                    reply = ""
+                    reply_specs = []
+                    delivery_plans = []
+                    reply_source = "none"
+                    action = "skip"
+                elif reply_specs or not skill_handled:
                     silence_reply, silence_reason = _should_silence_generated_reply(reply)
                     if silence_reply and force_reply:
                         log.warning(
@@ -1513,11 +1731,12 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             silence_reason,
                         )
                         reply = "我在，直接说就好~"
+                        reply_specs = [ReplyMessageSpec(text=reply)]
                         reply_source = "fallback"
                         silence_reply = False
-                    if silence_reply and not (action == "casual" and silence_reason == "silent_marker"):
-                            preview = _truncate_text(reply, 80) if reply else "-"
-                            log.info(
+                    if silence_reply:
+                        preview = _truncate_text(reply, 80) if reply else "-"
+                        log.info(
                             "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
                             group_id,
                             silence_reason,
@@ -1525,10 +1744,12 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             action,
                             preview,
                             )
-                            reply = ""
-                            reply_source = "none"
-                            action = "skip"
-                    if silence_reply and action == "casual" and silence_reason == "silent_marker":
+                        reply = ""
+                        reply_specs = []
+                        delivery_plans = []
+                        reply_source = "none"
+                        action = "skip"
+                    if False and silence_reply and action == "casual" and silence_reason == "silent_marker":
                         should_really_silence = True
                         if action == "casual" and silence_reason == "silent_marker":
                             log.warning("[%s] pending batch casual returned silent marker, using fallback", group_id)
@@ -1549,25 +1770,51 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             reply_source = "none"
                             action = "skip"
 
-            if action != "skip" and reply:
-                if merged_count > 1:
+            if action != "skip" and reply_specs:
+                resolved_modes: list[str] = []
+                for reply_spec in reply_specs:
+                    resolved_mode = reply_spec.delivery_mode
+                    if resolved_mode == "auto":
+                        resolved_mode = await reply_mode_svc.decide(
+                            user_text=merged_input_text,
+                            assistant_reply=reply_spec.text,
+                            msg_type=msg_type,
+                            is_mentioned=mentioned,
+                            is_reply_to_bot=reply_to_bot,
+                            is_reply_to_other=reply_to_other,
+                            merged_count=merged_count,
+                            merged_context=merged_context,
+                        )
+                    reply_target_id = (
+                        _resolve_reply_target_message_id(
+                            reply_spec.reply_to,
+                            alias_map=reply_target_aliases,
+                        )
+                        if resolved_mode == "reply"
+                        else None
+                    )
+                    delivery_plans.append(
+                        _ReplyDeliveryPlan(
+                            text=reply_spec.text,
+                            delivery_mode=resolved_mode,
+                            reply_to_message_id=reply_target_id,
+                        )
+                    )
+                    resolved_modes.append(resolved_mode)
+
+                unique_modes = sorted({mode for mode in resolved_modes if mode})
+                if not unique_modes:
                     delivery_mode = "reply"
-                    log.info(
-                        "[%s] pending batch reply mode forced=reply | reason=merged_batch messages=%d",
-                        group_id,
-                        merged_count,
-                    )
+                elif len(unique_modes) == 1:
+                    delivery_mode = unique_modes[0]
                 else:
-                    delivery_mode = await reply_mode_svc.decide(
-                        user_text=merged_input_text,
-                        assistant_reply=reply,
-                        msg_type=msg_type,
-                        is_mentioned=mentioned,
-                        is_reply_to_bot=reply_to_bot,
-                        is_reply_to_other=reply_to_other,
-                        merged_count=merged_count,
-                        merged_context=merged_context,
-                    )
+                    delivery_mode = "mixed"
+                log.info(
+                    "[%s] pending batch reply plans ready | count=%d modes=%s",
+                    group_id,
+                    len(delivery_plans),
+                    ",".join(unique_modes) or "(none)",
+                )
 
             await _best_effort_commit(
                 session,
@@ -1575,31 +1822,49 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 context="pending_reply_pre_delivery",
             )
 
-            if action != "skip" and reply:
+            if action != "skip" and delivery_plans:
                 if is_tts_always_enabled(tts_mode) and tts_service.available:
-                    voice_ok = await tts_service.send_message_tts(
-                        latest.message,
-                        reply,
-                        delivery_mode=delivery_mode,
-                        auto_delete_minutes=0,
-                        uid=str(user_id or group_id),
-                    )
-                    if voice_ok:
+                    tts_results: list[bool] = []
+                    for plan in delivery_plans:
+                        voice_ok = await tts_service.send_message_tts(
+                            latest.message,
+                            plan.text,
+                            delivery_mode=plan.delivery_mode,
+                            reply_to_message_id=plan.reply_to_message_id,
+                            auto_delete_minutes=0,
+                            uid=str(user_id or group_id),
+                        )
+                        tts_results.append(voice_ok)
+                    sent_reply_messages = [
+                        plan.text
+                        for plan, ok in zip(delivery_plans, tts_results)
+                        if ok
+                    ]
+                    if any(tts_results):
                         tts_sent_ok = True
-                    sent_ok = sent_ok or voice_ok
-                    if not voice_ok:
+                    sent_ok = sent_ok or any(tts_results)
+                    if not all(tts_results):
                         log.warning("[%s] always-tts send failed; suppressing text fallback", group_id)
-                elif reply and not tts_sent_ok:
-                    text_ok = await send_reply(
-                        latest.message,
-                        reply,
-                        delivery_mode=delivery_mode,
-                        stream=settings.bot.enable_streaming,
-                        stream_chunk_size=settings.bot.stream_chunk_size,
-                        stream_interval=settings.bot.stream_edit_interval_sec,
-                        auto_delete_minutes=0,
-                    )
-                    sent_ok = sent_ok or text_ok
+                elif delivery_plans and not tts_sent_ok:
+                    text_results: list[bool] = []
+                    for plan in delivery_plans:
+                        text_ok = await send_reply(
+                            latest.message,
+                            plan.text,
+                            delivery_mode=plan.delivery_mode,
+                            reply_to_message_id=plan.reply_to_message_id,
+                            stream=bool(settings.bot.enable_streaming and len(delivery_plans) == 1),
+                            stream_chunk_size=settings.bot.stream_chunk_size,
+                            stream_interval=settings.bot.stream_edit_interval_sec,
+                            auto_delete_minutes=0,
+                        )
+                        text_results.append(text_ok)
+                    sent_reply_messages = [
+                        plan.text
+                        for plan, ok in zip(delivery_plans, text_results)
+                        if ok
+                    ]
+                    sent_ok = sent_ok or any(text_results)
 
             if action == "skip":
                 log.info(
@@ -1617,22 +1882,31 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 )
                 return
 
-            stored_reply = reply or tts_text
-            if stored_reply and sent_ok:
-                await memory.add_message(group_id, "assistant", stored_reply, message_type="assistant_reply")
+            stored_reply_messages = list(sent_reply_messages)
+            if not stored_reply_messages and tts_text and tts_sent_ok:
+                stored_reply_messages = [tts_text]
+            if stored_reply_messages:
+                for stored_reply in stored_reply_messages:
+                    await memory.add_message(
+                        group_id,
+                        "assistant",
+                        stored_reply,
+                        message_type="assistant_reply",
+                    )
                 await memory.compact_if_needed(group_id)
             log.info(
-                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s len=%d elapsed=%dms",
+                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s count=%d len=%d elapsed=%dms",
                 group_id,
                 action,
                 reply_source,
-                bool(reply),
+                bool(reply_specs),
                 sent_ok,
                 delivery_mode,
                 skill_handled,
                 sticker_sent_ok,
                 tts_sent_ok,
                 sticker_file[:32] if sticker_file else "-",
+                len(reply_specs),
                 len(reply or ""),
                 int((time.perf_counter() - flow_started) * 1000),
             )

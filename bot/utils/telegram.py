@@ -564,6 +564,7 @@ async def send_reply(
     text: str,
     *,
     delivery_mode: str = "reply",
+    reply_to_message_id: int | None = None,
     stream: bool = False,
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
@@ -579,6 +580,7 @@ async def send_reply(
 
     mode = (delivery_mode or "reply").strip().lower()
     send_as_reply = mode != "message"
+    explicit_reply_target = int(reply_to_message_id or 0) or None
 
     async def _safe_send(
         body: str,
@@ -588,10 +590,21 @@ async def send_reply(
         retry_delay: float = 0.8,
     ) -> Message | None:
         attempt = 0
+        current_reply_id = explicit_reply_target if send_as_reply else None
         while attempt <= retries:
             try:
                 if send_as_reply:
-                    sent = await message.reply(body, parse_mode=parse_mode)
+                    if current_reply_id:
+                        sent = await message.bot.send_message(
+                            chat_id=message.chat.id,
+                            text=body,
+                            parse_mode=parse_mode,
+                            reply_to_message_id=current_reply_id,
+                        )
+                    elif explicit_reply_target:
+                        sent = await message.answer(body, parse_mode=parse_mode)
+                    else:
+                        sent = await message.reply(body, parse_mode=parse_mode)
                 else:
                     sent = await message.answer(body, parse_mode=parse_mode)
                 schedule_message_auto_delete(sent, auto_delete_minutes)
@@ -605,6 +618,10 @@ async def send_reply(
                 detail = str(exc).lower()
                 if "can't parse entities" in detail:
                     return None
+                if send_as_reply and current_reply_id and is_reply_target_missing_error(detail):
+                    current_reply_id = None
+                    attempt += 1
+                    continue
                 if attempt >= retries:
                     log.exception(
                         "send bad request chat_id=%s retries=%d",
@@ -746,6 +763,37 @@ async def send_reply(
                 seg_ok = await _send_stream_segment(segment)
                 all_ok = all_ok and seg_ok
         return all_ok
+
+
+async def send_reply_messages(
+    message: Message,
+    texts: list[str],
+    *,
+    delivery_mode: str = "reply",
+    stream: bool = False,
+    stream_chunk_size: int = 36,
+    stream_interval: float = 1.0,
+    auto_delete_minutes: int = 0,
+) -> list[bool]:
+    normalized = [str(item or "").strip() for item in texts if str(item or "").strip()]
+    if not normalized:
+        return []
+
+    use_stream = bool(stream and len(normalized) == 1)
+    results: list[bool] = []
+    for item in normalized:
+        ok = await send_reply(
+            message,
+            item,
+            delivery_mode=delivery_mode,
+            reply_to_message_id=None,
+            stream=use_stream,
+            stream_chunk_size=stream_chunk_size,
+            stream_interval=stream_interval,
+            auto_delete_minutes=auto_delete_minutes,
+        )
+        results.append(ok)
+    return results
 
 
 async def send_chat_message(

@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from bot.services.llm import LLMService
+from bot.services.reply_output import REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
@@ -77,6 +78,7 @@ class CasualService:
         intent_type: str,
         merged_count: int,
         merged_context: str,
+        reply_targets_context: str,
         input_limit: int,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
@@ -90,6 +92,9 @@ class CasualService:
         if recent_context:
             messages.append({"role": "system", "content": recent_context})
         messages.append({"role": "system", "content": build_current_time_context()})
+        messages.append({"role": "system", "content": REPLY_OUTPUT_PROTOCOL})
+        if reply_targets_context.strip():
+            messages.append({"role": "system", "content": reply_targets_context.strip()})
         messages.append(
             {
                 "role": "system",
@@ -151,6 +156,7 @@ class CasualService:
         intent_type: str = "casual",
         merged_count: int = 1,
         merged_context: str = "",
+        reply_targets_context: str = "",
     ) -> dict[str, Any]:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         return {
@@ -164,6 +170,7 @@ class CasualService:
                 intent_type=intent_type,
                 merged_count=merged_count,
                 merged_context=merged_context,
+                reply_targets_context=reply_targets_context,
                 input_limit=input_limit,
             )
         }
@@ -180,6 +187,7 @@ class CasualService:
         intent_type: str = "casual",
         merged_count: int = 1,
         merged_context: str = "",
+        reply_targets_context: str = "",
     ) -> str:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         if contains_prompt_injection(normalized_text):
@@ -195,6 +203,7 @@ class CasualService:
             intent_type=intent_type,
             merged_count=merged_count,
             merged_context=merged_context,
+            reply_targets_context=reply_targets_context,
             input_limit=input_limit,
         )
 
