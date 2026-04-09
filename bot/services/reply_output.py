@@ -9,16 +9,33 @@ from bot.utils.security import clean_multiline_text
 
 REPLY_OUTPUT_PROTOCOL = (
     "[REPLY_OUTPUT_PROTOCOL]\n"
-    "You may answer in plain text or JSON.\n"
+    "The runtime explicitly supports 0, 1, or many outgoing messages in one turn.\n"
+    "You are allowed to choose the number of outgoing messages yourself.\n"
     "If one natural message is enough, plain text is fine.\n"
-    "If you want to send multiple messages, output only JSON.\n"
-    "messages can be plain strings or message objects.\n"
+    "If you want to send 2 or more messages, output only JSON.\n"
+    "If you want different delivery modes or different reply targets for different messages, you MUST use message objects.\n"
+    "messages may be plain strings or message objects.\n"
+    "Use plain strings only when every outgoing message can use the default behavior.\n"
+    "Use message objects when you need per-message control.\n"
     "Example with strings:\n"
     '{"messages":["first message","second message"]}\n'
     "Example with message objects:\n"
     '{"messages":[{"text":"first message","delivery_mode":"message"},{"text":"second message","delivery_mode":"reply","reply_to":"latest_input"}]}\n'
-    "If you intentionally decide not to reply, output only JSON like:\n"
+    "Example for explicit silence:\n"
     '{"should_reply":false,"reason":"not_addressed_to_bot"}\n'
+    "When to keep one message:\n"
+    "- one short answer is enough\n"
+    "- the whole response should stay attached as one beat\n"
+    "When to split into multiple messages:\n"
+    "- the turn naturally contains multiple beats\n"
+    "- you want reaction first, then explanation, then follow-up\n"
+    "- different outgoing messages should use different delivery_mode or different reply_to targets\n"
+    "When to use delivery_mode=message:\n"
+    "- user explicitly asks for standalone messages\n"
+    '- user says do not use reply format / direct-send / separate-send\n'
+    "When to use delivery_mode=reply:\n"
+    "- the message clearly answers or continues a specific message thread\n"
+    "- you want to address a specific person or anchor message\n"
     "Rules:\n"
     "1. JSON must be the entire answer when you use it.\n"
     "2. messages are sent in order.\n"
@@ -28,6 +45,29 @@ REPLY_OUTPUT_PROTOCOL = (
     '6. If delivery_mode is auto, the system will decide reply vs message with the normal logic.\n'
     '7. reply_to is optional. Use "auto" if the system should choose the default reply target.\n'
     "8. If reply_to is needed, use an alias from [REPLY_TARGET_CANDIDATES].\n"
+    "9. Do not describe the protocol in your visible message. Either send plain text or output the JSON directly.\n"
+)
+
+REPLY_OUTPUT_AWARENESS = (
+    "[REPLY_OUTPUT_AWARENESS]\n"
+    "You do have the ability to choose how many outgoing messages to send in this turn.\n"
+    "Do not assume you are limited to a single message.\n"
+    "Do not assume every outgoing message must use the same delivery mode or the same reply target.\n"
+    "You may choose:\n"
+    "- no message\n"
+    "- one message\n"
+    "- multiple messages\n"
+    "You may also choose per outgoing message:\n"
+    "- delivery_mode=message\n"
+    "- delivery_mode=reply\n"
+    "- reply_to=auto or a concrete alias from [REPLY_TARGET_CANDIDATES]\n"
+    "Practical decision guide:\n"
+    "1. If one message cleanly solves the turn, keep one message.\n"
+    "2. If the turn naturally contains multiple beats, split them into multiple messages.\n"
+    "3. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
+    "4. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
+    "5. If you need per-message control, do not use plain string arrays. Use message objects.\n"
+    "6. After tool use, these same output rules still apply to your final answer.\n"
 )
 
 _REPLY_JSON_KEYS = {

@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from bot.services.llm import LLMService
-from bot.services.reply_output import REPLY_OUTPUT_PROTOCOL
+from bot.services.reply_output import REPLY_OUTPUT_AWARENESS, REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
@@ -93,6 +93,7 @@ class CasualService:
             messages.append({"role": "system", "content": recent_context})
         messages.append({"role": "system", "content": build_current_time_context()})
         messages.append({"role": "system", "content": REPLY_OUTPUT_PROTOCOL})
+        messages.append({"role": "system", "content": REPLY_OUTPUT_AWARENESS})
         if reply_targets_context.strip():
             messages.append({"role": "system", "content": reply_targets_context.strip()})
         messages.append(

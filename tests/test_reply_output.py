@@ -2,7 +2,11 @@ import unittest
 from types import SimpleNamespace
 
 from bot.services.casual import CasualService
-from bot.services.reply_output import REPLY_OUTPUT_PROTOCOL, parse_reply_output
+from bot.services.reply_output import (
+    REPLY_OUTPUT_AWARENESS,
+    REPLY_OUTPUT_PROTOCOL,
+    parse_reply_output,
+)
 from bot.services.skills.service import SkillService
 
 
@@ -70,15 +74,21 @@ class ReplyOutputParserTests(unittest.TestCase):
 
 
 class ReplyOutputPromptTests(unittest.TestCase):
+    def test_protocol_mentions_explicit_multi_message_and_per_message_control(self) -> None:
+        self.assertIn("0, 1, or many outgoing messages", REPLY_OUTPUT_PROTOCOL)
+        self.assertIn("MUST use message objects", REPLY_OUTPUT_PROTOCOL)
+
     def test_casual_prompt_includes_reply_output_protocol(self) -> None:
         payload = CasualService(_llm_stub()).build_prompt_payload("test")
 
         self.assertIn(REPLY_OUTPUT_PROTOCOL, [item["content"] for item in payload["messages"]])
+        self.assertIn(REPLY_OUTPUT_AWARENESS, [item["content"] for item in payload["messages"]])
 
     def test_skill_prompt_includes_reply_output_protocol(self) -> None:
         payload = SkillService(_llm_stub()).build_answer_prompt_payload("test")
 
         self.assertIn(REPLY_OUTPUT_PROTOCOL, [item["content"] for item in payload["messages"]])
+        self.assertIn(REPLY_OUTPUT_AWARENESS, [item["content"] for item in payload["messages"]])
 
 
 if __name__ == "__main__":
