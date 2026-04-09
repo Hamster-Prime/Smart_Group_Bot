@@ -57,8 +57,10 @@ class ReplyModeService:
             log.info("reply mode decided=%s merged=%s", result, merged_count > 1)
             return result
 
-        fallback = "reply"
-        if is_reply_to_other and not is_reply_to_bot:
-            fallback = "message"
+        fallback = "message"
+        if is_reply_to_bot:
+            fallback = "reply"
+        elif is_mentioned and not is_reply_to_other:
+            fallback = "reply"
         log.info("reply mode fallback=%s raw=%s", fallback, result or "(empty)")
         return fallback
