@@ -32,6 +32,20 @@ class ReplyOutputParserTests(unittest.TestCase):
         self.assertFalse(parsed.explicit_no_reply)
         self.assertFalse(parsed.used_json)
 
+    def test_plain_text_blank_line_bubbles_are_split_into_multiple_messages(self) -> None:
+        parsed = parse_reply_output("哈哈哈哈（气鼓鼓）\n\n才不要呢！主人打错字又怎样，我能看懂就好啦\n\n再说了，我会盯着看的呀~")
+
+        self.assertEqual(
+            parsed.messages,
+            [
+                "哈哈哈哈（气鼓鼓）",
+                "才不要呢！主人打错字又怎样，我能看懂就好啦",
+                "再说了，我会盯着看的呀~",
+            ],
+        )
+        self.assertFalse(parsed.explicit_no_reply)
+        self.assertFalse(parsed.used_json)
+
     def test_json_multiple_messages_are_preserved_in_order(self) -> None:
         parsed = parse_reply_output(
             '{"messages":["first reply","second reply"],"should_reply":true}'
@@ -77,6 +91,8 @@ class ReplyOutputPromptTests(unittest.TestCase):
     def test_protocol_mentions_explicit_multi_message_and_per_message_control(self) -> None:
         self.assertIn("0, 1, or many outgoing messages", REPLY_OUTPUT_PROTOCOL)
         self.assertIn("MUST use message objects", REPLY_OUTPUT_PROTOCOL)
+        self.assertIn("prefer multiple messages", REPLY_OUTPUT_AWARENESS)
+        self.assertIn("multiple paragraphs", REPLY_OUTPUT_PROTOCOL)
 
     def test_casual_prompt_includes_reply_output_protocol(self) -> None:
         payload = CasualService(_llm_stub()).build_prompt_payload("test")

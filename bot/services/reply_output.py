@@ -30,6 +30,7 @@ REPLY_OUTPUT_PROTOCOL = (
     "- the turn naturally contains multiple beats\n"
     "- you want reaction first, then explanation, then follow-up\n"
     "- different outgoing messages should use different delivery_mode or different reply_to targets\n"
+    "- if blank-line-separated paragraphs would read more naturally as separate bubbles, prefer multiple messages\n"
     "When to use delivery_mode=message:\n"
     "- user explicitly asks for standalone messages\n"
     '- user says do not use reply format / direct-send / separate-send\n'
@@ -40,6 +41,7 @@ REPLY_OUTPUT_PROTOCOL = (
     "1. JSON must be the entire answer when you use it.\n"
     "2. messages are sent in order.\n"
     "3. Keep each message concise and natural.\n"
+    "3a. If there are clearly separate beats, prefer multiple messages over one message with multiple paragraphs.\n"
     "4. If the bot is not the real target, prefer should_reply=false.\n"
     "5. delivery_mode supports auto / reply / message.\n"
     '6. If delivery_mode is auto, the system will decide reply vs message with the normal logic.\n'
@@ -64,6 +66,7 @@ REPLY_OUTPUT_AWARENESS = (
     "Practical decision guide:\n"
     "1. If one message cleanly solves the turn, keep one message.\n"
     "2. If the turn naturally contains multiple beats, split them into multiple messages.\n"
+    "2a. If blank-line-separated paragraphs would feel like separate bubbles, prefer multiple messages.\n"
     "3. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
     "4. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
     "5. If you need per-message control, do not use plain string arrays. Use message objects.\n"
@@ -84,6 +87,11 @@ _REPLY_JSON_KEYS = {
 }
 _NO_REPLY_ACTIONS = {"silent", "skip", "no_reply", "noreply", "no-response", "no_response"}
 _VALID_DELIVERY_MODES = {"auto", "reply", "message"}
+_STRUCTURED_PLAIN_TEXT_RE = re.compile(
+    r"(?m)^\s*(?:[-*+]\s+|\d+\.\s+|[（(]?\d+[)）]\s+|#{1,6}\s+|>|```|[一二三四五六七八九十]+[、.])"
+)
+_PLAIN_TEXT_MULTI_MESSAGE_MAX_PART_CHARS = 90
+_PLAIN_TEXT_MULTI_MESSAGE_MAX_TOTAL_CHARS = 240
 
 
 @dataclass(slots=True)
@@ -170,6 +178,46 @@ def _normalize_reply_to(value: Any) -> str:
     return normalized or "auto"
 
 
+def _looks_like_structured_plain_text(text: str) -> bool:
+    payload = (text or "").strip()
+    if not payload:
+        return False
+    return bool(_STRUCTURED_PLAIN_TEXT_RE.search(payload))
+
+
+def _extract_plain_text_message_specs(
+    value: str,
+    *,
+    max_messages: int,
+    max_len: int,
+) -> list[ReplyMessageSpec]:
+    payload = (value or "").strip()
+    if not payload or _looks_like_structured_plain_text(payload):
+        return []
+
+    raw_parts = re.split(r"\n\s*\n+", payload)
+    if len(raw_parts) < 2 or len(raw_parts) > min(max_messages, 6):
+        return []
+
+    out: list[ReplyMessageSpec] = []
+    total_chars = 0
+    for item in raw_parts:
+        normalized = _normalize_message_text(item, max_len=max_len)
+        if (
+            not normalized
+            or len(normalized) > _PLAIN_TEXT_MULTI_MESSAGE_MAX_PART_CHARS
+            or normalized.count("\n") > 1
+            or _looks_like_structured_plain_text(normalized)
+        ):
+            return []
+        out.append(ReplyMessageSpec(text=normalized))
+        total_chars += len(normalized)
+
+    if len(out) < 2 or total_chars > _PLAIN_TEXT_MULTI_MESSAGE_MAX_TOTAL_CHARS:
+        return []
+    return out
+
+
 def _extract_message_specs(value: Any, *, max_messages: int, max_len: int) -> list[ReplyMessageSpec]:
     if isinstance(value, str):
         text = _normalize_message_text(value, max_len=max_len)
@@ -224,6 +272,13 @@ def parse_reply_output(
 
     data = _extract_json_object(text)
     if not data or not _is_reply_json(data):
+        plain_text_specs = _extract_plain_text_message_specs(
+            text,
+            max_messages=max_messages,
+            max_len=max_message_chars,
+        )
+        if plain_text_specs:
+            return ParsedReplyOutput(message_specs=plain_text_specs)
         normalized = _normalize_message_text(text, max_len=max_message_chars)
         return ParsedReplyOutput(
             message_specs=[ReplyMessageSpec(text=normalized)] if normalized else []
