@@ -781,11 +781,15 @@ async def send_reply_messages(
 
     use_stream = bool(stream and len(normalized) == 1)
     results: list[bool] = []
-    for item in normalized:
+    normalized_mode = (delivery_mode or "reply").strip().lower()
+    for idx, item in enumerate(normalized):
+        current_mode = normalized_mode
+        if idx > 0 and normalized_mode == "reply":
+            current_mode = "message"
         ok = await send_reply(
             message,
             item,
-            delivery_mode=delivery_mode,
+            delivery_mode=current_mode,
             reply_to_message_id=None,
             stream=use_stream,
             stream_chunk_size=stream_chunk_size,

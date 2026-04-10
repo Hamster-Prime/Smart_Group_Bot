@@ -1080,6 +1080,45 @@ def _resolve_reply_target_message_id(
     return default_reply_id
 
 
+def _normalize_multi_message_delivery_plans(
+    delivery_plans: list[_ReplyDeliveryPlan],
+) -> list[_ReplyDeliveryPlan]:
+    if len(delivery_plans) <= 1:
+        return list(delivery_plans)
+
+    normalized: list[_ReplyDeliveryPlan] = []
+    current_reply_run_target: tuple[str, int | None] | None = None
+    reply_used_for_current_target = False
+
+    for plan in delivery_plans:
+        mode = (plan.delivery_mode or "reply").strip().lower()
+        if mode != "reply":
+            normalized.append(plan)
+            current_reply_run_target = None
+            reply_used_for_current_target = False
+            continue
+
+        target_key = ("reply", plan.reply_to_message_id)
+        if target_key != current_reply_run_target:
+            current_reply_run_target = target_key
+            reply_used_for_current_target = False
+
+        if reply_used_for_current_target:
+            normalized.append(
+                _ReplyDeliveryPlan(
+                    text=plan.text,
+                    delivery_mode="message",
+                    reply_to_message_id=None,
+                )
+            )
+            continue
+
+        normalized.append(plan)
+        reply_used_for_current_target = True
+
+    return normalized
+
+
 def _is_strong_pending_reply_signal(item: _PendingReplyItem) -> bool:
     return bool(item.mentioned or item.reply_to_bot or item.sender_is_owner)
 
@@ -1774,7 +1813,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             action = "skip"
 
             if action != "skip" and reply_specs:
-                resolved_modes: list[str] = []
                 for reply_spec in reply_specs:
                     resolved_mode = reply_spec.delivery_mode
                     if resolved_mode == "auto":
@@ -1803,7 +1841,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             reply_to_message_id=reply_target_id,
                         )
                     )
-                    resolved_modes.append(resolved_mode)
+
+                delivery_plans = _normalize_multi_message_delivery_plans(delivery_plans)
+                resolved_modes = [plan.delivery_mode for plan in delivery_plans]
 
                 unique_modes = sorted({mode for mode in resolved_modes if mode})
                 if not unique_modes:

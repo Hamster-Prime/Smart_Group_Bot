@@ -92,6 +92,34 @@ class ReplyTargetResolutionTests(unittest.TestCase):
             None,
         )
 
+    def test_normalize_multi_message_delivery_plans_only_first_same_target_keeps_reply(self) -> None:
+        plans = [
+            group._ReplyDeliveryPlan(text="第一条", delivery_mode="reply", reply_to_message_id=100),
+            group._ReplyDeliveryPlan(text="第二条", delivery_mode="reply", reply_to_message_id=100),
+            group._ReplyDeliveryPlan(text="第三条", delivery_mode="reply", reply_to_message_id=100),
+        ]
+
+        normalized = group._normalize_multi_message_delivery_plans(plans)
+
+        self.assertEqual(
+            [(plan.delivery_mode, plan.reply_to_message_id) for plan in normalized],
+            [("reply", 100), ("message", None), ("message", None)],
+        )
+
+    def test_normalize_multi_message_delivery_plans_keeps_reply_when_target_changes(self) -> None:
+        plans = [
+            group._ReplyDeliveryPlan(text="第一条", delivery_mode="reply", reply_to_message_id=100),
+            group._ReplyDeliveryPlan(text="第二条", delivery_mode="reply", reply_to_message_id=200),
+            group._ReplyDeliveryPlan(text="第三条", delivery_mode="reply", reply_to_message_id=200),
+        ]
+
+        normalized = group._normalize_multi_message_delivery_plans(plans)
+
+        self.assertEqual(
+            [(plan.delivery_mode, plan.reply_to_message_id) for plan in normalized],
+            [("reply", 100), ("reply", 200), ("message", None)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

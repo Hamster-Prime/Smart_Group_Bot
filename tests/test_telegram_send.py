@@ -84,6 +84,8 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mocked.await_count, 2)
         self.assertFalse(mocked.await_args_list[0].kwargs["stream"])
         self.assertFalse(mocked.await_args_list[1].kwargs["stream"])
+        self.assertEqual(mocked.await_args_list[0].kwargs["delivery_mode"], "reply")
+        self.assertEqual(mocked.await_args_list[1].kwargs["delivery_mode"], "message")
 
     async def test_send_reply_messages_keeps_streaming_for_single_message(self) -> None:
         message = SimpleNamespace()
