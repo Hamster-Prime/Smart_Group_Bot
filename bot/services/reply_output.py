@@ -12,7 +12,8 @@ REPLY_OUTPUT_PROTOCOL = (
     "The runtime explicitly supports 0, 1, or many outgoing messages in one turn.\n"
     "You are allowed to choose the number of outgoing messages yourself.\n"
     "If one natural message is enough, plain text is fine.\n"
-    "If you want to send 2 or more messages, output only JSON.\n"
+    "If you want to send 2 or more separate messages, you MUST output JSON.\n"
+    "Plain text output is always sent as a single message, even if it contains newlines.\n"
     "If you want different delivery modes or different reply targets for different messages, you MUST use message objects.\n"
     "messages may be plain strings or message objects.\n"
     "Use plain strings only when every outgoing message can use the default behavior.\n"
@@ -23,14 +24,16 @@ REPLY_OUTPUT_PROTOCOL = (
     '{"messages":[{"text":"first message","delivery_mode":"message"},{"text":"second message","delivery_mode":"reply","reply_to":"latest_input"}]}\n'
     "Example for explicit silence:\n"
     '{"should_reply":false,"reason":"not_addressed_to_bot"}\n'
-    "When to keep one message:\n"
-    "- one short answer is enough\n"
-    "- the whole response should stay attached as one beat\n"
-    "When to split into multiple messages:\n"
-    "- the turn naturally contains multiple beats\n"
-    "- you want reaction first, then explanation, then follow-up\n"
+    "When to keep one message (DEFAULT — most of the time):\n"
+    "- one response is enough, even if it has multiple lines\n"
+    "- you are replying to a single topic\n"
+    "- the response is a paragraph, an explanation, or a complete thought\n"
+    "When to split into multiple messages (RARE — only when truly needed):\n"
+    "- you need to address two completely different people or topics\n"
     "- different outgoing messages should use different delivery_mode or different reply_to targets\n"
-    "- if blank-line-separated paragraphs would read more naturally as separate bubbles, prefer multiple messages\n"
+    "- there are 2 genuinely independent beats that feel unnatural joined together\n"
+    "Do NOT split just because a response is long or has line breaks.\n"
+    "Do NOT split just to create a 'chat bubble' effect — one message is almost always better.\n"
     "When to use delivery_mode=message:\n"
     "- user explicitly asks for standalone messages\n"
     '- user says do not use reply format / direct-send / separate-send\n'
@@ -41,7 +44,6 @@ REPLY_OUTPUT_PROTOCOL = (
     "1. JSON must be the entire answer when you use it.\n"
     "2. messages are sent in order.\n"
     "3. Keep each message concise and natural.\n"
-    "3a. If there are clearly separate beats, prefer multiple messages over one message with multiple paragraphs.\n"
     "4. If the bot is not the real target, prefer should_reply=false.\n"
     "5. delivery_mode supports auto / reply / message.\n"
     '6. If delivery_mode is auto, the system will decide reply vs message with the normal logic.\n'
@@ -57,20 +59,20 @@ REPLY_OUTPUT_AWARENESS = (
     "Do not assume every outgoing message must use the same delivery mode or the same reply target.\n"
     "You may choose:\n"
     "- no message\n"
-    "- one message\n"
-    "- multiple messages\n"
+    "- one message (this is the default and most common choice)\n"
+    "- multiple messages (only when genuinely needed, e.g. addressing different people)\n"
     "You may also choose per outgoing message:\n"
     "- delivery_mode=message\n"
     "- delivery_mode=reply\n"
     "- reply_to=auto or a concrete alias from [REPLY_TARGET_CANDIDATES]\n"
     "Practical decision guide:\n"
-    "1. If one message cleanly solves the turn, keep one message.\n"
-    "2. If the turn naturally contains multiple beats, split them into multiple messages.\n"
-    "2a. If blank-line-separated paragraphs would feel like separate bubbles, prefer multiple messages.\n"
-    "3. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
-    "4. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
-    "5. If you need per-message control, do not use plain string arrays. Use message objects.\n"
-    "6. After tool use, these same output rules still apply to your final answer.\n"
+    "1. Default to ONE message. Most turns only need one message, even if the content has multiple sentences or line breaks.\n"
+    "2. Only split into multiple messages when they address genuinely different people, topics, or need different delivery modes.\n"
+    "3. Do NOT split for stylistic effect or to create chat bubbles — that is spammy.\n"
+    "4. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
+    "5. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
+    "6. If you need per-message control, do not use plain string arrays. Use message objects.\n"
+    "7. After tool use, these same output rules still apply to your final answer.\n"
 )
 
 _REPLY_JSON_KEYS = {
@@ -191,31 +193,9 @@ def _extract_plain_text_message_specs(
     max_messages: int,
     max_len: int,
 ) -> list[ReplyMessageSpec]:
-    payload = (value or "").strip()
-    if not payload or _looks_like_structured_plain_text(payload):
-        return []
-
-    raw_parts = re.split(r"\n\s*\n+", payload)
-    if len(raw_parts) < 2 or len(raw_parts) > min(max_messages, 6):
-        return []
-
-    out: list[ReplyMessageSpec] = []
-    total_chars = 0
-    for item in raw_parts:
-        normalized = _normalize_message_text(item, max_len=max_len)
-        if (
-            not normalized
-            or len(normalized) > _PLAIN_TEXT_MULTI_MESSAGE_MAX_PART_CHARS
-            or normalized.count("\n") > 1
-            or _looks_like_structured_plain_text(normalized)
-        ):
-            return []
-        out.append(ReplyMessageSpec(text=normalized))
-        total_chars += len(normalized)
-
-    if len(out) < 2 or total_chars > _PLAIN_TEXT_MULTI_MESSAGE_MAX_TOTAL_CHARS:
-        return []
-    return out
+    # Plain text is always sent as a single message.
+    # Multi-message output requires the LLM to use explicit JSON format.
+    return []
 
 
 def _extract_message_specs(value: Any, *, max_messages: int, max_len: int) -> list[ReplyMessageSpec]:

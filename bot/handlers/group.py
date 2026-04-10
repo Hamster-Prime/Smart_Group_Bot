@@ -1620,6 +1620,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         merged_count=merged_count,
                         merged_context=merged_context,
                         reply_targets_context=reply_targets_context,
+                        is_mentioned=mentioned,
+                        is_reply_to_bot=reply_to_bot,
                     ),
                 )
                 history = _exclude_batch_messages(history, memory_entries)
@@ -1635,6 +1637,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     merged_count=merged_count,
                     merged_context=merged_context,
                     reply_targets_context=reply_targets_context,
+                    is_mentioned=mentioned,
+                    is_reply_to_bot=reply_to_bot,
                 )
                 log.info(
                     "[%s] pending batch reply generation started | action=%s history=%d prompt_tokens=%s",
@@ -1663,6 +1667,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         merged_count=merged_count,
                         merged_context=merged_context,
                         reply_targets_context=reply_targets_context,
+                        is_mentioned=mentioned,
+                        is_reply_to_bot=reply_to_bot,
                     )
                     skill_handled = bool(skill_result.handled)
                     sticker_sent_ok = bool(skill_result.sticker_sent)
@@ -1707,6 +1713,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             merged_count=merged_count,
                             merged_context=merged_context,
                             reply_targets_context=reply_targets_context,
+                            is_mentioned=mentioned,
+                            is_reply_to_bot=reply_to_bot,
                         )
                         if raw_reply:
                             reply_source = "casual"

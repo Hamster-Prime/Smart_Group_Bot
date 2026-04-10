@@ -179,6 +179,25 @@ class SkillService:
             )
         return tools
 
+    @staticmethod
+    def _build_interaction_mode_context(
+        is_mentioned: bool,
+        is_reply_to_bot: bool,
+    ) -> str:
+        mode = "direct" if (is_mentioned or is_reply_to_bot) else "join"
+        if mode == "direct":
+            return (
+                "[INTERACTION_MODE]\ndirect\n"
+                "The sender is talking directly to you (mentioned you or replied to your message).\n"
+                "Respond naturally as the addressed party."
+            )
+        return (
+            "[INTERACTION_MODE]\njoin\n"
+            "You are voluntarily joining a group conversation — nobody asked you specifically.\n"
+            "Act like a group member chiming in, NOT like someone answering a question.\n"
+            "Keep it short: a comment, reaction, or opinion — not a full reply."
+        )
+
     def _build_answer_messages(
         self,
         user_text: str,
@@ -193,6 +212,8 @@ class SkillService:
         merged_context: str,
         reply_targets_context: str,
         selected_skills: dict[str, Skill],
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
@@ -231,6 +252,12 @@ class SkillService:
         normalized_intent = clean_text((intent_type or "casual").strip().lower(), max_len=16)
         if normalized_intent:
             messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
+        messages.append(
+            {
+                "role": "system",
+                "content": self._build_interaction_mode_context(is_mentioned, is_reply_to_bot),
+            }
+        )
         focus_context = build_current_turn_focus_context(
             user_text,
             merged_count=merged_count,
@@ -260,6 +287,8 @@ class SkillService:
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> dict[str, Any]:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         selected_skills = self._selected_skills(allow_tts=allow_tts)
@@ -276,6 +305,8 @@ class SkillService:
                 merged_context=merged_context,
                 reply_targets_context=reply_targets_context,
                 selected_skills=selected_skills,
+                is_mentioned=is_mentioned,
+                is_reply_to_bot=is_reply_to_bot,
             ),
             "tools": self._tool_definitions(selected_skills),
         }
@@ -580,6 +611,8 @@ class SkillService:
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         if contains_prompt_injection(user_text):
@@ -598,6 +631,8 @@ class SkillService:
             merged_context=merged_context,
             reply_targets_context=reply_targets_context,
             selected_skills=selected_skills,
+            is_mentioned=is_mentioned,
+            is_reply_to_bot=is_reply_to_bot,
         )
         tools = self._tool_definitions(selected_skills)
         context = SkillContext(

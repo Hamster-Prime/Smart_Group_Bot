@@ -66,6 +66,25 @@ class CasualService:
         input_limit = 1600 if merged_count > 1 else 1000
         return clean_multiline_text(text, max_len=input_limit), input_limit
 
+    @staticmethod
+    def _build_interaction_mode_context(
+        is_mentioned: bool,
+        is_reply_to_bot: bool,
+    ) -> str:
+        mode = "direct" if (is_mentioned or is_reply_to_bot) else "join"
+        if mode == "direct":
+            return (
+                "[INTERACTION_MODE]\ndirect\n"
+                "The sender is talking directly to you (mentioned you or replied to your message).\n"
+                "Respond naturally as the addressed party."
+            )
+        return (
+            "[INTERACTION_MODE]\njoin\n"
+            "You are voluntarily joining a group conversation — nobody asked you specifically.\n"
+            "Act like a group member chiming in, NOT like someone answering a question.\n"
+            "Keep it short: a comment, reaction, or opinion — not a full reply."
+        )
+
     def _build_messages_from_normalized_input(
         self,
         normalized_text: str,
@@ -80,6 +99,8 @@ class CasualService:
         merged_context: str,
         reply_targets_context: str,
         input_limit: int,
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": build_defended_system(with_persona(CASUAL_SYSTEM))},
@@ -126,6 +147,12 @@ class CasualService:
                 ),
             }
         )
+        messages.append(
+            {
+                "role": "system",
+                "content": self._build_interaction_mode_context(is_mentioned, is_reply_to_bot),
+            }
+        )
         focus_context = build_current_turn_focus_context(
             normalized_text,
             merged_count=merged_count,
@@ -158,6 +185,8 @@ class CasualService:
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> dict[str, Any]:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         return {
@@ -173,6 +202,8 @@ class CasualService:
                 merged_context=merged_context,
                 reply_targets_context=reply_targets_context,
                 input_limit=input_limit,
+                is_mentioned=is_mentioned,
+                is_reply_to_bot=is_reply_to_bot,
             )
         }
 
@@ -189,6 +220,8 @@ class CasualService:
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
+        is_mentioned: bool = False,
+        is_reply_to_bot: bool = False,
     ) -> str:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         if contains_prompt_injection(normalized_text):
@@ -206,6 +239,8 @@ class CasualService:
             merged_context=merged_context,
             reply_targets_context=reply_targets_context,
             input_limit=input_limit,
+            is_mentioned=is_mentioned,
+            is_reply_to_bot=is_reply_to_bot,
         )
 
         log.info("casual request: history=%d merged=%d", len(history) if history else 0, merged_count)
