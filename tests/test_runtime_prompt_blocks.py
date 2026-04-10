@@ -1,6 +1,12 @@
 import unittest
 
-from bot.utils.prompts import CHAT_BRIDGE_SYSTEM, REPLY_MODE_SYSTEM, STICKER_DECISION_SYSTEM
+from bot.utils.prompts import (
+    CASUAL_SYSTEM,
+    CHAT_BRIDGE_SYSTEM,
+    PERSONA_SYSTEM,
+    REPLY_MODE_SYSTEM,
+    STICKER_DECISION_SYSTEM,
+)
 
 
 class RuntimePromptBlockTests(unittest.TestCase):
@@ -42,3 +48,10 @@ class RuntimePromptBlockTests(unittest.TestCase):
             "[CURRENT_BRIDGE_MESSAGE]",
         ):
             self.assertIn(block, CHAT_BRIDGE_SYSTEM)
+
+    def test_core_prompts_discourage_blank_line_bubbles(self) -> None:
+        for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
+            self.assertIn("不要用空行", prompt)
+
+    def test_chat_bridge_prompt_discourages_blank_line_bubbles(self) -> None:
+        self.assertIn("Do not use blank lines to simulate multiple message bubbles", CHAT_BRIDGE_SYSTEM)
