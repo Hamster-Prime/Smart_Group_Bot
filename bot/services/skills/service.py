@@ -63,6 +63,9 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
         "douyin_search",
     }
 )
+_PLATFORM_LINK_SKILLS = frozenset(
+    {"bilibili_search", "weibo_search", "twitter_x_search", "xiaohongshu_search", "douyin_search"}
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -570,6 +573,144 @@ class SkillService:
             lines.append(final_url)
         return "\n\n".join(lines).strip()
 
+    @staticmethod
+    def _payload_result_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = payload.get("results")
+        return rows if isinstance(rows, list) else []
+
+    @staticmethod
+    def _payload_entry(payload: dict[str, Any]) -> dict[str, Any]:
+        entry = payload.get("entry")
+        return entry if isinstance(entry, dict) else {}
+
+    @staticmethod
+    def _collect_payload_urls(payload: dict[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for row in SkillService._payload_result_rows(payload):
+            if not isinstance(row, dict):
+                continue
+            url = clean_text(str(row.get("url") or ""), max_len=220).strip()
+            if url:
+                urls.append(url)
+
+        entry = SkillService._payload_entry(payload)
+        for key in ("url", "share_url", "redirected_url", "author_url", "download_url"):
+            value = clean_text(str(entry.get(key) or ""), max_len=220).strip()
+            if value:
+                urls.append(value)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped
+
+    @staticmethod
+    def _platform_label(skill_name: str, payload: dict[str, Any]) -> str:
+        platform = clean_text(str(payload.get("platform") or ""), max_len=40).strip()
+        label_map = {
+            "bilibili": "B站",
+            "weibo": "微博",
+            "twitter_x": "X/Twitter",
+            "xiaohongshu": "小红书",
+            "douyin": "抖音",
+        }
+        if platform in label_map:
+            return label_map[platform]
+        fallback_map = {
+            "bilibili_search": "B站",
+            "weibo_search": "微博",
+            "twitter_x_search": "X/Twitter",
+            "xiaohongshu_search": "小红书",
+            "douyin_search": "抖音",
+        }
+        return fallback_map.get(skill_name, "相关")
+
+    @classmethod
+    def _render_missing_result_links(
+        cls,
+        *,
+        skill_name: str,
+        payload: dict[str, Any],
+        content: str,
+    ) -> str:
+        label = cls._platform_label(skill_name, payload)
+        lines: list[str] = []
+
+        rows = cls._payload_result_rows(payload)
+        if rows:
+            for idx, row in enumerate(rows[:10], start=1):
+                if not isinstance(row, dict):
+                    continue
+                url = clean_text(str(row.get("url") or ""), max_len=220).strip()
+                if not url or url in content:
+                    continue
+                title = clean_multiline_text(str(row.get("title") or url), max_len=100).strip()
+                lines.append(f"{idx}. {title}\n{url}")
+            if lines:
+                return f"{label}相关链接：\n" + "\n".join(lines)
+
+        entry = cls._payload_entry(payload)
+        if entry:
+            entry_lines: list[str] = []
+            direct_url = clean_text(str(entry.get("url") or ""), max_len=220).strip()
+            if direct_url and direct_url not in content:
+                entry_lines.append(direct_url)
+
+            named_fields = (
+                ("分享链接", "share_url"),
+                ("跳转后链接", "redirected_url"),
+                ("作者主页", "author_url"),
+                ("相关直链", "download_url"),
+            )
+            for shown, key in named_fields:
+                value = clean_text(str(entry.get(key) or ""), max_len=220).strip()
+                if value and value not in content and value != direct_url:
+                    entry_lines.append(f"{shown}：{value}")
+
+            if entry_lines:
+                return f"{label}相关链接：\n" + "\n".join(entry_lines)
+
+        return ""
+
+    @classmethod
+    def _append_missing_platform_links(
+        cls,
+        *,
+        content: str,
+        recent_tool_results: list[dict[str, Any]],
+    ) -> str:
+        normalized = clean_multiline_text(content, max_len=4000).strip()
+        if not normalized:
+            return normalized
+
+        appendices: list[str] = []
+        seen_urls: set[str] = set()
+        for entry in recent_tool_results:
+            result = entry.get("result")
+            if not isinstance(result, SkillRunResult) or not result.ok or result.skill not in _PLATFORM_LINK_SKILLS:
+                continue
+            payload = result.payload if isinstance(result.payload, dict) else {}
+            payload_urls = [url for url in cls._collect_payload_urls(payload) if url not in seen_urls]
+            if not payload_urls:
+                continue
+            appendix = cls._render_missing_result_links(
+                skill_name=result.skill,
+                payload=payload,
+                content=normalized,
+            )
+            if not appendix:
+                continue
+            appendices.append(appendix)
+            seen_urls.update(payload_urls)
+
+        if not appendices:
+            return normalized
+        return normalized.rstrip() + "\n\n" + "\n\n".join(appendices)
+
     @classmethod
     def _build_tool_fallback_text(
         cls,
@@ -756,7 +897,12 @@ class SkillService:
                     last_success_summary=last_success_summary,
                 ):
                     log.info("skill tool loop finished: step=%d no_tool_call", step)
-                    return _build_answer_result(content)
+                    return _build_answer_result(
+                        self._append_missing_platform_links(
+                            content=content,
+                            recent_tool_results=recent_tool_results,
+                        )
+                    )
                 if (
                     not followup_retry_used
                     and step < self.max_tool_rounds

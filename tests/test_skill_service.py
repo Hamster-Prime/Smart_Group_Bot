@@ -82,6 +82,29 @@ class _PlannedSkillService(SkillService):
                 },
             )
 
+        if name == "weibo_search":
+            return SkillRunResult(
+                ok=True,
+                skill=name,
+                summary="拿到 2 条微博热搜",
+                payload={
+                    "platform": "weibo",
+                    "action": "hot_search",
+                    "results": [
+                        {
+                            "title": "热搜一",
+                            "url": "https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80",
+                            "snippet": "热度 112万",
+                        },
+                        {
+                            "title": "热搜二",
+                            "url": "https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C",
+                            "snippet": "热度 98万",
+                        },
+                    ],
+                },
+            )
+
         return SkillRunResult(ok=False, skill=name, summary="", error="unknown_skill")
 
 
@@ -207,6 +230,31 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("分享链接：https://v.douyin.com/abcdefg/", result.text)
         self.assertIn("跳转后链接：https://www.douyin.com/video/7445842287652441376", result.text)
         self.assertIn("相关直链：https://aweme.snssdk.com/aweme/v1/play/?video_id=foo", result.text)
+
+    async def test_platform_results_reply_without_links_gets_appendix(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "weibo_search",
+                                "arguments": '{"action":"hot_search","max_results":2}',
+                            },
+                        }
+                    ]
+                ),
+                _resp(content="微博热搜 Top 2\n1. 热搜一\n2. 热搜二"),
+            ]
+        )
+
+        result = await service.answer_with_skill("帮我看下今天的微博热搜", intent_type="casual")
+
+        self.assertIn("微博热搜 Top 2", result.text)
+        self.assertIn("微博相关链接：", result.text)
+        self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80", result.text)
+        self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C", result.text)
 
 
 if __name__ == "__main__":
