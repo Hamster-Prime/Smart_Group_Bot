@@ -52,6 +52,7 @@ class RuntimePromptBlockTests(unittest.TestCase):
     def test_core_prompts_discourage_blank_line_bubbles(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
             self.assertIn("不要用空行", prompt)
+            self.assertIn("系统可能会按段落拆成多条消息发送", prompt)
 
     def test_chat_bridge_prompt_discourages_blank_line_bubbles(self) -> None:
         self.assertIn("Do not use blank lines to simulate multiple message bubbles", CHAT_BRIDGE_SYSTEM)

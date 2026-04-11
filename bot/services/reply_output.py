@@ -12,11 +12,13 @@ REPLY_OUTPUT_PROTOCOL = (
     "The runtime explicitly supports 0, 1, or many outgoing messages in one turn.\n"
     "You are allowed to choose the number of outgoing messages yourself.\n"
     "If one natural message is enough, plain text is fine.\n"
-    "If you want to send 2 or more separate messages, you MUST output JSON.\n"
-    "Plain text output is always sent as a single message, even if it contains newlines.\n"
-    "Inside one visible message, normal line breaks are allowed, but avoid blank lines unless they are functionally necessary.\n"
+    "If you want reliable control over 2 or more separate messages, you MUST output JSON.\n"
+    "Plain text output normally stays one message.\n"
+    "Inside one visible message, normal line breaks are allowed.\n"
+    "But if your plain text contains blank lines, the runtime may split it into multiple messages, one paragraph per message.\n"
+    "So if you want one visible message, do NOT use blank lines. Use at most single newlines.\n"
     "Do NOT use blank lines to imitate multiple chat bubbles.\n"
-    "If you want separate bubbles, use JSON multi-message output.\n"
+    "If you want separate bubbles on purpose, use JSON multi-message output.\n"
     "If you want different delivery modes or different reply targets for different messages, you MUST use message objects.\n"
     "messages may be plain strings or message objects.\n"
     "Use plain strings only when every outgoing message can use the default behavior.\n"
@@ -70,13 +72,14 @@ REPLY_OUTPUT_AWARENESS = (
     "- reply_to=auto or a concrete alias from [REPLY_TARGET_CANDIDATES]\n"
     "Practical decision guide:\n"
     "1. Default to ONE message. Most turns only need one message, even if the content has multiple sentences or line breaks.\n"
-    "2. If you stay in one message, keep the layout compact: use normal line breaks when needed, but avoid blank lines unless they carry real structure.\n"
-    "3. Do NOT use blank lines to fake multiple bubbles or separate beats.\n"
-    "4. Only split into multiple messages when they address genuinely different people, topics, or need different delivery modes.\n"
-    "5. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
-    "6. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
-    "7. If you need per-message control, do not use plain string arrays. Use message objects.\n"
-    "8. After tool use, these same output rules still apply to your final answer.\n"
+    "2. If you stay in one message, keep the layout compact: use normal line breaks when needed, but do not leave blank lines.\n"
+    "3. Blank lines in plain text may be auto-split by the runtime into separate messages, one paragraph per message.\n"
+    "4. Do NOT use blank lines to fake multiple bubbles or separate beats.\n"
+    "5. Only split into multiple messages when they address genuinely different people, topics, or need different delivery modes.\n"
+    "6. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
+    "7. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
+    "8. If you need per-message control, do not use plain string arrays. Use message objects.\n"
+    "9. After tool use, these same output rules still apply to your final answer.\n"
 )
 
 _REPLY_JSON_KEYS = {
@@ -96,6 +99,7 @@ _VALID_DELIVERY_MODES = {"auto", "reply", "message"}
 _STRUCTURED_PLAIN_TEXT_RE = re.compile(
     r"(?m)^\s*(?:[-*+]\s+|\d+\.\s+|[（(]?\d+[)）]\s+|#{1,6}\s+|>|```|[一二三四五六七八九十]+[、.])"
 )
+_BLANK_LINE_SPLIT_RE = re.compile(r"\n\s*\n+")
 _PLAIN_TEXT_MULTI_MESSAGE_MAX_PART_CHARS = 90
 _PLAIN_TEXT_MULTI_MESSAGE_MAX_TOTAL_CHARS = 240
 
@@ -197,9 +201,30 @@ def _extract_plain_text_message_specs(
     max_messages: int,
     max_len: int,
 ) -> list[ReplyMessageSpec]:
-    # Plain text is always sent as a single message.
-    # Multi-message output requires the LLM to use explicit JSON format.
-    return []
+    if max_messages <= 1:
+        return []
+
+    normalized = clean_multiline_text(
+        value,
+        max_len=max(max_len, 1) * max(max_messages, 1),
+    ).strip()
+    if not normalized or "\n\n" not in normalized:
+        return []
+
+    parts = [
+        _normalize_message_text(part, max_len=max_len)
+        for part in _BLANK_LINE_SPLIT_RE.split(normalized)
+    ]
+    parts = [part for part in parts if part]
+    if len(parts) <= 1:
+        return []
+
+    if len(parts) > max_messages:
+        head = parts[: max_messages - 1]
+        tail = "\n\n".join(parts[max_messages - 1 :]).strip()
+        parts = head + ([tail] if tail else [])
+
+    return [ReplyMessageSpec(text=part) for part in parts]
 
 
 def _extract_message_specs(value: Any, *, max_messages: int, max_len: int) -> list[ReplyMessageSpec]:
