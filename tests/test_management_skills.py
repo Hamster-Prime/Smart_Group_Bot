@@ -1,13 +1,12 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot.services.group_intent import GroupIntent
+from bot.services.manage_intent import GroupIntent
+from bot.services.manage_intent import TaskIntent
 from bot.services.skills.base import SkillContext
 from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.task_manage import TaskManageSkill
-from bot.services.task_intent import TaskIntent
 
 
 class ManagementSkillDeleteGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -33,13 +32,17 @@ class ManagementSkillDeleteGuardTests(unittest.IsolatedAsyncioTestCase):
         skill = RuleManageSkill()
         context = SkillContext(
             session=object(),
-            llm=SimpleNamespace(generate=AsyncMock(return_value='{"action":"delete"}')),
+            llm=object(),
             chat_id=-10001,
             sender_is_tg_admin=True,
             current_user_text="删除第 3 条群规",
         )
 
-        result = await skill.run({}, context)
+        with patch(
+            "bot.services.skills.rule_manage.GroupIntentService.detect",
+            new=AsyncMock(return_value=GroupIntent(intent="rule_manage", rule_action="delete")),
+        ):
+            result = await skill.run({}, context)
 
         self.assertTrue(result.ok)
         self.assertIn("/rules", result.summary)

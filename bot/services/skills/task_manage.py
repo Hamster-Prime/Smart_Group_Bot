@@ -4,7 +4,7 @@ import html
 import re
 
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.services.task_intent import TaskIntentService
+from bot.services.manage_intent import TaskIntentService
 from bot.utils.security import clean_text
 
 _TASK_LIST_PATTERNS = (

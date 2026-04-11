@@ -4,7 +4,7 @@ import html
 import re
 
 from bot.services import memory_holder
-from bot.services.group_intent import GroupIntentService
+from bot.services.manage_intent import GroupIntentService
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
 

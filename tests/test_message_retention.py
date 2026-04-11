@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.config import Settings
 from bot.handlers import commands, group
-from bot.services.group_intent import GroupIntent
+from bot.services.manage_intent import GroupIntent
 
 
 def _settings(auto_delete_minutes: int = 1) -> Settings:

@@ -1,6 +1,6 @@
 import unittest
 
-from bot.services.group_intent import GroupIntentService
+from bot.services.manage_intent import GroupIntentService
 
 
 class _DummyLLM:
@@ -68,13 +68,15 @@ class GroupIntentServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_rule_add_still_works(self) -> None:
         llm = _DummyLLM(
-            '{"intent":"rule_manage","memory_action":"unknown","memory_content":"","memory_target":"","rule_instruction":"增加一条规则，禁止发广告"}'
+            '{"intent":"rule_manage","memory_action":"unknown","memory_content":"","memory_target":"","rule_action":"add","rule_type":"keyword","rule_pattern":"禁止发广告","rule_hit_action":"warn","rule_instruction":"增加一条规则，禁止发广告"}'
         )
         svc = GroupIntentService(llm)
 
         intent = await svc.detect("增加一条规则，禁止发广告")
 
         self.assertEqual(intent.intent, "rule_manage")
+        self.assertEqual(intent.rule_action, "add")
+        self.assertEqual(intent.rule_pattern, "禁止发广告")
         self.assertEqual(intent.rule_instruction, "增加一条规则，禁止发广告")
         self.assertEqual(llm.calls, 1)
 

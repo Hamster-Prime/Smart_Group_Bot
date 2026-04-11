@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime
 
-from bot.services.task_intent import TaskIntentService
+from bot.services.manage_intent import TaskIntentService
 
 
 class _DummyLLM:

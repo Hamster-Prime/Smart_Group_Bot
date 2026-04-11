@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import html
-import json
-import re
 
 from sqlalchemy import select
 
 from bot.db.models import ModerationRule
+from bot.services.manage_intent import GroupIntentService
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.utils.prompts import RULE_MANAGE_SYSTEM
 from bot.utils.security import clean_text
 
 _SEMANTIC_ABUSE_HINTS = {"骂人", "辱骂", "脏话", "人身攻击", "侮辱", "喷人"}
@@ -36,22 +34,6 @@ def _action_label(action: str) -> str:
         "delete": "删消息",
         "ban": "封禁",
     }.get((action or "").lower(), action or "未知")
-
-
-def _parse_json_payload(raw: str) -> dict | None:
-    payload = (raw or "").strip()
-    if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json)?", "", payload).strip()
-        payload = re.sub(r"```$", "", payload).strip()
-    if not payload.startswith("{"):
-        match = re.search(r"\{[\s\S]*\}", payload)
-        if match:
-            payload = match.group(0)
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _format_rule_list(rules: list[ModerationRule]) -> str:
@@ -131,15 +113,20 @@ class RuleManageSkill:
                 summary="请直接说要新增或查看什么群规；删除请使用 /rules。",
             )
 
-        parsed = _parse_json_payload(await context.llm.generate(RULE_MANAGE_SYSTEM, request_text))
-        if not parsed:
+        intent_svc = GroupIntentService(context.llm)
+        intent = await intent_svc.detect(
+            request_text,
+            history=context.history,
+            force_llm=True,
+        )
+        if intent.intent != "rule_manage":
             return SkillRunResult(
                 ok=True,
                 skill=self.name,
                 summary="我没看懂这条群规指令。你可以说“新增群规 禁止发广告”，删除请使用 /rules。",
             )
 
-        action = clean_text(str(parsed.get("action", "unknown")).lower(), max_len=24)
+        action = clean_text((intent.rule_action or "unknown").lower(), max_len=24)
         if action == "list":
             stmt = (
                 select(ModerationRule)
@@ -170,9 +157,9 @@ class RuleManageSkill:
                 summary="这条群规请求暂不支持；删除请使用 /rules。",
             )
 
-        rule_type = clean_text(str(parsed.get("rule_type", "keyword")).lower(), max_len=16)
-        pattern = clean_text(str(parsed.get("pattern", "")), max_len=1000)
-        hit_action = clean_text(str(parsed.get("hit_action", "warn")).lower(), max_len=16)
+        rule_type = clean_text((intent.rule_type or "keyword").lower(), max_len=16)
+        pattern = clean_text(intent.rule_pattern or "", max_len=1000)
+        hit_action = clean_text((intent.rule_hit_action or "warn").lower(), max_len=16)
         if rule_type not in {"keyword", "regex", "llm"}:
             return SkillRunResult(
                 ok=True,
