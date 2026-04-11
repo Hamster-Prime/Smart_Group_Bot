@@ -52,6 +52,8 @@ class ReplyOutputParserTests(unittest.TestCase):
                 "再说了，我会盯着看的呀~",
             ],
         )
+        self.assertTrue(all(spec.delivery_mode == "auto" for spec in parsed.message_specs))
+        self.assertTrue(all(spec.reply_to == "auto" for spec in parsed.message_specs))
         self.assertFalse(parsed.explicit_no_reply)
         self.assertFalse(parsed.used_json)
 
@@ -100,9 +102,10 @@ class ReplyOutputPromptTests(unittest.TestCase):
     def test_protocol_mentions_compact_single_message_guidance_and_per_message_control(self) -> None:
         self.assertIn("0, 1, or many outgoing messages", REPLY_OUTPUT_PROTOCOL)
         self.assertIn("MUST use message objects", REPLY_OUTPUT_PROTOCOL)
-        self.assertIn("runtime may split it into multiple messages", REPLY_OUTPUT_PROTOCOL)
+        self.assertIn("every blank-line-separated block is treated as a separate outgoing message", REPLY_OUTPUT_PROTOCOL)
         self.assertIn("If you want one visible message, do NOT use blank lines.", REPLY_OUTPUT_PROTOCOL)
-        self.assertIn("may be auto-split by the runtime", REPLY_OUTPUT_AWARENESS)
+        self.assertIn("If you want multiple plain-text messages with the default behavior, separate them with blank lines.", REPLY_OUTPUT_PROTOCOL)
+        self.assertIn("a blank line is a message separator", REPLY_OUTPUT_AWARENESS)
         self.assertIn("Use message objects", REPLY_OUTPUT_AWARENESS)
 
     def test_casual_prompt_includes_reply_output_protocol(self) -> None:

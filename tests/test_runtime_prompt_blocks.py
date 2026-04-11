@@ -5,6 +5,7 @@ from bot.utils.prompts import (
     CHAT_BRIDGE_SYSTEM,
     PERSONA_SYSTEM,
     REPLY_MODE_SYSTEM,
+    SKILL_TOOL_SYSTEM,
     STICKER_DECISION_SYSTEM,
 )
 
@@ -51,8 +52,12 @@ class RuntimePromptBlockTests(unittest.TestCase):
 
     def test_core_prompts_discourage_blank_line_bubbles(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
-            self.assertIn("不要用空行", prompt)
-            self.assertIn("系统可能会按段落拆成多条消息发送", prompt)
+            self.assertIn("不要留空行", prompt)
+            self.assertIn("空行就是“分开发送多条消息”的信号", prompt)
+
+    def test_skill_prompt_declares_blank_line_split_rule(self) -> None:
+        self.assertIn("纯文本里一旦出现空行，就会被当成分开发送多条消息", SKILL_TOOL_SYSTEM)
 
     def test_chat_bridge_prompt_discourages_blank_line_bubbles(self) -> None:
-        self.assertIn("Do not use blank lines to simulate multiple message bubbles", CHAT_BRIDGE_SYSTEM)
+        self.assertIn("any blank line will be treated as a separator for multiple outgoing messages", CHAT_BRIDGE_SYSTEM)
+        self.assertIn("do not output blank lines for spacing", CHAT_BRIDGE_SYSTEM)
