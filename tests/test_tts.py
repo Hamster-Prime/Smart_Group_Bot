@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,6 +19,7 @@ from bot.services.doubao_tts import (
     set_tts_mode,
 )
 from bot.services.skills.base import SkillContext
+from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 
 
@@ -51,6 +53,56 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(payload["req_params"]["additions"], str)
         self.assertIn("disable_markdown_filter", payload["req_params"]["additions"])
+        self.assertEqual(payload["namespace"], "UnidirectionalTTS")
+
+        additions = json.loads(payload["req_params"]["additions"])
+        self.assertTrue(additions["cache_config"]["use_cache"])
+
+    def test_doubao_payload_supports_context_and_emotion_scale(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+
+        payload = service._build_payload(
+            "真的很抱歉，这次是我处理得不好。",
+            uid="123",
+            emotion="sad",
+            emotion_scale=5,
+            speech_rate=-10,
+            context="用真诚克制的声音，像在认真道歉，语速稍慢。",
+        )
+
+        additions = json.loads(payload["req_params"]["additions"])
+        audio_params = payload["req_params"]["audio_params"]
+
+        self.assertEqual(audio_params["emotion"], "sad")
+        self.assertEqual(audio_params["emotion_scale"], 5)
+        self.assertEqual(audio_params["speech_rate"], -10)
+        self.assertIn("context_texts", additions)
+        self.assertIn("认真道歉", additions["context_texts"][0])
+
+    def test_doubao_payload_auto_infers_apology_style(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+
+        payload = service._build_payload("真的很抱歉，这次是我们的问题。", uid="123")
+
+        additions = json.loads(payload["req_params"]["additions"])
+        audio_params = payload["req_params"]["audio_params"]
+
+        self.assertEqual(audio_params["emotion"], "sad")
+        self.assertEqual(audio_params["emotion_scale"], 3)
+        self.assertLess(audio_params["speech_rate"], 0)
+        self.assertIn("歉意", additions["context_texts"][0])
 
     def test_split_text_keeps_single_segment_when_under_max_length(self) -> None:
         settings = _settings()
@@ -344,6 +396,40 @@ class DoubaoTTSReplyFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_kwargs["parse_mode"], "HTML")
         self.assertIn('tg://user?id=42', second_kwargs["caption"])
         self.assertIn("@Alice", second_kwargs["caption"])
+
+
+class DoubaoTTSSkillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skill_passes_context_and_emotion_scale_to_service(self) -> None:
+        tts_service = SimpleNamespace(
+            send_message_tts=AsyncMock(return_value=True),
+            send_chat_tts=AsyncMock(return_value=True),
+        )
+        skill = DoubaoTTSSkill(tts_service)
+        context = SkillContext(
+            message=SimpleNamespace(),
+            chat_id=-10001,
+            sender_user_id=42,
+            current_user_text="原始文本",
+        )
+
+        result = await skill.run(
+            {
+                "text": "你别急，我在。",
+                "emotion": "calm",
+                "emotion_scale": 5,
+                "context": "像在认真安慰朋友，声音放轻一点，语速慢一点。",
+                "speech_rate": -12,
+            },
+            context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.payload["emotion_scale"], 5)
+        kwargs = tts_service.send_message_tts.await_args.kwargs
+        self.assertEqual(kwargs["emotion"], "calm")
+        self.assertEqual(kwargs["emotion_scale"], 5)
+        self.assertEqual(kwargs["speech_rate"], -12)
+        self.assertIn("认真安慰朋友", kwargs["context"])
 
 
 if __name__ == "__main__":

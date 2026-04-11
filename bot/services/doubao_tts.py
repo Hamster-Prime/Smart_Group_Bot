@@ -52,6 +52,17 @@ _REPEATED_PAUSE_RE = re.compile(r"[，,、]{2,}")
 _REPEATED_STOP_RE = re.compile(r"[。\.]{2,}")
 _REPEATED_QA_RE = re.compile(r"[!?！？]{2,}")
 _MARKDOWN_DECORATION_RE = re.compile(r"[*_~>#]+")
+_EMOTION_FALLBACK_CODES = {1014}
+_NEWS_KEYWORDS = ("新闻", "快讯", "播报", "报道", "日讯", "通知", "公告", "提醒")
+_APOLOGY_KEYWORDS = ("抱歉", "对不起", "不好意思", "失礼", "给您带来不便", "很遗憾")
+_COMFORT_KEYWORDS = ("没事", "别怕", "慢慢来", "辛苦了", "抱抱", "晚安", "乖", "别难过")
+_HAPPY_KEYWORDS = ("太好了", "开心", "高兴", "好耶", "太棒了", "绝了", "哈哈", "成功了", "喜欢", "赢了")
+_ANGER_KEYWORDS = ("气死", "离谱", "无语", "烦死", "警告", "严禁", "禁止", "立刻", "马上", "闭嘴", "住手")
+_SUSPENSE_KEYWORDS = ("等等", "不对劲", "奇怪", "悬疑", "诡异", "突然", "怎么回事", "别回头")
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
 
 
 def normalize_tts_mode(value: Any, *, default: str = TTS_MODE_OFF) -> str:
@@ -130,6 +141,15 @@ class TTSSynthesisResult:
     logid: str = ""
 
 
+@dataclass(slots=True)
+class TTSStyleDecision:
+    emotion: str = ""
+    emotion_scale: int | None = None
+    speech_rate: int | None = None
+    loudness_rate: int | None = None
+    context: str = ""
+
+
 class DoubaoTTSService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -173,6 +193,148 @@ class DoubaoTTSService:
         if self.audio_format == "pcm":
             return ".pcm"
         return ".bin"
+
+    @staticmethod
+    def _clamp_emotion_scale(value: int | None) -> int:
+        if value is None:
+            return 4
+        return min(5, max(1, int(value)))
+
+    @staticmethod
+    def _clamp_audio_rate(value: int | None) -> int:
+        if value is None:
+            return 0
+        return min(100, max(-50, int(value)))
+
+    def _normalize_context(self, text: str) -> str:
+        cleaned = sanitize_outgoing_text(text or "")
+        cleaned = html.unescape(_HTML_TAG_RE.sub(" ", cleaned))
+        cleaned = _MARKDOWN_LINK_RE.sub(r"\1", cleaned)
+        cleaned = _URL_RE.sub("相关内容", cleaned)
+        cleaned = _MARKDOWN_DECORATION_RE.sub(" ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.strip(" ，。！？：、")
+        return cleaned[:160]
+
+    def _infer_style(self, text: str) -> TTSStyleDecision:
+        raw = sanitize_outgoing_text(text or "")
+        normalized = self.normalize_text(raw)
+        if not normalized:
+            return TTSStyleDecision()
+
+        exclaim_count = raw.count("!") + raw.count("！")
+        question_count = raw.count("?") + raw.count("？")
+
+        if _contains_any(normalized, _NEWS_KEYWORDS):
+            return TTSStyleDecision(
+                emotion="calm",
+                emotion_scale=2,
+                speech_rate=0,
+                loudness_rate=0,
+                context="用沉稳清晰的播报声，像在做正式新闻或信息播报，吐字清楚，节奏平稳。",
+            )
+        if _contains_any(normalized, _APOLOGY_KEYWORDS):
+            return TTSStyleDecision(
+                emotion="sad",
+                emotion_scale=4 if exclaim_count else 3,
+                speech_rate=-12,
+                loudness_rate=-6,
+                context="用真诚克制的声音，像在认真道歉并安抚对方情绪，语速稍慢，带着明显歉意。",
+            )
+        if _contains_any(normalized, _COMFORT_KEYWORDS):
+            return TTSStyleDecision(
+                emotion="calm",
+                emotion_scale=3,
+                speech_rate=-18,
+                loudness_rate=-8,
+                context="用温柔轻声的声音，像在安慰身边的人，语速放慢，语气柔和有陪伴感。",
+            )
+        if _contains_any(normalized, _ANGER_KEYWORDS):
+            return TTSStyleDecision(
+                emotion="angry",
+                emotion_scale=5 if exclaim_count else 4,
+                speech_rate=12,
+                loudness_rate=6,
+                context="用严肃不满的语气，情绪明确但不要失控，吐字更重，节奏略快，带着警告或指责感。",
+            )
+        if _contains_any(normalized, _HAPPY_KEYWORDS) or exclaim_count >= 2:
+            return TTSStyleDecision(
+                emotion="cheerful" if exclaim_count >= 2 else "happy",
+                emotion_scale=min(5, max(3, 3 + exclaim_count)),
+                speech_rate=12 if exclaim_count else 8,
+                loudness_rate=4 if exclaim_count else 2,
+                context="用开心明亮的声音，像在分享好消息，语调上扬，节奏轻快，带着明显兴奋感。",
+            )
+        if _contains_any(normalized, _SUSPENSE_KEYWORDS):
+            return TTSStyleDecision(
+                emotion="calm",
+                emotion_scale=2,
+                speech_rate=-10,
+                loudness_rate=-3,
+                context="用压低嗓音的叙述方式，语速稍慢，带一点紧张和悬念感，像在铺垫故事转折。",
+            )
+        if question_count and len(normalized) <= 40:
+            return TTSStyleDecision(
+                emotion="calm",
+                emotion_scale=2,
+                speech_rate=0,
+                loudness_rate=0,
+                context="用自然口语的方式发问，尾音轻微上扬，像在和朋友当面确认一件事。",
+            )
+        return TTSStyleDecision()
+
+    def _resolve_style(
+        self,
+        text: str,
+        *,
+        emotion: str = "",
+        emotion_scale: int | None = None,
+        speech_rate: int | None = None,
+        loudness_rate: int | None = None,
+        context: str = "",
+        use_default_emotion: bool = True,
+        auto_style: bool = True,
+    ) -> TTSStyleDecision:
+        chosen_emotion = str(emotion or "").strip()
+        chosen_context = self._normalize_context(context)
+        chosen_speech_rate = self.speech_rate if speech_rate is None else int(speech_rate)
+        chosen_loudness_rate = self.loudness_rate if loudness_rate is None else int(loudness_rate)
+        chosen_emotion_scale = emotion_scale
+
+        if use_default_emotion and not chosen_emotion:
+            chosen_emotion = self.emotion
+
+        inferred = TTSStyleDecision()
+        if auto_style and not chosen_emotion and not chosen_context:
+            inferred = self._infer_style(text)
+            if inferred.emotion:
+                chosen_emotion = inferred.emotion
+            if inferred.context:
+                chosen_context = inferred.context
+            if chosen_emotion_scale is None:
+                chosen_emotion_scale = inferred.emotion_scale
+            if speech_rate is None and self.speech_rate == 0 and inferred.speech_rate is not None:
+                chosen_speech_rate = inferred.speech_rate
+            if loudness_rate is None and self.loudness_rate == 0 and inferred.loudness_rate is not None:
+                chosen_loudness_rate = inferred.loudness_rate
+
+        if chosen_emotion and chosen_emotion_scale is None:
+            chosen_emotion_scale = self.emotion_scale
+
+        return TTSStyleDecision(
+            emotion=chosen_emotion,
+            emotion_scale=self._clamp_emotion_scale(chosen_emotion_scale) if chosen_emotion else None,
+            speech_rate=self._clamp_audio_rate(chosen_speech_rate),
+            loudness_rate=self._clamp_audio_rate(chosen_loudness_rate),
+            context=chosen_context,
+        )
+
+    @staticmethod
+    def _should_retry_without_emotion(*, code: int, message: str, style: TTSStyleDecision) -> bool:
+        if not style.emotion:
+            return False
+        lowered = (message or "").lower()
+        return code in _EMOTION_FALLBACK_CODES or "emotion" in lowered or "情感" in message
 
     def normalize_text(self, text: str) -> str:
         cleaned = sanitize_outgoing_text(text or "")
@@ -275,12 +437,26 @@ class DoubaoTTSService:
         *,
         uid: str,
         emotion: str = "",
+        emotion_scale: int | None = None,
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
+        context: str = "",
         audio_format: str | None = None,
         sample_rate: int | None = None,
         bit_rate: int | None = None,
+        use_default_emotion: bool = True,
+        auto_style: bool = True,
     ) -> dict[str, Any]:
+        style = self._resolve_style(
+            text,
+            emotion=emotion,
+            emotion_scale=emotion_scale,
+            speech_rate=speech_rate,
+            loudness_rate=loudness_rate,
+            context=context,
+            use_default_emotion=use_default_emotion,
+            auto_style=auto_style,
+        )
         actual_format = (audio_format or self.audio_format).strip() or self.audio_format
         actual_sample_rate = int(sample_rate or self.sample_rate or 24000)
         actual_bit_rate = int(bit_rate or self.bit_rate or 0)
@@ -291,22 +467,25 @@ class DoubaoTTSService:
         if actual_bit_rate > 0:
             audio_params["bit_rate"] = actual_bit_rate
 
-        chosen_emotion = (emotion or self.emotion).strip()
-        if chosen_emotion:
-            audio_params["emotion"] = chosen_emotion
-            audio_params["emotion_scale"] = min(5, max(1, self.emotion_scale))
+        if style.emotion:
+            audio_params["emotion"] = style.emotion
+            if style.emotion_scale is not None:
+                audio_params["emotion_scale"] = style.emotion_scale
 
-        chosen_speech_rate = self.speech_rate if speech_rate is None else int(speech_rate)
-        if chosen_speech_rate:
-            audio_params["speech_rate"] = min(100, max(-50, chosen_speech_rate))
+        if style.speech_rate:
+            audio_params["speech_rate"] = style.speech_rate
 
-        chosen_loudness_rate = self.loudness_rate if loudness_rate is None else int(loudness_rate)
-        if chosen_loudness_rate:
-            audio_params["loudness_rate"] = min(100, max(-50, chosen_loudness_rate))
+        if style.loudness_rate:
+            audio_params["loudness_rate"] = style.loudness_rate
 
-        additions: dict[str, Any] = {"disable_markdown_filter": True}
+        additions: dict[str, Any] = {
+            "disable_markdown_filter": True,
+            "cache_config": {"text_type": 1, "use_cache": True},
+        }
         if self.silence_duration_ms > 0:
             additions["silence_duration"] = self.silence_duration_ms
+        if style.context:
+            additions["context_texts"] = [style.context]
 
         req_params: dict[str, Any] = {
             "text": text,
@@ -320,6 +499,7 @@ class DoubaoTTSService:
 
         return {
             "user": {"uid": uid or self.app_id or "smart-group-bot"},
+            "namespace": "UnidirectionalTTS",
             "req_params": req_params,
         }
 
@@ -365,11 +545,15 @@ class DoubaoTTSService:
         *,
         uid: str = "",
         emotion: str = "",
+        emotion_scale: int | None = None,
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
+        context: str = "",
         audio_format: str | None = None,
         sample_rate: int | None = None,
         bit_rate: int | None = None,
+        _use_default_emotion: bool = True,
+        _auto_style: bool = True,
     ) -> TTSSynthesisResult:
         if not self.available:
             return TTSSynthesisResult(ok=False, error="tts_not_configured")
@@ -379,6 +563,17 @@ class DoubaoTTSService:
             return TTSSynthesisResult(ok=False, error="empty_text")
         if len(normalized) > self.max_text_length:
             return TTSSynthesisResult(ok=False, error="text_too_long", text=normalized)
+
+        style = self._resolve_style(
+            normalized,
+            emotion=emotion,
+            emotion_scale=emotion_scale,
+            speech_rate=speech_rate,
+            loudness_rate=loudness_rate,
+            context=context,
+            use_default_emotion=_use_default_emotion,
+            auto_style=_auto_style,
+        )
 
         request_id = str(uuid.uuid4())
         timeout = aiohttp.ClientTimeout(total=max(5.0, self.http_timeout_sec))
@@ -390,12 +585,16 @@ class DoubaoTTSService:
                     json=self._build_payload(
                         normalized,
                         uid=uid,
-                        emotion=emotion,
-                        speech_rate=speech_rate,
-                        loudness_rate=loudness_rate,
+                        emotion=style.emotion,
+                        emotion_scale=style.emotion_scale,
+                        speech_rate=style.speech_rate,
+                        loudness_rate=style.loudness_rate,
+                        context=style.context,
                         audio_format=audio_format,
                         sample_rate=sample_rate,
                         bit_rate=bit_rate,
+                        use_default_emotion=False,
+                        auto_style=False,
                     ),
                 ) as resp:
                     logid = str(resp.headers.get("X-Tt-Logid", "") or "")
@@ -429,6 +628,26 @@ class DoubaoTTSService:
                                 usage = raw_usage
                             finished = True
                             break
+                        if self._should_retry_without_emotion(code=code, message=message, style=style):
+                            log.info(
+                                "doubao tts emotion unsupported, retrying without emotion | emotion=%s logid=%s",
+                                style.emotion,
+                                logid,
+                            )
+                            return await self.synthesize(
+                                normalized,
+                                uid=uid,
+                                emotion="",
+                                emotion_scale=None,
+                                speech_rate=style.speech_rate,
+                                loudness_rate=style.loudness_rate,
+                                context=style.context,
+                                audio_format=audio_format,
+                                sample_rate=sample_rate,
+                                bit_rate=bit_rate,
+                                _use_default_emotion=False,
+                                _auto_style=False,
+                            )
                         log.warning("doubao tts failed code=%s message=%s logid=%s", code, message, logid)
                         return TTSSynthesisResult(
                             ok=False,
@@ -514,16 +733,20 @@ class DoubaoTTSService:
         *,
         uid: str = "",
         emotion: str = "",
+        emotion_scale: int | None = None,
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
+        context: str = "",
     ) -> TTSSynthesisResult:
         if self.audio_format != "ogg_opus":
             return await self.synthesize(
                 text,
                 uid=uid,
                 emotion=emotion,
+                emotion_scale=emotion_scale,
                 speech_rate=speech_rate,
                 loudness_rate=loudness_rate,
+                context=context,
             )
 
         source_bitrate = max(128000, int(self.bit_rate or 0))
@@ -531,8 +754,10 @@ class DoubaoTTSService:
             text,
             uid=uid,
             emotion=emotion,
+            emotion_scale=emotion_scale,
             speech_rate=speech_rate,
             loudness_rate=loudness_rate,
+            context=context,
             audio_format="mp3",
             sample_rate=max(44100, int(self.sample_rate or 44100)),
             bit_rate=source_bitrate,
@@ -671,8 +896,10 @@ class DoubaoTTSService:
         auto_delete_minutes: int = 0,
         uid: str = "",
         emotion: str = "",
+        emotion_scale: int | None = None,
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
+        context: str = "",
     ) -> bool:
         if not self.available:
             return False
@@ -687,16 +914,20 @@ class DoubaoTTSService:
                     segment,
                     uid=uid,
                     emotion=emotion,
+                    emotion_scale=emotion_scale,
                     speech_rate=speech_rate,
                     loudness_rate=loudness_rate,
+                    context=context,
                 )
             else:
                 result = await self.synthesize(
                     segment,
                     uid=uid,
                     emotion=emotion,
+                    emotion_scale=emotion_scale,
                     speech_rate=speech_rate,
                     loudness_rate=loudness_rate,
+                    context=context,
                 )
             if not result.ok or not result.audio_bytes:
                 return False
@@ -724,8 +955,10 @@ class DoubaoTTSService:
         auto_delete_minutes: int = 0,
         uid: str = "",
         emotion: str = "",
+        emotion_scale: int | None = None,
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
+        context: str = "",
     ) -> bool:
         if not self.available:
             return False
@@ -745,16 +978,20 @@ class DoubaoTTSService:
                     segment,
                     uid=uid,
                     emotion=emotion,
+                    emotion_scale=emotion_scale,
                     speech_rate=speech_rate,
                     loudness_rate=loudness_rate,
+                    context=context,
                 )
             else:
                 result = await self.synthesize(
                     segment,
                     uid=uid,
                     emotion=emotion,
+                    emotion_scale=emotion_scale,
                     speech_rate=speech_rate,
                     loudness_rate=loudness_rate,
+                    context=context,
                 )
             if not result.ok or not result.audio_bytes:
                 return False

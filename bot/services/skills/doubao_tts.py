@@ -29,7 +29,17 @@ class DoubaoTTSSkill:
             },
             "emotion": {
                 "type": "string",
-                "description": "Optional emotion style. Only use it when you are confident the configured speaker supports it.",
+                "description": "Optional emotion style like happy, sad, angry, cheerful, or calm. Prefer using it only when the tone is clear.",
+            },
+            "emotion_scale": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+                "description": "Optional emotion intensity from 1 to 5. Use together with emotion when stronger expression is needed.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional natural-language voice direction for emotional delivery, such as scene, mood, pacing, or speaking style. Prefer a short vivid sentence instead of a single word.",
             },
             "speech_rate": {
                 "type": "integer",
@@ -57,6 +67,12 @@ class DoubaoTTSSkill:
             delivery_mode = "reply"
 
         emotion = clean_text(str(arguments.get("emotion", "")), max_len=32)
+        context_text = clean_text(str(arguments.get("context", "")), max_len=160)
+
+        emotion_scale_raw = arguments.get("emotion_scale")
+        emotion_scale = int(emotion_scale_raw) if isinstance(emotion_scale_raw, int) else None
+        if emotion_scale is not None:
+            emotion_scale = min(5, max(1, emotion_scale))
 
         speech_rate_raw = arguments.get("speech_rate")
         loudness_rate_raw = arguments.get("loudness_rate")
@@ -73,8 +89,10 @@ class DoubaoTTSSkill:
                 auto_delete_minutes=0,
                 uid=uid,
                 emotion=emotion,
+                emotion_scale=emotion_scale,
                 speech_rate=speech_rate,
                 loudness_rate=loudness_rate,
+                context=context_text,
             )
         elif context.bot is not None and int(context.chat_id or 0):
             ok = await self.tts_service.send_chat_tts(
@@ -84,8 +102,10 @@ class DoubaoTTSSkill:
                 auto_delete_minutes=0,
                 uid=uid,
                 emotion=emotion,
+                emotion_scale=emotion_scale,
                 speech_rate=speech_rate,
                 loudness_rate=loudness_rate,
+                context=context_text,
             )
         else:
             return SkillRunResult(
@@ -111,7 +131,9 @@ class DoubaoTTSSkill:
                 "text": text,
                 "delivery_mode": delivery_mode,
                 "emotion": emotion,
+                "emotion_scale": emotion_scale,
                 "speech_rate": speech_rate,
                 "loudness_rate": loudness_rate,
+                "context": context_text,
             },
         )
