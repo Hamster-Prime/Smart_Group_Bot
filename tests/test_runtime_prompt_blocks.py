@@ -55,6 +55,12 @@ class RuntimePromptBlockTests(unittest.TestCase):
             self.assertIn("不要留空行", prompt)
             self.assertIn("空行就是“分开发送多条消息”的信号", prompt)
 
+    def test_core_prompts_forbid_parenthetical_stage_directions(self) -> None:
+        for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
+            self.assertIn("不要写括号里的动作描写或舞台指令", prompt)
+            self.assertNotIn("偶尔可以加小动作描述", prompt)
+            self.assertIn("晃脚丫", prompt)
+
     def test_skill_prompt_declares_blank_line_split_rule(self) -> None:
         self.assertIn("纯文本里一旦出现空行，就会被当成分开发送多条消息", SKILL_TOOL_SYSTEM)
 
