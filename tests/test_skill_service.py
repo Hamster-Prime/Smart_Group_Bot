@@ -18,6 +18,31 @@ def _resp(*, content: str = "", tool_calls: list[dict] | None = None) -> SimpleN
     )
 
 
+def _llm_stub() -> SimpleNamespace:
+    return SimpleNamespace(
+        main=SimpleNamespace(model="main-model", fallbacks=[]),
+        decision_config=SimpleNamespace(model="decision-model", fallbacks=[]),
+        vision_config=SimpleNamespace(model="vision-model", fallbacks=[]),
+        moderation_config=SimpleNamespace(model="moderation-model", fallbacks=[]),
+        compress_config=SimpleNamespace(model="compress-model", fallbacks=[]),
+        embed_config=SimpleNamespace(model="embed-model", fallbacks=[]),
+    )
+
+
+def _tts_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        doubao_tts_enabled=True,
+        doubao_tts_api_base="https://openspeech.bytedance.com",
+        doubao_tts_app_id="app-id",
+        doubao_tts_app_key="",
+        doubao_tts_access_key="access-key",
+        doubao_tts_resource_id="seed-tts-2.0",
+        doubao_tts_model="",
+        doubao_tts_speaker="voice_1",
+        moderation=SimpleNamespace(enabled=True),
+    )
+
+
 class _PlannedSkillService(SkillService):
     def __init__(self, responses: list[SimpleNamespace]) -> None:
         super().__init__(llm=object(), settings=None)
@@ -106,6 +131,40 @@ class _PlannedSkillService(SkillService):
             )
 
         return SkillRunResult(ok=False, skill=name, summary="", error="unknown_skill")
+
+
+class SkillServiceTTSPromptTests(unittest.TestCase):
+    def test_enable_mode_includes_group_tts_preference_block(self) -> None:
+        service = SkillService(_llm_stub(), settings=_tts_settings())
+
+        payload = service.build_answer_prompt_payload(
+            "晚安啦",
+            intent_type="casual",
+            allow_tts=True,
+            tts_mode="on",
+        )
+
+        contents = [item["content"] for item in payload["messages"]]
+        tts_blocks = [content for content in contents if "[GROUP_TTS_PREFERENCE]" in content]
+
+        self.assertEqual(len(tts_blocks), 1)
+        self.assertIn("tts_mode: on", tts_blocks[0])
+        self.assertIn("mildly prefers voice replies only in selected cases", tts_blocks[0])
+        self.assertIn("Plain text is still the default", tts_blocks[0])
+        self.assertIn("Do not treat tts_mode=on as voice-first or always-on", tts_blocks[0])
+
+    def test_off_mode_does_not_include_group_tts_preference_block(self) -> None:
+        service = SkillService(_llm_stub(), settings=_tts_settings())
+
+        payload = service.build_answer_prompt_payload(
+            "晚安啦",
+            intent_type="casual",
+            allow_tts=False,
+            tts_mode="off",
+        )
+
+        contents = [item["content"] for item in payload["messages"]]
+        self.assertFalse(any("[GROUP_TTS_PREFERENCE]" in content for content in contents))
 
 
 class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):

@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 class DoubaoTTSSkill:
     name = "doubao_tts"
     description = (
-        "Synthesize the provided Chinese text with Doubao TTS and send it as a voice message in the current chat."
+        "Synthesize the provided Chinese text with Doubao TTS and send it as a voice message in the current chat. Prefer this only when speech clearly adds warmth, emotion, companionship, or performance value, not as the default for all replies."
     )
     parameters_schema = {
         "type": "object",

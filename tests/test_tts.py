@@ -12,6 +12,7 @@ from bot.services.doubao_tts import (
     TTS_MODE_ALWAYS,
     TTS_MODE_OFF,
     TTS_MODE_ON,
+    build_tts_preference_context,
     build_tts_status_text,
     is_tts_always_enabled,
     is_tts_tool_enabled,
@@ -39,6 +40,19 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         settings_data = set_tts_mode({}, "always")
         self.assertTrue(is_tts_tool_enabled(settings_data))
         self.assertTrue(is_tts_always_enabled(settings_data))
+
+    def test_build_tts_preference_context_for_enable_mode(self) -> None:
+        context = build_tts_preference_context(TTS_MODE_ON, service_ready=True)
+
+        self.assertIn("[GROUP_TTS_PREFERENCE]", context)
+        self.assertIn("tts_mode: on", context)
+        self.assertIn("mildly prefers voice replies only in selected cases", context)
+        self.assertIn("Plain text is still the default", context)
+
+    def test_build_tts_preference_context_for_off_mode_is_empty(self) -> None:
+        context = build_tts_preference_context(TTS_MODE_OFF, service_ready=True)
+
+        self.assertEqual(context, "")
 
     def test_doubao_payload_additions_is_json_string(self) -> None:
         settings = _settings()

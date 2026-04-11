@@ -130,6 +130,44 @@ def build_tts_status_text(
     )
 
 
+def build_tts_preference_context(
+    tts_mode: Any,
+    *,
+    service_ready: bool,
+) -> str:
+    mode = normalize_tts_mode(tts_mode)
+    if mode == TTS_MODE_OFF or not service_ready:
+        return ""
+
+    lines = [
+        "[GROUP_TTS_PREFERENCE]",
+        f"tts_mode: {mode}",
+        "tts_service_ready: yes",
+    ]
+    if mode == TTS_MODE_ALWAYS:
+        lines.extend(
+            [
+                "This group is configured for voice-first replies.",
+                "For normal outgoing replies, prefer calling doubao_tts instead of returning plain text.",
+                "If doubao_tts is available and a spoken reply is possible, do not default to text-only output.",
+                "If you use doubao_tts, its text must be the exact final spoken reply, with no extra action explanation.",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "This group mildly prefers voice replies only in selected cases where speech clearly improves the experience.",
+            "Plain text is still the default for normal factual answers, management replies, search summaries, link-heavy replies, long explanations, and structured lists.",
+            "Prefer doubao_tts when speech adds obvious value: greetings, comforting, bedtime, celebration, playful reactions, emotional replies, companion-style replies, and short朗读/播报口吻.",
+            "Do not treat tts_mode=on as voice-first or always-on.",
+            "If both formats are equally fine and there is no clear speech advantage, keep plain text.",
+            "If you use doubao_tts, its text must be the exact final spoken reply, with no extra action explanation.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 @dataclass(slots=True)
 class TTSSynthesisResult:
     ok: bool

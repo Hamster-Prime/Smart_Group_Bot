@@ -6,7 +6,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from bot.config import Settings
-from bot.services.doubao_tts import DoubaoTTSService
+from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_preference_context
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
@@ -219,6 +219,7 @@ class SkillService:
         merged_context: str,
         reply_targets_context: str,
         selected_skills: dict[str, Skill],
+        tts_mode: str = TTS_MODE_OFF,
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
     ) -> list[dict[str, Any]]:
@@ -245,6 +246,16 @@ class SkillService:
                 ),
             }
         )
+        tts_preference_context = build_tts_preference_context(
+            tts_mode,
+            service_ready=bool(
+                self.tts_service
+                and self.tts_service.available
+                and self.tts_skill_name in selected_skills
+            ),
+        )
+        if tts_preference_context:
+            messages.append({"role": "system", "content": tts_preference_context})
         messages.append(
             {
                 "role": "system",
@@ -291,6 +302,7 @@ class SkillService:
         sender_is_tg_admin: bool = False,
         intent_type: str = "casual",
         allow_tts: bool = True,
+        tts_mode: str = TTS_MODE_OFF,
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
@@ -312,6 +324,7 @@ class SkillService:
                 merged_context=merged_context,
                 reply_targets_context=reply_targets_context,
                 selected_skills=selected_skills,
+                tts_mode=tts_mode,
                 is_mentioned=is_mentioned,
                 is_reply_to_bot=is_reply_to_bot,
             ),
@@ -898,6 +911,7 @@ class SkillService:
         message: Any | None = None,
         intent_type: str = "casual",
         allow_tts: bool = True,
+        tts_mode: str = TTS_MODE_OFF,
         merged_count: int = 1,
         merged_context: str = "",
         reply_targets_context: str = "",
@@ -921,6 +935,7 @@ class SkillService:
             merged_context=merged_context,
             reply_targets_context=reply_targets_context,
             selected_skills=selected_skills,
+            tts_mode=tts_mode,
             is_mentioned=is_mentioned,
             is_reply_to_bot=is_reply_to_bot,
         )
