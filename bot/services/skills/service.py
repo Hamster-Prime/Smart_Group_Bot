@@ -5,9 +5,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-import litellm
-
-from bot.config import ChatEndpointConfig, ModelConfig, Settings
+from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
@@ -134,32 +132,6 @@ class SkillService:
                         parts.append(txt)
             return "\n".join(parts)
         return str(content or "")
-
-    @staticmethod
-    def _build_chat_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "model": cfg.model,
-            "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
-        }
-        if cfg.api_key:
-            kwargs["api_key"] = cfg.api_key
-        if cfg.api_base:
-            kwargs["api_base"] = cfg.api_base
-        return kwargs
-
-    @staticmethod
-    def _candidate_models(cfg: ModelConfig) -> list[ChatEndpointConfig]:
-        return [
-            ChatEndpointConfig(
-                model=cfg.model,
-                api_key=cfg.api_key,
-                api_base=cfg.api_base,
-                temperature=cfg.temperature,
-                max_tokens=cfg.max_tokens,
-            ),
-            *cfg.fallbacks,
-        ]
 
     @staticmethod
     def _tool_definitions(skills: dict[str, Skill]) -> list[dict[str, Any]]:
@@ -317,40 +289,13 @@ class SkillService:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> Any | None:
-        candidates = self._candidate_models(self.llm.main)
-        total = len(candidates)
-        for idx, cfg in enumerate(candidates, start=1):
-            kwargs = self._build_chat_kwargs(cfg)
-            prompt_usage = self.llm.prompt_usage_text(messages, tools=tools, cfg=cfg)
-            log.info(
-                "skill planner+answer request: try=%d/%d model=%s prompt_tokens=%s messages=%d tools=%d",
-                idx,
-                total,
-                cfg.model,
-                prompt_usage,
-                len(messages),
-                len(tools),
-            )
-            try:
-                return await litellm.acompletion(
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    **kwargs,
-                )
-            except Exception as exc:
-                if idx < total:
-                    log.warning(
-                        "skill llm call failed: try=%d/%d model=%s error=%s -> fallback",
-                        idx,
-                        total,
-                        cfg.model,
-                        exc,
-                    )
-                    continue
-                log.exception("skill llm call failed: all fallbacks exhausted")
-                return None
-        return None
+        return await self.llm.complete_with_tools(
+            messages=messages,
+            tools=tools,
+            label="skill",
+            cfg=self.llm.main,
+            preview_limit=80,
+        )
 
     @staticmethod
     def _parse_tool_calls(message: Any) -> list[dict[str, str]]:

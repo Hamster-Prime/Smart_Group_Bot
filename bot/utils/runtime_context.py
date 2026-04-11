@@ -47,6 +47,14 @@ def _normalize_skill_names(skill_names: Iterable[str] | None) -> list[str]:
     return normalized
 
 
+def _same_model_family(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    if str(getattr(left, "model", "") or "").strip() != str(getattr(right, "model", "") or "").strip():
+        return False
+    return _format_fallback_models(left) == _format_fallback_models(right)
+
+
 def _model_value(
     *,
     settings: Any | None,
@@ -121,6 +129,7 @@ def build_bot_runtime_profile_context(
         llm_attr="embed_config",
     )
     chat_bridge_cfg = getattr(getattr(settings, "bot", None), "chat_bridge_model", None)
+    vision_same_as_main = _same_model_family(vision_cfg, main_cfg)
 
     for name in normalized_skills:
         label = skill_labels.get(name)
@@ -143,8 +152,8 @@ def build_bot_runtime_profile_context(
         f"main_reply_model: {getattr(main_cfg, 'model', '(unknown)')}",
         f"main_reply_fallbacks: {_format_fallback_models(main_cfg)}",
         "skill_planner_model: same_as_main_reply",
-        f"vision_model: {getattr(vision_cfg, 'model', '(unknown)')}",
-        f"vision_fallbacks: {_format_fallback_models(vision_cfg)}",
+        f"vision_model: {'same_as_main_reply' if vision_same_as_main else getattr(vision_cfg, 'model', '(unknown)')}",
+        f"vision_fallbacks: {'same_as_main_reply' if vision_same_as_main else _format_fallback_models(vision_cfg)}",
         f"decision_model: {getattr(decision_cfg, 'model', '(unknown)')}",
         f"decision_fallbacks: {_format_fallback_models(decision_cfg)}",
         f"moderation_model: {getattr(moderation_cfg, 'model', '(unknown)')}",

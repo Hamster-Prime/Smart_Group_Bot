@@ -22,6 +22,10 @@ class ChatEndpointConfig(BaseModel):
     api_base: str | None = None
     temperature: float = 0.7
     max_tokens: int = 2048
+    timeout_sec: float = 12.0
+    retry_attempts: int = 2
+    retry_backoff_sec: float = 0.8
+    retry_timeout_multiplier: float = 1.35
 
 
 class ModelConfig(ChatEndpointConfig):
@@ -32,6 +36,10 @@ class EmbedEndpointConfig(BaseModel):
     model: str = "gemini/text-embedding-004"
     api_key: str | None = None
     api_base: str | None = None
+    timeout_sec: float = 10.0
+    retry_attempts: int = 2
+    retry_backoff_sec: float = 0.8
+    retry_timeout_multiplier: float = 1.25
 
 
 class EmbedConfig(EmbedEndpointConfig):
@@ -63,16 +71,19 @@ class BotConfig(BaseModel):
         model="gemini/gemini-2.0-flash",
         temperature=0.1,
         max_tokens=512,
+        timeout_sec=6.0,
     )
     moderation_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.1,
         max_tokens=1024,
+        timeout_sec=8.0,
     )
     compress_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.3,
         max_tokens=1024,
+        timeout_sec=12.0,
     )
     embed_model: EmbedConfig = EmbedConfig()
     max_context_tokens: int = 4096
@@ -94,30 +105,40 @@ class Settings(BaseSettings):
     main_provider_name: str = ""
     main_model: str = "gemini-2.0-flash"
     main_fallbacks: str = ""
+    main_timeout_sec: float = 12.0
 
     vision_provider_name: str = ""
     vision_model: str = ""
     vision_fallbacks: str = ""
+    vision_timeout_sec: float = 15.0
 
     chat_bridge_provider_name: str = ""
     chat_bridge_model: str = ""
     chat_bridge_fallbacks: str = ""
+    chat_bridge_timeout_sec: float = 10.0
 
     decision_provider_name: str = ""
     decision_model: str = ""
     decision_fallbacks: str = ""
+    decision_timeout_sec: float = 6.0
 
     moderation_provider_name: str = ""
     moderation_model: str = ""
     moderation_fallbacks: str = ""
+    moderation_timeout_sec: float = 8.0
 
     compress_provider_name: str = ""
     compress_model: str = ""
     compress_fallbacks: str = ""
+    compress_timeout_sec: float = 12.0
 
     embed_provider_name: str = ""
     embed_model: str = "text-embedding-004"
     embed_fallbacks: str = ""
+    embed_timeout_sec: float = 10.0
+    llm_retry_attempts: int = 2
+    llm_retry_backoff_sec: float = 0.8
+    llm_retry_timeout_multiplier: float = 1.35
 
     max_context_tokens: int = 4096
     max_output_tokens: int = 2048
@@ -271,6 +292,10 @@ def _build_chat_config(
     model_name: str,
     temperature: float,
     max_tokens: int,
+    timeout_sec: float,
+    retry_attempts: int,
+    retry_backoff_sec: float,
+    retry_timeout_multiplier: float,
     fallback_spec: str,
 ) -> ModelConfig:
     if not provider_name:
@@ -285,6 +310,10 @@ def _build_chat_config(
         api_base=profile.api_base,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout_sec=timeout_sec,
+        retry_attempts=retry_attempts,
+        retry_backoff_sec=retry_backoff_sec,
+        retry_timeout_multiplier=retry_timeout_multiplier,
         fallbacks=[],
     )
 
@@ -297,6 +326,10 @@ def _build_chat_config(
                 api_base=fb_profile.api_base,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout_sec=timeout_sec,
+                retry_attempts=retry_attempts,
+                retry_backoff_sec=retry_backoff_sec,
+                retry_timeout_multiplier=retry_timeout_multiplier,
             )
         )
     return cfg
@@ -307,6 +340,10 @@ def _build_embed_config(
     profiles: dict[str, ProviderProfile],
     provider_name: str,
     model_name: str,
+    timeout_sec: float,
+    retry_attempts: int,
+    retry_backoff_sec: float,
+    retry_timeout_multiplier: float,
     fallback_spec: str,
 ) -> EmbedConfig:
     if not provider_name:
@@ -319,6 +356,10 @@ def _build_embed_config(
         model=_build_litellm_model(profile.provider, model_name),
         api_key=profile.api_key,
         api_base=profile.api_base,
+        timeout_sec=timeout_sec,
+        retry_attempts=retry_attempts,
+        retry_backoff_sec=retry_backoff_sec,
+        retry_timeout_multiplier=retry_timeout_multiplier,
         fallbacks=[],
     )
 
@@ -329,6 +370,10 @@ def _build_embed_config(
                 model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
+                timeout_sec=timeout_sec,
+                retry_attempts=retry_attempts,
+                retry_backoff_sec=retry_backoff_sec,
+                retry_timeout_multiplier=retry_timeout_multiplier,
             )
         )
     return cfg
@@ -424,6 +469,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=main_model_name,
         temperature=settings.bot.main_model.temperature,
         max_tokens=max(1, settings.max_output_tokens),
+        timeout_sec=max(1.0, float(settings.main_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.main_fallbacks,
     )
     settings.bot.vision_model = _build_chat_config(
@@ -432,6 +481,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=vision_model_name,
         temperature=settings.bot.vision_model.temperature,
         max_tokens=settings.bot.vision_model.max_tokens,
+        timeout_sec=max(1.0, float(settings.vision_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.vision_fallbacks,
     )
     settings.bot.chat_bridge_model = _build_chat_config(
@@ -440,6 +493,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=chat_bridge_model_name,
         temperature=settings.bot.chat_bridge_model.temperature,
         max_tokens=settings.bot.chat_bridge_model.max_tokens,
+        timeout_sec=max(1.0, float(settings.chat_bridge_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.chat_bridge_fallbacks,
     )
     settings.bot.decision_model = _build_chat_config(
@@ -448,6 +505,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=decision_model_name,
         temperature=settings.bot.decision_model.temperature,
         max_tokens=settings.bot.decision_model.max_tokens,
+        timeout_sec=max(1.0, float(settings.decision_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.decision_fallbacks,
     )
     settings.bot.moderation_model = _build_chat_config(
@@ -456,6 +517,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=moderation_model_name,
         temperature=settings.bot.moderation_model.temperature,
         max_tokens=settings.bot.moderation_model.max_tokens,
+        timeout_sec=max(1.0, float(settings.moderation_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.moderation_fallbacks,
     )
     settings.bot.compress_model = _build_chat_config(
@@ -464,12 +529,20 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         model_name=compress_model_name,
         temperature=settings.bot.compress_model.temperature,
         max_tokens=settings.bot.compress_model.max_tokens,
+        timeout_sec=max(1.0, float(settings.compress_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.compress_fallbacks,
     )
     settings.bot.embed_model = _build_embed_config(
         profiles=profiles,
         provider_name=embed_provider_name,
         model_name=embed_model_name,
+        timeout_sec=max(1.0, float(settings.embed_timeout_sec)),
+        retry_attempts=max(1, int(settings.llm_retry_attempts)),
+        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
+        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.embed_fallbacks,
     )
 
