@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
-from aiogram.types import Message
+try:
+    from aiogram.types import Message
+except ModuleNotFoundError:
+    class Message:  # type: ignore[no-redef]
+        pass
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession

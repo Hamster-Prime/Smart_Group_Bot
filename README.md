@@ -47,6 +47,13 @@
 | `websearch` | 联网搜索实时信息 |
 | `webfetch` | 获取网页详细内容 |
 | `music_search` | 搜索歌曲，或获取播放链接、专辑图、歌词 |
+| `bilibili_search` | 搜索 B 站视频/UP 主，读取视频详情、字幕摘录、热门和排行榜 |
+| `weibo_search` | 查看微博热搜、搜索微博内容、抓取微博链接摘要 |
+| `twitter_x_search` | 定向搜索 X/Twitter 推文或账号，抓取公开链接内容 |
+| `xiaohongshu_search` | 定向搜索小红书笔记/博主，抓取公开链接内容 |
+| `douyin_search` | 解析抖音分享文本/短链，搜索公开视频并提取内容 |
+
+其中 `twitter_x_search`、`xiaohongshu_search`、`weibo_search`、`douyin_search` 当前默认走“搜索 + 抓公开内容”的轻量模式，不依赖 Cookie 登录，也不做发帖、点赞、评论、下载等写操作。
 
 贴纸学习机制：
 - 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入数据库表 `sticker_library`。

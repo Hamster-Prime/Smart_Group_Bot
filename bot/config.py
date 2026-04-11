@@ -5,9 +5,27 @@ import re
 import tomllib
 from pathlib import Path
 
-from dotenv import dotenv_values
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+try:
+    from dotenv import dotenv_values
+except ModuleNotFoundError:
+    def dotenv_values(path: str | Path) -> dict[str, str]:
+        values: dict[str, str] = {}
+        file_path = Path(path)
+        if not file_path.exists():
+            return values
+        for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key:
+                values[key] = value
+        return values
 
 
 class ProviderProfile(BaseModel):

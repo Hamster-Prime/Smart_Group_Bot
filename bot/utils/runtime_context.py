@@ -88,6 +88,11 @@ def build_bot_runtime_profile_context(
         "music_search": "音乐搜索、歌曲发送、播放链接、封面与歌词",
         "websearch": "联网搜索实时信息",
         "webfetch": "抓取网页正文",
+        "bilibili_search": "B站搜索、视频详情、热门与排行榜",
+        "weibo_search": "微博热搜、搜索与链接内容提取",
+        "twitter_x_search": "X/Twitter 定向搜索与公开内容抓取",
+        "xiaohongshu_search": "小红书笔记/账号搜索与内容抓取",
+        "douyin_search": "抖音分享解析、搜索与公开内容提取",
         "doubao_tts": "文字转语音",
     }
 

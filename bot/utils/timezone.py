@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+try:
+    SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+except ZoneInfoNotFoundError:
+    SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def to_shanghai_datetime(

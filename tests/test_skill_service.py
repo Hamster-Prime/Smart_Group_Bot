@@ -65,6 +65,23 @@ class _PlannedSkillService(SkillService):
                 },
             )
 
+        if name == "douyin_search":
+            return SkillRunResult(
+                ok=True,
+                skill=name,
+                summary="已解析抖音分享视频 7445842287652441376",
+                payload={
+                    "entry": {
+                        "title": "测试抖音视频",
+                        "url": "https://www.iesdouyin.com/share/video/7445842287652441376",
+                        "share_url": "https://v.douyin.com/abcdefg/",
+                        "redirected_url": "https://www.douyin.com/video/7445842287652441376",
+                        "download_url": "https://aweme.snssdk.com/aweme/v1/play/?video_id=foo",
+                        "content": "这是一段视频简介",
+                    }
+                },
+            )
+
         return SkillRunResult(ok=False, skill=name, summary="", error="unknown_skill")
 
 
@@ -165,6 +182,31 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("我先查到这些相关结果：", result.text)
         self.assertIn("MosDNS 官方文档", result.text)
         self.assertIn("https://example.com/mosdns", result.text)
+
+    async def test_platform_entry_fallback_includes_share_links(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "douyin_search",
+                                "arguments": '{"action":"parse_share","share_text":"https://v.douyin.com/abcdefg/"}',
+                            },
+                        }
+                    ]
+                ),
+                _resp(content=""),
+            ]
+        )
+
+        result = await service.answer_with_skill("把这个抖音原链接发我", intent_type="casual")
+
+        self.assertIn("https://www.iesdouyin.com/share/video/7445842287652441376", result.text)
+        self.assertIn("分享链接：https://v.douyin.com/abcdefg/", result.text)
+        self.assertIn("跳转后链接：https://www.douyin.com/video/7445842287652441376", result.text)
+        self.assertIn("相关直链：https://aweme.snssdk.com/aweme/v1/play/?video_id=foo", result.text)
 
 
 if __name__ == "__main__":

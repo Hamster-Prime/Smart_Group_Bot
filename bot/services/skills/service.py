@@ -9,6 +9,8 @@ from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
+from bot.services.skills.bilibili_search import BilibiliSearchSkill
+from bot.services.skills.douyin_search import DouyinSearchSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.music_search import MusicSearchSkill
@@ -16,8 +18,11 @@ from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.task_manage import TaskManageSkill
+from bot.services.skills.twitter_x_search import TwitterXSearchSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
+from bot.services.skills.weibo_search import WeiboSearchSkill
+from bot.services.skills.xiaohongshu_search import XiaohongshuSearchSkill
 from bot.services.reply_output import REPLY_OUTPUT_AWARENESS, REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
@@ -40,8 +45,24 @@ _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "websearch": re.compile(r"^找到\s*\d+\s*[条个]\s*搜索结果[。！？!?\. ]*$"),
     "webfetch": re.compile(r"^(?:网页)?抓取成功[。！？!?\. ]*$"),
     "music_search": re.compile(r"^找到\s*\d+\s*首相关歌曲[。！？!?\. ]*$"),
+    "bilibili_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|视频|Feed|热搜)[。！？!?\. ]*$"),
+    "weibo_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|微博|Feed|热搜)[。！？!?\. ]*$"),
+    "twitter_x_search": re.compile(r"^找到\s*\d+\s*条.*?(?:结果|推文|账号)[。！？!?\. ]*$"),
+    "xiaohongshu_search": re.compile(r"^找到\s*\d+\s*条.*?(?:结果|笔记|账号)[。！？!?\. ]*$"),
+    "douyin_search": re.compile(r"^(?:找到\s*\d+\s*条抖音视频结果|已解析抖音分享视频.*)[。！？!?\. ]*$"),
 }
-_INFO_FOLLOWUP_SKILLS = frozenset({"websearch", "webfetch", "music_search"})
+_INFO_FOLLOWUP_SKILLS = frozenset(
+    {
+        "websearch",
+        "webfetch",
+        "music_search",
+        "bilibili_search",
+        "weibo_search",
+        "twitter_x_search",
+        "xiaohongshu_search",
+        "douyin_search",
+    }
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +90,11 @@ class SkillService:
         self._register(MusicSearchSkill(settings))
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
+        self._register(BilibiliSearchSkill())
+        self._register(WeiboSearchSkill())
+        self._register(TwitterXSearchSkill())
+        self._register(XiaohongshuSearchSkill())
+        self._register(DouyinSearchSkill())
         self.tts_skill_name = DoubaoTTSSkill.name
         self.tts_service = DoubaoTTSService(settings) if settings is not None else None
         if self.tts_service and self.tts_service.available:
@@ -437,15 +463,25 @@ class SkillService:
                 "Do not stop at only reporting the number of matches.\n"
                 "Use the returned tracks to answer the user in Chinese now."
             )
+        if result.skill in {"bilibili_search", "weibo_search", "twitter_x_search", "xiaohongshu_search", "douyin_search"}:
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have platform-specific search or content results.\n"
+                "Do not stop at an intermediate status like only reporting the count.\n"
+                "Read the returned titles, snippets, entry fields, and URLs, then answer the user's actual request in Chinese now.\n"
+                "If the user wants the original link, share link, profile link, source, or address, return the existing url-like fields directly.\n"
+                "Do not call websearch again when the platform skill payload already contains enough relevant links.\n"
+                "If the user shared a link, summarize the content directly instead of repeating that the tool succeeded."
+            )
         return ""
 
     @staticmethod
-    def _render_websearch_fallback(payload: dict[str, Any]) -> str:
+    def _render_result_list_fallback(payload: dict[str, Any], *, lead: str = "我先查到这些相关结果：") -> str:
         rows = payload.get("results")
         if not isinstance(rows, list):
             return ""
 
-        lines = ["我先查到这些相关结果："]
+        lines = [lead]
         for idx, row in enumerate(rows[:3], start=1):
             if not isinstance(row, dict):
                 continue
@@ -462,6 +498,58 @@ class SkillService:
 
         if len(lines) <= 1:
             return ""
+        return "\n\n".join(lines).strip()
+
+    @staticmethod
+    def _render_entry_fallback(payload: dict[str, Any]) -> str:
+        entry = payload.get("entry")
+        if not isinstance(entry, dict):
+            return ""
+
+        title = clean_multiline_text(str(entry.get("title") or ""), max_len=160).strip()
+        content = clean_multiline_text(
+            str(entry.get("content") or entry.get("desc") or entry.get("subtitle_excerpt") or ""),
+            max_len=520,
+        ).strip()
+        author = clean_text(str(entry.get("author") or entry.get("owner") or ""), max_len=80).strip()
+        url = clean_text(str(entry.get("url") or ""), max_len=220).strip()
+        share_url = clean_text(str(entry.get("share_url") or ""), max_len=220).strip()
+        redirected_url = clean_text(str(entry.get("redirected_url") or ""), max_len=220).strip()
+        author_url = clean_text(str(entry.get("author_url") or ""), max_len=220).strip()
+        download_url = clean_text(str(entry.get("download_url") or ""), max_len=220).strip()
+
+        lines: list[str] = []
+        if title:
+            lines.append(f"我先拿到这条内容：{title}")
+        if author:
+            lines.append(f"作者：{author}")
+        if content:
+            lines.append(content)
+
+        comments = entry.get("comments")
+        if isinstance(comments, list) and comments:
+            rendered_comments: list[str] = []
+            for item in comments[:3]:
+                if not isinstance(item, dict):
+                    continue
+                c_author = clean_text(str(item.get("author") or ""), max_len=40).strip()
+                c_content = clean_multiline_text(str(item.get("content") or ""), max_len=120).strip()
+                if c_content:
+                    prefix = f"{c_author}：" if c_author else ""
+                    rendered_comments.append(f"{prefix}{c_content}")
+            if rendered_comments:
+                lines.append("热门评论：\n" + "\n".join(rendered_comments))
+
+        if url:
+            lines.append(url)
+        if share_url and share_url != url:
+            lines.append(f"分享链接：{share_url}")
+        if redirected_url and redirected_url not in {url, share_url}:
+            lines.append(f"跳转后链接：{redirected_url}")
+        if author_url:
+            lines.append(f"作者主页：{author_url}")
+        if download_url:
+            lines.append(f"相关直链：{download_url}")
         return "\n\n".join(lines).strip()
 
     @staticmethod
@@ -491,19 +579,37 @@ class SkillService:
     ) -> str:
         latest = cls._latest_successful_tool_result(
             recent_tool_results,
-            allowed_skills=frozenset({"webfetch", "websearch"}),
+            allowed_skills=frozenset(
+                {
+                    "webfetch",
+                    "websearch",
+                    "bilibili_search",
+                    "weibo_search",
+                    "twitter_x_search",
+                    "xiaohongshu_search",
+                    "douyin_search",
+                }
+            ),
         )
         if not latest:
             return default_text
 
         result = latest["result"]
         payload = result.payload if isinstance(result.payload, dict) else {}
+        if payload.get("entry"):
+            rendered = cls._render_entry_fallback(payload)
+            if rendered:
+                return rendered
+        if payload.get("results"):
+            rendered = cls._render_result_list_fallback(payload)
+            if rendered:
+                return rendered
         if result.skill == "webfetch":
             rendered = cls._render_webfetch_fallback(payload)
             if rendered:
                 return rendered
         if result.skill == "websearch":
-            rendered = cls._render_websearch_fallback(payload)
+            rendered = cls._render_result_list_fallback(payload)
             if rendered:
                 return rendered
         return default_text
