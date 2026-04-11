@@ -1423,18 +1423,35 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             action = "skip"
 
             if action != "skip" and reply_specs:
+                auto_reply_specs = [
+                    reply_spec
+                    for reply_spec in reply_specs
+                    if reply_spec.delivery_mode == "auto"
+                ]
+                resolved_auto_modes = (
+                    await reply_mode_svc.decide_many(
+                        user_text=merged_input_text,
+                        assistant_replies=[reply_spec.text for reply_spec in auto_reply_specs],
+                        msg_type=msg_type,
+                        is_mentioned=mentioned,
+                        is_reply_to_bot=reply_to_bot,
+                        is_reply_to_other=reply_to_other,
+                        merged_count=merged_count,
+                        merged_context=merged_context,
+                    )
+                    if auto_reply_specs
+                    else []
+                )
+                auto_mode_iter = iter(resolved_auto_modes)
+
                 for reply_spec in reply_specs:
                     resolved_mode = reply_spec.delivery_mode
                     if resolved_mode == "auto":
-                        resolved_mode = await reply_mode_svc.decide(
-                            user_text=merged_input_text,
-                            assistant_reply=reply_spec.text,
-                            msg_type=msg_type,
-                            is_mentioned=mentioned,
-                            is_reply_to_bot=reply_to_bot,
-                            is_reply_to_other=reply_to_other,
-                            merged_count=merged_count,
-                            merged_context=merged_context,
+                        resolved_mode = next(
+                            auto_mode_iter,
+                            "reply"
+                            if reply_to_bot or (mentioned and not reply_to_other)
+                            else "message",
                         )
                     reply_target_id = (
                         _resolve_reply_target_message_id(

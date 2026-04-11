@@ -33,6 +33,28 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _URL_RE = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 
+class InvalidJsonResponseError(ValueError):
+    def __init__(
+        self,
+        *,
+        url: str,
+        status: int,
+        content_type: str,
+        body_preview: str,
+    ) -> None:
+        self.url = clean_text(url, max_len=300)
+        self.status = int(status or 0)
+        self.content_type = clean_text(content_type, max_len=120)
+        self.body_preview = clean_multiline_text(body_preview, max_len=240)
+        message = (
+            f"invalid_json_response status={self.status} "
+            f"content_type={self.content_type or '-'} "
+            f"url={self.url or '-'} "
+            f"preview={self.body_preview or '(empty)'}"
+        )
+        super().__init__(message)
+
+
 def contains_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
@@ -206,13 +228,29 @@ async def fetch_json(
     headers: dict[str, str] | None = None,
     timeout_sec: float = 15.0,
 ) -> tuple[int, Any, str]:
-    status, text, final_url, _ = await fetch_text(
+    status, text, final_url, content_type = await fetch_text(
         url,
         params=params,
         headers=headers,
         timeout_sec=timeout_sec,
     )
-    return status, json.loads(text), final_url
+    try:
+        return status, json.loads(text), final_url
+    except json.JSONDecodeError as exc:
+        preview = clean_multiline_text((text or "").strip(), max_len=240)
+        log.warning(
+            "fetch_json invalid json | status=%s content_type=%s url=%s preview=%s",
+            status,
+            content_type or "-",
+            final_url or url,
+            preview or "(empty)",
+        )
+        raise InvalidJsonResponseError(
+            url=final_url or url,
+            status=status,
+            content_type=content_type,
+            body_preview=preview,
+        ) from exc
 
 
 def _fetch_text_stdlib(
