@@ -18,6 +18,7 @@ from bot.services.doubao_tts import (
     is_tts_tool_enabled,
     normalize_tts_mode,
     set_tts_mode,
+    should_auto_send_tts_in_on_mode,
 )
 from bot.services.skills.base import SkillContext
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
@@ -53,6 +54,54 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         context = build_tts_preference_context(TTS_MODE_OFF, service_ready=True)
 
         self.assertEqual(context, "")
+
+    def test_should_auto_send_tts_in_on_mode_for_comfort_reply(self) -> None:
+        should_send = should_auto_send_tts_in_on_mode(
+            tts_mode=TTS_MODE_ON,
+            service_ready=True,
+            intent_type="casual",
+            user_text="我今天有点难过",
+            reply_text="别怕，我在，抱抱你。",
+            message_count=1,
+        )
+
+        self.assertTrue(should_send)
+
+    def test_should_auto_send_tts_in_on_mode_for_explicit_voice_request(self) -> None:
+        should_send = should_auto_send_tts_in_on_mode(
+            tts_mode=TTS_MODE_ON,
+            service_ready=True,
+            intent_type="search",
+            user_text="你直接用语音播报一下",
+            reply_text="今天的重点我给你念一下。",
+            message_count=1,
+        )
+
+        self.assertTrue(should_send)
+
+    def test_should_not_auto_send_tts_in_on_mode_for_search_summary(self) -> None:
+        should_send = should_auto_send_tts_in_on_mode(
+            tts_mode=TTS_MODE_ON,
+            service_ready=True,
+            intent_type="search",
+            user_text="查一下微博热搜",
+            reply_text="我先查到这些相关结果：1. 热搜一 https://example.com/1",
+            message_count=1,
+        )
+
+        self.assertFalse(should_send)
+
+    def test_should_not_auto_send_tts_in_on_mode_for_long_structured_reply(self) -> None:
+        should_send = should_auto_send_tts_in_on_mode(
+            tts_mode=TTS_MODE_ON,
+            service_ready=True,
+            intent_type="casual",
+            user_text="这个怎么弄",
+            reply_text="1. 先打开设置\n2. 再点高级选项\n3. 最后把链接复制出来",
+            message_count=1,
+        )
+
+        self.assertFalse(should_send)
 
     def test_doubao_payload_additions_is_json_string(self) -> None:
         settings = _settings()
