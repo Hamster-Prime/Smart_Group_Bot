@@ -59,38 +59,6 @@ _COMFORT_KEYWORDS = ("没事", "别怕", "慢慢来", "辛苦了", "抱抱", "�
 _HAPPY_KEYWORDS = ("太好了", "开心", "高兴", "好耶", "太棒了", "绝了", "哈哈", "成功了", "喜欢", "赢了")
 _ANGER_KEYWORDS = ("气死", "离谱", "无语", "烦死", "警告", "严禁", "禁止", "立刻", "马上", "闭嘴", "住手")
 _SUSPENSE_KEYWORDS = ("等等", "不对劲", "奇怪", "悬疑", "诡异", "突然", "怎么回事", "别回头")
-_TTS_EXPLICIT_REQUEST_KEYWORDS = (
-    "语音",
-    "tts",
-    "朗读",
-    "念给我听",
-    "读给我听",
-    "说给我听",
-    "播报",
-    "播一下",
-)
-_TTS_ENABLE_PREFERRED_REPLY_KEYWORDS = (
-    "晚安",
-    "早安",
-    "午安",
-    "抱抱",
-    "别怕",
-    "别急",
-    "没事",
-    "我在",
-    "辛苦了",
-    "加油",
-    "恭喜",
-    "生日快乐",
-    "哈哈",
-    "嘿嘿",
-    "好耶",
-    "太棒了",
-    "亲亲",
-    "rua",
-)
-_LIST_PREFIX_RE = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)、])\s+")
-
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
@@ -188,76 +156,15 @@ def build_tts_preference_context(
 
     lines.extend(
         [
-            "This group mildly prefers voice replies only in selected cases where speech clearly improves the experience.",
-            "Plain text is still the default for normal factual answers, management replies, search summaries, link-heavy replies, long explanations, and structured lists.",
-            "Prefer doubao_tts when speech adds obvious value: greetings, comforting, bedtime, celebration, playful reactions, emotional replies, companion-style replies, and short朗读/播报口吻.",
-            "Do not treat tts_mode=on as voice-first or always-on.",
-            "If both formats are equally fine and there is no clear speech advantage, keep plain text.",
+            "This group has TTS enabled. You have the ability to send voice messages via doubao_tts.",
+            "Use your own judgment to decide when voice is more natural and engaging than text.",
+            "Prefer voice for: greetings, comfort, goodnights, celebrations, playful banter, emotional reactions, companion-style replies, clingy or cute interactions with the owner, short readings or broadcasts, and any reply where spoken delivery clearly adds warmth or personality.",
+            "Keep text for: factual answers, link-heavy or list-heavy replies, management operations, search result summaries, long explanations, and structured content.",
+            "When in doubt between voice and text for a short, emotional, or conversational reply, lean toward voice.",
             "If you use doubao_tts, its text must be the exact final spoken reply, with no extra action explanation.",
         ]
     )
     return "\n".join(lines)
-
-
-def should_auto_send_tts_in_on_mode(
-    *,
-    tts_mode: Any,
-    service_ready: bool,
-    intent_type: str,
-    user_text: str,
-    reply_text: str,
-    message_count: int = 1,
-) -> bool:
-    if normalize_tts_mode(tts_mode) != TTS_MODE_ON or not service_ready:
-        return False
-    if message_count != 1:
-        return False
-
-    normalized_intent = str(intent_type or "").strip().lower()
-    normalized_user = sanitize_outgoing_text(user_text or "").strip()
-    normalized_reply = sanitize_outgoing_text(reply_text or "").strip()
-    if not normalized_reply:
-        return False
-
-    compact_reply = re.sub(r"\s+", " ", normalized_reply)
-    compact_user = re.sub(r"\s+", " ", normalized_user)
-    reply_length = len(compact_reply)
-    if reply_length < 2 or reply_length > 88:
-        return False
-    if "\n" in normalized_reply or "\r" in normalized_reply:
-        return False
-    if _URL_RE.search(normalized_reply):
-        return False
-    if _LIST_PREFIX_RE.search(normalized_reply):
-        return False
-    if "```" in normalized_reply or "`" in normalized_reply:
-        return False
-
-    explicit_voice_request = _contains_any(compact_user.lower(), _TTS_EXPLICIT_REQUEST_KEYWORDS)
-    if explicit_voice_request:
-        return True
-
-    if normalized_intent != "casual":
-        return False
-
-    if any(char.isdigit() for char in compact_reply) and reply_length >= 24:
-        return False
-    if "http" in compact_reply.lower() or "www." in compact_reply.lower():
-        return False
-    if "：" in compact_reply or ":" in compact_reply:
-        return False
-
-    positive_signal = _contains_any(compact_reply, _TTS_ENABLE_PREFERRED_REPLY_KEYWORDS) or _contains_any(
-        compact_user,
-        _TTS_ENABLE_PREFERRED_REPLY_KEYWORDS,
-    )
-    if positive_signal:
-        return True
-
-    exclaim_count = compact_reply.count("!") + compact_reply.count("！")
-    if exclaim_count >= 2 and reply_length <= 36:
-        return True
-    return False
 
 
 @dataclass(slots=True)

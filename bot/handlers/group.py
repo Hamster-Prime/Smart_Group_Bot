@@ -41,7 +41,6 @@ from bot.services.doubao_tts import (
     is_tts_always_enabled,
     is_tts_tool_enabled,
     normalize_tts_mode,
-    should_auto_send_tts_in_on_mode,
 )
 from bot.services.manage_intent import GroupIntent
 from bot.services.llm import LLMService
@@ -1524,39 +1523,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     sent_ok = sent_ok or any(tts_results)
                     if not all(tts_results):
                         log.warning("[%s] always-tts send failed; suppressing text fallback", group_id)
-                elif (
-                    delivery_plans
-                    and not tts_sent_ok
-                    and should_auto_send_tts_in_on_mode(
-                        tts_mode=tts_mode,
-                        service_ready=tts_service.available,
-                        intent_type=action,
-                        user_text=merged_input_text,
-                        reply_text=delivery_plans[0].text if len(delivery_plans) == 1 else "",
-                        message_count=len(delivery_plans),
-                    )
-                ):
-                    selected_plan = delivery_plans[0]
-                    voice_ok = await tts_service.send_message_tts(
-                        latest.message,
-                        selected_plan.text,
-                        delivery_mode=selected_plan.delivery_mode,
-                        reply_to_message_id=selected_plan.reply_to_message_id,
-                        auto_delete_minutes=0,
-                        uid=str(user_id or group_id),
-                    )
-                    if voice_ok:
-                        sent_reply_messages = [selected_plan.text]
-                        tts_sent_ok = True
-                        sent_ok = True
-                        log.info(
-                            "[%s] enable-tts auto voice send applied | intent=%s len=%d",
-                            group_id,
-                            action,
-                            len(selected_plan.text),
-                        )
-                    else:
-                        log.warning("[%s] enable-tts auto voice send failed; falling back to text", group_id)
                 elif delivery_plans and not tts_sent_ok:
                     text_results: list[bool] = []
                     for plan in delivery_plans:
