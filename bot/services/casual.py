@@ -81,8 +81,11 @@ class CasualService:
         return (
             "[INTERACTION_MODE]\njoin\n"
             "You are voluntarily joining a group conversation — nobody asked you specifically.\n"
-            "Act like a group member chiming in, NOT like someone answering a question.\n"
-            "Keep it short: a comment, reaction, or opinion — not a full reply."
+            "CRITICAL: The message is NOT directed at you. Any '你' or 'you' in the message is addressing another group member, NOT you.\n"
+            "Do NOT treat the message as a command, question, or request aimed at you.\n"
+            "Do NOT respond as if you are the one being asked to do something.\n"
+            "Act like a bystander group member chiming in with a brief comment, reaction, or opinion.\n"
+            "Keep it short and casual — a side remark, NOT a direct answer or compliance."
         )
 
     def _build_messages_from_normalized_input(
