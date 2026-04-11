@@ -258,6 +258,28 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80", result.text)
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C", result.text)
 
+    async def test_platform_summary_reply_does_not_append_full_list_without_link_request(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "weibo_search",
+                                "arguments": '{"action":"hot_search","max_results":10}',
+                            },
+                        }
+                    ]
+                ),
+                _resp(content="刚那主人查过一波，现在涨最快的是曝曾沛慈退出浪姐。"),
+            ]
+        )
+
+        result = await service.answer_with_skill("微博今天热度上升最快的话题是哪个", intent_type="casual")
+
+        self.assertEqual(result.text, "刚那主人查过一波，现在涨最快的是曝曾沛慈退出浪姐。")
+
     async def test_platform_results_last_item_url_stays_above_trailing_commentary(self) -> None:
         service = _PlannedSkillService([])
 
@@ -305,6 +327,7 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         result = service._append_missing_platform_links(
             content=content,
             recent_tool_results=recent_tool_results,
+            user_text="帮我看下今天的微博热搜",
         )
 
         self.assertIn(
@@ -315,6 +338,38 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
             "https://example.com/10\n\n薅金币那个比中彩票了，笑死我了",
             result,
         )
+
+    async def test_platform_summary_reply_appends_links_when_user_explicitly_requests_them(self) -> None:
+        service = _PlannedSkillService([])
+
+        recent_tool_results = [
+            {
+                "name": "weibo_search",
+                "arguments": {"action": "hot_search", "max_results": 2},
+                "result": SkillRunResult(
+                    ok=True,
+                    skill="weibo_search",
+                    summary="拿到 2 条微博热搜",
+                    payload={
+                        "platform": "weibo",
+                        "results": [
+                            {"title": "热搜一", "url": "https://example.com/1", "snippet": ""},
+                            {"title": "热搜二", "url": "https://example.com/2", "snippet": ""},
+                        ],
+                    },
+                ),
+            }
+        ]
+
+        result = service._append_missing_platform_links(
+            content="我先给你贴两个最相关的。",
+            recent_tool_results=recent_tool_results,
+            user_text="把微博热搜链接发我",
+        )
+
+        self.assertIn("微博相关链接：", result)
+        self.assertIn("https://example.com/1", result)
+        self.assertIn("https://example.com/2", result)
 
 
 if __name__ == "__main__":

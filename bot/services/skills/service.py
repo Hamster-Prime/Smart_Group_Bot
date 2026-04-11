@@ -68,6 +68,10 @@ _PLATFORM_LINK_SKILLS = frozenset(
 )
 _NUMBERED_LIST_ITEM_RE = re.compile(r"^(\s*)(\d{1,2})([.)、]\s*)")
 _URL_RE = re.compile(r"https?://\S+")
+_RESULT_LIST_RE = re.compile(r"(?m)^\s*\d{1,2}[.)、]\s+")
+_LINK_REQUEST_RE = re.compile(
+    r"(链接|链结|原链|原链接|原帖|原文|分享链接|分享链|地址|网址|来源|出处|主页)"
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -762,9 +766,15 @@ class SkillService:
         *,
         content: str,
         recent_tool_results: list[dict[str, Any]],
+        user_text: str = "",
     ) -> str:
         normalized = clean_multiline_text(content, max_len=4000).strip()
         if not normalized:
+            return normalized
+        normalized_user_text = clean_multiline_text(user_text, max_len=400).strip()
+        should_append_by_request = bool(_LINK_REQUEST_RE.search(normalized_user_text))
+        should_append_by_layout = bool(_RESULT_LIST_RE.search(normalized))
+        if not should_append_by_request and not should_append_by_layout:
             return normalized
 
         appendices: list[str] = []
@@ -989,6 +999,7 @@ class SkillService:
                         self._append_missing_platform_links(
                             content=content,
                             recent_tool_results=recent_tool_results,
+                            user_text=user_text,
                         )
                     )
                 if (
