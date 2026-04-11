@@ -231,7 +231,7 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("跳转后链接：https://www.douyin.com/video/7445842287652441376", result.text)
         self.assertIn("相关直链：https://aweme.snssdk.com/aweme/v1/play/?video_id=foo", result.text)
 
-    async def test_platform_results_reply_without_links_gets_appendix(self) -> None:
+    async def test_platform_results_reply_without_links_inline_urls(self) -> None:
         service = _PlannedSkillService(
             [
                 _resp(
@@ -252,7 +252,9 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         result = await service.answer_with_skill("帮我看下今天的微博热搜", intent_type="casual")
 
         self.assertIn("微博热搜 Top 2", result.text)
-        self.assertIn("微博相关链接：", result.text)
+        self.assertNotIn("微博相关链接：", result.text)
+        self.assertIn("1. 热搜一\nhttps://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80", result.text)
+        self.assertIn("2. 热搜二\nhttps://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C", result.text)
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80", result.text)
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C", result.text)
 

@@ -66,6 +66,8 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
 _PLATFORM_LINK_SKILLS = frozenset(
     {"bilibili_search", "weibo_search", "twitter_x_search", "xiaohongshu_search", "douyin_search"}
 )
+_NUMBERED_LIST_ITEM_RE = re.compile(r"^(\s*)(\d{1,2})([.)、]\s*)")
+_URL_RE = re.compile(r"https?://\S+")
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -677,6 +679,70 @@ class SkillService:
         return ""
 
     @classmethod
+    def _embed_result_urls_into_numbered_list(
+        cls,
+        *,
+        payload: dict[str, Any],
+        content: str,
+    ) -> str:
+        rows = cls._payload_result_rows(payload)
+        if not rows:
+            return content
+
+        lines = content.splitlines()
+        if not lines:
+            return content
+
+        matches: list[tuple[int, int, str]] = []
+        for idx, line in enumerate(lines):
+            match = _NUMBERED_LIST_ITEM_RE.match(line)
+            if not match:
+                continue
+            try:
+                number = int(match.group(2))
+            except ValueError:
+                continue
+            if number < 1:
+                continue
+            matches.append((number, idx, match.group(1)))
+
+        if not matches:
+            return content
+
+        merged_lines: list[str] = []
+        cursor = 0
+        changed = False
+        for match_idx, (number, start_idx, indent) in enumerate(matches):
+            end_idx = matches[match_idx + 1][1] if match_idx + 1 < len(matches) else len(lines)
+            block = lines[start_idx:end_idx]
+
+            merged_lines.extend(lines[cursor:start_idx])
+            merged_lines.extend(block)
+            cursor = end_idx
+
+            row_index = number - 1
+            if row_index >= len(rows):
+                continue
+            row = rows[row_index]
+            if not isinstance(row, dict):
+                continue
+            url = clean_text(str(row.get("url") or ""), max_len=220).strip()
+            if not url:
+                continue
+
+            block_text = "\n".join(block)
+            if url in block_text or _URL_RE.search(block_text):
+                continue
+
+            merged_lines.append(f"{indent}{url}")
+            changed = True
+
+        merged_lines.extend(lines[cursor:])
+        if not changed:
+            return content
+        return "\n".join(merged_lines).strip()
+
+    @classmethod
     def _append_missing_platform_links(
         cls,
         *,
@@ -697,6 +763,14 @@ class SkillService:
             payload_urls = [url for url in cls._collect_payload_urls(payload) if url not in seen_urls]
             if not payload_urls:
                 continue
+            embedded = cls._embed_result_urls_into_numbered_list(
+                payload=payload,
+                content=normalized,
+            )
+            if embedded != normalized:
+                normalized = embedded
+                seen_urls.update(url for url in payload_urls if url in normalized)
+                continue
             appendix = cls._render_missing_result_links(
                 skill_name=result.skill,
                 payload=payload,
@@ -709,7 +783,7 @@ class SkillService:
 
         if not appendices:
             return normalized
-        return normalized.rstrip() + "\n\n" + "\n\n".join(appendices)
+        return normalized.rstrip() + "\n" + "\n".join(appendices)
 
     @classmethod
     def _build_tool_fallback_text(
