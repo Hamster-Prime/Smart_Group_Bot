@@ -258,6 +258,64 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%B8%80", result.text)
         self.assertIn("https://s.weibo.com/weibo?q=%E7%83%AD%E6%90%9C%E4%BA%8C", result.text)
 
+    async def test_platform_results_last_item_url_stays_above_trailing_commentary(self) -> None:
+        service = _PlannedSkillService([])
+
+        payload = {
+            "platform": "weibo",
+            "results": [
+                {"title": f"热搜{i}", "url": f"https://example.com/{i}", "snippet": ""}
+                for i in range(1, 10)
+            ]
+            + [
+                {
+                    "title": "原来冲锋衣是胶水粘的",
+                    "url": "https://example.com/10",
+                    "snippet": "",
+                }
+            ],
+        }
+        recent_tool_results = [
+            {
+                "name": "weibo_search",
+                "arguments": {"action": "hot_search", "max_results": 10},
+                "result": SkillRunResult(
+                    ok=True,
+                    skill="weibo_search",
+                    summary="拿到 10 条微博热搜",
+                    payload=payload,
+                ),
+            }
+        ]
+        content = (
+            "微博热搜前十\n"
+            "1. 热搜一\n"
+            "2. 热搜二\n"
+            "3. 热搜三\n"
+            "4. 热搜四\n"
+            "5. 热搜五\n"
+            "6. 热搜六\n"
+            "7. 热搜七\n"
+            "8. 热搜八\n"
+            "9. 原来我真能花100万\n"
+            "10. 原来冲锋衣是胶水粘的\n\n"
+            "薅金币那个比中彩票了，笑死我了"
+        )
+
+        result = service._append_missing_platform_links(
+            content=content,
+            recent_tool_results=recent_tool_results,
+        )
+
+        self.assertIn(
+            "10. 原来冲锋衣是胶水粘的\nhttps://example.com/10",
+            result,
+        )
+        self.assertIn(
+            "https://example.com/10\n\n薅金币那个比中彩票了，笑死我了",
+            result,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

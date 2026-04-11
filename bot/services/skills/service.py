@@ -717,24 +717,38 @@ class SkillService:
             block = lines[start_idx:end_idx]
 
             merged_lines.extend(lines[cursor:start_idx])
-            merged_lines.extend(block)
-            cursor = end_idx
-
             row_index = number - 1
             if row_index >= len(rows):
+                merged_lines.extend(block)
+                cursor = end_idx
                 continue
             row = rows[row_index]
             if not isinstance(row, dict):
+                merged_lines.extend(block)
+                cursor = end_idx
                 continue
             url = clean_text(str(row.get("url") or ""), max_len=220).strip()
             if not url:
+                merged_lines.extend(block)
+                cursor = end_idx
                 continue
 
             block_text = "\n".join(block)
             if url in block_text or _URL_RE.search(block_text):
+                merged_lines.extend(block)
+                cursor = end_idx
                 continue
 
+            insert_at = len(block)
+            for inner_idx, line in enumerate(block[1:], start=1):
+                if not line.strip():
+                    insert_at = inner_idx
+                    break
+
+            merged_lines.extend(block[:insert_at])
             merged_lines.append(f"{indent}{url}")
+            merged_lines.extend(block[insert_at:])
+            cursor = end_idx
             changed = True
 
         merged_lines.extend(lines[cursor:])
