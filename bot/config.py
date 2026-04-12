@@ -35,6 +35,7 @@ class ProviderProfile(BaseModel):
     api_base: str | None = None
     stream: bool = False
     chat_endpoint: Literal["chat_completions", "responses"] = "chat_completions"
+    endpoint_path: str = "/chat/completions"
 
 
 class ChatEndpointConfig(BaseModel):
@@ -44,6 +45,7 @@ class ChatEndpointConfig(BaseModel):
     api_base: str | None = None
     stream: bool = False
     chat_endpoint: Literal["chat_completions", "responses"] = "chat_completions"
+    endpoint_path: str = "/chat/completions"
     temperature: float = 0.7
     max_tokens: int = 2048
     timeout_sec: float = 12.0
@@ -58,8 +60,10 @@ class ModelConfig(ChatEndpointConfig):
 
 class EmbedEndpointConfig(BaseModel):
     model: str = "gemini/text-embedding-004"
+    provider: str = ""
     api_key: str | None = None
     api_base: str | None = None
+    endpoint_path: str = "/v1beta/models"
     timeout_sec: float = 10.0
     retry_attempts: int = 2
     retry_backoff_sec: float = 0.8
@@ -255,6 +259,21 @@ def _env_truthy(value: str | None) -> bool:
     return normalized in {"1", "true", "yes", "on", "y", "t"}
 
 
+_API_BASE_SUFFIX_RULES: tuple[
+    tuple[str, str, str, Literal["chat_completions", "responses"]],
+    ...,
+] = (
+    ("/v1/chat/completions", "/chat/completions", "openai", "chat_completions"),
+    ("/chat/completions", "/chat/completions", "openai", "chat_completions"),
+    ("/v1/responses", "/responses", "openai", "responses"),
+    ("/responses", "/responses", "openai", "responses"),
+    ("/v1/messages", "/v1/messages", "anthropic", "chat_completions"),
+    ("/messages", "/messages", "anthropic", "chat_completions"),
+    ("/v1beta/models", "/models", "gemini", "chat_completions"),
+    ("/v1/models", "/models", "gemini", "chat_completions"),
+)
+
+
 def _normalize_chat_endpoint(provider: str, raw_value: str | None) -> Literal["chat_completions", "responses"]:
     provider_norm = (provider or "").strip().lower()
     value = (raw_value or "").strip().lower()
@@ -272,6 +291,70 @@ def _normalize_chat_endpoint(provider: str, raw_value: str | None) -> Literal["c
     raise ValueError(
         f"invalid MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT value: {raw_value!r}; expected /chat/completions or /responses"
     )
+
+
+def _normalize_api_base(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    return value.rstrip("/")
+
+
+def _default_endpoint_path(provider: str, chat_endpoint: Literal["chat_completions", "responses"]) -> str:
+    provider_norm = (provider or "").strip().lower()
+    if provider_norm == "anthropic":
+        return "/v1/messages"
+    if provider_norm == "gemini":
+        return "/v1beta/models"
+    if chat_endpoint == "responses":
+        return "/responses"
+    return "/chat/completions"
+
+
+def _infer_provider_profile_from_api_base(
+    provider: str,
+    raw_api_base: str | None,
+) -> tuple[str, str | None, Literal["chat_completions", "responses"] | None, str | None]:
+    provider_norm = (provider or "").strip().lower()
+    api_base = _normalize_api_base(raw_api_base)
+    if not api_base:
+        return provider_norm, None, None, None
+
+    lower_base = api_base.lower()
+    for match_suffix, strip_suffix, inferred_provider, inferred_endpoint in _API_BASE_SUFFIX_RULES:
+        if not lower_base.endswith(match_suffix):
+            continue
+        normalized_base = api_base[: -len(strip_suffix)].rstrip("/") or None
+        if inferred_provider == "openai" and provider_norm == "openai_compatible":
+            return provider_norm, normalized_base, inferred_endpoint, match_suffix
+        return inferred_provider, normalized_base, inferred_endpoint, match_suffix
+
+    return provider_norm, api_base, None, None
+
+
+def _resolve_provider_profile(
+    provider: str,
+    raw_api_base: str | None,
+    raw_chat_endpoint: str | None,
+) -> tuple[str, str | None, Literal["chat_completions", "responses"], str]:
+    effective_provider, api_base, inferred_endpoint, inferred_path = _infer_provider_profile_from_api_base(
+        provider,
+        raw_api_base,
+    )
+    if inferred_endpoint is not None:
+        if raw_chat_endpoint:
+            explicit_endpoint = _normalize_chat_endpoint(effective_provider, raw_chat_endpoint)
+            if explicit_endpoint != inferred_endpoint:
+                raise ValueError(
+                    "MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT conflicts with the endpoint suffix in "
+                    f"MODEL_PROVIDER_<NAME>_API_BASE: {raw_chat_endpoint!r} vs {raw_api_base!r}"
+                )
+        return effective_provider, api_base, inferred_endpoint, inferred_path or _default_endpoint_path(
+            effective_provider,
+            inferred_endpoint,
+        )
+    chat_endpoint = _normalize_chat_endpoint(effective_provider, raw_chat_endpoint)
+    return effective_provider, api_base, chat_endpoint, _default_endpoint_path(effective_provider, chat_endpoint)
 
 
 def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderProfile]:
@@ -302,13 +385,18 @@ def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderPro
         if not provider:
             raise ValueError(f"MODEL_PROVIDER_{name.upper()}_PROVIDER is required")
         api_key = (fields.get("api_key") or "").strip() or None
-        api_base = (fields.get("api_base") or "").strip() or None
+        effective_provider, api_base, chat_endpoint, endpoint_path = _resolve_provider_profile(
+            provider,
+            fields.get("api_base"),
+            fields.get("chat_endpoint"),
+        )
         profiles[name] = ProviderProfile(
-            provider=provider,
+            provider=effective_provider,
             api_key=api_key,
             api_base=api_base,
             stream=_env_truthy(fields.get("stream")),
-            chat_endpoint=_normalize_chat_endpoint(provider, fields.get("chat_endpoint")),
+            chat_endpoint=chat_endpoint,
+            endpoint_path=endpoint_path,
         )
 
     return profiles
@@ -373,6 +461,7 @@ def _build_chat_config(
         api_base=profile.api_base,
         stream=profile.stream,
         chat_endpoint=profile.chat_endpoint,
+        endpoint_path=profile.endpoint_path,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_sec=timeout_sec,
@@ -392,6 +481,7 @@ def _build_chat_config(
                 api_base=fb_profile.api_base,
                 stream=fb_profile.stream,
                 chat_endpoint=fb_profile.chat_endpoint,
+                endpoint_path=fb_profile.endpoint_path,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
@@ -422,8 +512,10 @@ def _build_embed_config(
     profile = _get_profile(profiles, provider_name)
     cfg = EmbedConfig(
         model=_build_litellm_model(profile.provider, model_name),
+        provider=profile.provider,
         api_key=profile.api_key,
         api_base=profile.api_base,
+        endpoint_path=profile.endpoint_path,
         timeout_sec=timeout_sec,
         retry_attempts=retry_attempts,
         retry_backoff_sec=retry_backoff_sec,
@@ -436,8 +528,10 @@ def _build_embed_config(
         cfg.fallbacks.append(
             EmbedEndpointConfig(
                 model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
+                provider=fb_profile.provider,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
+                endpoint_path=fb_profile.endpoint_path,
                 timeout_sec=timeout_sec,
                 retry_attempts=retry_attempts,
                 retry_backoff_sec=retry_backoff_sec,

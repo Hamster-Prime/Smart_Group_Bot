@@ -39,24 +39,72 @@ class LLMService:
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
 
-    @staticmethod
-    def _build_chat_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
+    @classmethod
+    def _resolve_request_api_base(
+        cls,
+        *,
+        provider: str,
+        api_base: str | None,
+        endpoint_path: str | None,
+        model: str,
+    ) -> str | None:
+        base = str(api_base or "").strip()
+        if not base:
+            return None
+
+        provider_norm = str(provider or "").strip().lower()
+        if provider_norm != "gemini":
+            return base
+
+        normalized_base = base.rstrip("/")
+        normalized_endpoint = f"/{str(endpoint_path or '/v1beta/models').strip().strip('/')}"
+        version_suffix = normalized_endpoint[: -len("/models")] if normalized_endpoint.endswith("/models") else ""
+        lower_base = normalized_base.lower()
+        lower_endpoint = normalized_endpoint.lower()
+        lower_version_suffix = version_suffix.lower()
+
+        if lower_base.endswith(lower_endpoint):
+            return normalized_base[: -len("/models")]
+        if lower_version_suffix and lower_base.endswith(lower_version_suffix):
+            return normalized_base
+        if version_suffix:
+            return f"{normalized_base}{version_suffix}"
+        return normalized_base
+
+    @classmethod
+    def _build_chat_kwargs(
+        cls,
+        cfg: ChatEndpointConfig,
+        *,
+        stream: bool | None = None,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
         }
-        if getattr(cfg, "stream", False):
+        if bool(getattr(cfg, "stream", False)) if stream is None else bool(stream):
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
-        if cfg.api_base:
-            kwargs["api_base"] = cfg.api_base
+        resolved_api_base = cls._resolve_request_api_base(
+            provider=getattr(cfg, "provider", ""),
+            api_base=cfg.api_base,
+            endpoint_path=getattr(cfg, "endpoint_path", "/chat/completions"),
+            model=cfg.model,
+        )
+        if resolved_api_base:
+            kwargs["api_base"] = resolved_api_base
         return kwargs
 
-    @staticmethod
-    def _build_responses_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
+    @classmethod
+    def _build_responses_kwargs(
+        cls,
+        cfg: ChatEndpointConfig,
+        *,
+        stream: bool | None = None,
+    ) -> dict[str, Any]:
         model = str(cfg.model or "").strip()
         provider = str(getattr(cfg, "provider", "") or "").strip().lower()
         if provider in {"openai", "openai_compatible"} and model.lower().startswith("openai/"):
@@ -68,16 +116,22 @@ class LLMService:
             "max_output_tokens": cfg.max_tokens,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
         }
-        if getattr(cfg, "stream", False):
+        if bool(getattr(cfg, "stream", False)) if stream is None else bool(stream):
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
-        if cfg.api_base:
-            kwargs["api_base"] = cfg.api_base
+        resolved_api_base = cls._resolve_request_api_base(
+            provider=provider,
+            api_base=cfg.api_base,
+            endpoint_path=getattr(cfg, "endpoint_path", "/chat/completions"),
+            model=cfg.model,
+        )
+        if resolved_api_base:
+            kwargs["api_base"] = resolved_api_base
         return kwargs
 
-    @staticmethod
-    def _build_embed_kwargs(cfg: EmbedEndpointConfig, texts: list[str]) -> dict[str, Any]:
+    @classmethod
+    def _build_embed_kwargs(cls, cfg: EmbedEndpointConfig, texts: list[str]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "input": texts,
@@ -85,8 +139,14 @@ class LLMService:
         }
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
-        if cfg.api_base:
-            kwargs["api_base"] = cfg.api_base
+        resolved_api_base = cls._resolve_request_api_base(
+            provider=getattr(cfg, "provider", ""),
+            api_base=cfg.api_base,
+            endpoint_path=getattr(cfg, "endpoint_path", "/v1beta/models"),
+            model=cfg.model,
+        )
+        if resolved_api_base:
+            kwargs["api_base"] = resolved_api_base
         return kwargs
 
     @staticmethod
@@ -99,6 +159,7 @@ class LLMService:
                 api_base=cfg.api_base,
                 stream=cfg.stream,
                 chat_endpoint=getattr(cfg, "chat_endpoint", "chat_completions"),
+                endpoint_path=getattr(cfg, "endpoint_path", "/chat/completions"),
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 timeout_sec=cfg.timeout_sec,
@@ -114,8 +175,10 @@ class LLMService:
         return [
             EmbedEndpointConfig(
                 model=cfg.model,
+                provider=getattr(cfg, "provider", ""),
                 api_key=cfg.api_key,
                 api_base=cfg.api_base,
+                endpoint_path=getattr(cfg, "endpoint_path", "/v1beta/models"),
                 timeout_sec=cfg.timeout_sec,
                 retry_attempts=cfg.retry_attempts,
                 retry_backoff_sec=cfg.retry_backoff_sec,
@@ -144,6 +207,13 @@ class LLMService:
         if isinstance(obj, dict):
             return obj.get(key, default)
         return getattr(obj, key, default)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _merge_stream_piece(existing: str, piece: str) -> str:
@@ -236,69 +306,270 @@ class LLMService:
     def _coerce_usage(cls, usage: Any) -> SimpleNamespace | None:
         if not usage:
             return None
+        prompt_tokens = cls._coerce_int(cls._get_value(usage, "prompt_tokens", 0))
+        if not prompt_tokens:
+            prompt_tokens = cls._coerce_int(cls._get_value(usage, "input_tokens", 0))
+
+        completion_tokens = cls._coerce_int(cls._get_value(usage, "completion_tokens", 0))
+        if not completion_tokens:
+            completion_tokens = cls._coerce_int(cls._get_value(usage, "output_tokens", 0))
+
+        total_tokens = cls._coerce_int(cls._get_value(usage, "total_tokens", 0))
+        if not total_tokens and (prompt_tokens or completion_tokens):
+            total_tokens = prompt_tokens + completion_tokens
+
+        if not prompt_tokens and not completion_tokens and not total_tokens:
+            return None
         return SimpleNamespace(
-            prompt_tokens=int(cls._get_value(usage, "prompt_tokens", 0) or 0),
-            completion_tokens=int(cls._get_value(usage, "completion_tokens", 0) or 0),
-            total_tokens=int(cls._get_value(usage, "total_tokens", 0) or 0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
 
-    async def _consume_chat_stream(self, stream_resp: Any) -> Any:
-        content_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        usage: SimpleNamespace | None = None
-
-        async for chunk in stream_resp:
-            if chunk is None:
-                continue
-
-            chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
-            if chunk_usage is not None:
-                usage = chunk_usage
-
-            choices = self._get_value(chunk, "choices", None) or []
-            if not choices:
-                continue
-
-            choice = choices[0]
-            delta = self._get_value(choice, "delta", None)
-            if delta is None:
-                delta = self._get_value(choice, "message", None)
-            if delta is None:
-                delta = choice
-
-            delta_text = self._stream_delta_text(delta)
-            if delta_text:
-                content_parts.append(delta_text)
-
-            self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
-
+    @classmethod
+    def _normalize_tool_calls(cls, raw_tool_calls: Any) -> list[dict[str, Any]]:
         normalized_tool_calls: list[dict[str, Any]] = []
-        for idx, tool_call in enumerate(tool_calls, start=1):
-            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-            name = str(function.get("name", "") or "").strip()
-            arguments = str(function.get("arguments", "") or "")
+        if not raw_tool_calls:
+            return normalized_tool_calls
+
+        for idx, raw_call in enumerate(raw_tool_calls, start=1):
+            function = cls._get_value(raw_call, "function", {}) or {}
+            name = str(
+                cls._get_value(function, "name", "") or cls._get_value(raw_call, "name", "") or ""
+            ).strip()
+            arguments = cls._get_value(function, "arguments", None)
+            if arguments is None:
+                arguments = cls._get_value(raw_call, "arguments", "")
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = str(arguments or "")
+            call_id = str(
+                cls._get_value(raw_call, "id", "") or cls._get_value(raw_call, "call_id", "") or ""
+            ).strip() or f"call_{idx}"
+            call_type = str(cls._get_value(raw_call, "type", "") or "function").strip() or "function"
             if not name and not arguments:
                 continue
             normalized_tool_calls.append(
                 {
-                    "id": str(tool_call.get("id", "") or "").strip() or f"call_{idx}",
-                    "type": str(tool_call.get("type", "") or "").strip() or "function",
+                    "id": call_id,
+                    "type": call_type,
                     "function": {
                         "name": name,
                         "arguments": arguments,
                     },
                 }
             )
+        return normalized_tool_calls
 
+    @classmethod
+    def _responses_text_piece(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(cls._responses_text_piece(item) for item in value)
+
+        item_type = str(cls._get_value(value, "type", "") or "").strip().lower()
+        if item_type in {"output_text", "text", "input_text"}:
+            return cls._responses_text_piece(cls._get_value(value, "text", ""))
+
+        text_value = cls._get_value(value, "text", None)
+        if text_value not in (None, ""):
+            return cls._responses_text_piece(text_value)
+
+        value_text = cls._get_value(value, "value", None)
+        if value_text not in (None, ""):
+            return str(value_text)
+
+        return ""
+
+    @classmethod
+    def _extract_responses_message(cls, response_obj: Any) -> SimpleNamespace | None:
+        output_items = cls._get_value(response_obj, "output", None) or []
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+
+        for item in output_items:
+            item_type = str(cls._get_value(item, "type", "") or "").strip().lower()
+            if item_type == "message":
+                content_parts.append(cls._responses_text_piece(cls._get_value(item, "content", None)))
+                continue
+            if item_type == "function_call":
+                tool_calls.extend(cls._normalize_tool_calls([item]))
+                continue
+            if item_type in {"output_text", "text"}:
+                text_piece = cls._responses_text_piece(item)
+                if text_piece:
+                    content_parts.append(text_piece)
+
+        if not content_parts and not tool_calls:
+            text_piece = cls._responses_text_piece(cls._get_value(response_obj, "text", None))
+            if text_piece:
+                content_parts.append(text_piece)
+
+        content = "".join(content_parts)
+        if not content.strip() and not tool_calls:
+            return None
+
+        return SimpleNamespace(
+            content=content,
+            tool_calls=tool_calls,
+        )
+
+    @classmethod
+    def _build_model_response(
+        cls,
+        *,
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+        usage: SimpleNamespace | None = None,
+    ) -> Any:
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content="".join(content_parts),
-                        tool_calls=normalized_tool_calls,
+                        content=content,
+                        tool_calls=tool_calls or [],
                     )
                 )
             ],
+            usage=usage,
+        )
+
+    @classmethod
+    def _normalize_response_object(cls, resp: Any) -> Any:
+        usage = cls._coerce_usage(cls._get_value(resp, "usage"))
+        choices = cls._get_value(resp, "choices", None) or []
+        if choices:
+            message = cls._get_value(choices[0], "message", None)
+            if message is not None:
+                return cls._build_model_response(
+                    content=cls._normalize_content_text(cls._get_value(message, "content", "")),
+                    tool_calls=cls._normalize_tool_calls(cls._get_value(message, "tool_calls", None)),
+                    usage=usage,
+                )
+
+        message = cls._extract_responses_message(resp)
+        if message is not None:
+            return cls._build_model_response(
+                content=message.content,
+                tool_calls=message.tool_calls,
+                usage=usage,
+            )
+
+        return resp
+
+    @classmethod
+    def _completed_stream_response(cls, stream_resp: Any, completed_response: Any) -> Any | None:
+        completed = completed_response
+        if completed is None:
+            completed = cls._get_value(stream_resp, "completed_response", None)
+
+        response_obj = cls._get_value(completed, "response", None)
+        if response_obj is None and completed is not None:
+            response_obj = completed
+        if response_obj is None:
+            return None
+
+        normalized = cls._normalize_response_object(response_obj)
+        choices = cls._get_value(normalized, "choices", None) or []
+        if not choices:
+            return None
+        return normalized
+
+    @staticmethod
+    def _should_stream_upstream(label: str, cfg: ChatEndpointConfig) -> bool:
+        return bool(getattr(cfg, "stream", False))
+
+    async def _consume_chat_stream(self, stream_resp: Any) -> Any:
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: SimpleNamespace | None = None
+        completed_response: Any = None
+
+        try:
+            async for chunk in stream_resp:
+                if chunk is None:
+                    continue
+
+                event_type = str(self._get_value(chunk, "type", "") or "").strip().lower()
+                if event_type.endswith("completed"):
+                    completed_response = self._get_value(chunk, "response", None) or completed_response
+
+                chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
+                if chunk_usage is not None:
+                    usage = chunk_usage
+
+                if event_type == "response.output_text.delta":
+                    delta_text = str(self._get_value(chunk, "delta", "") or "")
+                    if delta_text:
+                        content_parts.append(delta_text)
+                    continue
+
+                if event_type == "response.output_item.added":
+                    output_item = self._get_value(chunk, "item", None)
+                    if str(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
+                        self._merge_stream_tool_calls(
+                            tool_calls,
+                            [
+                                {
+                                    "index": self._get_value(chunk, "output_index", 0),
+                                    "id": self._get_value(output_item, "call_id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": self._get_value(output_item, "name", ""),
+                                        "arguments": "",
+                                    },
+                                }
+                            ],
+                        )
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    self._merge_stream_tool_calls(
+                        tool_calls,
+                        [
+                            {
+                                "index": self._get_value(chunk, "output_index", 0),
+                                "type": "function",
+                                "function": {
+                                    "arguments": self._get_value(chunk, "delta", ""),
+                                },
+                            }
+                        ],
+                    )
+                    continue
+
+                choices = self._get_value(chunk, "choices", None) or []
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = self._get_value(choice, "delta", None)
+                if delta is None:
+                    delta = self._get_value(choice, "message", None)
+                if delta is None:
+                    delta = choice
+
+                delta_text = self._stream_delta_text(delta)
+                if delta_text:
+                    content_parts.append(delta_text)
+
+                self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
+        except Exception:
+            normalized = self._completed_stream_response(stream_resp, completed_response)
+            if normalized is not None:
+                return normalized
+            raise
+
+        normalized = self._completed_stream_response(stream_resp, completed_response)
+        if normalized is not None:
+            return normalized
+
+        return self._build_model_response(
+            content="".join(content_parts),
+            tool_calls=self._normalize_tool_calls(tool_calls),
             usage=usage,
         )
 
@@ -306,59 +577,90 @@ class LLMService:
         content_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
+        completed_response: Any = None
 
-        for chunk in stream_resp:
-            if chunk is None:
-                continue
+        try:
+            for chunk in stream_resp:
+                if chunk is None:
+                    continue
 
-            chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
-            if chunk_usage is not None:
-                usage = chunk_usage
+                event_type = str(self._get_value(chunk, "type", "") or "").strip().lower()
+                if event_type.endswith("completed"):
+                    completed_response = self._get_value(chunk, "response", None) or completed_response
 
-            choices = self._get_value(chunk, "choices", None) or []
-            if not choices:
-                continue
+                chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
+                if chunk_usage is not None:
+                    usage = chunk_usage
 
-            choice = choices[0]
-            delta = self._get_value(choice, "delta", None)
-            if delta is None:
-                delta = self._get_value(choice, "message", None)
-            if delta is None:
-                delta = choice
+                if event_type == "response.output_text.delta":
+                    delta_text = str(self._get_value(chunk, "delta", "") or "")
+                    if delta_text:
+                        content_parts.append(delta_text)
+                    continue
 
-            delta_text = self._stream_delta_text(delta)
-            if delta_text:
-                content_parts.append(delta_text)
+                if event_type == "response.output_item.added":
+                    output_item = self._get_value(chunk, "item", None)
+                    if str(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
+                        self._merge_stream_tool_calls(
+                            tool_calls,
+                            [
+                                {
+                                    "index": self._get_value(chunk, "output_index", 0),
+                                    "id": self._get_value(output_item, "call_id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": self._get_value(output_item, "name", ""),
+                                        "arguments": "",
+                                    },
+                                }
+                            ],
+                        )
+                    continue
 
-            self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
-
-        normalized_tool_calls: list[dict[str, Any]] = []
-        for idx, tool_call in enumerate(tool_calls, start=1):
-            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
-            name = str(function.get("name", "") or "").strip()
-            arguments = str(function.get("arguments", "") or "")
-            if not name and not arguments:
-                continue
-            normalized_tool_calls.append(
-                {
-                    "id": str(tool_call.get("id", "") or "").strip() or f"call_{idx}",
-                    "type": str(tool_call.get("type", "") or "").strip() or "function",
-                    "function": {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                }
-            )
-
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="".join(content_parts),
-                        tool_calls=normalized_tool_calls,
+                if event_type == "response.function_call_arguments.delta":
+                    self._merge_stream_tool_calls(
+                        tool_calls,
+                        [
+                            {
+                                "index": self._get_value(chunk, "output_index", 0),
+                                "type": "function",
+                                "function": {
+                                    "arguments": self._get_value(chunk, "delta", ""),
+                                },
+                            }
+                        ],
                     )
-                )
-            ],
+                    continue
+
+                choices = self._get_value(chunk, "choices", None) or []
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = self._get_value(choice, "delta", None)
+                if delta is None:
+                    delta = self._get_value(choice, "message", None)
+                if delta is None:
+                    delta = choice
+
+                delta_text = self._stream_delta_text(delta)
+                if delta_text:
+                    content_parts.append(delta_text)
+
+                self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
+        except Exception:
+            normalized = self._completed_stream_response(stream_resp, completed_response)
+            if normalized is not None:
+                return normalized
+            raise
+
+        normalized = self._completed_stream_response(stream_resp, completed_response)
+        if normalized is not None:
+            return normalized
+
+        return self._build_model_response(
+            content="".join(content_parts),
+            tool_calls=self._normalize_tool_calls(tool_calls),
             usage=usage,
         )
 
@@ -575,6 +877,7 @@ class LLMService:
         *,
         messages: list[dict[str, Any]],
         cfg: ChatEndpointConfig,
+        stream: bool = False,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
     ) -> Any:
@@ -582,7 +885,7 @@ class LLMService:
         if responses_fn is None:
             raise RuntimeError("installed litellm does not support responses(); please upgrade litellm")
 
-        kwargs = self._build_responses_kwargs(cfg)
+        kwargs = self._build_responses_kwargs(cfg, stream=stream)
         if tools:
             kwargs["tools"] = tools
             if tool_choice:
@@ -595,9 +898,9 @@ class LLMService:
             if "unexpected keyword argument 'input'" not in str(exc):
                 raise
             resp = responses_fn(messages=messages, **kwargs)
-        if getattr(cfg, "stream", False):
+        if stream:
             return self._consume_chat_stream_sync(resp)
-        return resp
+        return self._normalize_response_object(resp)
 
     async def _chat_completion_response_with_retries(
         self,
@@ -613,21 +916,22 @@ class LLMService:
         total_attempts = self._retry_attempts(cfg)
 
         for attempt in range(1, total_attempts + 1):
-            kwargs = self._build_chat_kwargs(cfg)
+            stream = self._should_stream_upstream(label, cfg)
+            kwargs = self._build_chat_kwargs(cfg, stream=stream)
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
             prompt_usage = self.prompt_usage_text(messages, tools=tools, cfg=cfg)
             log.info(
                 "LLM request | stage=%s | model=%s | endpoint=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs | stream=%s",
                 label_cn,
                 cfg.model,
-                getattr(cfg, "chat_endpoint", "chat_completions"),
+                getattr(cfg, "endpoint_path", getattr(cfg, "chat_endpoint", "chat_completions")),
                 attempt,
                 total_attempts,
                 prompt_usage,
                 len(messages),
                 len(tools or []),
                 timeout_sec,
-                bool(getattr(cfg, "stream", False)),
+                stream,
             )
             try:
                 if self._uses_responses_api(cfg):
@@ -636,6 +940,7 @@ class LLMService:
                             self._responses_sync_request,
                             messages=messages,
                             cfg=cfg,
+                            stream=stream,
                             tools=tools,
                             tool_choice=tool_choice,
                         ),
@@ -648,13 +953,14 @@ class LLMService:
                         else litellm.acompletion(messages=messages, **kwargs)
                     )
                     raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
-                    if getattr(cfg, "stream", False):
+                    if stream:
                         resp = await self._await_with_timeout(
                             self._consume_chat_stream(raw_resp),
                             timeout_sec=timeout_sec,
                         )
                     else:
-                        resp = raw_resp
+                        resp = self._normalize_response_object(raw_resp)
+                resp = self._normalize_response_object(resp)
                 message = resp.choices[0].message
                 content = self._normalize_content_text(message.content)
                 tool_calls = getattr(message, "tool_calls", None)

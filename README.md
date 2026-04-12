@@ -118,8 +118,13 @@ LOG_FILE_BACKUP_COUNT=3
 
 # ---- 模型供应商池（可配置多个 NAME）----
 # If a provider or gateway only accepts streaming requests, set MODEL_PROVIDER_<NAME>_STREAM=true
-# MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT supports /chat/completions or /responses
-# openai defaults to /responses, openai_compatible defaults to /chat/completions
+# MODEL_PROVIDER_<NAME>_API_BASE may point to the full upstream endpoint URL.
+# The request format is auto-detected from the API_BASE suffix:
+#   .../chat/completions -> OpenAI chat_completions
+#   .../responses -> OpenAI responses
+#   .../v1/messages -> Anthropic messages
+#   .../v1beta/models -> Gemini models
+# MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT is only needed as a legacy fallback when API_BASE has no suffix
 MODEL_PROVIDER_GEMINI_PROVIDER=gemini
 MODEL_PROVIDER_GEMINI_API_KEY=
 MODEL_PROVIDER_GEMINI_API_BASE=
@@ -128,13 +133,11 @@ MODEL_PROVIDER_GEMINI_STREAM=false
 MODEL_PROVIDER_OPENAI_PROVIDER=openai
 MODEL_PROVIDER_OPENAI_API_KEY=
 MODEL_PROVIDER_OPENAI_API_BASE=
-MODEL_PROVIDER_OPENAI_CHAT_ENDPOINT=/responses
 MODEL_PROVIDER_OPENAI_STREAM=false
 
 MODEL_PROVIDER_ARK_PROVIDER=openai_compatible
 MODEL_PROVIDER_ARK_API_KEY=
 MODEL_PROVIDER_ARK_API_BASE=
-MODEL_PROVIDER_ARK_CHAT_ENDPOINT=/chat/completions
 MODEL_PROVIDER_ARK_STREAM=false
 
 # ---- 主模型 (聊天、工具调用) ----

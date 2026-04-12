@@ -30,11 +30,11 @@ class ChatBridgeConfigTests(unittest.TestCase):
         raw_env = {
             "MODEL_PROVIDER_ARK_PROVIDER": "openai_compatible",
             "MODEL_PROVIDER_ARK_API_KEY": "ark-key",
-            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1",
+            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1/chat/completions",
             "MODEL_PROVIDER_ARK_STREAM": "true",
             "MODEL_PROVIDER_GEMINI_PROVIDER": "gemini",
             "MODEL_PROVIDER_GEMINI_API_KEY": "gemini-key",
-            "MODEL_PROVIDER_GEMINI_API_BASE": "https://gemini.example",
+            "MODEL_PROVIDER_GEMINI_API_BASE": "https://gemini.example/v1beta/models",
             "MODEL_PROVIDER_GEMINI_STREAM": "false",
         }
 
@@ -46,13 +46,18 @@ class ChatBridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded.bot.main_model.model, "openai/main-reply")
         self.assertEqual(loaded.bot.main_model.chat_endpoint, "chat_completions")
+        self.assertEqual(loaded.bot.main_model.api_base, "https://ark.example/v1")
+        self.assertEqual(loaded.bot.main_model.endpoint_path, "/v1/chat/completions")
         self.assertEqual(loaded.bot.chat_bridge_model.model, "gemini/bridge-reply")
         self.assertEqual(loaded.bot.chat_bridge_model.api_key, "gemini-key")
-        self.assertEqual(loaded.bot.chat_bridge_model.api_base, "https://gemini.example")
+        self.assertEqual(loaded.bot.chat_bridge_model.api_base, "https://gemini.example/v1beta")
+        self.assertEqual(loaded.bot.chat_bridge_model.endpoint_path, "/v1beta/models")
         self.assertTrue(loaded.bot.main_model.stream)
         self.assertFalse(loaded.bot.chat_bridge_model.stream)
         self.assertEqual(len(loaded.bot.chat_bridge_model.fallbacks), 1)
         self.assertEqual(loaded.bot.chat_bridge_model.fallbacks[0].model, "openai/bridge-fallback")
+        self.assertEqual(loaded.bot.chat_bridge_model.fallbacks[0].api_base, "https://ark.example/v1")
+        self.assertEqual(loaded.bot.chat_bridge_model.fallbacks[0].endpoint_path, "/v1/chat/completions")
         self.assertTrue(loaded.bot.chat_bridge_model.fallbacks[0].stream)
 
     def test_load_settings_defaults_chat_bridge_model_to_main_binding(self) -> None:
@@ -71,7 +76,7 @@ class ChatBridgeConfigTests(unittest.TestCase):
         raw_env = {
             "MODEL_PROVIDER_ARK_PROVIDER": "openai_compatible",
             "MODEL_PROVIDER_ARK_API_KEY": "ark-key",
-            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1",
+            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1/chat/completions",
         }
 
         with (
@@ -83,6 +88,8 @@ class ChatBridgeConfigTests(unittest.TestCase):
         self.assertEqual(loaded.bot.chat_bridge_model.model, "openai/main-reply")
         self.assertEqual(loaded.bot.chat_bridge_model.api_key, "ark-key")
         self.assertEqual(loaded.bot.chat_bridge_model.chat_endpoint, "chat_completions")
+        self.assertEqual(loaded.bot.chat_bridge_model.api_base, "https://ark.example/v1")
+        self.assertEqual(loaded.bot.chat_bridge_model.endpoint_path, "/v1/chat/completions")
 
     def test_load_settings_supports_anthropic_provider_profile(self) -> None:
         settings = Settings(_env_file=None)
@@ -155,8 +162,9 @@ class ChatBridgeConfigTests(unittest.TestCase):
         self.assertEqual(loaded.bot.main_model.model, "openai/gpt-4.1")
         self.assertEqual(loaded.bot.main_model.chat_endpoint, "responses")
         self.assertEqual(loaded.bot.decision_model.chat_endpoint, "responses")
+        self.assertEqual(loaded.bot.main_model.endpoint_path, "/responses")
 
-    def test_load_settings_allows_openai_compatible_switch_to_responses_api(self) -> None:
+    def test_load_settings_infers_responses_api_from_full_openai_endpoint(self) -> None:
         settings = Settings(_env_file=None)
         settings.main_provider_name = "ark"
         settings.main_model = "gpt-4.1"
@@ -172,8 +180,7 @@ class ChatBridgeConfigTests(unittest.TestCase):
         raw_env = {
             "MODEL_PROVIDER_ARK_PROVIDER": "openai_compatible",
             "MODEL_PROVIDER_ARK_API_KEY": "ark-key",
-            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1",
-            "MODEL_PROVIDER_ARK_CHAT_ENDPOINT": "/responses",
+            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1/responses",
         }
 
         with (
@@ -184,6 +191,69 @@ class ChatBridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded.bot.main_model.chat_endpoint, "responses")
         self.assertEqual(loaded.bot.main_model.api_base, "https://ark.example/v1")
+        self.assertEqual(loaded.bot.main_model.endpoint_path, "/v1/responses")
+
+    def test_load_settings_infers_anthropic_transport_from_full_messages_endpoint(self) -> None:
+        settings = Settings(_env_file=None)
+        settings.main_provider_name = "local"
+        settings.main_model = "claude-haiku"
+        settings.decision_provider_name = "local"
+        settings.decision_model = "claude-decision"
+        settings.moderation_provider_name = "local"
+        settings.moderation_model = "claude-moderation"
+        settings.compress_provider_name = "local"
+        settings.compress_model = "claude-compress"
+        settings.embed_provider_name = "local"
+        settings.embed_model = "text-embedding-3-small"
+
+        raw_env = {
+            "MODEL_PROVIDER_LOCAL_PROVIDER": "openai_compatible",
+            "MODEL_PROVIDER_LOCAL_API_KEY": "local-key",
+            "MODEL_PROVIDER_LOCAL_API_BASE": "https://gateway.example/v1/messages",
+        }
+
+        with (
+            patch("bot.config.Settings", return_value=settings),
+            patch("bot.config._load_raw_env", return_value=raw_env),
+        ):
+            loaded = config_module.load_settings(config_path="missing.toml")
+
+        self.assertEqual(loaded.bot.main_model.model, "anthropic/claude-haiku")
+        self.assertEqual(loaded.bot.main_model.provider, "anthropic")
+        self.assertEqual(loaded.bot.main_model.api_base, "https://gateway.example")
+        self.assertEqual(loaded.bot.main_model.chat_endpoint, "chat_completions")
+        self.assertEqual(loaded.bot.main_model.endpoint_path, "/v1/messages")
+
+    def test_load_settings_infers_gemini_transport_from_full_models_endpoint(self) -> None:
+        settings = Settings(_env_file=None)
+        settings.main_provider_name = "local"
+        settings.main_model = "gemini-2.0-flash"
+        settings.decision_provider_name = "local"
+        settings.decision_model = "gemini-2.0-flash-lite"
+        settings.moderation_provider_name = "local"
+        settings.moderation_model = "gemini-2.0-flash-lite"
+        settings.compress_provider_name = "local"
+        settings.compress_model = "gemini-2.0-flash-lite"
+        settings.embed_provider_name = "local"
+        settings.embed_model = "text-embedding-004"
+
+        raw_env = {
+            "MODEL_PROVIDER_LOCAL_PROVIDER": "openai_compatible",
+            "MODEL_PROVIDER_LOCAL_API_KEY": "local-key",
+            "MODEL_PROVIDER_LOCAL_API_BASE": "https://gateway.example/v1beta/models",
+        }
+
+        with (
+            patch("bot.config.Settings", return_value=settings),
+            patch("bot.config._load_raw_env", return_value=raw_env),
+        ):
+            loaded = config_module.load_settings(config_path="missing.toml")
+
+        self.assertEqual(loaded.bot.main_model.model, "gemini/gemini-2.0-flash")
+        self.assertEqual(loaded.bot.main_model.provider, "gemini")
+        self.assertEqual(loaded.bot.main_model.api_base, "https://gateway.example/v1beta")
+        self.assertEqual(loaded.bot.main_model.chat_endpoint, "chat_completions")
+        self.assertEqual(loaded.bot.main_model.endpoint_path, "/v1beta/models")
 
 
 if __name__ == "__main__":
