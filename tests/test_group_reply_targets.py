@@ -121,5 +121,44 @@ class ReplyTargetResolutionTests(unittest.TestCase):
         )
 
 
+    def test_recent_group_message_window_uses_group_history_instead_of_current_user_fragments(self) -> None:
+        items = [_item(_message(52, "fragment one"), "fragment one"), _item(_message(53, "fragment two"), "fragment two")]
+        history = [
+            {
+                "role": "user",
+                "content": "Alice asks about phones",
+                "created_at": "2026-04-12 10:00:00",
+                "sender_id": 1,
+                "sender_name": "Alice",
+                "message_type": "text",
+            },
+            {
+                "role": "assistant",
+                "content": "bot already suggested two models",
+                "created_at": "2026-04-12 10:00:05",
+                "sender_id": None,
+                "sender_name": "bot",
+                "message_type": "assistant_reply",
+            },
+            {
+                "role": "user",
+                "content": "Bob asks if battery life matters more",
+                "created_at": "2026-04-12 10:00:08",
+                "sender_id": 2,
+                "sender_name": "Bob",
+                "message_type": "text",
+            },
+        ]
+
+        context = group._build_recent_group_message_window(items, recent_history=history)
+
+        self.assertIn("[RECENT_GROUP_MESSAGES]", context)
+        self.assertIn("Alice asks about phones", context)
+        self.assertIn("bot already suggested two models", context)
+        self.assertIn("[RECENT_BOT_MESSAGES]", context)
+        self.assertNotIn("fragment one", context)
+        self.assertNotIn("fragment two", context)
+
+
 if __name__ == "__main__":
     unittest.main()

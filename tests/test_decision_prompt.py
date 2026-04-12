@@ -13,11 +13,17 @@ class DecisionPromptTests(unittest.TestCase):
             "[SENDER_IS_OWNER]",
             "[IS_MERGED_MESSAGE]",
             "[RECENT_HISTORY_FOR_DECISION]",
+            "[MERGED_MESSAGE_CONTEXT]",
             "[CURRENT_MESSAGE]",
         ):
             self.assertIn(block, DECISION_SYSTEM)
 
     def test_decision_prompt_is_conservative_by_default(self) -> None:
-        self.assertIn("默认输出 `skip`", DECISION_SYSTEM)
-        self.assertIn("不要因为你“能回答”就回答", DECISION_SYSTEM)
-        self.assertIn("不要把主人的每句闲聊都接住", DECISION_SYSTEM)
+        self.assertIn("Prefer replying less often over jumping into every topic.", DECISION_SYSTEM)
+        self.assertIn("raise the bar for another reply", DECISION_SYSTEM)
+        self.assertIn("When unsure, default to `skip`.", DECISION_SYSTEM)
+
+    def test_decision_prompt_mentions_bot_frequency_signals(self) -> None:
+        self.assertIn("role=assistant", DECISION_SYSTEM)
+        self.assertIn("sender_id=BOT", DECISION_SYSTEM)
+        self.assertIn("replied recently or multiple times already", DECISION_SYSTEM)

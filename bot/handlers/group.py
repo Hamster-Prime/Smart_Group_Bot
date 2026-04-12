@@ -57,6 +57,7 @@ from bot.services.scheduled_tasks import (
 )
 from bot.services.skills import SkillService
 from bot.services.sticker_library import sticker_library
+from bot.utils.security import format_history_message_line
 from bot.utils.telegram import (
     answer_with_auto_delete,
     extract_reply_context,
@@ -503,7 +504,44 @@ def _build_merged_user_text(items: list[_PendingReplyItem]) -> str:
     return "\n".join(texts)
 
 
-def _build_merged_context(items: list[_PendingReplyItem]) -> str:
+def _build_recent_bot_messages_context(
+    history: list[dict[str, Any]] | None,
+    *,
+    recent_tail_items: int = 12,
+    max_items: int = 3,
+) -> str:
+    if not history:
+        return ""
+
+    recent_tail = [
+        item
+        for item in history
+        if str(item.get("role", "")).strip().lower() != "system"
+    ][-max(1, recent_tail_items) :]
+    recent_bot_messages = [
+        item
+        for item in recent_tail
+        if str(item.get("role", "")).strip().lower() == "assistant"
+    ]
+    if not recent_bot_messages:
+        return ""
+
+    lines = [
+        "[RECENT_BOT_MESSAGES]",
+        "Use these recent bot messages to avoid replying too frequently unless the latest merged user intent clearly asks for the bot.",
+        f"recent_tail_size={len(recent_tail)}",
+        f"recent_bot_message_count={len(recent_bot_messages)}",
+    ]
+    for item in recent_bot_messages[-max(1, max_items) :]:
+        lines.append(format_history_message_line(item, max_body_chars=160))
+    return "\n".join(lines)
+
+
+def _build_merged_context(
+    items: list[_PendingReplyItem],
+    *,
+    recent_history: list[dict[str, Any]] | None = None,
+) -> str:
     if not items:
         return ""
 
@@ -521,7 +559,44 @@ def _build_merged_context(items: list[_PendingReplyItem]) -> str:
         text = _truncate_text((item.input_text or "").replace("\n", " ").strip(), 280)
         lines.append(f"[{idx}] {meta}")
         lines.append(text or "(empty)")
+
+    recent_bot_context = _build_recent_bot_messages_context(recent_history)
+    if recent_bot_context:
+        lines.append(recent_bot_context)
     return "\n".join(lines)
+
+
+def _build_recent_group_message_window(
+    items: list[_PendingReplyItem],
+    *,
+    recent_history: list[dict[str, Any]] | None = None,
+) -> str:
+    if not items:
+        return ""
+
+    recent_group_messages = [
+        item
+        for item in (recent_history or [])
+        if str(item.get("role", "")).strip().lower() != "system"
+    ][-6:]
+    lines = [
+        f"current_sender_batch_count={len(items)}",
+        "[RECENT_GROUP_MESSAGES]",
+        "These are the most recent group messages before the current merged batch. Use them to judge topic continuity and whether the bot already spoke recently.",
+    ]
+    if recent_group_messages:
+        for item in recent_group_messages:
+            lines.append(format_history_message_line(item, max_body_chars=160))
+    else:
+        lines.append("(none)")
+
+    recent_bot_context = _build_recent_bot_messages_context(recent_history)
+    if recent_bot_context:
+        lines.append(recent_bot_context)
+    return "\n".join(lines)
+
+
+_build_merged_context = _build_recent_group_message_window
 
 
 def _message_sender_label(message: Message | None) -> str:
@@ -1106,7 +1181,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
     flow_started = time.perf_counter()
     merged_count = len(items)
     merged_input_text = _build_merged_user_text(items)
-    merged_context = _build_merged_context(items)
+    merged_context = _build_recent_group_message_window(items)
     reply_targets_context, reply_target_aliases = _build_reply_targets_context(items)
     memory_entries = [item.memory_entry for item in items if item.memory_entry]
     memory = memory_holder.get()
@@ -1160,6 +1235,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 return
 
             decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
+            merged_context = _build_recent_group_message_window(items, recent_history=decision_history)
             decision_started = time.perf_counter()
             action, action_forced = await _resolve_pending_reply_action(
                 decision_svc=decision_svc,
