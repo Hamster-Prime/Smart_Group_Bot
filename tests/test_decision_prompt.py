@@ -18,12 +18,13 @@ class DecisionPromptTests(unittest.TestCase):
         ):
             self.assertIn(block, DECISION_SYSTEM)
 
-    def test_decision_prompt_is_conservative_by_default(self) -> None:
-        self.assertIn("Prefer replying less often over jumping into every topic.", DECISION_SYSTEM)
-        self.assertIn("raise the bar for another reply", DECISION_SYSTEM)
-        self.assertIn("When unsure, default to `skip`.", DECISION_SYSTEM)
+    def test_decision_prompt_is_active_but_rate_limited(self) -> None:
+        self.assertIn("active but non-annoying group member", DECISION_SYSTEM)
+        self.assertIn("Use [MERGED_MESSAGE_CONTEXT] to control reply frequency.", DECISION_SYSTEM)
+        self.assertIn("do not reply to every follow-up", DECISION_SYSTEM)
 
     def test_decision_prompt_mentions_bot_frequency_signals(self) -> None:
         self.assertIn("role=assistant", DECISION_SYSTEM)
         self.assertIn("sender_id=BOT", DECISION_SYSTEM)
         self.assertIn("replied recently or multiple times already", DECISION_SYSTEM)
+        self.assertIn("spoken very recently in the same ongoing exchange", DECISION_SYSTEM)
