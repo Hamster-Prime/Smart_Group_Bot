@@ -195,10 +195,22 @@ class LLMService:
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    txt = str(item.get("text", "")).strip()
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type", "") or "").strip().lower()
+                if item_type in {"text", "output_text", "input_text"}:
+                    txt = item.get("text", "")
+                    if isinstance(txt, dict):
+                        txt = txt.get("value", "")
+                    txt = str(txt or "").strip()
                     if txt:
                         parts.append(txt)
+                    continue
+                if item_type == "refusal":
+                    refusal = str(item.get("refusal", "") or "").strip()
+                    if refusal:
+                        parts.append(refusal)
+                    continue
             return "\n".join(parts)
         return str(content or "")
 
@@ -207,6 +219,15 @@ class LLMService:
         if isinstance(obj, dict):
             return obj.get(key, default)
         return getattr(obj, key, default)
+
+    @staticmethod
+    def _string_value(value: Any) -> str:
+        if value is None:
+            return ""
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, str):
+            return enum_value
+        return str(value)
 
     @staticmethod
     def _coerce_int(value: Any) -> int:
@@ -226,6 +247,24 @@ class LLMService:
         if existing.endswith(piece):
             return existing
         return existing + piece
+
+    @classmethod
+    def _merge_stream_content_slot(
+        cls,
+        merged: dict[tuple[int, int], str],
+        *,
+        output_index: Any,
+        content_index: Any,
+        piece: str,
+    ) -> None:
+        if not piece:
+            return
+        slot = (cls._coerce_int(output_index), cls._coerce_int(content_index))
+        merged[slot] = cls._merge_stream_piece(merged.get(slot, ""), piece)
+
+    @staticmethod
+    def _joined_stream_content_slots(merged: dict[tuple[int, int], str]) -> str:
+        return "".join(text for _, text in sorted(merged.items()))
 
     @classmethod
     def _stream_delta_text(cls, delta: Any) -> str:
@@ -279,7 +318,7 @@ class LLMService:
             if call_id:
                 entry["id"] = call_id
 
-            call_type = str(cls._get_value(raw_call, "type", "") or "")
+            call_type = cls._string_value(cls._get_value(raw_call, "type", "") or "")
             if call_type:
                 entry["type"] = call_type
 
@@ -346,7 +385,7 @@ class LLMService:
             call_id = str(
                 cls._get_value(raw_call, "id", "") or cls._get_value(raw_call, "call_id", "") or ""
             ).strip() or f"call_{idx}"
-            call_type = str(cls._get_value(raw_call, "type", "") or "function").strip() or "function"
+            call_type = cls._string_value(cls._get_value(raw_call, "type", "") or "function").strip() or "function"
             if not name and not arguments:
                 continue
             normalized_tool_calls.append(
@@ -370,13 +409,19 @@ class LLMService:
         if isinstance(value, list):
             return "".join(cls._responses_text_piece(item) for item in value)
 
-        item_type = str(cls._get_value(value, "type", "") or "").strip().lower()
+        item_type = cls._string_value(cls._get_value(value, "type", "") or "").strip().lower()
         if item_type in {"output_text", "text", "input_text"}:
             return cls._responses_text_piece(cls._get_value(value, "text", ""))
+        if item_type == "refusal":
+            return str(cls._get_value(value, "refusal", "") or "")
 
         text_value = cls._get_value(value, "text", None)
         if text_value not in (None, ""):
             return cls._responses_text_piece(text_value)
+
+        refusal_value = cls._get_value(value, "refusal", None)
+        if refusal_value not in (None, ""):
+            return str(refusal_value)
 
         value_text = cls._get_value(value, "value", None)
         if value_text not in (None, ""):
@@ -391,7 +436,7 @@ class LLMService:
         tool_calls: list[dict[str, Any]] = []
 
         for item in output_items:
-            item_type = str(cls._get_value(item, "type", "") or "").strip().lower()
+            item_type = cls._string_value(cls._get_value(item, "type", "") or "").strip().lower()
             if item_type == "message":
                 content_parts.append(cls._responses_text_piece(cls._get_value(item, "content", None)))
                 continue
@@ -483,7 +528,7 @@ class LLMService:
         return bool(getattr(cfg, "stream", False))
 
     async def _consume_chat_stream(self, stream_resp: Any) -> Any:
-        content_parts: list[str] = []
+        content_parts: dict[tuple[int, int], str] = {}
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
         completed_response: Any = None
@@ -493,7 +538,7 @@ class LLMService:
                 if chunk is None:
                     continue
 
-                event_type = str(self._get_value(chunk, "type", "") or "").strip().lower()
+                event_type = self._string_value(self._get_value(chunk, "type", "") or "").strip().lower()
                 if event_type.endswith("completed"):
                     completed_response = self._get_value(chunk, "response", None) or completed_response
 
@@ -501,15 +546,47 @@ class LLMService:
                 if chunk_usage is not None:
                     usage = chunk_usage
 
-                if event_type == "response.output_text.delta":
-                    delta_text = str(self._get_value(chunk, "delta", "") or "")
-                    if delta_text:
-                        content_parts.append(delta_text)
+                if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "delta", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.output_text.done":
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "text", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.refusal.done":
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "refusal", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.content_part.done":
+                    text_piece = self._responses_text_piece(self._get_value(chunk, "part", None))
+                    if text_piece:
+                        self._merge_stream_content_slot(
+                            content_parts,
+                            output_index=self._get_value(chunk, "output_index", 0),
+                            content_index=self._get_value(chunk, "content_index", 0),
+                            piece=text_piece,
+                        )
                     continue
 
                 if event_type == "response.output_item.added":
                     output_item = self._get_value(chunk, "item", None)
-                    if str(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
+                    if self._string_value(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
                         self._merge_stream_tool_calls(
                             tool_calls,
                             [
@@ -526,6 +603,22 @@ class LLMService:
                         )
                     continue
 
+                if event_type == "response.output_item.done":
+                    output_item = self._get_value(chunk, "item", None)
+                    item_type = self._string_value(self._get_value(output_item, "type", "") or "").strip().lower()
+                    if item_type == "function_call":
+                        self._merge_stream_tool_calls(tool_calls, [output_item])
+                    else:
+                        text_piece = self._responses_text_piece(self._get_value(output_item, "content", None))
+                        if text_piece:
+                            self._merge_stream_content_slot(
+                                content_parts,
+                                output_index=self._get_value(chunk, "output_index", 0),
+                                content_index=0,
+                                piece=text_piece,
+                            )
+                    continue
+
                 if event_type == "response.function_call_arguments.delta":
                     self._merge_stream_tool_calls(
                         tool_calls,
@@ -535,6 +628,21 @@ class LLMService:
                                 "type": "function",
                                 "function": {
                                     "arguments": self._get_value(chunk, "delta", ""),
+                                },
+                            }
+                        ],
+                    )
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    self._merge_stream_tool_calls(
+                        tool_calls,
+                        [
+                            {
+                                "index": self._get_value(chunk, "output_index", 0),
+                                "type": "function",
+                                "function": {
+                                    "arguments": self._get_value(chunk, "arguments", ""),
                                 },
                             }
                         ],
@@ -554,7 +662,12 @@ class LLMService:
 
                 delta_text = self._stream_delta_text(delta)
                 if delta_text:
-                    content_parts.append(delta_text)
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=0,
+                        content_index=0,
+                        piece=delta_text,
+                    )
 
                 self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
         except Exception:
@@ -568,13 +681,13 @@ class LLMService:
             return normalized
 
         return self._build_model_response(
-            content="".join(content_parts),
+            content=self._joined_stream_content_slots(content_parts),
             tool_calls=self._normalize_tool_calls(tool_calls),
             usage=usage,
         )
 
     def _consume_chat_stream_sync(self, stream_resp: Any) -> Any:
-        content_parts: list[str] = []
+        content_parts: dict[tuple[int, int], str] = {}
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
         completed_response: Any = None
@@ -584,7 +697,7 @@ class LLMService:
                 if chunk is None:
                     continue
 
-                event_type = str(self._get_value(chunk, "type", "") or "").strip().lower()
+                event_type = self._string_value(self._get_value(chunk, "type", "") or "").strip().lower()
                 if event_type.endswith("completed"):
                     completed_response = self._get_value(chunk, "response", None) or completed_response
 
@@ -592,15 +705,47 @@ class LLMService:
                 if chunk_usage is not None:
                     usage = chunk_usage
 
-                if event_type == "response.output_text.delta":
-                    delta_text = str(self._get_value(chunk, "delta", "") or "")
-                    if delta_text:
-                        content_parts.append(delta_text)
+                if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "delta", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.output_text.done":
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "text", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.refusal.done":
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=self._get_value(chunk, "output_index", 0),
+                        content_index=self._get_value(chunk, "content_index", 0),
+                        piece=str(self._get_value(chunk, "refusal", "") or ""),
+                    )
+                    continue
+
+                if event_type == "response.content_part.done":
+                    text_piece = self._responses_text_piece(self._get_value(chunk, "part", None))
+                    if text_piece:
+                        self._merge_stream_content_slot(
+                            content_parts,
+                            output_index=self._get_value(chunk, "output_index", 0),
+                            content_index=self._get_value(chunk, "content_index", 0),
+                            piece=text_piece,
+                        )
                     continue
 
                 if event_type == "response.output_item.added":
                     output_item = self._get_value(chunk, "item", None)
-                    if str(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
+                    if self._string_value(self._get_value(output_item, "type", "") or "").strip().lower() == "function_call":
                         self._merge_stream_tool_calls(
                             tool_calls,
                             [
@@ -617,6 +762,22 @@ class LLMService:
                         )
                     continue
 
+                if event_type == "response.output_item.done":
+                    output_item = self._get_value(chunk, "item", None)
+                    item_type = self._string_value(self._get_value(output_item, "type", "") or "").strip().lower()
+                    if item_type == "function_call":
+                        self._merge_stream_tool_calls(tool_calls, [output_item])
+                    else:
+                        text_piece = self._responses_text_piece(self._get_value(output_item, "content", None))
+                        if text_piece:
+                            self._merge_stream_content_slot(
+                                content_parts,
+                                output_index=self._get_value(chunk, "output_index", 0),
+                                content_index=0,
+                                piece=text_piece,
+                            )
+                    continue
+
                 if event_type == "response.function_call_arguments.delta":
                     self._merge_stream_tool_calls(
                         tool_calls,
@@ -626,6 +787,21 @@ class LLMService:
                                 "type": "function",
                                 "function": {
                                     "arguments": self._get_value(chunk, "delta", ""),
+                                },
+                            }
+                        ],
+                    )
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    self._merge_stream_tool_calls(
+                        tool_calls,
+                        [
+                            {
+                                "index": self._get_value(chunk, "output_index", 0),
+                                "type": "function",
+                                "function": {
+                                    "arguments": self._get_value(chunk, "arguments", ""),
                                 },
                             }
                         ],
@@ -645,7 +821,12 @@ class LLMService:
 
                 delta_text = self._stream_delta_text(delta)
                 if delta_text:
-                    content_parts.append(delta_text)
+                    self._merge_stream_content_slot(
+                        content_parts,
+                        output_index=0,
+                        content_index=0,
+                        piece=delta_text,
+                    )
 
                 self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
         except Exception:
@@ -659,7 +840,7 @@ class LLMService:
             return normalized
 
         return self._build_model_response(
-            content="".join(content_parts),
+            content=self._joined_stream_content_slots(content_parts),
             tool_calls=self._normalize_tool_calls(tool_calls),
             usage=usage,
         )

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from enum import Enum
 from typing import Any
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -25,16 +26,22 @@ def _chat_resp(*, content: Any = "", tool_calls: list[dict] | None = None) -> Si
 def _responses_resp(
     *,
     content: str = "",
+    refusal: str = "",
     tool_calls: list[dict] | None = None,
     usage: Any | None = None,
 ) -> SimpleNamespace:
     output: list[Any] = []
+    message_parts: list[Any] = []
     if content:
+        message_parts.append(SimpleNamespace(type="output_text", text=content))
+    if refusal:
+        message_parts.append(SimpleNamespace(type="refusal", refusal=refusal))
+    if message_parts:
         output.append(
             SimpleNamespace(
                 type="message",
                 role="assistant",
-                content=[SimpleNamespace(type="output_text", text=content)],
+                content=message_parts,
             )
         )
 
@@ -86,6 +93,11 @@ class _SyncStream:
         if not self._chunks:
             raise StopIteration
         return self._chunks.pop(0)
+
+
+class _EventType(Enum):
+    OUTPUT_TEXT_DELTA = "response.output_text.delta"
+    RESPONSE_COMPLETED = "response.completed"
 
 
 class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -487,6 +499,124 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "a cute cat sticker")
         mock_responses.assert_called_once()
         self.assertTrue(bool(mock_responses.call_args.kwargs.get("stream")))
+
+    async def test_generate_supports_streaming_responses_refusal_events(self) -> None:
+        llm = self._make_llm()
+        llm.main.provider = "openai"
+        llm.main.chat_endpoint = "responses"
+        llm.main.stream = True
+        completed = _responses_resp(
+            refusal="抱歉，我不能帮助处理这个请求。",
+            usage={"input_tokens": 42, "output_tokens": 9, "total_tokens": 51},
+        )
+        mock_responses = Mock(
+            return_value=_SyncStream(
+                [
+                    SimpleNamespace(
+                        type="response.refusal.delta",
+                        delta="抱歉，",
+                        output_index=0,
+                        content_index=0,
+                    ),
+                    SimpleNamespace(
+                        type="response.refusal.delta",
+                        delta="我不能帮助处理这个请求。",
+                        output_index=0,
+                        content_index=0,
+                    ),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=completed,
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "抱歉，我不能帮助处理这个请求。")
+        mock_responses.assert_called_once()
+        self.assertTrue(mock_responses.call_args.kwargs["stream"])
+
+    async def test_generate_supports_streaming_responses_done_events_without_completed_event(self) -> None:
+        llm = self._make_llm()
+        llm.main.provider = "openai"
+        llm.main.chat_endpoint = "responses"
+        llm.main.stream = True
+        mock_responses = Mock(
+            return_value=_SyncStream(
+                [
+                    SimpleNamespace(
+                        type="response.output_text.done",
+                        output_index=0,
+                        content_index=0,
+                        text="hello world",
+                    ),
+                    SimpleNamespace(
+                        type="response.output_item.done",
+                        output_index=0,
+                        item=SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            content=[SimpleNamespace(type="output_text", text="hello world")],
+                        ),
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "hello world")
+        mock_responses.assert_called_once()
+        self.assertTrue(mock_responses.call_args.kwargs["stream"])
+
+    async def test_generate_supports_streaming_responses_enum_event_types_with_empty_completed_output(self) -> None:
+        llm = self._make_llm()
+        llm.main.provider = "openai"
+        llm.main.chat_endpoint = "responses"
+        llm.main.stream = True
+        completed = SimpleNamespace(
+            output=[],
+            usage={"input_tokens": 42, "output_tokens": 2, "total_tokens": 44},
+        )
+        mock_responses = Mock(
+            return_value=_SyncStream(
+                [
+                    SimpleNamespace(
+                        type=_EventType.OUTPUT_TEXT_DELTA,
+                        delta="hello world",
+                        output_index=0,
+                        content_index=0,
+                    ),
+                    SimpleNamespace(
+                        type=_EventType.RESPONSE_COMPLETED,
+                        response=completed,
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "hello world")
+        mock_responses.assert_called_once()
+        self.assertTrue(mock_responses.call_args.kwargs["stream"])
 
     async def test_decision_requests_honor_streaming_gateways(self) -> None:
         llm = self._make_llm()
