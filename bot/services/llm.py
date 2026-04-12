@@ -56,6 +56,27 @@ class LLMService:
         return kwargs
 
     @staticmethod
+    def _build_responses_kwargs(cfg: ChatEndpointConfig) -> dict[str, Any]:
+        model = str(cfg.model or "").strip()
+        provider = str(getattr(cfg, "provider", "") or "").strip().lower()
+        if provider in {"openai", "openai_compatible"} and model.lower().startswith("openai/"):
+            model = model.split("/", 1)[1]
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": cfg.temperature,
+            "max_output_tokens": cfg.max_tokens,
+            "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
+        }
+        if getattr(cfg, "stream", False):
+            kwargs["stream"] = True
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        if cfg.api_base:
+            kwargs["api_base"] = cfg.api_base
+        return kwargs
+
+    @staticmethod
     def _build_embed_kwargs(cfg: EmbedEndpointConfig, texts: list[str]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
@@ -73,9 +94,11 @@ class LLMService:
         return [
             ChatEndpointConfig(
                 model=cfg.model,
+                provider=getattr(cfg, "provider", ""),
                 api_key=cfg.api_key,
                 api_base=cfg.api_base,
                 stream=cfg.stream,
+                chat_endpoint=getattr(cfg, "chat_endpoint", "chat_completions"),
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 timeout_sec=cfg.timeout_sec,
@@ -279,6 +302,66 @@ class LLMService:
             usage=usage,
         )
 
+    def _consume_chat_stream_sync(self, stream_resp: Any) -> Any:
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: SimpleNamespace | None = None
+
+        for chunk in stream_resp:
+            if chunk is None:
+                continue
+
+            chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            choices = self._get_value(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = self._get_value(choice, "delta", None)
+            if delta is None:
+                delta = self._get_value(choice, "message", None)
+            if delta is None:
+                delta = choice
+
+            delta_text = self._stream_delta_text(delta)
+            if delta_text:
+                content_parts.append(delta_text)
+
+            self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
+
+        normalized_tool_calls: list[dict[str, Any]] = []
+        for idx, tool_call in enumerate(tool_calls, start=1):
+            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            name = str(function.get("name", "") or "").strip()
+            arguments = str(function.get("arguments", "") or "")
+            if not name and not arguments:
+                continue
+            normalized_tool_calls.append(
+                {
+                    "id": str(tool_call.get("id", "") or "").strip() or f"call_{idx}",
+                    "type": str(tool_call.get("type", "") or "").strip() or "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+            )
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="".join(content_parts),
+                        tool_calls=normalized_tool_calls,
+                    )
+                )
+            ],
+            usage=usage,
+        )
+
     @staticmethod
     def _preview_for_log(text: str, *, limit: int) -> tuple[str, bool]:
         """Render a single-line preview for logs and report whether it was truncated."""
@@ -371,6 +454,151 @@ class LLMService:
     async def _await_with_timeout(awaitable: Any, *, timeout_sec: float) -> Any:
         return await asyncio.wait_for(awaitable, timeout=max(1.0, timeout_sec))
 
+    @staticmethod
+    def _uses_responses_api(cfg: ChatEndpointConfig) -> bool:
+        return str(getattr(cfg, "chat_endpoint", "chat_completions") or "chat_completions") == "responses"
+
+    @classmethod
+    def _convert_responses_content(cls, content: Any) -> Any:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content or "")
+
+        parts: list[dict[str, Any]] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append({"type": "input_text", "text": item})
+                continue
+            if not isinstance(item, dict):
+                text_value = str(item or "")
+                if text_value:
+                    parts.append({"type": "input_text", "text": text_value})
+                continue
+
+            item_type = str(item.get("type", "") or "").strip().lower()
+            if item_type in {"text", "input_text", "output_text"}:
+                text_value = item.get("text", "")
+                if isinstance(text_value, dict):
+                    text_value = text_value.get("value", "")
+                text_value = str(text_value or "")
+                if text_value:
+                    parts.append({"type": "input_text", "text": text_value})
+                continue
+
+            if item_type in {"image_url", "input_image"}:
+                image_payload = item.get("image_url", item)
+                if isinstance(image_payload, dict):
+                    image_url = str(image_payload.get("url", "") or image_payload.get("image_url", "") or "").strip()
+                    detail = str(image_payload.get("detail", "auto") or "auto").strip()
+                else:
+                    image_url = str(image_payload or "").strip()
+                    detail = "auto"
+                if image_url:
+                    parts.append(
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": detail or "auto",
+                        }
+                    )
+                continue
+
+        if not parts:
+            return cls._normalize_content_text(content)
+        return parts
+
+    @classmethod
+    def _messages_to_responses_input(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = str(message.get("role", "") or "").strip().lower()
+            content = message.get("content", "")
+
+            if role in {"system", "developer", "user"}:
+                items.append(
+                    {
+                        "role": role,
+                        "content": cls._convert_responses_content(content),
+                    }
+                )
+                continue
+
+            if role == "assistant":
+                normalized_content = cls._convert_responses_content(content)
+                if normalized_content:
+                    items.append({"role": "assistant", "content": normalized_content})
+
+                raw_tool_calls = message.get("tool_calls") or []
+                for tool_call in raw_tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function", {}) or {}
+                    name = str(function.get("name", "") or "").strip()
+                    arguments = function.get("arguments", "")
+                    if isinstance(arguments, dict):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    arguments = str(arguments or "")
+                    call_id = str(tool_call.get("id", "") or "").strip()
+                    if name and call_id:
+                        items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        )
+                continue
+
+            if role == "tool":
+                call_id = str(message.get("tool_call_id", "") or "").strip()
+                if not call_id:
+                    continue
+                output = content if isinstance(content, str) else cls._normalize_content_text(content)
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": str(output or ""),
+                    }
+                )
+
+        return items
+
+    def _responses_sync_request(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        cfg: ChatEndpointConfig,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> Any:
+        responses_fn = getattr(litellm, "responses", None)
+        if responses_fn is None:
+            raise RuntimeError("installed litellm does not support responses(); please upgrade litellm")
+
+        kwargs = self._build_responses_kwargs(cfg)
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
+
+        input_items = self._messages_to_responses_input(messages)
+        try:
+            resp = responses_fn(input=input_items, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'input'" not in str(exc):
+                raise
+            resp = responses_fn(messages=messages, **kwargs)
+        if getattr(cfg, "stream", False):
+            return self._consume_chat_stream_sync(resp)
+        return resp
+
     async def _chat_completion_response_with_retries(
         self,
         *,
@@ -389,9 +617,10 @@ class LLMService:
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
             prompt_usage = self.prompt_usage_text(messages, tools=tools, cfg=cfg)
             log.info(
-                "LLM request | stage=%s | model=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs | stream=%s",
+                "LLM request | stage=%s | model=%s | endpoint=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs | stream=%s",
                 label_cn,
                 cfg.model,
+                getattr(cfg, "chat_endpoint", "chat_completions"),
                 attempt,
                 total_attempts,
                 prompt_usage,
@@ -401,19 +630,31 @@ class LLMService:
                 bool(getattr(cfg, "stream", False)),
             )
             try:
-                request = (
-                    litellm.acompletion(messages=messages, tools=tools, tool_choice=tool_choice, **kwargs)
-                    if tools
-                    else litellm.acompletion(messages=messages, **kwargs)
-                )
-                raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
-                if getattr(cfg, "stream", False):
+                if self._uses_responses_api(cfg):
                     resp = await self._await_with_timeout(
-                        self._consume_chat_stream(raw_resp),
+                        asyncio.to_thread(
+                            self._responses_sync_request,
+                            messages=messages,
+                            cfg=cfg,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        ),
                         timeout_sec=timeout_sec,
                     )
                 else:
-                    resp = raw_resp
+                    request = (
+                        litellm.acompletion(messages=messages, tools=tools, tool_choice=tool_choice, **kwargs)
+                        if tools
+                        else litellm.acompletion(messages=messages, **kwargs)
+                    )
+                    raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
+                    if getattr(cfg, "stream", False):
+                        resp = await self._await_with_timeout(
+                            self._consume_chat_stream(raw_resp),
+                            timeout_sec=timeout_sec,
+                        )
+                    else:
+                        resp = raw_resp
                 message = resp.choices[0].message
                 content = self._normalize_content_text(message.content)
                 tool_calls = getattr(message, "tool_calls", None)

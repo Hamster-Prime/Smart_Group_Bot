@@ -4,6 +4,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,13 +34,16 @@ class ProviderProfile(BaseModel):
     api_key: str | None = None
     api_base: str | None = None
     stream: bool = False
+    chat_endpoint: Literal["chat_completions", "responses"] = "chat_completions"
 
 
 class ChatEndpointConfig(BaseModel):
     model: str = "gemini/gemini-2.0-flash"
+    provider: str = ""
     api_key: str | None = None
     api_base: str | None = None
     stream: bool = False
+    chat_endpoint: Literal["chat_completions", "responses"] = "chat_completions"
     temperature: float = 0.7
     max_tokens: int = 2048
     timeout_sec: float = 12.0
@@ -251,6 +255,25 @@ def _env_truthy(value: str | None) -> bool:
     return normalized in {"1", "true", "yes", "on", "y", "t"}
 
 
+def _normalize_chat_endpoint(provider: str, raw_value: str | None) -> Literal["chat_completions", "responses"]:
+    provider_norm = (provider or "").strip().lower()
+    value = (raw_value or "").strip().lower()
+
+    if not value:
+        return "responses" if provider_norm == "openai" else "chat_completions"
+    if value in {"/chat/completions", "chat/completions", "chat_completions", "chat-completions", "chat"}:
+        return "chat_completions"
+    if value in {"/responses", "responses", "response"}:
+        if provider_norm not in {"openai", "openai_compatible"}:
+            raise ValueError(
+                f"MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT=/responses is only supported for openai/openai_compatible, got {provider!r}"
+            )
+        return "responses"
+    raise ValueError(
+        f"invalid MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT value: {raw_value!r}; expected /chat/completions or /responses"
+    )
+
+
 def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderProfile]:
     """
     Parse provider profiles from env:
@@ -258,8 +281,11 @@ def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderPro
     MODEL_PROVIDER_<NAME>_API_KEY
     MODEL_PROVIDER_<NAME>_API_BASE
     MODEL_PROVIDER_<NAME>_STREAM
+    MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT
     """
-    pattern = re.compile(r"^MODEL_PROVIDER_([A-Z0-9_]+)_(PROVIDER|API_KEY|API_BASE|STREAM)$")
+    pattern = re.compile(
+        r"^MODEL_PROVIDER_([A-Z0-9_]+)_(PROVIDER|API_KEY|API_BASE|STREAM|CHAT_ENDPOINT)$"
+    )
     grouped: dict[str, dict[str, str]] = {}
 
     for key, value in raw_env.items():
@@ -282,6 +308,7 @@ def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderPro
             api_key=api_key,
             api_base=api_base,
             stream=_env_truthy(fields.get("stream")),
+            chat_endpoint=_normalize_chat_endpoint(provider, fields.get("chat_endpoint")),
         )
 
     return profiles
@@ -341,9 +368,11 @@ def _build_chat_config(
     profile = _get_profile(profiles, provider_name)
     cfg = ModelConfig(
         model=_build_litellm_model(profile.provider, model_name),
+        provider=profile.provider,
         api_key=profile.api_key,
         api_base=profile.api_base,
         stream=profile.stream,
+        chat_endpoint=profile.chat_endpoint,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_sec=timeout_sec,
@@ -358,9 +387,11 @@ def _build_chat_config(
         cfg.fallbacks.append(
             ChatEndpointConfig(
                 model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
+                provider=fb_profile.provider,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
                 stream=fb_profile.stream,
+                chat_endpoint=fb_profile.chat_endpoint,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,

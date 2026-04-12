@@ -45,6 +45,7 @@ class ChatBridgeConfigTests(unittest.TestCase):
             loaded = config_module.load_settings(config_path="missing.toml")
 
         self.assertEqual(loaded.bot.main_model.model, "openai/main-reply")
+        self.assertEqual(loaded.bot.main_model.chat_endpoint, "chat_completions")
         self.assertEqual(loaded.bot.chat_bridge_model.model, "gemini/bridge-reply")
         self.assertEqual(loaded.bot.chat_bridge_model.api_key, "gemini-key")
         self.assertEqual(loaded.bot.chat_bridge_model.api_base, "https://gemini.example")
@@ -81,6 +82,7 @@ class ChatBridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded.bot.chat_bridge_model.model, "openai/main-reply")
         self.assertEqual(loaded.bot.chat_bridge_model.api_key, "ark-key")
+        self.assertEqual(loaded.bot.chat_bridge_model.chat_endpoint, "chat_completions")
 
     def test_load_settings_supports_anthropic_provider_profile(self) -> None:
         settings = Settings(_env_file=None)
@@ -125,6 +127,63 @@ class ChatBridgeConfigTests(unittest.TestCase):
         self.assertEqual(loaded.bot.chat_bridge_model.model, "anthropic/claude-haiku")
         self.assertEqual(loaded.bot.decision_model.model, "anthropic/claude-decision")
         self.assertEqual(loaded.bot.embed_model.model, "openai/text-embedding-3-small")
+
+    def test_load_settings_defaults_openai_provider_to_responses_api(self) -> None:
+        settings = Settings(_env_file=None)
+        settings.main_provider_name = "openai_main"
+        settings.main_model = "gpt-4.1"
+        settings.decision_provider_name = "openai_main"
+        settings.decision_model = "gpt-4.1-mini"
+        settings.moderation_provider_name = "openai_main"
+        settings.moderation_model = "gpt-4.1-mini"
+        settings.compress_provider_name = "openai_main"
+        settings.compress_model = "gpt-4.1-nano"
+        settings.embed_provider_name = "openai_main"
+        settings.embed_model = "text-embedding-3-small"
+
+        raw_env = {
+            "MODEL_PROVIDER_OPENAI_MAIN_PROVIDER": "openai",
+            "MODEL_PROVIDER_OPENAI_MAIN_API_KEY": "openai-key",
+        }
+
+        with (
+            patch("bot.config.Settings", return_value=settings),
+            patch("bot.config._load_raw_env", return_value=raw_env),
+        ):
+            loaded = config_module.load_settings(config_path="missing.toml")
+
+        self.assertEqual(loaded.bot.main_model.model, "openai/gpt-4.1")
+        self.assertEqual(loaded.bot.main_model.chat_endpoint, "responses")
+        self.assertEqual(loaded.bot.decision_model.chat_endpoint, "responses")
+
+    def test_load_settings_allows_openai_compatible_switch_to_responses_api(self) -> None:
+        settings = Settings(_env_file=None)
+        settings.main_provider_name = "ark"
+        settings.main_model = "gpt-4.1"
+        settings.decision_provider_name = "ark"
+        settings.decision_model = "gpt-4.1-mini"
+        settings.moderation_provider_name = "ark"
+        settings.moderation_model = "gpt-4.1-mini"
+        settings.compress_provider_name = "ark"
+        settings.compress_model = "gpt-4.1-nano"
+        settings.embed_provider_name = "ark"
+        settings.embed_model = "text-embedding-3-small"
+
+        raw_env = {
+            "MODEL_PROVIDER_ARK_PROVIDER": "openai_compatible",
+            "MODEL_PROVIDER_ARK_API_KEY": "ark-key",
+            "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1",
+            "MODEL_PROVIDER_ARK_CHAT_ENDPOINT": "/responses",
+        }
+
+        with (
+            patch("bot.config.Settings", return_value=settings),
+            patch("bot.config._load_raw_env", return_value=raw_env),
+        ):
+            loaded = config_module.load_settings(config_path="missing.toml")
+
+        self.assertEqual(loaded.bot.main_model.chat_endpoint, "responses")
+        self.assertEqual(loaded.bot.main_model.api_base, "https://ark.example/v1")
 
 
 if __name__ == "__main__":
