@@ -215,7 +215,11 @@ class Settings(BaseSettings):
 
 
 def _build_litellm_model(provider: str, model: str) -> str:
-    """Build LiteLLM model string from provider + model name."""
+    """Build LiteLLM model string from provider + model name.
+
+    Most native LiteLLM providers, including `anthropic`, use `<provider>/<model>`.
+    OpenAI-compatible gateways are normalized to the `openai/<model>` prefix.
+    """
     provider_norm = (provider or "").strip().lower()
     model_norm = (model or "").strip()
     if not model_norm:

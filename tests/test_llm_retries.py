@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from typing import Any
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -7,7 +8,7 @@ from bot.config import ChatEndpointConfig, EmbedConfig, ModelConfig
 from bot.services.llm import LLMService
 
 
-def _chat_resp(*, content: str = "", tool_calls: list[dict] | None = None) -> SimpleNamespace:
+def _chat_resp(*, content: Any = "", tool_calls: list[dict] | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -138,6 +139,28 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(resp)
         self.assertEqual(mock_completion.await_count, 2)
         self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["name"], "websearch")
+
+    async def test_generate_normalizes_anthropic_text_blocks(self) -> None:
+        llm = self._make_llm()
+        mock_completion = AsyncMock(
+            return_value=_chat_resp(
+                content=[
+                    {"type": "text", "text": "first line"},
+                    {"type": "tool_use", "name": "ignored"},
+                    {"type": "text", "text": "second line"},
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "first line\nsecond line")
+        self.assertEqual(mock_completion.await_count, 1)
 
     async def test_embed_retries_same_model_before_fallback(self) -> None:
         llm = self._make_llm()
