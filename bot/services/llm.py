@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import litellm
@@ -45,6 +47,8 @@ class LLMService:
             "max_tokens": cfg.max_tokens,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
         }
+        if getattr(cfg, "stream", False):
+            kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
         if cfg.api_base:
@@ -71,6 +75,7 @@ class LLMService:
                 model=cfg.model,
                 api_key=cfg.api_key,
                 api_base=cfg.api_base,
+                stream=cfg.stream,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 timeout_sec=cfg.timeout_sec,
@@ -110,6 +115,169 @@ class LLMService:
                         parts.append(txt)
             return "\n".join(parts)
         return str(content or "")
+
+    @staticmethod
+    def _get_value(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _merge_stream_piece(existing: str, piece: str) -> str:
+        if not piece:
+            return existing
+        if not existing:
+            return piece
+        if piece.startswith(existing):
+            return piece
+        if existing.endswith(piece):
+            return existing
+        return existing + piece
+
+    @classmethod
+    def _stream_delta_text(cls, delta: Any) -> str:
+        content = cls._get_value(delta, "content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text_value = item.get("text", "")
+                    if isinstance(text_value, dict):
+                        text_value = text_value.get("value", "")
+                    parts.append(str(text_value or ""))
+                    continue
+                if "text" in item:
+                    parts.append(str(item.get("text", "") or ""))
+            return "".join(parts)
+        text = cls._get_value(delta, "text")
+        if text is None:
+            return ""
+        return str(text)
+
+    @classmethod
+    def _merge_stream_tool_calls(cls, merged: list[dict[str, Any]], delta_tool_calls: Any) -> None:
+        if not delta_tool_calls:
+            return
+
+        for raw_call in delta_tool_calls:
+            try:
+                index = int(cls._get_value(raw_call, "index", len(merged)) or 0)
+            except (TypeError, ValueError):
+                index = len(merged)
+
+            while len(merged) <= index:
+                merged.append(
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                )
+
+            entry = merged[index]
+            call_id = str(cls._get_value(raw_call, "id", "") or "")
+            if call_id:
+                entry["id"] = call_id
+
+            call_type = str(cls._get_value(raw_call, "type", "") or "")
+            if call_type:
+                entry["type"] = call_type
+
+            raw_function = cls._get_value(raw_call, "function", {}) or {}
+            function = entry.setdefault("function", {"name": "", "arguments": ""})
+
+            name_piece = str(cls._get_value(raw_function, "name", "") or "")
+            if name_piece:
+                function["name"] = cls._merge_stream_piece(str(function.get("name", "") or ""), name_piece)
+
+            args_piece = cls._get_value(raw_function, "arguments", "")
+            if args_piece is None:
+                args_piece = ""
+            if isinstance(args_piece, dict):
+                args_piece = json.dumps(args_piece, ensure_ascii=False)
+            args_piece = str(args_piece)
+            if args_piece:
+                function["arguments"] = cls._merge_stream_piece(
+                    str(function.get("arguments", "") or ""),
+                    args_piece,
+                )
+
+    @classmethod
+    def _coerce_usage(cls, usage: Any) -> SimpleNamespace | None:
+        if not usage:
+            return None
+        return SimpleNamespace(
+            prompt_tokens=int(cls._get_value(usage, "prompt_tokens", 0) or 0),
+            completion_tokens=int(cls._get_value(usage, "completion_tokens", 0) or 0),
+            total_tokens=int(cls._get_value(usage, "total_tokens", 0) or 0),
+        )
+
+    async def _consume_chat_stream(self, stream_resp: Any) -> Any:
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: SimpleNamespace | None = None
+
+        async for chunk in stream_resp:
+            if chunk is None:
+                continue
+
+            chunk_usage = self._coerce_usage(self._get_value(chunk, "usage"))
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            choices = self._get_value(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = self._get_value(choice, "delta", None)
+            if delta is None:
+                delta = self._get_value(choice, "message", None)
+            if delta is None:
+                delta = choice
+
+            delta_text = self._stream_delta_text(delta)
+            if delta_text:
+                content_parts.append(delta_text)
+
+            self._merge_stream_tool_calls(tool_calls, self._get_value(delta, "tool_calls"))
+
+        normalized_tool_calls: list[dict[str, Any]] = []
+        for idx, tool_call in enumerate(tool_calls, start=1):
+            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            name = str(function.get("name", "") or "").strip()
+            arguments = str(function.get("arguments", "") or "")
+            if not name and not arguments:
+                continue
+            normalized_tool_calls.append(
+                {
+                    "id": str(tool_call.get("id", "") or "").strip() or f"call_{idx}",
+                    "type": str(tool_call.get("type", "") or "").strip() or "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+            )
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="".join(content_parts),
+                        tool_calls=normalized_tool_calls,
+                    )
+                )
+            ],
+            usage=usage,
+        )
 
     @staticmethod
     def _preview_for_log(text: str, *, limit: int) -> tuple[str, bool]:
@@ -221,7 +389,7 @@ class LLMService:
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
             prompt_usage = self.prompt_usage_text(messages, tools=tools, cfg=cfg)
             log.info(
-                "LLM request | stage=%s | model=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs",
+                "LLM request | stage=%s | model=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs | stream=%s",
                 label_cn,
                 cfg.model,
                 attempt,
@@ -230,6 +398,7 @@ class LLMService:
                 len(messages),
                 len(tools or []),
                 timeout_sec,
+                bool(getattr(cfg, "stream", False)),
             )
             try:
                 request = (
@@ -237,7 +406,14 @@ class LLMService:
                     if tools
                     else litellm.acompletion(messages=messages, **kwargs)
                 )
-                resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
+                raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
+                if getattr(cfg, "stream", False):
+                    resp = await self._await_with_timeout(
+                        self._consume_chat_stream(raw_resp),
+                        timeout_sec=timeout_sec,
+                    )
+                else:
+                    resp = raw_resp
                 message = resp.choices[0].message
                 content = self._normalize_content_text(message.content)
                 tool_calls = getattr(message, "tool_calls", None)
@@ -259,6 +435,8 @@ class LLMService:
                 usage = getattr(resp, "usage", None)
                 tokens_in = getattr(usage, "prompt_tokens", 0)
                 tokens_out = getattr(usage, "completion_tokens", 0)
+                if not tokens_in:
+                    tokens_in = self.count_prompt_tokens(messages, tools=tools, cfg=cfg)
                 preview, truncated = self._preview_for_log(content, limit=preview_limit)
                 log.info(
                     "LLM response | stage=%s | model=%s | attempt=%d/%d | len=%d | tool_calls=%d | prompt_tokens=%s | output_tokens=%d | preview_truncated=%s | preview=%s",

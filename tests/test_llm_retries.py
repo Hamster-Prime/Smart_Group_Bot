@@ -26,6 +26,19 @@ def _embed_resp(vector: list[float]) -> SimpleNamespace:
     return SimpleNamespace(data=[{"embedding": vector}])
 
 
+class _AsyncStream:
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> "_AsyncStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
 class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
     def _make_llm(self) -> LLMService:
         main = ModelConfig(
@@ -161,6 +174,102 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "first line\nsecond line")
         self.assertEqual(mock_completion.await_count, 1)
+
+    async def test_generate_supports_streaming_provider_requests(self) -> None:
+        llm = self._make_llm()
+        llm.main.stream = True
+        mock_completion = AsyncMock(
+            return_value=_AsyncStream(
+                [
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="hello "))],
+                    ),
+                    SimpleNamespace(
+                        choices=[SimpleNamespace(delta=SimpleNamespace(content="world"))],
+                        usage=SimpleNamespace(prompt_tokens=42, completion_tokens=2),
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "hello world")
+        self.assertEqual(mock_completion.await_count, 1)
+        self.assertTrue(mock_completion.await_args.kwargs["stream"])
+
+    async def test_complete_with_tools_supports_streaming_tool_calls(self) -> None:
+        llm = self._make_llm()
+        llm.main.stream = True
+        mock_completion = AsyncMock(
+            return_value=_AsyncStream(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call-1",
+                                            function=SimpleNamespace(
+                                                name="web",
+                                                arguments='{"que',
+                                            ),
+                                        )
+                                    ]
+                                )
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            function=SimpleNamespace(
+                                                name="search",
+                                                arguments='ry":"weather"}',
+                                            ),
+                                        )
+                                    ]
+                                )
+                            )
+                        ]
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            resp = await llm.complete_with_tools(
+                messages=[{"role": "user", "content": "weather"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "websearch",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            )
+
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["name"], "websearch")
+        self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["arguments"], '{"query":"weather"}')
+        self.assertTrue(mock_completion.await_args.kwargs["stream"])
 
     async def test_embed_retries_same_model_before_fallback(self) -> None:
         llm = self._make_llm()

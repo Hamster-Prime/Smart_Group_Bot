@@ -31,9 +31,11 @@ class ChatBridgeConfigTests(unittest.TestCase):
             "MODEL_PROVIDER_ARK_PROVIDER": "openai_compatible",
             "MODEL_PROVIDER_ARK_API_KEY": "ark-key",
             "MODEL_PROVIDER_ARK_API_BASE": "https://ark.example/v1",
+            "MODEL_PROVIDER_ARK_STREAM": "true",
             "MODEL_PROVIDER_GEMINI_PROVIDER": "gemini",
             "MODEL_PROVIDER_GEMINI_API_KEY": "gemini-key",
             "MODEL_PROVIDER_GEMINI_API_BASE": "https://gemini.example",
+            "MODEL_PROVIDER_GEMINI_STREAM": "false",
         }
 
         with (
@@ -46,8 +48,11 @@ class ChatBridgeConfigTests(unittest.TestCase):
         self.assertEqual(loaded.bot.chat_bridge_model.model, "gemini/bridge-reply")
         self.assertEqual(loaded.bot.chat_bridge_model.api_key, "gemini-key")
         self.assertEqual(loaded.bot.chat_bridge_model.api_base, "https://gemini.example")
+        self.assertTrue(loaded.bot.main_model.stream)
+        self.assertFalse(loaded.bot.chat_bridge_model.stream)
         self.assertEqual(len(loaded.bot.chat_bridge_model.fallbacks), 1)
         self.assertEqual(loaded.bot.chat_bridge_model.fallbacks[0].model, "openai/bridge-fallback")
+        self.assertTrue(loaded.bot.chat_bridge_model.fallbacks[0].stream)
 
     def test_load_settings_defaults_chat_bridge_model_to_main_binding(self) -> None:
         settings = Settings(_env_file=None)

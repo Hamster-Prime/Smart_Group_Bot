@@ -32,12 +32,14 @@ class ProviderProfile(BaseModel):
     provider: str
     api_key: str | None = None
     api_base: str | None = None
+    stream: bool = False
 
 
 class ChatEndpointConfig(BaseModel):
     model: str = "gemini/gemini-2.0-flash"
     api_key: str | None = None
     api_base: str | None = None
+    stream: bool = False
     temperature: float = 0.7
     max_tokens: int = 2048
     timeout_sec: float = 12.0
@@ -244,14 +246,20 @@ def _load_raw_env(env_file: str = ".env") -> dict[str, str]:
     return {k.upper(): str(v) for k, v in merged.items() if k}
 
 
+def _env_truthy(value: str | None) -> bool:
+    normalized = (value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on", "y", "t"}
+
+
 def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderProfile]:
     """
     Parse provider profiles from env:
     MODEL_PROVIDER_<NAME>_PROVIDER
     MODEL_PROVIDER_<NAME>_API_KEY
     MODEL_PROVIDER_<NAME>_API_BASE
+    MODEL_PROVIDER_<NAME>_STREAM
     """
-    pattern = re.compile(r"^MODEL_PROVIDER_([A-Z0-9_]+)_(PROVIDER|API_KEY|API_BASE)$")
+    pattern = re.compile(r"^MODEL_PROVIDER_([A-Z0-9_]+)_(PROVIDER|API_KEY|API_BASE|STREAM)$")
     grouped: dict[str, dict[str, str]] = {}
 
     for key, value in raw_env.items():
@@ -269,7 +277,12 @@ def _collect_provider_profiles(raw_env: dict[str, str]) -> dict[str, ProviderPro
             raise ValueError(f"MODEL_PROVIDER_{name.upper()}_PROVIDER is required")
         api_key = (fields.get("api_key") or "").strip() or None
         api_base = (fields.get("api_base") or "").strip() or None
-        profiles[name] = ProviderProfile(provider=provider, api_key=api_key, api_base=api_base)
+        profiles[name] = ProviderProfile(
+            provider=provider,
+            api_key=api_key,
+            api_base=api_base,
+            stream=_env_truthy(fields.get("stream")),
+        )
 
     return profiles
 
@@ -330,6 +343,7 @@ def _build_chat_config(
         model=_build_litellm_model(profile.provider, model_name),
         api_key=profile.api_key,
         api_base=profile.api_base,
+        stream=profile.stream,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout_sec=timeout_sec,
@@ -346,6 +360,7 @@ def _build_chat_config(
                 model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
+                stream=fb_profile.stream,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
