@@ -1,10 +1,7 @@
-import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
-from bot.services.skills.douyin_search import DouyinSearchSkill
-from bot.services.skills.twitter_x_search import TwitterXSearchSkill
 
 
 class BilibiliSearchSkillTests(unittest.TestCase):
@@ -48,34 +45,6 @@ class BilibiliSearchFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.payload["effective_query"], "测试UP site:space.bilibili.com")
         self.assertEqual(result.payload["results"][0]["url"], "https://space.bilibili.com/123456")
-
-
-class TwitterXSearchSkillTests(unittest.TestCase):
-    def test_extract_status_id(self) -> None:
-        skill = TwitterXSearchSkill()
-        self.assertEqual(skill._extract_status_id("https://x.com/openai/status/1234567890123456789"), "1234567890123456789")
-        self.assertEqual(skill._extract_status_id("https://twitter.com/openai/status/987654321"), "987654321")
-        self.assertEqual(skill._extract_status_id("https://x.com/openai"), "")
-
-
-class DouyinSearchSkillTests(unittest.TestCase):
-    def test_parse_video_id_from_final_url(self) -> None:
-        skill = DouyinSearchSkill()
-        self.assertEqual(
-            skill._parse_video_id_from_final_url("https://www.iesdouyin.com/share/video/7445842287652441376"),
-            "7445842287652441376",
-        )
-        self.assertEqual(
-            skill._parse_video_id_from_final_url("https://www.douyin.com/video/7445842287652441376"),
-            "7445842287652441376",
-        )
-
-    def test_extract_router_data_json(self) -> None:
-        skill = DouyinSearchSkill()
-        router = {"loaderData": {"video_(id)/page": {"videoInfoRes": {"item_list": []}}}}
-        html = f"<script>window._ROUTER_DATA = {router!r}</script>"
-        with self.assertRaises(json.JSONDecodeError):
-            skill._extract_router_data_json(html)
 
 
 if __name__ == "__main__":

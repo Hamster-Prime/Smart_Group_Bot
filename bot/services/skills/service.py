@@ -10,7 +10,6 @@ from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_pr
 from bot.services.llm import LLMService
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
-from bot.services.skills.douyin_search import DouyinSearchSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.music_search import MusicSearchSkill
@@ -18,11 +17,9 @@ from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
 from bot.services.skills.task_manage import TaskManageSkill
-from bot.services.skills.twitter_x_search import TwitterXSearchSkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.services.skills.weibo_search import WeiboSearchSkill
-from bot.services.skills.xiaohongshu_search import XiaohongshuSearchSkill
 from bot.services.reply_output import REPLY_OUTPUT_AWARENESS, REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
@@ -47,9 +44,6 @@ _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "music_search": re.compile(r"^找到\s*\d+\s*首相关歌曲[。！？!?\. ]*$"),
     "bilibili_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|视频|Feed|热搜)[。！？!?\. ]*$"),
     "weibo_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|微博|Feed|热搜)[。！？!?\. ]*$"),
-    "twitter_x_search": re.compile(r"^找到\s*\d+\s*条.*?(?:结果|推文|账号)[。！？!?\. ]*$"),
-    "xiaohongshu_search": re.compile(r"^找到\s*\d+\s*条.*?(?:结果|笔记|账号)[。！？!?\. ]*$"),
-    "douyin_search": re.compile(r"^(?:找到\s*\d+\s*条抖音视频结果|已解析抖音分享视频.*)[。！？!?\. ]*$"),
 }
 _INFO_FOLLOWUP_SKILLS = frozenset(
     {
@@ -58,14 +52,9 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
         "music_search",
         "bilibili_search",
         "weibo_search",
-        "twitter_x_search",
-        "xiaohongshu_search",
-        "douyin_search",
     }
 )
-_PLATFORM_LINK_SKILLS = frozenset(
-    {"bilibili_search", "weibo_search", "twitter_x_search", "xiaohongshu_search", "douyin_search"}
-)
+_PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
 _NUMBERED_LIST_ITEM_RE = re.compile(r"^(\s*)(\d{1,2})([.)、]\s*)")
 _URL_RE = re.compile(r"https?://\S+")
 _RESULT_LIST_RE = re.compile(r"(?m)^\s*\d{1,2}[.)、]\s+")
@@ -101,9 +90,6 @@ class SkillService:
         self._register(WebFetchSkill())
         self._register(BilibiliSearchSkill())
         self._register(WeiboSearchSkill())
-        self._register(TwitterXSearchSkill())
-        self._register(XiaohongshuSearchSkill())
-        self._register(DouyinSearchSkill())
         self.tts_skill_name = DoubaoTTSSkill.name
         self.tts_service = DoubaoTTSService(settings) if settings is not None else None
         if self.tts_service and self.tts_service.available:
@@ -488,7 +474,7 @@ class SkillService:
                 "Do not stop at only reporting the number of matches.\n"
                 "Use the returned tracks to answer the user in Chinese now."
             )
-        if result.skill in {"bilibili_search", "weibo_search", "twitter_x_search", "xiaohongshu_search", "douyin_search"}:
+        if result.skill in {"bilibili_search", "weibo_search"}:
             return (
                 "[TOOL_FOLLOWUP]\n"
                 "You already have platform-specific search or content results.\n"
@@ -636,18 +622,12 @@ class SkillService:
         label_map = {
             "bilibili": "B站",
             "weibo": "微博",
-            "twitter_x": "X/Twitter",
-            "xiaohongshu": "小红书",
-            "douyin": "抖音",
         }
         if platform in label_map:
             return label_map[platform]
         fallback_map = {
             "bilibili_search": "B站",
             "weibo_search": "微博",
-            "twitter_x_search": "X/Twitter",
-            "xiaohongshu_search": "小红书",
-            "douyin_search": "抖音",
         }
         return fallback_map.get(skill_name, "相关")
 
@@ -840,9 +820,6 @@ class SkillService:
                     "websearch",
                     "bilibili_search",
                     "weibo_search",
-                    "twitter_x_search",
-                    "xiaohongshu_search",
-                    "douyin_search",
                 }
             ),
         )

@@ -90,18 +90,17 @@ class _PlannedSkillService(SkillService):
                 },
             )
 
-        if name == "douyin_search":
+        if name == "bilibili_search":
             return SkillRunResult(
                 ok=True,
                 skill=name,
-                summary="已解析抖音分享视频 7445842287652441376",
+                summary="拿到 B 站视频详情",
                 payload={
                     "entry": {
-                        "title": "测试抖音视频",
-                        "url": "https://www.iesdouyin.com/share/video/7445842287652441376",
-                        "share_url": "https://v.douyin.com/abcdefg/",
-                        "redirected_url": "https://www.douyin.com/video/7445842287652441376",
-                        "download_url": "https://aweme.snssdk.com/aweme/v1/play/?video_id=foo",
+                        "title": "测试 B 站视频",
+                        "author": "测试 UP 主",
+                        "url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                        "author_url": "https://space.bilibili.com/123456",
                         "content": "这是一段视频简介",
                     }
                 },
@@ -145,13 +144,12 @@ class SkillServiceTTSPromptTests(unittest.TestCase):
         )
 
         contents = [item["content"] for item in payload["messages"]]
-        tts_blocks = [content for content in contents if "[GROUP_TTS_PREFERENCE]" in content]
+        tts_blocks = [content for content in contents if content.startswith("[GROUP_TTS_PREFERENCE]\n")]
 
         self.assertEqual(len(tts_blocks), 1)
         self.assertIn("tts_mode: on", tts_blocks[0])
-        self.assertIn("mildly prefers voice replies only in selected cases", tts_blocks[0])
-        self.assertIn("Plain text is still the default", tts_blocks[0])
-        self.assertIn("Do not treat tts_mode=on as voice-first or always-on", tts_blocks[0])
+        self.assertIn("When in doubt between voice and text for a short, emotional, or conversational reply, lean toward voice.", tts_blocks[0])
+        self.assertIn("Keep text for: factual answers, link-heavy or list-heavy replies", tts_blocks[0])
 
     def test_off_mode_does_not_include_group_tts_preference_block(self) -> None:
         service = SkillService(_llm_stub(), settings=_tts_settings())
@@ -164,7 +162,7 @@ class SkillServiceTTSPromptTests(unittest.TestCase):
         )
 
         contents = [item["content"] for item in payload["messages"]]
-        self.assertFalse(any("[GROUP_TTS_PREFERENCE]" in content for content in contents))
+        self.assertFalse(any(content.startswith("[GROUP_TTS_PREFERENCE]\n") for content in contents))
 
 
 class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
@@ -265,7 +263,7 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MosDNS 官方文档", result.text)
         self.assertIn("https://example.com/mosdns", result.text)
 
-    async def test_platform_entry_fallback_includes_share_links(self) -> None:
+    async def test_platform_entry_fallback_includes_author_link(self) -> None:
         service = _PlannedSkillService(
             [
                 _resp(
@@ -273,8 +271,8 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "id": "call-1",
                             "function": {
-                                "name": "douyin_search",
-                                "arguments": '{"action":"parse_share","share_text":"https://v.douyin.com/abcdefg/"}',
+                                "name": "bilibili_search",
+                                "arguments": '{"action":"video_detail","query":"BV1xx411c7mD"}',
                             },
                         }
                     ]
@@ -283,12 +281,10 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        result = await service.answer_with_skill("把这个抖音原链接发我", intent_type="casual")
+        result = await service.answer_with_skill("把这个视频原链接发我", intent_type="casual")
 
-        self.assertIn("https://www.iesdouyin.com/share/video/7445842287652441376", result.text)
-        self.assertIn("分享链接：https://v.douyin.com/abcdefg/", result.text)
-        self.assertIn("跳转后链接：https://www.douyin.com/video/7445842287652441376", result.text)
-        self.assertIn("相关直链：https://aweme.snssdk.com/aweme/v1/play/?video_id=foo", result.text)
+        self.assertIn("https://www.bilibili.com/video/BV1xx411c7mD", result.text)
+        self.assertIn("作者主页：https://space.bilibili.com/123456", result.text)
 
     async def test_platform_results_reply_without_links_inline_urls(self) -> None:
         service = _PlannedSkillService(
