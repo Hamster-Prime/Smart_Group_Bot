@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import html
 import logging
-import re
 from urllib.parse import urlparse
 
-import aiohttp
-
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.utils.security import clean_text
+from bot.services.skills.platform_common import fetch_text, parse_html_summary
+from bot.utils.security import clean_multiline_text, clean_text
 
 log = logging.getLogger(__name__)
-
-_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\\1>")
-_TAG_RE = re.compile(r"(?is)<[^>]+>")
-_TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 
 
 class WebFetchSkill:
@@ -39,14 +32,13 @@ class WebFetchSkill:
 
     @staticmethod
     def _html_to_text(raw_html: str) -> tuple[str, str]:
-        m = _TITLE_RE.search(raw_html)
-        title = clean_text(html.unescape(m.group(1) if m else ""), max_len=200)
-
-        body = _SCRIPT_STYLE_RE.sub(" ", raw_html)
-        body = _TAG_RE.sub(" ", body)
-        body = html.unescape(body)
-        body = clean_text(body, max_len=6000)
-        return title, body
+        summary = parse_html_summary(raw_html, max_content_len=6000)
+        title = clean_text(summary.get("title") or "", max_len=200)
+        content = clean_multiline_text(
+            str(summary.get("description") or summary.get("content") or ""),
+            max_len=6000,
+        )
+        return title, content
 
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         _ = context  # Unused for this skill.
@@ -58,45 +50,44 @@ class WebFetchSkill:
             "User-Agent": "SmartGroupBot/1.0 (+https://example.local)",
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         }
-        timeout = aiohttp.ClientTimeout(total=15)
 
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as sess:
-                async with sess.get(u, allow_redirects=True) as resp:
-                    status = resp.status
-                    final_url = str(resp.url)
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if status >= 400:
-                        return SkillRunResult(
-                            ok=False,
-                            skill=self.name,
-                            summary=f"网页请求失败: HTTP {status}",
-                            error=f"http_{status}",
-                        )
+            status, raw, final_url, ctype = await fetch_text(
+                u,
+                headers=headers,
+                timeout_sec=15.0,
+                allow_redirects=True,
+            )
+            if status >= 400:
+                return SkillRunResult(
+                    ok=False,
+                    skill=self.name,
+                    summary=f"网页请求失败: HTTP {status}",
+                    error=f"http_{status}",
+                )
 
-                    raw = await resp.text(errors="ignore")
-                    title, content = self._html_to_text(raw)
-                    if not content:
-                        return SkillRunResult(
-                            ok=False,
-                            skill=self.name,
-                            summary="网页内容为空或不可解析",
-                            error="empty_content",
-                        )
+            title, content = self._html_to_text(raw)
+            if not content:
+                return SkillRunResult(
+                    ok=False,
+                    skill=self.name,
+                    summary="网页内容为空或不可解析",
+                    error="empty_content",
+                )
 
-                    return SkillRunResult(
-                        ok=True,
-                        skill=self.name,
-                        summary="网页抓取成功",
-                        payload={
-                            "url": u,
-                            "final_url": final_url,
-                            "status": status,
-                            "content_type": ctype,
-                            "title": title,
-                            "content": content,
-                        },
-                    )
+            return SkillRunResult(
+                ok=True,
+                skill=self.name,
+                summary="网页抓取成功",
+                payload={
+                    "url": u,
+                    "final_url": final_url,
+                    "status": status,
+                    "content_type": ctype,
+                    "title": title,
+                    "content": content,
+                },
+            )
         except Exception as e:
             log.exception("webfetch failed")
             return SkillRunResult(ok=False, skill=self.name, summary="网页抓取失败", error=str(e))
