@@ -8,502 +8,370 @@
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-0066CC?style=for-the-badge&logo=aiogram&logoColor=white)](https://docs.aiogram.dev/)
 [![LiteLLM](https://img.shields.io/badge/LiteLLM-supported-8B5CF6?style=for-the-badge)](https://docs.litellm.ai/)
 
-**基于 LLM 的 Telegram 群聊智能管理机器人**
+**基于 LLM 的 Telegram 群聊智能机器人**
 
-🧠 智能决策 · 📚 知识库 RAG · 🛡️ 内容审查 · 🔍 联网搜索 · 🎭 贴纸学习 · 🧬 多层记忆
-
-</div>
-
----
-
-## ✨ 功能特性
-
-<div align="center">
-
-| 🧠 智能决策 | 📚 知识库 RAG | 🛡️ 内容审查 | 🔍 联网搜索 |
-|:---:|:---:|:---:|:---:|
-| LLM 判断是否回复 | 语义向量检索 | 实时违规检测 | 实时信息获取 |
-| 三级响应策略 | 自然语言录入 | 三级惩罚机制 | 网页内容抓取 |
-| 被 @ 强制响应 | 自动整理嵌入 | 正则 + AI 双模式 | 工具自主调用 |
+🧠 智能决策 · 🛡️ 内容审核 · 📝 永久记忆 · ⏰ 定时任务 · 🎭 贴纸系统 · 🔍 联网搜索 · 🎵 音乐点播 · 🗣️ TTS 语音
 
 </div>
 
 ---
 
-### 🧠 智能决策系统
-
-大模型驱动的三级响应策略，精准控制机器人行为：
-
-| 策略 | 触发条件 | 说明 |
-|:---:|:---|:---|
-| `skip` | 普通闲聊 / 无关消息 | 忽略，不回复 |
-| `question` | 问题 + 需要回答 | 检索知识库或直接回答 |
-| `casual` | 需要互动的场景 | 自由闲聊回复 |
-
-- 被 **@** 时强制响应，无需额外配置
-- 决策模型可独立配置，支持 fallback 链自动降级
-
----
-
-### 📚 知识库 (RAG)
+## 架构概览
 
 ```
-用户提问 → 向量语义检索 → 上下文匹配 → LLM 生成回答
+消息进入
+  │
+  ├─ 内容审核 (keyword / regex / LLM 三级检测)
+  │     └─ 命中 → warn / delete / ban（按规则独立配置）
+  │
+  ├─ 管理意图路由 (manage_intent)
+  │     └─ memory_manage / rule_manage / task_manage → 直接执行
+  │
+  ├─ 决策模型 (decision)
+  │     ├─ skip → 结束
+  │     └─ casual → 进入回复流程
+  │
+  ├─ 回复流程 (skill tool-calling loop)
+  │     ├─ 主模型自主选择技能调用
+  │     ├─ 贴纸决策模块独立判断是否发送贴纸
+  │     └─ 回复模式选择 (reply / message)
+  │
+  └─ 输出
 ```
 
-- **自然语言录入** — 直接描述即可添加，无需记忆复杂命令（`/kb` 命令）
-- **向量检索** — 基于语义相似度精准匹配
-- **自动整理** — 每小时自动嵌入和索引
-- **参数可调** — `top_k` / `similarity_threshold` / `enable_relaxed` / `min_reliable_score`
+---
+
+## 模型角色
+
+项目通过 LiteLLM 接入多供应商，支持 fallback 链自动降级。以下角色均可独立配置供应商和模型，未配置则自动复用主模型：
+
+| 角色 | 用途 | 默认模型 |
+|:---|:---|:---|
+| **main** | 聊天回复、技能工具调用 | 必须配置 |
+| **decision** | 判断是否回复（skip / casual） | 复用 main |
+| **moderation** | 内容审核 | 复用 decision |
+| **vision** | 图片/贴纸理解 | 复用 main |
+| **chat_bridge** | bot 间 /chat 对话 | 复用 main |
+| **compress** | 上下文压缩摘要 | 复用 main |
+| **embed** | 向量嵌入（预留） | text-embedding-004 |
 
 ---
 
-### 🧠 永久记忆与上下文压缩
+## 功能特性
 
-- **永久记忆**：管理员可直接自然语言写入/修改/删除群组永久记忆
-- **自动压缩**：上下文达到预算上限后，自动归纳为摘要并持续滚动更新
-- **持久化存储**：永久记忆和摘要都写入本地数据库，重启不丢失
-- **上下文注入**：回复时自动带入 `[permanent-memory]` 与 `[context-summary]`
+### 智能决策
 
----
+决策模型接收消息上下文（是否 @bot、是否回复 bot、发送者身份、最近历史等），输出 `skip` 或 `casual`。被 @ 或回复 bot 消息时强制响应；群友互聊时优先保持沉默。
 
-### 🛡️ 群规与审查
+### 内容审核
 
-三级惩罚机制，从警告到踢出逐步升级：
+支持三种规则类型，每种规则可独立配置命中动作：
 
-```
-违规 → warn → warn → ban (第3次自动踢出)
-  │                │
-  └─ delete ───────┘  (同时删除违规消息)
-```
+| 规则类型 | 说明 |
+|:---|:---|
+| `keyword` | 关键词字面匹配 |
+| `regex` | 正则表达式匹配 |
+| `llm` | LLM 语义判断（同义词、变体、谐音等） |
 
-- **动态群规**：支持自然语言添加群规则
-- **内容审查**：LLM 实时检测违规内容
-- **用户免审**：管理员可按群为指定用户设置 AI 审查豁免
-- **命中动作可配置**：
-  - `warn`：仅警告
-  - `delete`：仅删除违规消息（需管理权限）
-  - `ban`：2 次警告，第 3 次自动踢出群组（并删除违规消息）
-- **正则支持**：支持正则表达式匹配规则
+命中动作：`warn`（警告）、`delete`（删除消息）、`ban`（累计 3 次警告后踢出）。支持按用户设置 AI 审核豁免，支持全群「仅审核不回复」模式。
 
----
+### 永久记忆
 
-### 🎭 贴纸系统
+管理员通过自然语言或 `/lm` 命令维护群组永久记忆。回复时自动注入 `[permanent-memory]` 上下文。支持列表翻页和内联按钮删除。存储于 SQLite，重启不丢失。
 
-边聊边学的智能贴纸选择：
+### 定时任务
 
-- 收到贴纸消息后，机器人会自动记录贴纸 `file_id`、emoji、贴纸包信息，并结合视觉描述写入数据库表 `sticker_library`
-- 贴纸回复由独立贴纸决策模块控制，会优先按语义从已学习贴纸中选择，实现"边聊边学"
-- 支持默认贴纸池兜底（`SKILL_STICKER_FILE_IDS` 配置）
+支持自然语言创建提醒和定时查询任务：
+- `reminder`：到时间后提醒群成员
+- `agent_task`：到时间后自动执行 LLM 查询并返回结果
 
----
+通过 `/task` 创建，`/tasks` 查看列表，`/canceltask` 取消。内置后台调度器持续轮询执行。
 
-### 🔍 内置技能
+### 主动话题
 
-技能接入方式：由主模型通过 tool-calling 自主决定是否调用技能，不再额外走"技能规划模型"。
+群组长时间沉默后，bot 可自动抛出一个结合群记忆的话题。通过 `/proactive on|off|status` 控制，支持静默时段配置。
+
+### 技能系统 (Tool Calling)
+
+主模型通过 function calling 自主决定调用哪些技能，无独立技能规划模型：
 
 | 技能 | 说明 |
 |:---|:---|
-| `websearch` | 联网搜索实时信息 |
-| `webfetch` | 获取网页详细内容 |
-| `kb_search` | 知识库语义检索 |
+| `memory_manage` | 查看/新增/修改永久记忆（删除走 /lm） |
+| `rule_manage` | 查看/新增群规（删除走 /rules） |
+| `task_manage` | 创建/查看定时任务（删除走 /tasks） |
+| `send_sticker` | 语义匹配发送贴纸 |
+| `websearch` | DuckDuckGo 联网搜索 |
+| `webfetch` | 抓取网页正文内容 |
+| `music_search` | GD Studio 音乐 API：搜索、点播、歌词、专辑封面 |
+| `bilibili_search` | B站视频/UP主搜索、热门、排行榜 |
+| `weibo_search` | 微博热搜、内容搜索、Feed 流 |
+| `doubao_tts` | 豆包 TTS 语音合成（需配置） |
 
-贴纸发送由独立的**贴纸决策模块**控制（非 tool-calling），收到消息后自动判断是否发送贴纸，并按语义从已学习贴纸库中选择。
+### 贴纸系统
+
+收到贴纸后自动记录 file_id、emoji、贴纸包和视觉描述到 `sticker_library` 表。回复时由独立的贴纸决策模块判断是否发送，优先按语义从已学习贴纸中选择，支持默认贴纸池兜底。
+
+### Chat Bridge
+
+通过 `/chat enable` 开启 bot 间自动对话。当群内有其他 bot 发消息时，本 bot 会自动回复，形成 bot 间持续对话。
+
+### AV 查询
+
+支持按番号直查、按演员/关键词搜索，来源覆盖 JAVBUS / MADOUQU / DMM / FC2。每群独立开关（`/av enable|disable`），支持内联翻页浏览详情和种子。
+
+### 日志
+
+日志行携带流程上下文（trace_id），支持彩色输出和文件轮转：
+
+| 配置项 | 说明 |
+|:---|:---|
+| `LOG_LEVEL` | 日志级别 |
+| `LOG_COLOR` | on / off / auto |
+| `LOG_TO_FILE` | 是否写入文件 |
+| `LOG_FILE_PATH` | 文件路径 |
+| `LOG_FILE_MAX_BYTES` | 单文件最大字节（超出轮转） |
+| `LOG_FILE_BACKUP_COUNT` | 保留历史文件数 |
 
 ---
 
-## 🚀 快速开始
+## 命令参考
+
+### 核心入口
+
+| 命令 | 说明 |
+|:---|:---|
+| `/help` | 查看完整帮助 |
+| `/lm` | 永久记忆列表（翻页 + 内联删除） |
+| `/lm add <内容>` | 新增永久记忆 |
+| `/lm replace <#ID或关键词> => <新内容>` | 修改永久记忆 |
+| `/task <自然语言>` | 创建定时任务 |
+| `/tasks` | 定时任务列表（翻页 + 内联删除） |
+| `/canceltask <ID>` | 按 ID 取消定时任务 |
+| `/addrule <自然语言>` | 新增群规 |
+| `/rules` | 群规列表（翻页 + 内联删除） |
+| `/av <番号/演员/关键词>` | 搜索 AV 资源 |
+
+### 群审核管理（需已授权群管理）
+
+| 命令 | 说明 |
+|:---|:---|
+| `/warnings` | 查看警告/封禁名单 |
+| `/aiexempt` | 回复用户消息后豁免其 AI 审核 |
+| `/unaiexempt` | 回复用户消息后取消审核豁免 |
+| `/mute` | 回复用户消息后忽略其后续回复 |
+| `/mute all` | 全群仅审核，不再回复 |
+| `/unmute` | 回复用户消息后恢复其回复 |
+| `/unmute all` | 恢复全群正常回复 |
+| `/proactive on\|off\|status` | 主动话题开关/状态 |
+
+### 最高管理员命令
+
+| 命令 | 说明 |
+|:---|:---|
+| `/authgroup [群ID]` | 授权群组 |
+| `/unauthgroup [群ID]` | 撤销群组授权 |
+| `/authlist` | 授权群组列表 |
+| `/authadmin [群ID] [用户ID]` | 授权群管理 |
+| `/unauthadmin [群ID] [用户ID]` | 撤销群管理 |
+| `/adminlist [群ID]` | 群管理列表 |
+| `/atreply [enable\|disable]` | 仅 @ 才回复模式 |
+| `/chat [enable\|disable]` | bot 间对话开关 |
+| `/tts [enable\|disable\|always]` | TTS 语音模式 |
+| `/av enable\|disable` | 每群 AV 查询开关 |
+
+---
+
+## 快速开始
 
 ### 环境要求
 
 - Python 3.12+
 - Telegram Bot Token
-- 大模型 API（支持 GPT/Claude/Gemini 等）
+- 至少一个大模型 API（支持 OpenAI / Anthropic / Gemini / OpenAI Compatible 等）
 
-### 安装部署
+### 安装
 
 ```bash
-# 克隆项目
 git clone https://github.com/Hamster-Prime/Smart_Group_Bot.git
 cd Smart_Group_Bot
 
 # 安装依赖
 pip install -e .
 
-# 配置环境变量
+# 配置
 cp .env.example .env
-# 编辑 .env 文件填写配置
+# 编辑 .env，至少填写 BOT_TOKEN、SUPER_ADMIN_ID、MAIN_PROVIDER_NAME、MAIN_MODEL
 
-# 启动机器人
-python -m bot
+# 启动
+python start.py
 ```
 
-### Docker 部署（可选）
+### Docker
 
 ```bash
-# 使用 docker compose（推荐）
 docker compose up -d
-
-# 或手动构建
-docker build -t smart-group-bot .
-docker run -d --env-file .env --name smart-bot smart-group-bot
 ```
 
 ---
 
-## ⚙️ 配置说明
+## 配置说明
 
-编辑 `.env` 文件，完整配置参见 `.env.example`：
+### 供应商配置
 
 ```env
-# Telegram Bot
-BOT_TOKEN=
-SUPER_ADMIN_ID=
+# 格式：MODEL_PROVIDER_<NAME>_PROVIDER / API_KEY / API_BASE / STREAM
+# 支持 provider: gemini / openai / anthropic / openai_compatible
+# API_BASE 后缀自动检测端点格式
 
-# ---- 日志 ----
-LOG_LEVEL=INFO
-LOG_THIRD_PARTY_LEVEL=WARNING
-LOG_COLOR=on
-LOG_TO_FILE=false
-LOG_FILE_PATH=bot.log
-LOG_FILE_MAX_BYTES=5242880
-LOG_FILE_BACKUP_COUNT=3
-
-# ---- 模型供应商池（可配置多个 NAME）----
-# If a provider or gateway only accepts streaming requests, set MODEL_PROVIDER_<NAME>_STREAM=true
-# MODEL_PROVIDER_<NAME>_API_BASE may point to the full upstream endpoint URL.
-# The request format is auto-detected from the API_BASE suffix:
-#   .../chat/completions -> OpenAI chat_completions
-#   .../responses -> OpenAI responses
-#   .../v1/messages -> Anthropic messages
-#   .../v1beta/models -> Gemini models
-# MODEL_PROVIDER_<NAME>_CHAT_ENDPOINT is only needed as a legacy fallback when API_BASE has no suffix
 MODEL_PROVIDER_GEMINI_PROVIDER=gemini
-MODEL_PROVIDER_GEMINI_API_KEY=
-MODEL_PROVIDER_GEMINI_API_BASE=
-MODEL_PROVIDER_GEMINI_STREAM=false
-
-MODEL_PROVIDER_OPENAI_PROVIDER=openai
-MODEL_PROVIDER_OPENAI_API_KEY=
-MODEL_PROVIDER_OPENAI_API_BASE=
-MODEL_PROVIDER_OPENAI_STREAM=false
+MODEL_PROVIDER_GEMINI_API_KEY=xxx
 
 MODEL_PROVIDER_ARK_PROVIDER=openai_compatible
-MODEL_PROVIDER_ARK_API_KEY=
-MODEL_PROVIDER_ARK_API_BASE=
-MODEL_PROVIDER_ARK_STREAM=false
+MODEL_PROVIDER_ARK_API_KEY=xxx
+MODEL_PROVIDER_ARK_API_BASE=https://ark.example.com/v1/chat/completions
+```
 
-# ---- 主模型 (聊天、工具调用) ----
+### 模型分配
+
+```env
 MAIN_PROVIDER_NAME=ARK
-MAIN_MODEL=
-# fallback 格式: provider_name:model,provider_name2:model2
+MAIN_MODEL=your-chat-model
 MAIN_FALLBACKS=GEMINI:gemini-2.0-flash
 
-# ---- 决策模型 (回复判断、内容审核) ----
-# 留空则复用主模型 provider_name/model
+# 以下可选，留空则复用主模型配置
 DECISION_PROVIDER_NAME=
 DECISION_MODEL=
-DECISION_FALLBACKS=
-
-# ---- 审核模型（内容审核）----
-# 留空则复用决策模型配置
 MODERATION_PROVIDER_NAME=
 MODERATION_MODEL=
-MODERATION_FALLBACKS=
+VISION_PROVIDER_NAME=
+VISION_MODEL=
+```
 
-# ---- 压缩模型 (上下文压缩) ----
-# 留空则复用主模型配置
-COMPRESS_PROVIDER_NAME=
-COMPRESS_MODEL=
-COMPRESS_FALLBACKS=
+### 运行时
 
-# ---- 嵌入模型 (保留，可选) ----
-# 留空则复用主模型 provider_name
-EMBED_PROVIDER_NAME=
-EMBED_MODEL=text-embedding-004
-EMBED_FALLBACKS=
+```env
+BOT_ENABLE_TYPING=true          # 发送前显示「正在输入」
+BOT_ENABLE_STREAMING=true       # 流式回复
+BOT_INBOUND_DEBOUNCE_SECONDS=5  # 入站消息合并等待时间
+BOT_AUTO_DELETE_MINUTES=0       # 自动删除 bot 消息（分钟），0=关闭
+BOT_DECISION_CONTEXT_ITEMS=5    # 决策模型可见的历史条数
 
-# ---- 知识库检索参数 ----
-KNOWLEDGE_TOP_K=3
-KNOWLEDGE_SIMILARITY_THRESHOLD=0.55
-KNOWLEDGE_ENABLE_FALLBACK=false
-KNOWLEDGE_ENABLE_RELAXED=false
-KNOWLEDGE_MIN_RELIABLE_SCORE=0.60
+# 主动话题
+BOT_PROACTIVE_DEFAULT_ENABLED=false
+BOT_PROACTIVE_IDLE_MINUTES=180
+BOT_PROACTIVE_QUIET_HOURS_START=0
+BOT_PROACTIVE_QUIET_HOURS_END=9
+```
 
-# ---- 上下文设置 ----
-MAX_CONTEXT_TOKENS=256000
-MAX_OUTPUT_TOKENS=64000
-BOT_ENABLE_TYPING=true
-BOT_ENABLE_STREAMING=true
-BOT_STREAM_CHUNK_SIZE=36
-BOT_STREAM_EDIT_INTERVAL_SEC=1.0
-# Bot 发出的消息在 N 分钟后自动删除，0 表示关闭
-BOT_AUTO_DELETE_MINUTES=0
-# 决策模型可见的最近上下文条数（0-20，0=不传历史）
-BOT_DECISION_CONTEXT_ITEMS=5
+### 数据库
 
-# ---- 技能配置 ----
-# 贴纸 file_id 列表，逗号分隔（供贴纸决策模块回退使用）
-# 已学习贴纸会保存到数据库表 sticker_library（首次会自动导入 memory/stickers/<group_id>.json）
-SKILL_STICKER_FILE_IDS=
-
-# 数据库（默认 SQLite）
+```env
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
-
-# ---- Memory v2（多层记忆架构）----
-MEMORY_V2_ENABLED=true
-MEMORY_WORKING_RECENT_ITEMS=50
-MEMORY_VECTOR_BACKEND=qdrant
-MEMORY_QDRANT_HOST=localhost
-MEMORY_QDRANT_PORT=6333
-MEMORY_QDRANT_COLLECTION_PREFIX=chat_memory
-MEMORY_HYBRID_TOP_K=20
-MEMORY_RETRIEVAL_CANDIDATE_MULTIPLIER=3
-MEMORY_SIMILARITY_WEIGHT=0.4
-MEMORY_TIME_WEIGHT=0.3
-MEMORY_IMPORTANCE_WEIGHT=0.3
-MEMORY_TIME_DECAY_FACTOR=0.95
-MEMORY_IMPORTANCE_LLM_ENABLED=true
-MEMORY_IMPORTANCE_LLM_MIN=0.3
-MEMORY_IMPORTANCE_LLM_MAX=0.7
-MEMORY_CONSOLIDATION_ENABLED=true
-MEMORY_CONSOLIDATION_MIN_IMPORTANCE=0.7
-MEMORY_PRUNE_ENABLED=true
-MEMORY_PRUNE_DAYS=30
-MEMORY_MAX_CONCURRENT_INDEX_TASKS=2
-MEMORY_MIGRATE_LEGACY_ON_START=true
-MEMORY_LEGACY_MEMORY_DIR=memory
-MEMORY_LEGACY_MIGRATION_MARKER=data/memory_v2_legacy_migrated.flag
-MEMORY_KG_ENABLED=false
-MEMORY_KG_URI=
-MEMORY_KG_USER=
-MEMORY_KG_PASSWORD=
-
-# ---- AV 搜索 ----
-AV_ENABLED=true
-AV_HTTP_TIMEOUT_SEC=15
-AV_MAX_RESULTS=18
-AV_JAVBUS_BASE_URL=https://www.javbus.com
-AV_MADOUQU_BASE_URL=https://madouqu.com
 ```
 
-### 日志配置
-
-日志行会携带流程上下文：
-- `流`：单条消息处理链路 ID（同一条消息全流程一致）
-
-日志可选彩色输出：
-- `LOG_COLOR=on`：始终彩色
-- `LOG_COLOR=off`：关闭彩色
-- `LOG_COLOR=auto`：仅在终端支持时彩色
-
-日志可选写入文件（默认关闭）：
-- `LOG_TO_FILE=false`：关闭文件输出
-- `LOG_TO_FILE=true`：开启文件输出
-- `LOG_FILE_PATH=bot.log`：日志文件路径（相对路径默认以项目根目录为基准）
-- `LOG_FILE_MAX_BYTES=5242880`：单个日志文件最大字节数（超出后自动轮转）
-- `LOG_FILE_BACKUP_COUNT=3`：保留历史轮转文件数量
+完整配置项参见 `.env.example`。
 
 ---
 
-## 📖 使用指南
-
-### 基础命令
-
-| 命令 | 权限 | 说明 |
-|:---|:---:|:---|
-| `/start` | 所有人 | 开始使用，显示简介 |
-| `/help` | 所有人 | 查看完整命令帮助 |
-| `/kb <自然语言指令>` | 已授权群管理 | 知识库管理（添加/删除/搜索/列表） |
-| `/kb list` | 已授权群管理 | 查看知识库条目列表 |
-| `/addrule <规则>` | 已授权群管理 | 添加群规 |
-| `/rules` | 所有人 | 查看当前群规 |
-| `/warnings` | 所有人 | 查看本群警告/封禁名单 |
-| `/aiexempt` | 已授权群管理 | 回复用户消息，设置 AI 审查豁免 |
-| `/unaiexempt` | 已授权群管理 | 回复用户消息，取消 AI 审查豁免 |
-| `/mute` | 已授权群管理 | 回复用户消息，加入"只审查不回复"名单 |
-| `/mute all` | 已授权群管理 | 本群开启"只审查不回复"模式 |
-| `/unmute` | 已授权群管理 | 回复用户消息，移出"只审查不回复"名单 |
-| `/unmute all` | 已授权群管理 | 本群关闭"只审查不回复"模式 |
-| `/av <番号/演员/关键词>` | 需本群启用 | 搜索 JAVBUS + MADOUQU |
-| `/av enable` | 最高管理员 | 在当前群启用 AV 查询 |
-| `/av disable` | 最高管理员 | 在当前群停用 AV 查询 |
-| `/authgroup <群ID>` | 最高管理员 | 授权群组 |
-| `/unauthgroup <群ID>` | 最高管理员 | 撤销授权群组 |
-| `/authlist` | 最高管理员 | 授权群组列表 |
-| `/authadmin <群ID> <用户ID>` | 最高管理员 | 授权群管理 |
-| `/unauthadmin <群ID> <用户ID>` | 最高管理员 | 撤销授权群管理 |
-| `/adminlist` | 最高管理员 | 群管理列表 |
-
-### 自然语言交互
-
-无需记忆命令，直接用自然语言与机器人交互：
-
-```
-管理员：记住"白菜是 LongEmby 的服主和主理人"
-Bot：已写入永久记忆 #12。
-
-管理员：把"白菜是 LongEmby 的服主和主理人"改成"白菜是 LongEmby 的主理人"
-Bot：已更新永久记忆。
-
-管理员：增加一条规则，禁止发广告
-Bot：已添加群规：禁止发广告
-
-用户：@Bot 今天的天气怎么样？
-Bot：[调用 websearch 查询天气并回复]
-```
-
-### 决策提示词示例
-
-机器人内置的决策逻辑：
-
-```
-你是一个群聊消息决策器。判断机器人是否应回复。
-
-输入区块：
-- [是否@机器人]：是/否
-- [是否回复消息]：是/否
-- [是否回复机器人]：是/否
-- [是否回复其他用户]：是/否
-- [是否@其他用户]：是/否
-- [当前发送者是否主人]：是/否
-- [当前发送者是否TG群管理员]：是/否
-- [消息类型]
-- [发送者]
-- [消息正文]
-- [最近上下文]
-
-决策规则（按优先级）：
-1. 若 [是否@其他用户]=是：直接输出 skip
-2. 若 [是否回复其他用户]=是：直接输出 skip（除非回复的是机器人）
-3. 若 [是否@机器人]=是：必须回复
-4. 若 [当前发送者是否主人]=是：不要轻易 skip
-5. 若 [最近上下文] 显示群友互聊且无人指向机器人：优先 skip
-6. 不要因为"有问号"就一律回复
-
-仅输出一个词（小写）：skip / question / casual
-```
-
----
-
-## 🏗️ 架构设计
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Telegram Group                       │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                   Smart Group Bot                        │
-│                                                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │   Decision   │  │  Moderation  │  │   Memory v2  │  │
-│  │     LLM      │  │     LLM      │  │(working +    │  │
-│  │ skip/q/casual│  │  keyword +   │  │ vector +     │  │
-│  │              │  │  regex + llm │  │  knowledge)  │  │
-│  └──────┬───────┘  └──────────────┘  └──────────────┘  │
-│         │                                                │
-│    ┌────▼──────────────────────────────────┐             │
-│    │          Skill Service                │             │
-│    │  ┌─────────┐ ┌──────────┐ ┌────────┐ │             │
-│    │  │websearch│ │ webfetch │ │kb_search│ │             │
-│    │  └─────────┘ └──────────┘ └────────┘ │             │
-│    │  tool-calling loop (主模型自主决策)     │             │
-│    └──────────────────────────────────────┘             │
-│                                                          │
-│  ┌──────────────┐  ┌──────────────┐                    │
-│  │    Casual    │  │   Sticker    │                    │
-│  │   Service    │  │   Decision   │                    │
-│  │  (闲聊回复)  │  │  (贴纸决策)  │                    │
-│  └──────────────┘  └──────────────┘                    │
-└─────────────────────────────────────────────────────────┘
-```
-
-**消息处理流程：**
-1. 消息进入 → 内容审查（keyword/regex/llm 三级检测）
-2. 决策模型判断 → `skip` / `question` / `casual`
-3. `question` → 知识库检索 → 若 `NO_TRUSTED_ANSWER` → 强制联网搜索降级
-4. `casual` → 调用 Skill Service（tool-calling loop，自主选择技能）
-5. 贴纸决策模块独立判断是否发送贴纸
-
----
-
-## 📁 项目结构
+## 项目结构
 
 ```
 Smart_Group_Bot/
 ├── bot/
-│   ├── config.py            # 配置加载
-│   ├── loader.py            # 应用初始化
-│   ├── handlers/            # 消息处理器
-│   │   ├── group.py         #   群聊消息（决策+回复主流程）
-│   │   ├── admin.py         #   管理操作
-│   │   └── commands.py      #   命令处理（/kb /av /rules 等）
-│   ├── middlewares/         # 中间件
-│   │   ├── throttle.py      #   限流
-│   │   ├── db.py            #   数据库会话
-│   │   └── logging_mw.py    #   日志追踪
-│   ├── services/            # 核心业务
-│   │   ├── decision.py      #   决策引擎（skip/question/casual）
-│   │   ├── moderation.py    #   内容审查
-│   │   ├── casual.py        #   闲聊回复
-│   │   ├── knowledge.py     #   知识库管理
-│   │   ├── rag.py           #   RAG 管道
-│   │   ├── llm.py           #   LLM 调用封装
-│   │   ├── memory.py        #   永久记忆
-│   │   ├── memory_v2.py     #   多层记忆架构
-│   │   ├── memory_holder.py #   记忆持有者
-│   │   ├── authz.py         #   权限管理
-│   │   ├── av_search.py     #   AV 搜索（JAVBUS/MADOUQU）
-│   │   ├── sticker_decision.py #  贴纸决策模块
-│   │   ├── sticker_library.py   #  贴纸学习库
-│   │   ├── kb_metrics.py    #   知识库指标
-│   │   └── skills/          #   可扩展技能
-│   │       ├── base.py      #     技能基类
-│   │       ├── service.py   #     技能调度服务（tool-calling loop）
-│   │       ├── websearch.py #     联网搜索
-│   │       ├── webfetch.py  #     网页抓取
-│   │       ├── kb_search.py #     知识库检索
-│   │       └── send_sticker.py #  贴纸发送
-│   ├── db/                  # 数据库模型
-│   └── utils/               # 工具函数
-├── prompt/                  # 各模块提示词
-├── config.toml              # 可选配置覆盖
-├── .env.example             # 环境变量模板
+│   ├── __main__.py             # 入口（python -m bot）
+│   ├── config.py               # 配置加载（.env + config.toml）
+│   ├── loader.py               # Bot / Dispatcher 初始化
+│   ├── handlers/
+│   │   ├── commands.py         # 命令处理（/start /help /lm /task /av 等）
+│   │   ├── admin.py            # 管理命令（授权、群规、审核、TTS 等）
+│   │   └── group.py            # 群消息主流程（审核→决策→回复）
+│   ├── middlewares/
+│   │   ├── db.py               # 数据库会话注入
+│   │   ├── logging_mw.py       # 日志追踪
+│   │   └── throttle.py         # 限流
+│   ├── services/
+│   │   ├── llm.py              # LLM 调用封装（LiteLLM + fallback）
+│   │   ├── decision.py         # 决策引擎
+│   │   ├── moderation.py       # 内容审核
+│   │   ├── memory.py           # 记忆服务（对话历史 + 上下文压缩）
+│   │   ├── memory_holder.py    # 全局记忆持有者
+│   │   ├── manage_intent.py    # 管理意图路由
+│   │   ├── reply_mode.py       # 回复模式选择（reply / message）
+│   │   ├── reply_output.py     # 回复解析与输出
+│   │   ├── chat_bridge.py      # bot 间对话
+│   │   ├── sticker_decision.py # 贴纸决策模块
+│   │   ├── sticker_library.py  # 贴纸学习库
+│   │   ├── at_reply.py         # 仅 @ 回复模式
+│   │   ├── authz.py            # 权限管理
+│   │   ├── av_search.py        # AV 搜索
+│   │   ├── doubao_tts.py       # 豆包 TTS 服务
+│   │   ├── scheduled_tasks.py  # 定时任务调度
+│   │   └── skills/
+│   │       ├── service.py      # 技能调度（tool-calling loop）
+│   │       ├── base.py         # 技能基类
+│   │       ├── memory_manage.py
+│   │       ├── rule_manage.py
+│   │       ├── task_manage.py
+│   │       ├── scheduled_task.py
+│   │       ├── send_sticker.py
+│   │       ├── websearch.py
+│   │       ├── webfetch.py
+│   │       ├── music_search.py
+│   │       ├── bilibili_search.py
+│   │       ├── weibo_search.py
+│   │       └── doubao_tts.py
+│   ├── db/
+│   │   ├── models.py           # ORM 模型
+│   │   ├── engine.py           # 数据库引擎
+│   │   └── sqlite_session.py   # SQLite 并发处理
+│   └── utils/
+│       ├── command_catalog.py  # 命令注册表
+│       ├── conversation_context.py
+│       ├── logging_setup.py    # 日志配置
+│       ├── prompts.py          # 提示词加载
+│       ├── runtime_context.py  # 运行时上下文构建
+│       ├── security.py         # 输入安全处理
+│       ├── telegram.py         # Telegram 工具函数
+│       └── timezone.py         # 时区工具
+├── prompt/                     # 各模块提示词（Markdown）
+│   ├── persona.md              # 人设
+│   ├── decision.md             # 决策提示词
+│   ├── moderation.md           # 审核提示词
+│   ├── skill_tools_v2.md       # 技能系统提示词
+│   ├── manage_intent.md        # 管理意图路由提示词
+│   ├── reply_mode.md           # 回复模式提示词
+│   ├── sticker_decision.md     # 贴纸决策提示词
+│   ├── chat_bridge.md          # bot 间对话提示词
+│   ├── compress.md             # 上下文压缩提示词
+│   └── scheduled_task.md       # 定时任务提示词
+├── tests/                      # 测试（pytest）
+├── config.toml                 # 可选 TOML 配置覆盖
+├── .env.example                # 环境变量模板
+├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
-├── start.py                 # 启动脚本
-└── start.bat                # Windows 启动脚本
+├── start.py                    # 一键启动脚本
+└── start.bat                   # Windows 启动脚本
 ```
 
 ---
 
-## 🤝 贡献指南
+## 技术栈
 
-欢迎提交 Issue 和 PR！
-
-1. Fork 本项目
-2. 创建特性分支：`git checkout -b feature/AmazingFeature`
-3. 提交更改：`git commit -m 'Add some AmazingFeature'`
-4. 推送分支：`git push origin feature/AmazingFeature`
-5. 提交 Pull Request
-
----
-
-## 📄 开源协议
-
-本项目基于 [MIT](LICENSE) 协议开源。
+| 组件 | 用途 |
+|:---|:---|
+| aiogram 3.x | Telegram Bot API |
+| LiteLLM | 多供应商 LLM 抽象层 |
+| SQLAlchemy 2.x (async) | 数据库 ORM |
+| aiosqlite | SQLite 异步驱动 |
+| Pydantic v2 | 配置模型 |
+| DuckDuckGo (ddgs) | 联网搜索 |
+| aiohttp | HTTP 客户端 |
 
 ---
 
-<div align="center">
+## 开源协议
 
-**Made with ❤️ by [Hamster-Prime](https://github.com/Hamster-Prime)**
+[MIT](LICENSE)
 
-[![Issues](https://img.shields.io/github/issues/Hamster-Prime/Smart_Group_Bot?style=for-the-badge)](https://github.com/Hamster-Prime/Smart_Group_Bot/issues)
-[![Stars](https://img.shields.io/github/stars/Hamster-Prime/Smart_Group_Bot?style=for-the-badge)](https://github.com/Hamster-Prime/Smart_Group_Bot/stargazers)
-[![Forks](https://img.shields.io/github/forks/Hamster-Prime/Smart_Group_Bot?style=for-the-badge)](https://github.com/Hamster-Prime/Smart_Group_Bot/network/members)
-
-[问题反馈](https://github.com/Hamster-Prime/Smart_Group_Bot/issues) · [功能建议](https://github.com/Hamster-Prime/Smart_Group_Bot/discussions)
-
-</div>
