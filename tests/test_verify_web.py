@@ -360,6 +360,9 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         args = self.bot.restrict_chat_member.await_args
         self.assertEqual(args.args[:2], (-100, 102))
         self.assertTrue(args.kwargs["permissions"].can_send_messages)
+        self.assertTrue(args.kwargs["permissions"].can_react_to_messages)
+        self.assertTrue(args.kwargs["permissions"].can_edit_tag)
+        self.assertTrue(args.kwargs["use_independent_chat_permissions"])
         self.bot.edit_message_text.assert_awaited_once()
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 102))
@@ -500,7 +503,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await get_join_verification(session, -100, 111))
 
     async def test_verification_single_use(self) -> None:
-        await self._seed(user_id=107)
+        verification_id = await self._seed(user_id=107)
 
         both_verifying = asyncio.Event()
         verification_count = 0
@@ -518,17 +521,66 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(side_effect=verify_concurrently),
         ) as verify_mock:
             first, second = await asyncio.gather(
-                self._submit(107),
-                self._submit(107),
+                self._submit(107, verification_id=verification_id),
+                self._submit(107, verification_id=verification_id),
             )
-            repeated = await self._submit(107)
+            repeated = await self._submit(107, verification_id=verification_id)
 
-        self.assertEqual(sorted((first.status, second.status)), [200, 404])
-        self.assertEqual(repeated.status, 404)
+        self.assertEqual((first.status, second.status), (200, 200))
+        self.assertEqual(repeated.status, 200)
         self.assertEqual(verify_mock.await_count, 2)
         self.assertEqual(self.bot.restrict_chat_member.await_count, 1)
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 107))
+
+    async def test_restore_response_loss_is_confirmed_from_member_state(self) -> None:
+        verification_id = await self._seed(user_id=123)
+        self.bot.restrict_chat_member.side_effect = RuntimeError("response lost")
+        self.bot.get_chat_member = AsyncMock(
+            return_value=SimpleNamespace(status="member")
+        )
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            response = await self._submit(
+                123,
+                verification_id=verification_id,
+            )
+
+        self.assertEqual(response.status, 200)
+        self.bot.get_chat_member.assert_awaited_once_with(-100, 123)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 123))
+
+    async def test_restore_failure_requeues_verification_for_retry(self) -> None:
+        verification_id = await self._seed(user_id=124)
+        self.bot.restrict_chat_member.side_effect = RuntimeError("telegram unavailable")
+        self.bot.get_chat_member = AsyncMock(side_effect=RuntimeError("lookup failed"))
+
+        with (
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(True, [])),
+            ),
+            patch(
+                "bot.services.join_verification.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+        ):
+            response = await self._submit(
+                124,
+                verification_id=verification_id,
+            )
+
+        self.assertEqual(response.status, 502)
+        payload = await response.json()
+        self.assertGreater(payload["verification_id"], 0)
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 124)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.id, payload["verification_id"])
 
     async def test_identity_comes_from_init_data_not_body(self) -> None:
         # A pending user B cannot be verified by user A's signed session.

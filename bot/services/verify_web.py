@@ -16,10 +16,13 @@ the join/moderation verification challenge.
 """
 from __future__ import annotations
 
-import html
+import asyncio
 import hashlib
+import html
 import logging
 import secrets
+import time
+from datetime import timedelta
 from pathlib import Path
 
 import aiohttp
@@ -38,12 +41,14 @@ from bot.services.join_verification import (
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
     extend_pending_verification_deadlines,
+    get_join_verification,
     get_pending_verification_by_id_for_user,
     get_pending_verification_for_user,
     mark_turnstile_configuration_unavailable,
     normalize_verification_provider,
     restore_member_permissions,
     turnstile_verification_configured,
+    upsert_join_verification,
     verification_keys_for_provider,
     verification_provider,
 )
@@ -72,6 +77,7 @@ _TURNSTILE_SERVICE_ERRORS = {
     TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE,
     "internal-error",
 }
+_COMPLETED_VERIFICATION_TTL_SECONDS = 5 * 60
 _SETTINGS_STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
 
 
@@ -161,7 +167,8 @@ if (tg) {{ tg.ready(); tg.expand(); }}
 
 const provider = "{provider}";
 const configTag = "{config_tag}";
-const verificationId = {verification_id};
+let verificationId = {verification_id};
+let challengeSubmitting = false;
 
 function resetChallenge() {{
   if (provider === "hcaptcha" && window.hcaptcha) window.hcaptcha.reset();
@@ -169,6 +176,7 @@ function resetChallenge() {{
 }}
 
 function onChallengeError() {{
+  if (challengeSubmitting) return;
   const status = document.getElementById("status");
   status.textContent = "❌ 验证组件暂时不可用，请稍后重试。";
   status.className = "err";
@@ -176,6 +184,7 @@ function onChallengeError() {{
 }}
 
 function onChallengeExpired() {{
+  if (challengeSubmitting) return;
   const status = document.getElementById("status");
   status.textContent = "验证已过期，请重新完成验证。";
   status.className = "err";
@@ -183,8 +192,11 @@ function onChallengeExpired() {{
 }}
 
 async function onChallengeSuccess(token) {{
+  if (challengeSubmitting) return;
+  challengeSubmitting = true;
   const status = document.getElementById("status");
   if (!tg || !tg.initData) {{
+    challengeSubmitting = false;
     status.textContent = "❌ 请在 Telegram 内打开本页面。";
     status.className = "err";
     return;
@@ -203,11 +215,16 @@ async function onChallengeSuccess(token) {{
       status.className = "ok";
       setTimeout(() => tg.close(), 1500);
     }} else {{
+      challengeSubmitting = false;
+      if (Number.isInteger(data.verification_id) && data.verification_id > 0) {{
+        verificationId = data.verification_id;
+      }}
       status.textContent = "❌ " + (data.error || "验证失败，请重试。");
       status.className = "err";
       resetChallenge();
     }}
   }} catch (e) {{
+    challengeSubmitting = false;
     status.textContent = "❌ 网络错误，请稍后重试。";
     status.className = "err";
     resetChallenge();
@@ -294,7 +311,13 @@ async def verify_hcaptcha_token(
     if isinstance(raw_errors, str):
         raw_errors = [raw_errors]
     errors = [str(item) for item in raw_errors if str(item).strip()]
-    return bool(data.get("success")), errors
+    success = bool(data.get("success"))
+    if not success:
+        log.info(
+            "hcaptcha siteverify rejected | errors=%s",
+            errors or {key: value for key, value in data.items() if key != "response"},
+        )
+    return success, errors
 
 
 class VerifyWebServer:
@@ -313,6 +336,38 @@ class VerifyWebServer:
         self.session_factory = session_factory
         self.runtime_config = runtime_config
         self._runner: web.AppRunner | None = None
+        self._completed_verifications: dict[tuple[int, int], float] = {}
+
+    def _verification_completed(self, verification_id: int, user_id: int) -> bool:
+        if verification_id <= 0:
+            return False
+        now = time.monotonic()
+        cutoff = now - _COMPLETED_VERIFICATION_TTL_SECONDS
+        stale = [
+            key
+            for key, completed_at in self._completed_verifications.items()
+            if completed_at < cutoff
+        ]
+        for key in stale:
+            self._completed_verifications.pop(key, None)
+        return (int(verification_id), int(user_id)) in self._completed_verifications
+
+    def _mark_verification_completed(self, verification_id: int, user_id: int) -> None:
+        if verification_id > 0:
+            self._completed_verifications[(int(verification_id), int(user_id))] = (
+                time.monotonic()
+            )
+
+    async def _wait_for_completed_verification(
+        self,
+        verification_id: int,
+        user_id: int,
+    ) -> bool:
+        for _attempt in range(10):
+            if self._verification_completed(verification_id, user_id):
+                return True
+            await asyncio.sleep(0.1)
+        return self._verification_completed(verification_id, user_id)
 
     def build_app(self) -> web.Application:
         app = web.Application()
@@ -479,6 +534,8 @@ class VerifyWebServer:
                 {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
             )
         user_id = int(web_user.id)
+        if self._verification_completed(verification_id, user_id):
+            return web.json_response({"ok": True})
 
         async with self.session_factory() as session:
             record = (
@@ -500,7 +557,14 @@ class VerifyWebServer:
                     )
                 )
             )
-        if record is None or record.deadline_at <= now_shanghai_naive():
+        if record is None:
+            if self._verification_completed(verification_id, user_id):
+                return web.json_response({"ok": True})
+            return web.json_response(
+                {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
+                status=404,
+            )
+        if record.deadline_at <= now_shanghai_naive():
             return web.json_response(
                 {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
                 status=404,
@@ -549,6 +613,15 @@ class VerifyWebServer:
                 status=409,
             )
         if not passed:
+            if (
+                provider == "hcaptcha"
+                and "already-seen-response" in verification_errors
+                and await self._wait_for_completed_verification(
+                    verification_id,
+                    user_id,
+                )
+            ):
+                return web.json_response({"ok": True})
             configuration_error_codes = (
                 _HCAPTCHA_CONFIGURATION_ERRORS
                 if provider == "hcaptcha"
@@ -605,6 +678,11 @@ class VerifyWebServer:
                 or current.deadline_at != record.deadline_at
                 or current.deadline_at <= now
             ):
+                if await self._wait_for_completed_verification(
+                    verification_id,
+                    user_id,
+                ):
+                    return web.json_response({"ok": True})
                 return web.json_response(
                     {"ok": False, "error": "验证已过期或失效，请联系群管理员"},
                     status=404,
@@ -638,6 +716,11 @@ class VerifyWebServer:
             )
             if not claimed:
                 await session.rollback()
+                if await self._wait_for_completed_verification(
+                    verification_id,
+                    user_id,
+                ):
+                    return web.json_response({"ok": True})
                 return web.json_response(
                     {"ok": False, "error": "验证已失效，请重新打开验证入口"},
                     status=404,
@@ -647,6 +730,7 @@ class VerifyWebServer:
             prompt_message_id = int(current.prompt_message_id or 0)
             display_name = (current.display_name or "").strip()
             kind = current.kind
+            reason = current.reason or ""
             # Commit before Telegram calls so a failed restore cannot roll the
             # pass back and let the sweeper kick a verified member.
             await session.commit()
@@ -659,19 +743,57 @@ class VerifyWebServer:
             user_id,
             restored,
         )
+        if not restored:
+            timeout_seconds = (
+                self.settings.moderation.challenge_timeout_seconds
+                if kind == VERIFICATION_KIND_MODERATION
+                else self.settings.join_verification_timeout_seconds
+            )
+            async with self.session_factory() as session:
+                await upsert_join_verification(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                    deadline_at=now_shanghai_naive()
+                    + timedelta(seconds=max(60, int(timeout_seconds))),
+                    kind=kind,
+                    reason=reason,
+                    display_name=display_name,
+                    prompt_message_id=prompt_message_id,
+                    provider=provider,
+                )
+                await session.commit()
+                retry_record = await get_join_verification(
+                    session,
+                    group_id,
+                    user_id,
+                )
+                retry_verification_id = int(retry_record.id) if retry_record else 0
+            await self._announce_pass(
+                group_id=group_id,
+                user_id=user_id,
+                display_name=display_name,
+                prompt_message_id=prompt_message_id,
+                kind=kind,
+                restored=False,
+            )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "验证已通过，但 Telegram 放行暂时失败；验证入口已保留，请稍后重试",
+                    "verification_id": retry_verification_id,
+                },
+                status=502,
+            )
+        self._mark_verification_completed(verification_id, user_id)
         await self._announce_pass(
             group_id=group_id,
             user_id=user_id,
             display_name=display_name,
             prompt_message_id=prompt_message_id,
             kind=kind,
-            restored=restored,
+            restored=True,
         )
-        if not restored:
-            return web.json_response(
-                {"ok": False, "error": "验证已通过，但恢复权限失败，请联系群管理员"},
-                status=502,
-            )
         return web.json_response({"ok": True})
 
     async def _announce_pass(

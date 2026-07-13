@@ -205,6 +205,8 @@ _FULL_RESTRICT = ChatPermissions(
     can_send_polls=False,
     can_send_other_messages=False,
     can_add_web_page_previews=False,
+    can_react_to_messages=False,
+    can_edit_tag=False,
     can_change_info=False,
     can_invite_users=False,
     can_pin_messages=False,
@@ -223,6 +225,8 @@ _FULL_ALLOW = ChatPermissions(
     can_send_polls=True,
     can_send_other_messages=True,
     can_add_web_page_previews=True,
+    can_react_to_messages=True,
+    can_edit_tag=True,
     can_change_info=True,
     can_invite_users=True,
     can_pin_messages=True,
@@ -643,12 +647,61 @@ async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 async def restore_member_permissions(bot: Bot, chat_id: int, user_id: int) -> bool:
-    try:
-        await bot.restrict_chat_member(chat_id, user_id, permissions=_FULL_ALLOW)
-        return True
-    except Exception:
-        log.exception("join verification restore failed | chat=%s user=%s", chat_id, user_id)
-        return False
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            restored = await bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                permissions=_FULL_ALLOW,
+                use_independent_chat_permissions=True,
+            )
+            if restored:
+                return True
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "join verification restore request failed | chat=%s user=%s attempt=%s/3 error=%s",
+                chat_id,
+                user_id,
+                attempt,
+                exc,
+            )
+
+        # Telegram may apply the permission update even when the HTTP response
+        # is lost. Confirm the actual member state before retrying or reporting
+        # failure to the Mini App.
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            status = str(getattr(member, "status", "") or "")
+            if status in {"member", "administrator", "creator"} or (
+                status == "restricted"
+                and bool(getattr(member, "can_send_messages", False))
+            ):
+                log.info(
+                    "join verification restore confirmed after ambiguous response | chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return True
+        except Exception:
+            log.debug(
+                "join verification restore status check failed | chat=%s user=%s",
+                chat_id,
+                user_id,
+                exc_info=True,
+            )
+
+        if attempt < 3:
+            await asyncio.sleep(0.35 * attempt)
+
+    log.error(
+        "join verification restore failed | chat=%s user=%s error=%s",
+        chat_id,
+        user_id,
+        last_error or "Telegram returned false",
+    )
+    return False
 
 
 async def kick_member(bot: Bot, chat_id: int, user_id: int) -> bool:
