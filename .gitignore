@@ -68,3 +68,6 @@ pnpm-debug.log*
 *.temp
 *.bak
 *-implement-the-following-plan.txt
+
+# uv lockfile (not committed for this project)
+uv.lock

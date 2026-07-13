@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import html
 import logging
@@ -17,21 +17,26 @@ from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabl
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
-    deauthorize_group_admin,
     deauthorize_group,
+    deauthorize_group_admin,
     ensure_group_admin_permission,
     ensure_group_authorized,
     ensure_super_admin,
     is_group_admin_authorized,
     is_super_admin_user_id,
-    list_group_admins,
     list_authorized_groups,
+    list_group_admins,
 )
-from bot.services.chat_bridge import (
-    begin_chat_bridge_target_selection,
-    build_chat_bridge_status_text,
-    set_chat_bridge_enabled,
+from bot.services.join_screening import (
+    add_global_ban,
+    list_global_bans,
+    remove_global_ban,
 )
+from bot.services.join_verification import (
+    delete_join_verifications_for_user,
+    restore_member_permissions,
+)
+from bot.services.speech_style import get_style_state, set_style_target
 from bot.services.doubao_tts import (
     DoubaoTTSService,
     TTS_MODE_ALWAYS,
@@ -41,7 +46,7 @@ from bot.services.doubao_tts import (
     set_tts_mode,
 )
 from bot.services.llm import LLMService
-from bot.services.scheduled_tasks import (
+from bot.services.proactive import (
     get_cooldown_status_text,
     set_cooldown_task_enabled,
 )
@@ -84,12 +89,30 @@ _AT_REPLY_USAGE = (
     "2. /atreply disable\n\n"
     "请最高管理员在目标群内使用。"
 )
-_CHAT_USAGE = (
+_BAN_USAGE = (
     "<b>命令用法</b>\n"
-    "0. /chat（查看当前状态）\n"
-    "1. /chat enable\n"
-    "2. /chat disable\n\n"
-    "请最高管理员在目标群内使用。"
+    "1. 回复目标用户消息后发送 /ban [原因]\n"
+    "2. /ban &lt;用户ID&gt; [原因]\n\n"
+    "封禁：加入封禁名单并立即在本群封禁；此后其任何消息都会被自动删除。"
+)
+_UNBAN_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复目标用户消息后发送 /unban\n"
+    "2. /unban &lt;用户ID&gt;\n\n"
+    "解封：移出封禁名单、清空违规次数，并永久豁免资料审查（消息仍会被正常审核）。"
+)
+_CLEAR_WARNINGS_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复目标用户消息后发送 /clearwarnings\n"
+    "2. /clearwarnings &lt;用户ID&gt;\n\n"
+    "此命令只清空累计违规次数，不执行解封。"
+)
+_MIMIC_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复目标用户消息后发送 /mimic（开始学习 TA 的说话风格）\n"
+    "2. /mimic status（查看当前状态）\n"
+    "3. /mimic off（停止学习并清除画像）\n\n"
+    "bot 会持续收集目标用户的发言，每约 50 条蒸馏刷新一次说话风格画像并应用到回复，总量上限 1000 条。"
 )
 
 
@@ -107,7 +130,14 @@ async def _answer(
     )
 
 
-async def _maybe_flush(session: AsyncSession) -> None:
+async def _commit_settings(session: AsyncSession) -> None:
+    """Make runtime setting changes visible before awaiting Telegram replies."""
+    commit = getattr(session, "commit", None)
+    if commit is not None:
+        await commit()
+        return
+    # Lightweight unit-test doubles may only expose flush; production always
+    # receives an AsyncSession and therefore takes the commit path above.
     flush = getattr(session, "flush", None)
     if flush is not None:
         await flush()
@@ -216,6 +246,7 @@ def _action_label(action: str) -> str:
         "warn": "警告",
         "delete": "删消息",
         "ban": "封禁",
+        "challenge": "真人质询",
     }.get((action or "").lower(), action or "未知")
 
 
@@ -487,7 +518,7 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>命令用法</b>\n"
             "/authgroup &lt;群ID&gt;\n"
             "或在群内直接发送 /authgroup"
@@ -496,13 +527,13 @@ async def cmd_authgroup(message: Message, session: AsyncSession, settings: Setti
 
     created = await authorize_group(session, group_id, message.from_user.id if message.from_user else 0)
     if created:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 授权成功"
         )
     else:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 已处于授权状态"
@@ -517,7 +548,7 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
     args = (message.text or "").partition(" ")[2].strip()
     group_id = _resolve_target_group_id(message, args)
     if group_id is None:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>命令用法</b>\n"
             "/unauthgroup &lt;群ID&gt;\n"
             "或在群内直接发送 /unauthgroup"
@@ -526,13 +557,13 @@ async def cmd_unauthgroup(message: Message, session: AsyncSession, settings: Set
 
     removed = await deauthorize_group(session, group_id)
     if removed:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 已取消授权"
         )
     else:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>群组授权结果</b>\n"
             f"<b>群ID</b>: {group_id}\n"
             "<b>状态</b>: 当前未授权"
@@ -561,6 +592,8 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
 
 @router.message(Command("authadmin"))
 async def cmd_authadmin(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
     if not await ensure_super_admin(message, settings):
         return
 
@@ -594,6 +627,8 @@ async def cmd_authadmin(message: Message, session: AsyncSession, settings: Setti
 
 @router.message(Command("unauthadmin"))
 async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
     if not await ensure_super_admin(message, settings):
         return
 
@@ -627,6 +662,8 @@ async def cmd_unauthadmin(message: Message, session: AsyncSession, settings: Set
 
 @router.message(Command("adminlist"))
 async def cmd_adminlist(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
     if not await ensure_super_admin(message, settings):
         return
 
@@ -657,6 +694,245 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+
+
+def _resolve_ban_target(message: Message, args: str) -> tuple[int | None, str]:
+    """Returns (user_id, reason). Target from reply or first numeric arg."""
+    arg = (args or "").strip()
+    reply = message.reply_to_message
+    if reply and reply.from_user:
+        return reply.from_user.id, arg
+
+    if not arg:
+        return None, ""
+    first, _, rest = arg.partition(" ")
+    try:
+        return int(first), rest.strip()
+    except ValueError:
+        return None, ""
+
+
+async def _authorized_group_ids(session: AsyncSession) -> list[int]:
+    rows = await list_authorized_groups(session)
+    return [int(row.group_id) for row in rows]
+
+
+async def _clear_user_warning(
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+) -> tuple[int, bool]:
+    stmt = select(UserWarning).where(
+        UserWarning.group_id == group_id,
+        UserWarning.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    warning = result.scalar_one_or_none()
+    if warning is None:
+        return 0, False
+
+    previous_count = max(0, int(warning.count or 0))
+    was_banned = bool(warning.is_banned)
+    await session.delete(warning)
+    return previous_count, was_banned
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, reason = _resolve_ban_target(message, args)
+    if target_id is None:
+        await _answer(message, settings, _BAN_USAGE)
+        return
+    if is_super_admin_user_id(target_id, settings):
+        await _answer(message, settings, "不能封禁最高管理员。")
+        return
+
+    operator = message.from_user
+    created = await add_global_ban(
+        session,
+        target_id,
+        reason=reason or "手动封禁",
+        source="manual",
+        created_by=operator.id if operator else 0,
+    )
+    await delete_join_verifications_for_user(session, target_id)
+    group_ids = await _authorized_group_ids(session)
+    # Publish the registry entry and challenge cancellation before Telegram
+    # calls so an in-flight CF callback cannot restore a manually banned user.
+    await session.commit()
+
+    banned_groups = 0
+    for group_id in group_ids:
+        try:
+            await message.bot.ban_chat_member(group_id, target_id)
+            banned_groups += 1
+        except Exception as exc:
+            log.info("ban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+
+    status = "已加入封禁名单" if created else "已在封禁名单（信息已更新）"
+    lines = [
+        "<b>封禁结果</b>",
+        f"<b>用户ID</b>: <code>{target_id}</code>",
+        f"<b>状态</b>: {status}",
+    ]
+    if reason:
+        lines.append(f"<b>原因</b>: {html.escape(reason)}")
+    lines.append(f"<b>群内封禁</b>: {banned_groups}/{len(group_ids)} 个授权群成功")
+    lines.append("该用户此后发言或再入群都会被自动封禁。")
+    await _answer(message, settings, "\n".join(lines))
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_super_admin(message, settings):
+        return
+
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, _ = _resolve_ban_target(message, args)
+    if target_id is None:
+        await _answer(message, settings, _UNBAN_USAGE)
+        return
+
+    operator = message.from_user
+    removed = await remove_global_ban(
+        session,
+        target_id,
+        operator_id=operator.id if operator else 0,
+    )
+    await delete_join_verifications_for_user(session, target_id)
+    group_ids = await _authorized_group_ids(session)
+    cleared_total = 0
+    for group_id in group_ids:
+        cleared_count, _ = await _clear_user_warning(session, group_id, target_id)
+        cleared_total += cleared_count
+    await session.commit()
+
+    unbanned_groups = 0
+    restored_groups = 0
+    for group_id in group_ids:
+        try:
+            await message.bot.unban_chat_member(group_id, target_id, only_if_banned=True)
+            unbanned_groups += 1
+            if await restore_member_permissions(message.bot, group_id, target_id):
+                restored_groups += 1
+        except Exception as exc:
+            log.info("unban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+
+    status = "已移出封禁名单" if removed else "原本不在封禁名单"
+    lines = [
+        "<b>解封结果</b>",
+        f"<b>用户ID</b>: <code>{target_id}</code>",
+        f"<b>状态</b>: {status}",
+        f"<b>群内解封</b>: {unbanned_groups}/{len(group_ids)} 个授权群成功",
+        f"<b>发言权限恢复</b>: {restored_groups} 个群成功",
+        (
+            f"<b>违规次数</b>: 已清零（累计 {cleared_total} 次）"
+            if cleared_total
+            else "<b>违规次数</b>: 原本无记录"
+        ),
+        "<b>资料审查</b>: 已永久豁免（消息仍会被正常审核）",
+    ]
+    await _answer(message, settings, "\n".join(lines))
+
+
+async def _clear_style_samples(session: AsyncSession, group_id: int) -> None:
+    from sqlalchemy import delete
+
+    from bot.db.models import SpeechStyleSample
+
+    await session.execute(
+        delete(SpeechStyleSample).where(SpeechStyleSample.group_id == group_id)
+    )
+
+
+@router.message(Command("mimic"))
+async def cmd_mimic(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+
+    arg = (message.text or "").partition(" ")[2].strip().lower()
+    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
+    state = get_style_state(group_row.settings)
+
+    if arg == "status":
+        target_id = int(state.get("target_user_id") or 0)
+        if not target_id:
+            await _answer(message, settings, "<b>说话风格学习</b>\n当前未指定学习目标。")
+            return
+        profile = (state.get("profile_text") or "").strip()
+        lines = [
+            "<b>说话风格学习状态</b>",
+            f"<b>目标</b>: {html.escape(str(state.get('target_user_name') or target_id))}"
+            f"（<code>{target_id}</code>）",
+            f"<b>已收集</b>: {int(state.get('sample_count') or 0)}/1000 条",
+            f"<b>画像</b>: {'已生成（' + str(len(profile)) + ' 字）' if profile else '尚未生成（满 50 条后自动蒸馏）'}",
+        ]
+        await _answer(message, settings, "\n".join(lines))
+        return
+
+    if arg in {"off", "disable", "stop"}:
+        group_row.settings = set_style_target(group_row.settings, user_id=0, user_name="")
+        await _clear_style_samples(session, message.chat.id)
+        await _answer(message, settings, "<b>说话风格学习</b>\n已停止学习并清除画像。")
+        return
+
+    reply = message.reply_to_message
+    target = reply.from_user if reply else None
+    if target is None or arg:
+        await _answer(message, settings, _MIMIC_USAGE)
+        return
+    if target.is_bot:
+        await _answer(message, settings, "不能学习 bot 的说话风格。")
+        return
+
+    group_row.settings = set_style_target(
+        group_row.settings,
+        user_id=target.id,
+        user_name=target.full_name or target.username or str(target.id),
+    )
+    await _clear_style_samples(session, message.chat.id)
+    shown = html.escape(target.full_name or target.username or str(target.id))
+    await _answer(
+        message,
+        settings,
+        "<b>说话风格学习</b>\n"
+        f"已开始学习 <b>{shown}</b>（<code>{target.id}</code>）的说话风格。\n"
+        "每约 50 条发言自动蒸馏刷新一次画像，总上限 1000 条。\n"
+        "使用 /mimic status 查看进度，/mimic off 停止。",
+    )
+
+
+@router.message(Command("banlist"))
+async def cmd_banlist(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_super_admin(message, settings):
+        return
+
+    rows = await list_global_bans(session, limit=30)
+    if not rows:
+        await _answer(message, settings, "<b>封禁名单</b>\n当前为空。")
+        return
+
+    lines = ["<b>封禁名单</b>（最近 30 条）"]
+    for row in rows:
+        reason = _truncate_text(row.reason or "-", 40)
+        source = "资料审查" if row.source == "join_screening" else "手动"
+        lines.append(
+            f"• <code>{row.user_id}</code> | {source} | {html.escape(reason)}"
+        )
+    lines.append("\n解封请使用 /unban &lt;用户ID&gt;")
+    await _answer(message, settings, "\n".join(lines))
 
 
 @router.message(Command("addrule"))
@@ -871,6 +1147,13 @@ async def on_adminlist_paging(
     settings: Settings,
     session: AsyncSession | None = None,
 ) -> None:
+    msg = callback.message
+    if not msg or not msg.chat:
+        await callback.answer("消息已失效", show_alert=True)
+        return
+    if not await ensure_group_authorized(msg, session, settings):
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
     if not callback.data:
         await callback.answer()
         return
@@ -878,11 +1161,6 @@ async def on_adminlist_paging(
         await callback.answer("会话未就绪，请重新 /adminlist", show_alert=True)
         return
     if not await _callback_user_is_super_admin(callback, settings):
-        return
-
-    msg = callback.message
-    if not msg:
-        await callback.answer("消息已失效", show_alert=True)
         return
 
     parts = callback.data.split(":")
@@ -1004,7 +1282,7 @@ async def cmd_mute(message: Message, session: AsyncSession, settings: Settings) 
 
         settings_data[_MUTE_ALL_REPLIES_KEY] = True
         group_row.settings = settings_data
-        await _maybe_flush(session)
+        await _commit_settings(session)
         await _answer(
             message,
             settings,
@@ -1091,7 +1369,7 @@ async def cmd_unmute(message: Message, session: AsyncSession, settings: Settings
 
         settings_data.pop(_MUTE_ALL_REPLIES_KEY, None)
         group_row.settings = settings_data
-        await _maybe_flush(session)
+        await _commit_settings(session)
         await _answer(
             message,
             settings,
@@ -1168,6 +1446,7 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
             get_cooldown_status_text(
                 group_settings,
                 default_enabled=settings.bot.proactive_default_enabled,
+                config=settings.bot,
             ),
         )
         return
@@ -1178,13 +1457,14 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
             enabled=True,
             config=settings.bot,
         )
-        await _maybe_flush(session)
+        await _commit_settings(session)
         await _answer(
             message,
             settings,
             get_cooldown_status_text(
                 group_row.settings,
                 default_enabled=settings.bot.proactive_default_enabled,
+                config=settings.bot,
             ),
         )
         return
@@ -1195,13 +1475,14 @@ async def cmd_proactive(message: Message, session: AsyncSession, settings: Setti
             enabled=False,
             config=settings.bot,
         )
-        await _maybe_flush(session)
+        await _commit_settings(session)
         await _answer(
             message,
             settings,
             get_cooldown_status_text(
                 group_row.settings,
                 default_enabled=settings.bot.proactive_default_enabled,
+                config=settings.bot,
             ),
         )
         return
@@ -1256,7 +1537,7 @@ async def cmd_tts(message: Message, session: AsyncSession, settings: Settings) -
         return
 
     group_row.settings = set_tts_mode(group_settings, target_mode)
-    await _maybe_flush(session)
+    await _commit_settings(session)
     await _answer(
         message,
         settings,
@@ -1304,7 +1585,7 @@ async def cmd_atreply(message: Message, session: AsyncSession, settings: Setting
         return
 
     group_row.settings = set_at_reply_enabled(group_settings, target_enabled)
-    await _maybe_flush(session)
+    await _commit_settings(session)
     await _answer(
         message,
         settings,
@@ -1315,72 +1596,41 @@ async def cmd_atreply(message: Message, session: AsyncSession, settings: Setting
     )
 
 
-@router.message(F.text.regexp(r"^/chat(?:@[A-Za-z][A-Za-z0-9_]{4,31})?(?:\s+(?:enable|disable))?\s*$"))
-async def cmd_chat(message: Message, session: AsyncSession, settings: Settings) -> None:
+@router.message(Command("clearwarnings", "clearwarning", "clearwarns", "clearwarn"))
+async def cmd_clearwarnings(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    if not await ensure_super_admin(message, settings):
+    if not await ensure_group_admin_permission(message, session, settings):
         return
 
-    args = (message.text or "").partition(" ")[2].strip().lower()
-    if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>/chat 对话设置</b>\n请在目标群内使用该命令。")
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, _ = _resolve_ban_target(message, args)
+    if target_id is None:
+        await _answer(message, settings, _CLEAR_WARNINGS_USAGE)
         return
 
-    group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
-    group_settings = dict(group_row.settings or {})
-
-    if not args:
-        await _answer(
-            message,
-            settings,
-            build_chat_bridge_status_text(
-                group_id=message.chat.id,
-                group_settings=group_settings,
-            ),
-        )
-        return
-
-    if args == "disable":
-        group_row.settings = set_chat_bridge_enabled(group_settings, False)
-        await _maybe_flush(session)
-        await _answer(
-            message,
-            settings,
-            build_chat_bridge_status_text(
-                group_id=message.chat.id,
-                group_settings=group_row.settings,
-            ),
-        )
-        return
-
-    if args != "enable":
-        await _answer(message, settings, _CHAT_USAGE)
-        return
-
-    pending_settings = begin_chat_bridge_target_selection(
-        group_settings,
-        admin_id=(message.from_user.id if message.from_user else 0),
+    cleared_count, was_banned = await _clear_user_warning(
+        session,
+        message.chat.id,
+        target_id,
     )
-    group_row.settings = pending_settings
-    await _maybe_flush(session)
-
-    prompt = (
-        "<b>/chat 对话设置</b>\n"
-        "<b>状态</b>: 已开启，等待目标 bot\n"
-        "<b>下一步</b>: 请回复这条消息，发送目标 bot 用户名，例如：@examplebot"
+    status = (
+        f"累计违规次数已清零（原为 {cleared_count} 次）"
+        if cleared_count
+        else "原本无违规次数"
     )
-    sent = await answer_with_auto_delete(
-        message,
-        prompt,
-        auto_delete_minutes=0,
-    )
-    group_row.settings = begin_chat_bridge_target_selection(
-        group_row.settings,
-        admin_id=(message.from_user.id if message.from_user else 0),
-        prompt_message_id=int(getattr(sent, "message_id", 0) or 0),
-    )
-    await _maybe_flush(session)
+    lines = [
+        "<b>违规次数清除结果</b>",
+        f"<b>用户ID</b>: <code>{target_id}</code>",
+        f"<b>状态</b>: {status}",
+    ]
+    if was_banned:
+        lines.append("该用户此前已达封禁状态；本命令不会解封，请使用 /unban。")
+    await _answer(message, settings, "\n".join(lines))
 
 
 @router.message(Command("warnings"))
@@ -1505,5 +1755,3 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
         f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
         "<b>状态</b>: 已取消豁免"
     )
-
-

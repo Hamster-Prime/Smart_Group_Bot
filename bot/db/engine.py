@@ -79,6 +79,23 @@ async def _sqlite_migrate_message_vector_timestamps(conn) -> bool:
     return changed
 
 
+async def _sqlite_migrate_join_verifications(conn) -> bool:
+    """Drop older join_verifications schemas (captcha-era / link-token-era).
+
+    Both had NOT NULL columns (answer/attempts, token) that break inserts
+    from the current Mini App model. Rows are transient pending
+    verifications, so dropping is safe; the affected users just get a fresh
+    challenge on their next join.
+    """
+    columns = await _sqlite_table_columns(conn, "join_verifications")
+    if not columns or not ({"answer", "token"} & columns):
+        return False
+    await conn.execute(text("DROP TABLE join_verifications"))
+    await conn.run_sync(Base.metadata.create_all)
+    log.info("Migrated: recreated join_verifications for Mini App verification")
+    return True
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -158,6 +175,19 @@ async def init_db(
                 )
             )
             await _sqlite_migrate_message_vector_timestamps(conn)
+            await _sqlite_migrate_join_verifications(conn)
+            await _sqlite_ensure_column(
+                conn,
+                "join_verifications",
+                "kind",
+                "kind VARCHAR(32) NOT NULL DEFAULT 'join'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "join_verifications",
+                "reason",
+                "reason TEXT NOT NULL DEFAULT ''",
+            )
 
     session_factory = async_sessionmaker(
         engine,

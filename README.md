@@ -10,7 +10,7 @@
 
 **基于 LLM 的 Telegram 群聊智能机器人**
 
-🧠 智能决策 · 🛡️ 内容审核 · 📝 永久记忆 · ⏰ 定时任务 · 🎭 贴纸系统 · 🔍 联网搜索 · 🎵 音乐点播 · 🗣️ TTS 语音
+🧠 智能决策 · 🛡️ 内容审核 · 🔐 入群验证 · 📝 永久记忆 · 🎭 贴纸系统 · 🔍 联网搜索 · 🎵 音乐点播 · 🗣️ TTS 语音
 
 </div>
 
@@ -21,11 +21,16 @@
 ```
 消息进入
   │
-  ├─ 内容审核 (keyword / regex / LLM 三级检测)
-  │     └─ 命中 → warn / delete / ban（按规则独立配置）
+  ├─ 全局封禁拦截（外层中间件，命中即删+封）
+  │
+  ├─ 资料筛查（外层中间件，改名/改简介后自动复查）
+  │
+  ├─ 内容审核 (keyword / regex / LLM 三级检测，带置信度)
+  │     ├─ 高置信度命中 → warn / delete / ban（按规则独立配置）
+  │     └─ 低置信度命中 → 删消息 + Turnstile 真人质询
   │
   ├─ 管理意图路由 (manage_intent)
-  │     └─ memory_manage / rule_manage / task_manage → 直接执行
+  │     └─ memory_manage / rule_manage → 直接执行
   │
   ├─ 决策模型 (decision)
   │     ├─ skip → 结束
@@ -43,7 +48,7 @@
 
 ## 模型角色
 
-项目通过 LiteLLM 接入多供应商，支持 fallback 链自动降级。以下角色均可独立配置供应商和模型，未配置则自动复用主模型：
+项目通过 LiteLLM 接入多供应商，支持 fallback 链自动降级。以下角色均可独立配置供应商和模型，未配置则自动复用主模型。每个角色支持独立的 `*_REASONING_EFFORT` 配置（none/minimal/low/medium/high，默认 main=low、其余=none）：
 
 | 角色 | 用途 | 默认模型 |
 |:---|:---|:---|
@@ -51,8 +56,7 @@
 | **decision** | 判断是否回复（skip / casual） | 复用 main |
 | **moderation** | 内容审核 | 复用 decision |
 | **vision** | 图片/贴纸理解 | 复用 main |
-| **chat_bridge** | bot 间 /chat 对话 | 复用 main |
-| **compress** | 上下文压缩摘要 | 复用 main |
+| **compress** | 上下文压缩摘要、风格蒸馏 | 复用 main |
 | **embed** | 向量嵌入（预留） | text-embedding-004 |
 
 ---
@@ -73,23 +77,29 @@
 | `regex` | 正则表达式匹配 |
 | `llm` | LLM 语义判断（同义词、变体、谐音等） |
 
-命中动作：`warn`（警告）、`delete`（删除消息）、`ban`（累计 3 次警告后踢出）。支持按用户设置 AI 审核豁免，支持全群「仅审核不回复」模式。
+命中动作：`warn`（警告）、`delete`（删除消息）、`ban`（累计 3 次警告后踢出）。支持按用户设置 AI 审核豁免，支持全群「仅审核不回复」模式。管理员可用 `/clearwarnings` 清空某用户的累计违规次数。
+
+**置信度分级**：审核模型输出 0.0–1.0 的置信度。高置信度（默认 ≥0.9）命中直接执行规则动作；低置信度命中不直接处罚，而是删除消息并发起 Turnstile 真人质询——通过质询即恢复，超时未通过则封禁。审核输出不可解析时按不违规处理且不写入已审核缓存。
+
+### 入群验证（Turnstile 真人质询）
+
+`JOIN_VERIFICATION_ENABLED=true` 时，新成员入群后先被禁言，需点击群内按钮跳转 bot 私聊，在私聊内通过 Telegram Mini App 完成 Cloudflare Turnstile 质询后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证，验证页不暴露域名。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
+
+### 资料筛查与全局封禁
+
+新成员入群时用群规审查其昵称/用户名/简介，命中即自动加入全局封禁名单；此后每条群消息都会复查发送者可见资料（含 /help、视频、纯媒体消息），改名无法逃避。全局封禁的用户在任意授权群发言即被删消息+封禁。最高管理员通过 `/ban`、`/unban`、`/banlist` 管理名单；`/unban` 同时清空违规次数并永久豁免资料审查。
 
 ### 永久记忆
 
 管理员通过自然语言或 `/lm` 命令维护群组永久记忆。回复时自动注入 `[permanent-memory]` 上下文。支持列表翻页和内联按钮删除。存储于 SQLite，重启不丢失。
 
-### 定时任务
-
-支持自然语言创建提醒和定时查询任务：
-- `reminder`：到时间后提醒群成员
-- `agent_task`：到时间后自动执行 LLM 查询并返回结果
-
-通过 `/task` 创建，`/tasks` 查看列表，`/canceltask` 取消。内置后台调度器持续轮询执行。
-
 ### 主动话题
 
 群组长时间沉默后，bot 可自动抛出一个结合群记忆的话题。通过 `/proactive on|off|status` 控制，支持静默时段配置。
+
+### 说话风格模仿
+
+管理员回复目标用户消息后发送 `/mimic`，bot 开始采样该用户的群消息（滚动窗口 200 条、总上限 1000 条），每约 50 条由 compress 模型蒸馏一次风格画像，并以 `[SPEECH_STYLE_PROFILE]` 注入回复提示词。`/mimic status` 查看进度，`/mimic off` 停止并清理样本。
 
 ### 技能系统 (Tool Calling)
 
@@ -99,22 +109,18 @@
 |:---|:---|
 | `memory_manage` | 查看/新增/修改永久记忆（删除走 /lm） |
 | `rule_manage` | 查看/新增群规（删除走 /rules） |
-| `task_manage` | 创建/查看定时任务（删除走 /tasks） |
 | `send_sticker` | 语义匹配发送贴纸 |
 | `websearch` | DuckDuckGo 联网搜索 |
 | `webfetch` | 抓取网页正文内容 |
 | `music_search` | GD Studio 音乐 API：搜索、点播、歌词、专辑封面 |
 | `bilibili_search` | B站视频/UP主搜索、热门、排行榜 |
 | `weibo_search` | 微博热搜、内容搜索、Feed 流 |
+| `sub2api_query` | Sub2API 网关查询：模型列表、模型测活（需配置） |
 | `doubao_tts` | 豆包 TTS 语音合成（需配置） |
 
 ### 贴纸系统
 
 收到贴纸后自动记录 file_id、emoji、贴纸包和视觉描述到 `sticker_library` 表。回复时由独立的贴纸决策模块判断是否发送，优先按语义从已学习贴纸中选择，支持默认贴纸池兜底。
-
-### Chat Bridge
-
-通过 `/chat enable` 开启 bot 间自动对话。当群内有其他 bot 发消息时，本 bot 会自动回复，形成 bot 间持续对话。
 
 ### AV 查询
 
@@ -145,9 +151,6 @@
 | `/lm` | 永久记忆列表（翻页 + 内联删除） |
 | `/lm add <内容>` | 新增永久记忆 |
 | `/lm replace <#ID或关键词> => <新内容>` | 修改永久记忆 |
-| `/task <自然语言>` | 创建定时任务 |
-| `/tasks` | 定时任务列表（翻页 + 内联删除） |
-| `/canceltask <ID>` | 按 ID 取消定时任务 |
 | `/addrule <自然语言>` | 新增群规 |
 | `/rules` | 群规列表（翻页 + 内联删除） |
 | `/av <番号/演员/关键词>` | 搜索 AV 资源 |
@@ -157,6 +160,7 @@
 | 命令 | 说明 |
 |:---|:---|
 | `/warnings` | 查看警告/封禁名单 |
+| `/clearwarnings [用户ID]` | 清空某用户的累计违规次数（也可回复消息） |
 | `/aiexempt` | 回复用户消息后豁免其 AI 审核 |
 | `/unaiexempt` | 回复用户消息后取消审核豁免 |
 | `/mute` | 回复用户消息后忽略其后续回复 |
@@ -164,6 +168,7 @@
 | `/unmute` | 回复用户消息后恢复其回复 |
 | `/unmute all` | 恢复全群正常回复 |
 | `/proactive on\|off\|status` | 主动话题开关/状态 |
+| `/mimic [status\|off]` | 回复用户后学习其说话风格 |
 
 ### 最高管理员命令
 
@@ -172,11 +177,13 @@
 | `/authgroup [群ID]` | 授权群组 |
 | `/unauthgroup [群ID]` | 撤销群组授权 |
 | `/authlist` | 授权群组列表 |
+| `/ban [用户ID] [原因]` | 全局封禁（也可回复消息） |
+| `/unban [用户ID]` | 解封 + 清零违规 + 豁免资料审查 |
+| `/banlist` | 查看封禁名单 |
 | `/authadmin [群ID] [用户ID]` | 授权群管理 |
 | `/unauthadmin [群ID] [用户ID]` | 撤销群管理 |
 | `/adminlist [群ID]` | 群管理列表 |
 | `/atreply [enable\|disable]` | 仅 @ 才回复模式 |
-| `/chat [enable\|disable]` | bot 间对话开关 |
 | `/tts [enable\|disable\|always]` | TTS 语音模式 |
 | `/av enable\|disable` | 每群 AV 查询开关 |
 
@@ -246,6 +253,11 @@ MODERATION_PROVIDER_NAME=
 MODERATION_MODEL=
 VISION_PROVIDER_NAME=
 VISION_MODEL=
+
+# 每角色 reasoning effort（none/minimal/low/medium/high，留空则不发送该参数）
+MAIN_REASONING_EFFORT=low
+DECISION_REASONING_EFFORT=none
+MODERATION_REASONING_EFFORT=none
 ```
 
 ### 运行时
@@ -263,6 +275,20 @@ BOT_PROACTIVE_IDLE_MINUTES=180
 BOT_PROACTIVE_QUIET_HOURS_START=0
 BOT_PROACTIVE_QUIET_HOURS_END=9
 ```
+
+### 入群验证 / 审核质询（Turnstile）
+
+```env
+JOIN_VERIFICATION_ENABLED=false
+JOIN_VERIFICATION_TIMEOUT_SECONDS=600
+JOIN_VERIFICATION_TURNSTILE_SITE_KEY=
+JOIN_VERIFICATION_TURNSTILE_SECRET_KEY=
+# 验证页对外可访问的 https 地址（Cloudflare Tunnel / 反代到监听端口）
+JOIN_VERIFICATION_PUBLIC_BASE_URL=
+JOIN_VERIFICATION_LISTEN_PORT=8480
+```
+
+开启后需要 bot 是带「封禁用户」权限的群管理员。Turnstile 参数由入群验证和低置信度审核质询共用；审核置信度阈值在 `config.toml` 的 `[moderation] high_confidence_threshold` 配置（默认 0.9）。
 
 ### 数据库
 
@@ -283,49 +309,55 @@ Smart_Group_Bot/
 │   ├── config.py               # 配置加载（.env + config.toml）
 │   ├── loader.py               # Bot / Dispatcher 初始化
 │   ├── handlers/
-│   │   ├── commands.py         # 命令处理（/start /help /lm /task /av 等）
-│   │   ├── admin.py            # 管理命令（授权、群规、审核、TTS 等）
+│   │   ├── commands.py         # 命令处理（/start /help /lm /av 等）
+│   │   ├── admin.py            # 管理命令（授权、群规、审核、封禁、TTS 等）
+│   │   ├── membership.py       # 入群/离群事件（筛查、验证）
 │   │   └── group.py            # 群消息主流程（审核→决策→回复）
 │   ├── middlewares/
 │   │   ├── db.py               # 数据库会话注入
 │   │   ├── logging_mw.py       # 日志追踪
-│   │   └── throttle.py         # 限流
+│   │   ├── global_ban.py       # 全局封禁拦截（外层）
+│   │   └── profile_screen.py   # 发言时资料复查（外层）
 │   ├── services/
-│   │   ├── llm.py              # LLM 调用封装（LiteLLM + fallback）
+│   │   ├── llm.py              # LLM 调用封装（LiteLLM + fallback + 流式合并）
 │   │   ├── decision.py         # 决策引擎
-│   │   ├── moderation.py       # 内容审核
+│   │   ├── moderation.py       # 内容审核（置信度分级）
 │   │   ├── memory.py           # 记忆服务（对话历史 + 上下文压缩）
 │   │   ├── memory_holder.py    # 全局记忆持有者
 │   │   ├── manage_intent.py    # 管理意图路由
 │   │   ├── reply_mode.py       # 回复模式选择（reply / message）
 │   │   ├── reply_output.py     # 回复解析与输出
-│   │   ├── chat_bridge.py      # bot 间对话
+│   │   ├── proactive.py        # 主动话题
+│   │   ├── join_screening.py   # 入群资料筛查 + 全局封禁
+│   │   ├── join_verification.py# 入群验证 / 审核质询（Turnstile）
+│   │   ├── verify_web.py       # 内置验证页服务（aiohttp + Mini App）
+│   │   ├── speech_style.py     # 说话风格模仿（/mimic）
+│   │   ├── admin_status.py     # 管理员身份缓存（仅缓存非管理员结果）
 │   │   ├── sticker_decision.py # 贴纸决策模块
 │   │   ├── sticker_library.py  # 贴纸学习库
 │   │   ├── at_reply.py         # 仅 @ 回复模式
 │   │   ├── authz.py            # 权限管理
 │   │   ├── av_search.py        # AV 搜索
 │   │   ├── doubao_tts.py       # 豆包 TTS 服务
-│   │   ├── scheduled_tasks.py  # 定时任务调度
 │   │   └── skills/
 │   │       ├── service.py      # 技能调度（tool-calling loop）
 │   │       ├── base.py         # 技能基类
 │   │       ├── memory_manage.py
 │   │       ├── rule_manage.py
-│   │       ├── task_manage.py
-│   │       ├── scheduled_task.py
 │   │       ├── send_sticker.py
 │   │       ├── websearch.py
 │   │       ├── webfetch.py
 │   │       ├── music_search.py
 │   │       ├── bilibili_search.py
 │   │       ├── weibo_search.py
+│   │       ├── sub2api_query.py
 │   │       └── doubao_tts.py
 │   ├── db/
 │   │   ├── models.py           # ORM 模型
 │   │   ├── engine.py           # 数据库引擎
 │   │   └── sqlite_session.py   # SQLite 并发处理
 │   └── utils/
+│       ├── bot_identity.py     # 运行时 bot 身份块
 │       ├── command_catalog.py  # 命令注册表
 │       ├── conversation_context.py
 │       ├── logging_setup.py    # 日志配置
@@ -337,22 +369,21 @@ Smart_Group_Bot/
 ├── prompt/                     # 各模块提示词（Markdown）
 │   ├── persona.md              # 人设
 │   ├── decision.md             # 决策提示词
-│   ├── moderation.md           # 审核提示词
+│   ├── moderation.md           # 审核提示词（含置信度）
 │   ├── skill_tools_v2.md       # 技能系统提示词
 │   ├── manage_intent.md        # 管理意图路由提示词
 │   ├── reply_mode.md           # 回复模式提示词
 │   ├── sticker_decision.md     # 贴纸决策提示词
-│   ├── chat_bridge.md          # bot 间对话提示词
-│   ├── compress.md             # 上下文压缩提示词
-│   └── scheduled_task.md       # 定时任务提示词
+│   ├── proactive_topic.md      # 主动话题提示词
+│   ├── style_distill.md        # 风格蒸馏提示词
+│   └── compress.md             # 上下文压缩提示词
 ├── tests/                      # 测试（pytest）
 ├── config.toml                 # 可选 TOML 配置覆盖
 ├── .env.example                # 环境变量模板
 ├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
-├── start.py                    # 一键启动脚本
-└── start.bat                   # Windows 启动脚本
+└── start.py                    # 一键启动脚本
 ```
 
 ---

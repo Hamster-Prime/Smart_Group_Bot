@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from bot.config import Settings
 from bot.handlers import admin, commands
 from bot.services.skills.base import SkillRunResult
+from bot.utils.command_catalog import build_command_guide_context
 
 
 def _settings() -> Settings:
@@ -29,6 +30,91 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             await commands.cmd_help(message, session=object(), settings=settings)
 
         self.assertIn("命令总览", answer_mock.await_args.args[2])
+        self.assertIn("/clearwarnings", answer_mock.await_args.args[2])
+
+    async def test_command_guide_includes_clearwarnings(self) -> None:
+        guide = build_command_guide_context()
+
+        self.assertIn("command: /clearwarnings", guide)
+        self.assertIn("清空某用户的累计违规次数", guide)
+
+    async def test_clearwarnings_calls_warning_reset_for_target(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/clearwarnings 456",
+            reply_to_message=None,
+        )
+        session = object()
+        settings = _settings()
+
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch(
+                "bot.handlers.admin.ensure_group_admin_permission",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._clear_user_warning",
+                new=AsyncMock(return_value=(2, False)),
+            ) as clear_mock,
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_clearwarnings(message, session=session, settings=settings)
+
+        clear_mock.assert_awaited_once_with(session, -10001, 456)
+        self.assertIn("原为 2 次", answer_mock.await_args.args[2])
+
+    async def test_warning_reset_deletes_state_and_returns_previous_values(self) -> None:
+        warning = SimpleNamespace(count=4, is_banned=True)
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(scalar_one_or_none=lambda: warning)
+            ),
+            delete=AsyncMock(),
+        )
+
+        cleared = await admin._clear_user_warning(session, -10001, 456)
+
+        self.assertEqual(cleared, (4, True))
+        session.delete.assert_awaited_once_with(warning)
+
+    async def test_unban_calls_warning_reset_for_target(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/unban 456",
+            reply_to_message=None,
+            bot=SimpleNamespace(unban_chat_member=AsyncMock()),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        settings = _settings()
+        settings.super_admin_id = 123
+
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.remove_global_ban", new=AsyncMock(return_value=False)),
+            patch("bot.handlers.admin.delete_join_verifications_for_user", new=AsyncMock()),
+            patch(
+                "bot.handlers.admin._authorized_group_ids",
+                new=AsyncMock(return_value=[-10001]),
+            ),
+            patch(
+                "bot.handlers.admin._clear_user_warning",
+                new=AsyncMock(return_value=(3, True)),
+            ) as clear_mock,
+            patch(
+                "bot.handlers.admin.restore_member_permissions",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_unban(message, session=session, settings=settings)
+
+        clear_mock.assert_awaited_once_with(session, -10001, 456)
+        session.commit.assert_awaited_once()
+        self.assertIn("累计 3 次", answer_mock.await_args.args[2])
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(

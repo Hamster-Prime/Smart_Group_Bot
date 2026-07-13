@@ -14,9 +14,8 @@ from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.music_search import MusicSearchSkill
 from bot.services.skills.rule_manage import RuleManageSkill
-from bot.services.skills.scheduled_task import ScheduledTaskSkill
 from bot.services.skills.send_sticker import SendStickerSkill
-from bot.services.skills.task_manage import TaskManageSkill
+from bot.services.skills.sub2api_query import Sub2ApiQuerySkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.services.skills.weibo_search import WeiboSearchSkill
@@ -25,6 +24,7 @@ from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
 )
+from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
@@ -44,6 +44,9 @@ _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "music_search": re.compile(r"^找到\s*\d+\s*首相关歌曲[。！？!?\. ]*$"),
     "bilibili_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|视频|Feed|热搜)[。！？!?\. ]*$"),
     "weibo_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|微博|Feed|热搜)[。！？!?\. ]*$"),
+    "sub2api_query": re.compile(
+        r"^(?:查到\s*\d+\s*个可用模型|模型\s*\S+\s*(?:可用|不可用).*)[。！？!?\. ]*$"
+    ),
 }
 _INFO_FOLLOWUP_SKILLS = frozenset(
     {
@@ -52,6 +55,7 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
         "music_search",
         "bilibili_search",
         "weibo_search",
+        "sub2api_query",
     }
 )
 _PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
@@ -82,14 +86,15 @@ class SkillService:
         self.skills: dict[str, Skill] = {}
         self._register(MemoryManageSkill())
         self._register(RuleManageSkill())
-        self._register(TaskManageSkill())
-        self._register(ScheduledTaskSkill(settings))
         self._register(SendStickerSkill())
         self._register(MusicSearchSkill(settings))
         self._register(WebSearchSkill())
         self._register(WebFetchSkill())
         self._register(BilibiliSearchSkill())
         self._register(WeiboSearchSkill())
+        sub2api_skill = Sub2ApiQuerySkill(settings)
+        if sub2api_skill.available:
+            self._register(sub2api_skill)
         self.tts_skill_name = DoubaoTTSSkill.name
         self.tts_service = DoubaoTTSService(settings) if settings is not None else None
         if self.tts_service and self.tts_service.available:
@@ -158,8 +163,6 @@ class SkillService:
     def _tool_definitions(skills: dict[str, Skill]) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         for skill in skills.values():
-            if skill.name == "scheduled_task":
-                continue
             tools.append(
                 {
                     "type": "function",
@@ -211,6 +214,7 @@ class SkillService:
         tts_mode: str = TTS_MODE_OFF,
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
@@ -245,6 +249,11 @@ class SkillService:
         )
         if tts_preference_context:
             messages.append({"role": "system", "content": tts_preference_context})
+        # Late-position identity block: history may contain stale bot names
+        # (users addressing an old identity); this must win over them.
+        identity_context = build_bot_identity_context()
+        if identity_context:
+            messages.append({"role": "system", "content": identity_context})
         messages.append(
             {
                 "role": "system",
@@ -259,6 +268,8 @@ class SkillService:
         normalized_intent = clean_text((intent_type or "casual").strip().lower(), max_len=16)
         if normalized_intent:
             messages.append({"role": "system", "content": f"[INTENT_TYPE]\n{normalized_intent}"})
+        if style_profile_context.strip():
+            messages.append({"role": "system", "content": style_profile_context.strip()})
         messages.append(
             {
                 "role": "system",
@@ -297,6 +308,7 @@ class SkillService:
         reply_targets_context: str = "",
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> dict[str, Any]:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         selected_skills = self._selected_skills(allow_tts=allow_tts)
@@ -316,6 +328,7 @@ class SkillService:
                 tts_mode=tts_mode,
                 is_mentioned=is_mentioned,
                 is_reply_to_bot=is_reply_to_bot,
+                style_profile_context=style_profile_context,
             ),
             "tools": self._tool_definitions(selected_skills),
         }
@@ -473,6 +486,15 @@ class SkillService:
                 "You already have music search results.\n"
                 "Do not stop at only reporting the number of matches.\n"
                 "Use the returned tracks to answer the user in Chinese now."
+            )
+        if result.skill == "sub2api_query":
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have Sub2API gateway query results (models list or liveness check).\n"
+                "Do not stop at an intermediate status like only reporting the count or raw summary.\n"
+                "Read the payload fields (models[].id, alive, latency_ms, error_detail) "
+                "and answer the user's actual request in Chinese now.\n"
+                "When listing models, show the model ids so the user can pick one to test."
             )
         if result.skill in {"bilibili_search", "weibo_search"}:
             return (
@@ -897,6 +919,7 @@ class SkillService:
         reply_targets_context: str = "",
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         if contains_prompt_injection(user_text):
@@ -918,6 +941,7 @@ class SkillService:
             tts_mode=tts_mode,
             is_mentioned=is_mentioned,
             is_reply_to_bot=is_reply_to_bot,
+            style_profile_context=style_profile_context,
         )
         tools = self._tool_definitions(selected_skills)
         context = SkillContext(

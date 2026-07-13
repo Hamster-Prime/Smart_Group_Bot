@@ -1,12 +1,16 @@
-import sqlite3
+import asyncio
 import shutil
+import sqlite3
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from bot.config import BotConfig
 from bot.db.engine import init_db
+from bot.db.models import MessageVector
 from bot.services.memory import MemoryService
 from bot.utils.security import sanitize_history_for_llm
 
@@ -24,6 +28,20 @@ class _SummaryStubLLM(_StubLLM):
     async def compress(self, system: str, user_text: str) -> str:
         _ = system, user_text
         return "压缩后摘要"
+
+
+class _BlockingSummaryStubLLM(_StubLLM):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.resume = asyncio.Event()
+        self.payload = ""
+
+    async def compress(self, system: str, user_text: str) -> str:
+        _ = system
+        self.payload = user_text
+        self.started.set()
+        await self.resume.wait()
+        return "压缩期间之前的摘要"
 
 
 def _create_legacy_message_vectors_table(db_path: Path, *, include_embedding: bool = False) -> None:
@@ -252,6 +270,84 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await memory._get_summary(12345), "压缩后摘要")
             self.assertFalse(any(msg.get("role") == "user" for msg in prompt_history))
         finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_compaction_preserves_messages_added_while_llm_is_in_flight(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        engine = None
+        compact_task = None
+        llm = _BlockingSummaryStubLLM()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                llm,
+                session_factory=session_factory,
+            )
+            memory._count_tokens = lambda _messages: memory.max_context  # type: ignore[method-assign]
+            group_id = 12345
+
+            await memory.add_message(
+                group_id,
+                "user",
+                "snapshot-before-compression",
+                message_id="before-compression",
+            )
+            compact_task = asyncio.create_task(memory.compact_if_needed(group_id))
+            await asyncio.wait_for(llm.started.wait(), timeout=5)
+
+            await memory.add_message(
+                group_id,
+                "user",
+                "arrived-during-compression",
+                message_id="during-compression",
+            )
+            llm.resume.set()
+            self.assertTrue(await asyncio.wait_for(compact_task, timeout=5))
+
+            self.assertIn("snapshot-before-compression", llm.payload)
+            self.assertNotIn("arrived-during-compression", llm.payload)
+            current_history = memory.get_history(group_id)
+            self.assertEqual(
+                [item["content"] for item in current_history],
+                ["arrived-during-compression"],
+            )
+
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector)
+                            .where(MessageVector.group_id == group_id)
+                            .order_by(MessageVector.id.asc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(
+                [(row.message_id, row.content) for row in rows],
+                [(f"{group_id}:during-compression", "arrived-during-compression")],
+            )
+
+            reloaded = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _StubLLM(),
+                session_factory=session_factory,
+            )
+            await reloaded.bootstrap()
+            self.assertEqual(
+                [item["content"] for item in reloaded.get_history(group_id)],
+                ["arrived-during-compression"],
+            )
+        finally:
+            llm.resume.set()
+            if compact_task is not None and not compact_task.done():
+                compact_task.cancel()
+                await asyncio.gather(compact_task, return_exceptions=True)
+            if engine is not None:
+                await engine.dispose()
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 

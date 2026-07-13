@@ -36,6 +36,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group.ensure_group_authorized", new=AsyncMock(return_value=True)),
             patch("bot.handlers.group._ensure_group_row", new=AsyncMock(return_value=group_row)) as ensure_group_row,
             patch("bot.handlers.group.record_group_activity", return_value={}),
+            patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
             patch("bot.handlers.group.extract_message_text", return_value=("", "text")),
         ):
             await group.on_group_message(message, session=session, settings=settings)
@@ -58,6 +59,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
                 decision_model="",
                 compress_model="",
                 moderation_model="",
+                vision_model="",
                 embed_model="",
                 max_context_tokens=0,
             ),
@@ -77,7 +79,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group._append_image_context", new=AsyncMock(return_value=("bad text", ""))),
             patch("bot.handlers.group._build_reply_context_for_llm", new=AsyncMock(return_value="")),
             patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
-            patch("bot.handlers.group.is_user_admin", new=AsyncMock(return_value=False)),
+            patch("bot.handlers.group._is_user_admin_cached", new=AsyncMock(return_value=False)),
             patch("bot.handlers.group.LLMService", return_value=object()),
             patch("bot.handlers.group.SkillService", return_value=object()),
             patch("bot.handlers.group.ModerationService", return_value=moderation_service),

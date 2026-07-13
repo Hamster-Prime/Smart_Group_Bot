@@ -4,6 +4,7 @@ import logging
 import re
 
 from bot.services.llm import LLMService
+from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.prompts import DECISION_SYSTEM
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
@@ -79,7 +80,10 @@ class DecisionService:
                 f"{wrap_untrusted('merged_message_context', merged_context, max_len=1800)}\n"
             )
 
+        identity_context = build_bot_identity_context()
+        identity_block = f"{identity_context}\n" if identity_context else ""
         context = (
+            f"{identity_block}"
             f"{build_current_time_context()}\n"
             f"{sender_block}"
             f"{self._bool_block('IS_MENTIONED', is_mentioned)}\n"

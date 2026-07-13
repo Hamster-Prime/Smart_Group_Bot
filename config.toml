@@ -18,3 +18,5 @@ max_tokens = 1024
 [moderation]
 enabled = true
 warn_threshold = 3
+high_confidence_threshold = 0.9
+challenge_timeout_seconds = 600

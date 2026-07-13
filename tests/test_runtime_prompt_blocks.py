@@ -2,7 +2,6 @@ import unittest
 
 from bot.utils.prompts import (
     CASUAL_SYSTEM,
-    CHAT_BRIDGE_SYSTEM,
     PERSONA_SYSTEM,
     REPLY_MODE_SYSTEM,
     SKILL_TOOL_SYSTEM,
@@ -39,31 +38,15 @@ class RuntimePromptBlockTests(unittest.TestCase):
         ):
             self.assertIn(block, STICKER_DECISION_SYSTEM)
 
-    def test_chat_bridge_prompt_lists_runtime_blocks(self) -> None:
-        for block in (
-            "[CURRENT_TIME]",
-            "[CHAT_BRIDGE_MODE]",
-            "[PEER_BOT]",
-            "[RECENT_GROUP_CONTEXT]",
-            "[CURRENT_TURN_FOCUS]",
-            "[CURRENT_BRIDGE_MESSAGE]",
-        ):
-            self.assertIn(block, CHAT_BRIDGE_SYSTEM)
-
     def test_core_prompts_discourage_blank_line_bubbles(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
-            self.assertIn("不要留空行", prompt)
-            self.assertIn("空行就是“分开发送多条消息”的信号", prompt)
+            self.assertIn("do not leave blank lines", prompt)
+            self.assertIn('a blank line is the signal for "send as separate messages"', prompt)
 
     def test_core_prompts_forbid_parenthetical_stage_directions(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
-            self.assertIn("不要写括号里的动作描写或舞台指令", prompt)
-            self.assertNotIn("偶尔可以加小动作描述", prompt)
-            self.assertIn("晃脚丫", prompt)
+            self.assertIn("Do not write bracketed action descriptions or stage directions", prompt)
+            self.assertIn("(swings feet)", prompt)
 
     def test_skill_prompt_declares_blank_line_split_rule(self) -> None:
-        self.assertIn("纯文本里一旦出现空行，就会被当成分开发送多条消息", SKILL_TOOL_SYSTEM)
-
-    def test_chat_bridge_prompt_discourages_blank_line_bubbles(self) -> None:
-        self.assertIn("any blank line will be treated as a separator for multiple outgoing messages", CHAT_BRIDGE_SYSTEM)
-        self.assertIn("do not output blank lines for spacing", CHAT_BRIDGE_SYSTEM)
+        self.assertIn('a blank line is treated as "send as separate messages."', SKILL_TOOL_SYSTEM)

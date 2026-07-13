@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
@@ -52,6 +52,8 @@ class ChatEndpointConfig(BaseModel):
     retry_attempts: int = 2
     retry_backoff_sec: float = 0.8
     retry_timeout_multiplier: float = 1.35
+    # "" = do not send the param; none/minimal/low/medium/high are forwarded.
+    reasoning_effort: str = ""
 
 
 class ModelConfig(ChatEndpointConfig):
@@ -94,7 +96,6 @@ class BotConfig(BaseModel):
     proactive_retry_minutes: int = 30
     main_model: ModelConfig = ModelConfig()
     vision_model: ModelConfig = ModelConfig()
-    chat_bridge_model: ModelConfig = ModelConfig()
     decision_model: ModelConfig = ModelConfig(
         model="gemini/gemini-2.0-flash",
         temperature=0.1,
@@ -121,6 +122,11 @@ class BotConfig(BaseModel):
 class ModerationConfig(BaseModel):
     enabled: bool = True
     warn_threshold: int = 3
+    # 违规判定置信度 >= 该值时直接按规则动作处理；低于该值时删除消息并
+    # 要求 Turnstile 质询（质询依赖入群验证的 Turnstile/公网地址配置）。
+    high_confidence_threshold: float = Field(default=0.9, allow_inf_nan=False)
+    # 低置信度质询限时（秒），超时自动封禁。
+    challenge_timeout_seconds: int = 600
 
 
 class Settings(BaseSettings):
@@ -129,36 +135,44 @@ class Settings(BaseSettings):
     bot_token: str = ""
     super_admin_id: int = 0
 
+    @field_validator("super_admin_id", mode="before")
+    @classmethod
+    def _empty_env_int_as_zero(cls, value: object) -> object:
+        # .env templates ship these as blank lines; treat "" as unset.
+        if isinstance(value, str) and not value.strip():
+            return 0
+        return value
+
     # Role -> provider profile name + model.
     main_provider_name: str = ""
     main_model: str = "gemini-2.0-flash"
     main_fallbacks: str = ""
     main_timeout_sec: float = 12.0
+    main_reasoning_effort: str = "low"
 
     vision_provider_name: str = ""
     vision_model: str = ""
     vision_fallbacks: str = ""
     vision_timeout_sec: float = 15.0
-
-    chat_bridge_provider_name: str = ""
-    chat_bridge_model: str = ""
-    chat_bridge_fallbacks: str = ""
-    chat_bridge_timeout_sec: float = 10.0
+    vision_reasoning_effort: str = "none"
 
     decision_provider_name: str = ""
     decision_model: str = ""
     decision_fallbacks: str = ""
     decision_timeout_sec: float = 6.0
+    decision_reasoning_effort: str = "none"
 
     moderation_provider_name: str = ""
     moderation_model: str = ""
     moderation_fallbacks: str = ""
     moderation_timeout_sec: float = 8.0
+    moderation_reasoning_effort: str = "none"
 
     compress_provider_name: str = ""
     compress_model: str = ""
     compress_fallbacks: str = ""
     compress_timeout_sec: float = 12.0
+    compress_reasoning_effort: str = "none"
 
     embed_provider_name: str = ""
     embed_model: str = "text-embedding-004"
@@ -187,14 +201,6 @@ class Settings(BaseSettings):
     skill_sticker_file_ids: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/bot.db"
 
-    av_enabled: bool = True
-    av_http_timeout_sec: float = 15.0
-    av_max_results: int = 18
-    av_javbus_base_url: str = "https://www.javbus.com"
-    av_madouqu_base_url: str = "https://madouqu.com"
-    av_dmm_base_url: str = "https://www.dmm.co.jp"
-    av_fc2_base_url: str = "https://adult.contents.fc2.com"
-
     doubao_tts_enabled: bool = False
     doubao_tts_http_timeout_sec: float = 20.0
     doubao_tts_max_text_length: int = 500
@@ -219,6 +225,32 @@ class Settings(BaseSettings):
     music_api_base_url: str = "https://music-api.gdstudio.xyz/api.php"
     music_api_default_source: str = "kuwo"
     music_api_stable_sources: str = "kuwo,netease,joox,bilibili"
+
+    sub2api_enabled: bool = False
+    sub2api_base_url: str = ""
+    sub2api_api_key: str = ""
+    sub2api_http_timeout_sec: float = 15.0
+    sub2api_check_timeout_sec: float = 45.0
+
+    av_enabled: bool = True
+    av_http_timeout_sec: float = 15.0
+    av_max_results: int = 18
+    av_javbus_base_url: str = "https://www.javbus.com"
+    av_madouqu_base_url: str = "https://madouqu.com"
+    av_dmm_base_url: str = "https://www.dmm.co.jp"
+    av_fc2_base_url: str = "https://adult.contents.fc2.com"
+
+    # 入群验证：新成员先全员禁言，私聊 bot 获取链接并通过
+    # Cloudflare Turnstile 真人质询后恢复权限。
+    join_verification_enabled: bool = False
+    join_verification_timeout_seconds: int = 600
+    join_verification_check_interval_seconds: float = 30.0
+    join_verification_turnstile_site_key: str = ""
+    join_verification_turnstile_secret_key: str = ""
+    # 验证页面对外可访问的地址（反代/隧道后的 https 地址）。
+    join_verification_public_base_url: str = ""
+    join_verification_listen_host: str = "0.0.0.0"
+    join_verification_listen_port: int = 8480
 
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
@@ -257,6 +289,26 @@ def _load_raw_env(env_file: str = ".env") -> dict[str, str]:
 def _env_truthy(value: str | None) -> bool:
     normalized = (value or "").strip().lower()
     return normalized in {"1", "true", "yes", "on", "y", "t"}
+
+
+_VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high"}
+_REASONING_EFFORT_ALIASES = {
+    "off": "none",
+    "disable": "none",
+    "disabled": "none",
+    "0": "none",
+    "false": "none",
+}
+
+
+def _normalize_reasoning_effort(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if not value:
+        return ""
+    value = _REASONING_EFFORT_ALIASES.get(value, value)
+    if value in _VALID_REASONING_EFFORTS:
+        return value
+    return ""
 
 
 _API_BASE_SUFFIX_RULES: tuple[
@@ -447,12 +499,14 @@ def _build_chat_config(
     retry_backoff_sec: float,
     retry_timeout_multiplier: float,
     fallback_spec: str,
+    reasoning_effort: str = "",
 ) -> ModelConfig:
     if not provider_name:
         raise ValueError("provider name is required")
     if not model_name:
         raise ValueError("model name is required")
 
+    effort = _normalize_reasoning_effort(reasoning_effort)
     profile = _get_profile(profiles, provider_name)
     cfg = ModelConfig(
         model=_build_litellm_model(profile.provider, model_name),
@@ -468,6 +522,7 @@ def _build_chat_config(
         retry_attempts=retry_attempts,
         retry_backoff_sec=retry_backoff_sec,
         retry_timeout_multiplier=retry_timeout_multiplier,
+        reasoning_effort=effort,
         fallbacks=[],
     )
 
@@ -488,6 +543,7 @@ def _build_chat_config(
                 retry_attempts=retry_attempts,
                 retry_backoff_sec=retry_backoff_sec,
                 retry_timeout_multiplier=retry_timeout_multiplier,
+                reasoning_effort=effort,
             )
         )
     return cfg
@@ -558,8 +614,6 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             settings.bot.main_model = ModelConfig(**bot_data["main_model"])
         if "vision_model" in bot_data:
             settings.bot.vision_model = ModelConfig(**bot_data["vision_model"])
-        if "chat_bridge_model" in bot_data:
-            settings.bot.chat_bridge_model = ModelConfig(**bot_data["chat_bridge_model"])
         if "decision_model" in bot_data:
             settings.bot.decision_model = ModelConfig(**bot_data["decision_model"])
         if "moderation_model" in bot_data:
@@ -575,6 +629,12 @@ def load_settings(config_path: str = "config.toml") -> Settings:
 
     if "moderation" in toml_data:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
+    settings.moderation.high_confidence_threshold = min(
+        1.0, max(0.0, float(settings.moderation.high_confidence_threshold))
+    )
+    settings.moderation.challenge_timeout_seconds = max(
+        60, int(settings.moderation.challenge_timeout_seconds)
+    )
 
     settings.bot.token = settings.bot_token
     settings.bot.inbound_debounce_seconds = max(0.0, float(settings.bot_inbound_debounce_seconds))
@@ -594,6 +654,30 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.proactive_quiet_hours_end = min(23, max(0, int(settings.bot_proactive_quiet_hours_end)))
     settings.bot.proactive_retry_minutes = max(5, int(settings.bot_proactive_retry_minutes))
 
+    settings.join_verification_timeout_seconds = max(
+        60, int(settings.join_verification_timeout_seconds)
+    )
+    settings.join_verification_check_interval_seconds = max(
+        5.0, float(settings.join_verification_check_interval_seconds)
+    )
+    settings.join_verification_listen_port = min(
+        65535, max(1, int(settings.join_verification_listen_port))
+    )
+    if settings.join_verification_enabled:
+        missing = [
+            name
+            for name, value in (
+                ("JOIN_VERIFICATION_TURNSTILE_SITE_KEY", settings.join_verification_turnstile_site_key),
+                ("JOIN_VERIFICATION_TURNSTILE_SECRET_KEY", settings.join_verification_turnstile_secret_key),
+                ("JOIN_VERIFICATION_PUBLIC_BASE_URL", settings.join_verification_public_base_url),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                "JOIN_VERIFICATION_ENABLED=true requires " + ", ".join(missing)
+            )
+
     # New provider registry + role binding.
     raw_env = _load_raw_env()
     profiles = _collect_provider_profiles(raw_env)
@@ -611,7 +695,6 @@ def load_settings(config_path: str = "config.toml") -> Settings:
 
     vision_provider_name = (settings.vision_provider_name or main_provider_name).strip().lower()
     decision_provider_name = (settings.decision_provider_name or main_provider_name).strip().lower()
-    chat_bridge_provider_name = (settings.chat_bridge_provider_name or main_provider_name).strip().lower()
     moderation_provider_name = (
         settings.moderation_provider_name or decision_provider_name or main_provider_name
     ).strip().lower()
@@ -619,7 +702,6 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     embed_provider_name = (settings.embed_provider_name or main_provider_name).strip().lower()
 
     vision_model_name = (settings.vision_model or main_model_name).strip()
-    chat_bridge_model_name = (settings.chat_bridge_model or main_model_name).strip()
     decision_model_name = (settings.decision_model or main_model_name).strip()
     moderation_model_name = (settings.moderation_model or decision_model_name).strip()
     compress_model_name = (settings.compress_model or main_model_name).strip()
@@ -636,6 +718,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.main_fallbacks,
+        reasoning_effort=settings.main_reasoning_effort,
     )
     settings.bot.vision_model = _build_chat_config(
         profiles=profiles,
@@ -648,18 +731,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.vision_fallbacks,
-    )
-    settings.bot.chat_bridge_model = _build_chat_config(
-        profiles=profiles,
-        provider_name=chat_bridge_provider_name,
-        model_name=chat_bridge_model_name,
-        temperature=settings.bot.chat_bridge_model.temperature,
-        max_tokens=settings.bot.chat_bridge_model.max_tokens,
-        timeout_sec=max(1.0, float(settings.chat_bridge_timeout_sec)),
-        retry_attempts=max(1, int(settings.llm_retry_attempts)),
-        retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
-        retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
-        fallback_spec=settings.chat_bridge_fallbacks,
+        reasoning_effort=settings.vision_reasoning_effort,
     )
     settings.bot.decision_model = _build_chat_config(
         profiles=profiles,
@@ -672,6 +744,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.decision_fallbacks,
+        reasoning_effort=settings.decision_reasoning_effort,
     )
     settings.bot.moderation_model = _build_chat_config(
         profiles=profiles,
@@ -684,6 +757,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.moderation_fallbacks,
+        reasoning_effort=settings.moderation_reasoning_effort,
     )
     settings.bot.compress_model = _build_chat_config(
         profiles=profiles,
@@ -696,6 +770,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         fallback_spec=settings.compress_fallbacks,
+        reasoning_effort=settings.compress_reasoning_effort,
     )
     settings.bot.embed_model = _build_embed_config(
         profiles=profiles,

@@ -22,19 +22,10 @@ from bot.config import Settings
 from bot.db.models import Group, ModerationRule, ReplyMute
 from bot.db.sqlite_session import is_database_locked_error
 from bot.services import memory_holder
+from bot.services.admin_status import is_user_admin_cached
 from bot.services.at_reply import is_at_reply_enabled
-from bot.services.authz import ensure_group_authorized, is_group_admin_authorized, is_super_admin_user_id
+from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
 from bot.services.casual import CasualService
-from bot.services.chat_bridge import (
-    ChatBridgeService,
-    compose_chat_bridge_message,
-    extract_chat_bridge_target_username,
-    get_chat_bridge_state,
-    is_bot_style_name,
-    normalize_chat_bridge_username,
-    parse_incoming_chat_bridge_message,
-    set_chat_bridge_target,
-)
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import (
     DoubaoTTSService,
@@ -42,19 +33,20 @@ from bot.services.doubao_tts import (
     is_tts_tool_enabled,
     normalize_tts_mode,
 )
-from bot.services.manage_intent import GroupIntent
+from bot.services.speech_style import (
+    SpeechStyleService,
+    build_style_profile_context,
+    get_style_state,
+)
 from bot.services.llm import LLMService
+from bot.services.join_verification import (
+    begin_moderation_challenge,
+    moderation_challenge_ready,
+)
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
-from bot.services.scheduled_tasks import (
-    cancel_scheduled_task,
-    create_scheduled_task,
-    format_due_at_local,
-    format_task_summary,
-    match_scheduled_task_for_cancel,
-    record_group_activity,
-)
+from bot.services.proactive import note_group_activity, record_group_activity
 from bot.services.skills import SkillService
 from bot.services.sticker_library import sticker_library
 from bot.utils.security import format_history_message_line
@@ -64,7 +56,6 @@ from bot.utils.telegram import (
     extract_message_text,
     has_explicit_bot_mention,
     is_bot_mentioned,
-    is_user_admin,
     is_reply_to_bot,
     is_group,
     is_reply_message,
@@ -218,12 +209,6 @@ def _truncate_text(text: str, max_len: int) -> str:
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[:max_len] + "..."
-
-
-def _management_reply_auto_delete_minutes(intent: GroupIntent, settings: Settings) -> int:
-    if intent.intent == "memory_manage" and (intent.memory_action or "").strip().lower() == "add":
-        return 0
-    return settings.bot.auto_delete_minutes
 
 
 def _build_moderation_notice(
@@ -801,6 +786,57 @@ def _normalize_multi_message_delivery_plans(
     return normalized
 
 
+# Kept as a module-level name so tests can patch bot.handlers.group._is_user_admin_cached.
+_is_user_admin_cached = is_user_admin_cached
+
+
+async def _revalidate_pending_sender_admin(item: _PendingReplyItem) -> bool:
+    """Resolve admin authority again when a queued reply is about to run.
+
+    A normal user's enqueue-time flag is only a snapshot.  Anonymous messages
+    sent as the group itself have no user membership to refresh, so retain the
+    group-identity semantics used by the inbound handler.
+    """
+    message = item.message
+    if _uses_sender_chat_identity(message):
+        sender_chat = getattr(message, "sender_chat", None)
+        return bool(sender_chat and int(getattr(sender_chat, "id", 0) or 0) == item.group_id)
+
+    try:
+        return bool(await _is_user_admin_cached(message))
+    except Exception:
+        # Authorization checks must fail closed even if the shared lookup
+        # implementation or Telegram API raises unexpectedly.
+        log.warning(
+            "[%s] pending admin revalidation failed | user=%s",
+            item.group_id,
+            item.user_id,
+            exc_info=True,
+        )
+        return False
+
+
+_MEMORY_COMPACT_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _schedule_memory_compaction(memory: Any, group_id: int) -> None:
+    """Run compaction off the hot path; it only matters before the NEXT prompt build."""
+
+    async def _run() -> None:
+        try:
+            await memory.compact_if_needed(group_id)
+        except Exception:
+            log.exception("[%s] background memory compaction failed", group_id)
+
+    try:
+        task = asyncio.create_task(_run(), name=f"memory-compact:{group_id}")
+    except RuntimeError:
+        return
+    # Keep a strong reference so the loop cannot GC the task mid-flight.
+    _MEMORY_COMPACT_TASKS.add(task)
+    task.add_done_callback(_MEMORY_COMPACT_TASKS.discard)
+
+
 def _is_strong_pending_reply_signal(item: _PendingReplyItem) -> bool:
     return bool(item.mentioned or item.reply_to_bot or item.sender_is_owner)
 
@@ -825,7 +861,7 @@ def _next_pending_reply_flush_at(
         return now
 
     if _is_strong_pending_reply_signal(item):
-        delay_seconds = min(base_delay, 0.8)
+        delay_seconds = min(base_delay, 0.5)
     elif batch_size >= 3:
         delay_seconds = min(base_delay, 0.9)
     elif batch_size == 2:
@@ -919,258 +955,6 @@ async def _resolve_pending_reply_action(
     return action, False
 
 
-def _build_chat_bridge_memory_entry(
-    *,
-    sender_id: int,
-    sender_username: str,
-    display_name: str,
-    text: str,
-) -> str:
-    sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
-    return (
-        f"id:{sender_id} username:{sender_username_tag} "
-        f"is_owner:no is_tg_admin:no trusted_source:none "
-        f"name:{display_name} {text}"
-    )
-
-
-def _chat_bridge_fallback_body(mode: str) -> str:
-    if mode == "start":
-        return "最近群里这个话题你怎么看？"
-    return "你刚才那句展开说说？"
-
-
-async def _generate_chat_bridge_body(
-    *,
-    settings: Settings,
-    group_id: int,
-    peer_username: str,
-    mode: str,
-    current_message: str,
-    message: Message,
-) -> str:
-    memory = memory_holder.get()
-    llm = LLMService(
-        settings.bot.chat_bridge_model,
-        settings.bot.decision_model,
-        settings.bot.compress_model,
-        moderation=settings.bot.moderation_model,
-        vision=settings.bot.vision_model,
-        embed=settings.bot.embed_model,
-        max_context_tokens=settings.bot.max_context_tokens,
-    )
-    bridge = ChatBridgeService(llm, settings=settings)
-    history = await memory.get_history_for_llm(
-        group_id,
-        prompt_payload_builder=lambda candidate_history: bridge.build_prompt_payload(
-            mode=mode,
-            peer_username=peer_username,
-            current_message=current_message,
-            history=candidate_history,
-        ),
-    )
-
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        body = await bridge.reply(
-            mode=mode,
-            peer_username=peer_username,
-            current_message=current_message,
-            history=history,
-        )
-
-    cleaned = sanitize_outgoing_text(body)
-    if cleaned:
-        return cleaned
-    return _chat_bridge_fallback_body(mode)
-
-
-async def _send_chat_bridge_turn(
-    *,
-    settings: Settings,
-    message: Message,
-    group_id: int,
-    peer_username: str,
-    mode: str,
-    current_message: str,
-) -> bool:
-    reply_body = await _generate_chat_bridge_body(
-        settings=settings,
-        group_id=group_id,
-        peer_username=peer_username,
-        mode=mode,
-        current_message=current_message,
-        message=message,
-    )
-    outgoing = compose_chat_bridge_message(peer_username, reply_body)
-    if not outgoing:
-        outgoing = compose_chat_bridge_message(peer_username, _chat_bridge_fallback_body(mode))
-    if not outgoing:
-        return False
-
-    sent_ok = await send_reply(
-        message,
-        outgoing,
-        delivery_mode="message",
-        stream=settings.bot.enable_streaming,
-        stream_chunk_size=settings.bot.stream_chunk_size,
-        stream_interval=settings.bot.stream_edit_interval_sec,
-        auto_delete_minutes=0,
-    )
-    if not sent_ok:
-        return False
-
-    memory = memory_holder.get()
-    await memory.add_message(
-        group_id,
-        "assistant",
-        outgoing,
-        sender_name="bot",
-        message_type="assistant_reply",
-    )
-    await memory.compact_if_needed(group_id)
-    return True
-
-
-async def _maybe_handle_chat_bridge_target_reply(
-    *,
-    message: Message,
-    session: AsyncSession,
-    settings: Settings,
-    group_row: Group,
-    sender_identity: _SenderIdentity,
-    input_text: str,
-    my_username: str,
-) -> bool:
-    state = get_chat_bridge_state(group_row.settings)
-    if not state.waiting_for_target:
-        return False
-    if sender_identity.is_chat:
-        return False
-
-    user = message.from_user
-    if user is None or user.is_bot or not is_super_admin_user_id(user.id, settings):
-        return False
-    if state.pending_admin_id and user.id != state.pending_admin_id:
-        return False
-
-    reply = getattr(message, "reply_to_message", None)
-    prompt_message_id = int(getattr(reply, "message_id", 0) or 0)
-    if state.prompt_message_id and prompt_message_id != state.prompt_message_id:
-        return False
-
-    target_username = extract_chat_bridge_target_username(input_text)
-    if not target_username:
-        await answer_with_auto_delete(
-            message,
-            "<b>/chat 对话设置</b>\n请回复目标 bot 用户名，格式例如：@examplebot",
-            auto_delete_minutes=0,
-        )
-        return True
-
-    if target_username == normalize_chat_bridge_username(my_username):
-        await answer_with_auto_delete(
-            message,
-            "<b>/chat 对话设置</b>\n目标 bot 不能是当前 bot 自己，请换一个用户名。",
-            auto_delete_minutes=0,
-        )
-        return True
-
-    if not is_bot_style_name(target_username):
-        await answer_with_auto_delete(
-            message,
-            "<b>/chat 对话设置</b>\n目标用户名需要明显是 bot 账号，并以 bot 结尾，例如：@examplebot",
-            auto_delete_minutes=0,
-        )
-        return True
-
-    group_row.settings = set_chat_bridge_target(group_row.settings, target_username)
-    await _best_effort_commit(
-        session,
-        group_id=message.chat.id,
-        context="chat_bridge_target_set",
-    )
-
-    sent_ok = await _send_chat_bridge_turn(
-        settings=settings,
-        message=message,
-        group_id=message.chat.id,
-        peer_username=target_username,
-        mode="start",
-        current_message="",
-    )
-    if not sent_ok:
-        await answer_with_auto_delete(
-            message,
-            "<b>/chat 对话设置</b>\n已记录目标 bot，但首条 /chat 消息发送失败，请稍后重试。",
-            auto_delete_minutes=0,
-        )
-    return True
-
-
-async def _maybe_handle_chat_bridge_turn(
-    *,
-    message: Message,
-    settings: Settings,
-    sender_identity: _SenderIdentity,
-    input_text: str,
-    group_row: Group,
-    my_username: str,
-) -> bool:
-    state = get_chat_bridge_state(group_row.settings)
-    incoming = parse_incoming_chat_bridge_message(input_text)
-    if incoming is None or not state.active:
-        return False
-
-    my_username_norm = normalize_chat_bridge_username(my_username)
-    if not my_username_norm or incoming.target_username != my_username_norm:
-        return False
-
-    user = message.from_user
-    sender_username = normalize_chat_bridge_username(sender_identity.username)
-    if user is None or not user.is_bot or not sender_username:
-        return False
-    if sender_username != state.target_username:
-        log.info(
-            "[%s] chat bridge ignored | sender=@%s active_target=@%s",
-            message.chat.id,
-            sender_username or "(none)",
-            state.target_username or "(none)",
-        )
-        return False
-    if not is_bot_style_name(sender_username, sender_identity.display_name, getattr(user, "full_name", "")):
-        return False
-
-    memory = memory_holder.get()
-    await memory.add_message(
-        message.chat.id,
-        "user",
-        _build_chat_bridge_memory_entry(
-            sender_id=sender_identity.actor_id,
-            sender_username=sender_username,
-            display_name=sender_identity.display_name,
-            text=input_text,
-        ),
-        user_id=sender_identity.actor_id,
-        sender_name=sender_identity.display_name,
-        message_type="chat_bridge_inbound",
-        message_id=str(message.message_id),
-        created_at=message.date,
-    )
-    await memory.compact_if_needed(message.chat.id)
-
-    sent_ok = await _send_chat_bridge_turn(
-        settings=settings,
-        message=message,
-        group_id=message.chat.id,
-        peer_username=sender_username,
-        mode="reply",
-        current_message=incoming.body,
-    )
-    if not sent_ok:
-        log.warning("[%s] chat bridge reply send failed | peer=@%s", message.chat.id, sender_username)
-    return True
-
-
 async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings: Settings) -> None:
     if not items:
         return
@@ -1224,6 +1008,11 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                 log.info("[%s] pending batch skipped | reason=mute_all_replies user=%s", group_id, user_id)
                 return
             tts_mode = normalize_tts_mode(group_settings)
+            style_state = get_style_state(group_settings)
+            style_profile_context = build_style_profile_context(
+                str(style_state.get("profile_text") or ""),
+                target_name=str(style_state.get("target_user_name") or ""),
+            )
 
             mute_stmt = select(ReplyMute.id).where(
                 ReplyMute.group_id == group_id,
@@ -1237,6 +1026,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             decision_history = _exclude_batch_messages(memory.get_history(group_id), memory_entries)
             merged_context = _build_recent_group_message_window(items, recent_history=decision_history)
             decision_started = time.perf_counter()
+            # The enqueue-time snapshot is sufficient for reply-routing
+            # semantics, but it must never authorize a later skill execution.
             action, action_forced = await _resolve_pending_reply_action(
                 decision_svc=decision_svc,
                 group_settings=group_settings,
@@ -1297,7 +1088,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         sender_user_id=user_id,
                         sender_username=latest.sender_username,
                         sender_is_owner=latest.sender_is_owner,
-                        sender_is_tg_admin=latest.sender_is_tg_admin,
+                        # This payload is only used for token budgeting. Keep it
+                        # conservative until the execution-time lookup below.
+                        sender_is_tg_admin=False,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
                         tts_mode=tts_mode,
@@ -1306,38 +1099,26 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_targets_context=reply_targets_context,
                         is_mentioned=mentioned,
                         is_reply_to_bot=reply_to_bot,
+                        style_profile_context=style_profile_context,
                     ),
                 )
                 history = _exclude_batch_messages(history, memory_entries)
-                skill_prompt_payload = skill.build_answer_prompt_payload(
-                    merged_input_text,
-                    history=history,
-                    sender_user_id=user_id,
-                    sender_username=latest.sender_username,
-                    sender_is_owner=latest.sender_is_owner,
-                    sender_is_tg_admin=latest.sender_is_tg_admin,
-                    intent_type=action,
-                    allow_tts=is_tts_tool_enabled(tts_mode),
-                    tts_mode=tts_mode,
-                    merged_count=merged_count,
-                    merged_context=merged_context,
-                    reply_targets_context=reply_targets_context,
-                    is_mentioned=mentioned,
-                    is_reply_to_bot=reply_to_bot,
-                )
                 log.info(
-                    "[%s] pending batch reply generation started | action=%s history=%d prompt_tokens=%s",
+                    "[%s] pending batch reply generation started | action=%s history=%d",
                     group_id,
                     action,
                     len(history),
-                    llm.prompt_usage_text(
-                        skill_prompt_payload["messages"],
-                        tools=skill_prompt_payload["tools"],
-                    ),
                 )
 
                 async with typing_action(latest.message, enabled=settings.bot.enable_typing):
                     raw_reply = ""
+                    sender_is_tg_admin = await _revalidate_pending_sender_admin(latest)
+                    if latest.sender_is_tg_admin and not sender_is_tg_admin:
+                        log.info(
+                            "[%s] pending admin authority revoked before skill execution | user=%s",
+                            group_id,
+                            user_id,
+                        )
                     skill_result = await skill.answer_with_skill(
                         merged_input_text,
                         session=session,
@@ -1345,7 +1126,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         sender_user_id=user_id,
                         sender_username=latest.sender_username,
                         sender_is_owner=latest.sender_is_owner,
-                        sender_is_tg_admin=latest.sender_is_tg_admin,
+                        sender_is_tg_admin=sender_is_tg_admin,
                         message=latest.message,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
@@ -1355,6 +1136,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_targets_context=reply_targets_context,
                         is_mentioned=mentioned,
                         is_reply_to_bot=reply_to_bot,
+                        style_profile_context=style_profile_context,
                     )
                     skill_handled = bool(skill_result.handled)
                     sticker_sent_ok = bool(skill_result.sticker_sent)
@@ -1394,13 +1176,14 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             sender_user_id=user_id,
                             sender_username=latest.sender_username,
                             sender_is_owner=latest.sender_is_owner,
-                            sender_is_tg_admin=latest.sender_is_tg_admin,
+                            sender_is_tg_admin=sender_is_tg_admin,
                             intent_type=action,
                             merged_count=merged_count,
                             merged_context=merged_context,
                             reply_targets_context=reply_targets_context,
                             is_mentioned=mentioned,
                             is_reply_to_bot=reply_to_bot,
+                            style_profile_context=style_profile_context,
                         )
                         if raw_reply:
                             reply_source = "casual"
@@ -1485,26 +1268,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         delivery_plans = []
                         reply_source = "none"
                         action = "skip"
-                    if False and silence_reply and action == "casual" and silence_reason == "silent_marker":
-                        should_really_silence = True
-                        if action == "casual" and silence_reason == "silent_marker":
-                            log.warning("[%s] pending batch casual returned silent marker, using fallback", group_id)
-                        reply = "嗯哼，我在听~"
-                        should_really_silence = False
-                        reply_source = "fallback"
-                        if should_really_silence:
-                            preview = _truncate_text(reply, 80) if reply else "-"
-                            log.info(
-                            "[%s] pending batch reply suppressed | reason=%s source=%s intent=%s preview=%s",
-                            group_id,
-                            silence_reason,
-                            reply_source,
-                            action,
-                            preview,
-                            )
-                            reply = ""
-                            reply_source = "none"
-                            action = "skip"
 
             if action != "skip" and reply_specs:
                 auto_reply_specs = [
@@ -1512,8 +1275,13 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                     for reply_spec in reply_specs
                     if reply_spec.delivery_mode == "auto"
                 ]
-                resolved_auto_modes = (
-                    await reply_mode_svc.decide_many(
+                # Obvious case: the user addressed the bot directly, so replies
+                # anchor to their message — no reply-mode LLM round needed.
+                obvious_reply_mode = reply_to_bot or (mentioned and not reply_to_other)
+                if auto_reply_specs and obvious_reply_mode:
+                    resolved_auto_modes = ["reply"] * len(auto_reply_specs)
+                elif auto_reply_specs:
+                    resolved_auto_modes = await reply_mode_svc.decide_many(
                         user_text=merged_input_text,
                         assistant_replies=[reply_spec.text for reply_spec in auto_reply_specs],
                         msg_type=msg_type,
@@ -1523,9 +1291,8 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         merged_count=merged_count,
                         merged_context=merged_context,
                     )
-                    if auto_reply_specs
-                    else []
-                )
+                else:
+                    resolved_auto_modes = []
                 auto_mode_iter = iter(resolved_auto_modes)
 
                 for reply_spec in reply_specs:
@@ -1647,7 +1414,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         stored_reply,
                         message_type="assistant_reply",
                     )
-                await memory.compact_if_needed(group_id)
+                _schedule_memory_compaction(memory, group_id)
             log.info(
                 "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s count=%d len=%d elapsed=%dms",
                 group_id,
@@ -1792,48 +1559,32 @@ async def on_group_message(
     user = message.from_user
     sender_identity = _resolve_sender_identity(message)
     user_id = sender_identity.actor_id
+    # Signal the background proactive task before any DB/API await. The
+    # persisted timestamp is committed immediately below; the in-process
+    # revision closes the shorter pre-commit race during topic generation.
+    note_group_activity(group_id)
     group_row = await _ensure_group_row(session, group_id, message.chat.title or "")
     group_row.settings = record_group_activity(group_row.settings, settings.bot)
+    await _best_effort_commit(
+        session,
+        group_id=group_id,
+        context="group_activity",
+    )
 
     text, msg_type = extract_message_text(message)
     if not text:
         return
     if msg_type in {"video", "video_caption", "video_note"}:
-        log.info("[%s]銆愭祦绋嬨€戝獟浣撴梺璺?| 绫诲瀷=%s", group_id, msg_type)
+        log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
         return
     input_text = text
     flow_started = time.perf_counter()
     group_settings = group_row.settings or {}
     bot_me = await message.bot.me()
-    my_username = normalize_chat_bridge_username(bot_me.username or "")
 
-    if await _maybe_handle_chat_bridge_target_reply(
-        message=message,
-        session=session,
-        settings=settings,
-        group_row=group_row,
-        sender_identity=sender_identity,
-        input_text=input_text,
-        my_username=my_username,
-    ):
-        return
-
+    # Other bots' messages never enter the moderation/reply pipeline.
     raw_bot_sender = bool(message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message))
     if raw_bot_sender:
-        if await _maybe_handle_chat_bridge_turn(
-            message=message,
-            settings=settings,
-            sender_identity=sender_identity,
-            input_text=input_text,
-            group_row=group_row,
-            my_username=my_username,
-        ):
-            await _best_effort_commit(
-                session,
-                group_id=group_id,
-                context="chat_bridge_turn",
-            )
-            return
         return
 
     warn_target = _build_warn_target(
@@ -1846,10 +1597,6 @@ async def on_group_message(
 
     mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 
-    if msg_type in {"video", "video_caption", "video_note"}:
-        log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
-        return
-
     sender_username = sender_identity.username
     display_name = sender_identity.display_name
     sender_is_owner = bool(user and not sender_identity.is_chat and is_super_admin_user_id(user.id, settings))
@@ -1857,7 +1604,7 @@ async def on_group_message(
     sender_is_group_identity = bool(
         sender_identity.is_chat and sender_chat and getattr(sender_chat, "id", None) == group_id
     )
-    sender_is_tg_admin = sender_is_group_identity or await is_user_admin(message)
+    sender_is_tg_admin = sender_is_group_identity or await _is_user_admin_cached(message)
     owner_flag = "yes" if sender_is_owner else "no"
     tg_admin_flag = "yes" if sender_is_tg_admin else "no"
     trusted_source = "tg_admin" if sender_is_tg_admin else "none"
@@ -1878,12 +1625,6 @@ async def on_group_message(
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
-    sticker_pool = [
-        x.strip()
-        for x in (settings.skill_sticker_file_ids or "").split(",")
-        if x and x.strip()
-    ]
-    skill = SkillService(llm, settings=settings, default_sticker_file_ids=sticker_pool)
 
     input_text, vision_text = await _append_image_context(message, llm, input_text, msg_type)
     reply_context = await _build_reply_context_for_llm(message, llm)
@@ -1914,7 +1655,7 @@ async def on_group_message(
     await _best_effort_commit(
         session,
         group_id=group_id,
-        context="group_activity_and_sticker_learning",
+        context="sticker_learning",
     )
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
@@ -1934,12 +1675,21 @@ async def on_group_message(
             if manual_exempt:
                 log.info("[%s] moderation skipped | reason=manual_exempt user=%s", group_id, user_id)
 
+        # On-message profile re-screening moved to
+        # bot.middlewares.profile_screen (outer middleware), so it also covers
+        # matched commands, videos, and empty-text media that never reach this
+        # handler.
+
         if not auto_exempt_moderation and not manual_exempt:
-            violated, reason, rule = await mod.check_rules(session, group_id, input_text)
+            verdict = await mod.evaluate(session, group_id, input_text)
+            violated = verdict.violated
+            reason = verdict.reason
+            rule = verdict.rule
             log.info(
-                "[%s]【流程】审核 | 完成 | 违规=%s | 原因=%s | 耗时=%dms",
+                "[%s]【流程】审核 | 完成 | 违规=%s | 置信度=%.2f | 原因=%s | 耗时=%dms",
                 group_id,
                 violated,
+                verdict.confidence,
                 reason,
                 int((time.perf_counter() - moderation_started) * 1000),
             )
@@ -1947,6 +1697,63 @@ async def on_group_message(
                 action = str(rule.action if rule else "warn").strip().lower()
                 if action not in {"warn", "delete", "ban"}:
                     action = "warn"
+
+                message_deleted = False
+                if not mod.is_high_confidence(verdict):
+                    if moderation_challenge_ready(settings):
+                        try:
+                            await message.delete()
+                            message_deleted = True
+                        except Exception:
+                            log.warning(
+                                "[%s] low-confidence message delete failed | user=%s",
+                                group_id,
+                                user_id,
+                            )
+                        challenged = await begin_moderation_challenge(
+                            bot=message.bot,
+                            session=session,
+                            settings=settings,
+                            group_id=group_id,
+                            user_id=user_id,
+                            display_name=display_name,
+                            bot_username=getattr(bot_me, "username", "") or "",
+                            reason=reason,
+                        )
+                        if challenged:
+                            await mod.record_violation(
+                                session,
+                                group_id,
+                                user_id,
+                                input_text,
+                                "challenge",
+                                rule,
+                            )
+                            log.info(
+                                "[%s]【结束】审核质询 | user=%s | confidence=%.2f | 已删=%s | 总耗时=%dms",
+                                group_id,
+                                user_id,
+                                verdict.confidence,
+                                message_deleted,
+                                int((time.perf_counter() - flow_started) * 1000),
+                            )
+                            return
+                    if not verdict.conclusive:
+                        log.warning(
+                            "[%s] inconclusive moderation confidence; no direct action | user=%s",
+                            group_id,
+                            user_id,
+                        )
+                        return
+                    log.warning(
+                        "[%s] low-confidence challenge unavailable; falling back to rule action | "
+                        "user=%s confidence=%.2f action=%s",
+                        group_id,
+                        user_id,
+                        verdict.confidence,
+                        action,
+                    )
+
                 await mod.record_violation(session, group_id, user_id, input_text, action, rule)
                 if action == "warn":
                     notice = _build_moderation_notice(
@@ -1969,7 +1776,8 @@ async def on_group_message(
 
                 if action == "delete":
                     try:
-                        await message.delete()
+                        if not message_deleted:
+                            await message.delete()
                     except Exception:
                         pass
                     notice = _build_moderation_notice(
@@ -2003,7 +1811,8 @@ async def on_group_message(
                 )
 
                 try:
-                    await message.delete()
+                    if not message_deleted:
+                        await message.delete()
                 except Exception:
                     pass
 
@@ -2074,9 +1883,28 @@ async def on_group_message(
             message_id=str(message.message_id),
             created_at=message.date,
         )
-        await memory.compact_if_needed(group_id)
+        _schedule_memory_compaction(memory, group_id)
     else:
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
+
+    if msg_type == "text" and not sender_identity.is_chat:
+        try:
+            style_service = SpeechStyleService(llm)
+            collected = await style_service.collect_sample(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+                text=text,
+            )
+            if collected:
+                await _best_effort_commit(
+                    session,
+                    group_id=group_id,
+                    context="speech_style_sample",
+                )
+        except Exception:
+            await session.rollback()
+            log.exception("[%s] speech style collection failed", group_id)
 
     explicit_mention = has_explicit_bot_mention(message, bot_me.username or "", bot_me.id)
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)

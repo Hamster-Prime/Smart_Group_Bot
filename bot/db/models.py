@@ -150,6 +150,96 @@ class AuthorizedGroup(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class GlobalBan(Base):
+    """Ban registry; enforced on join and on every message."""
+
+    __tablename__ = "global_bans"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    # manual / join_screening / profile_screening / moderation_challenge_timeout
+    source: Mapped[str] = mapped_column(String(32), default="manual")
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class JoinScreeningExemption(Base):
+    """Users unbanned via /unban: skip name/bio screening afterwards."""
+
+    __tablename__ = "join_screening_exemptions"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class JoinVerification(Base):
+    """Pending Turnstile verification; the user stays fully restricted until
+    they pass the Cloudflare challenge inside the Telegram Mini App.
+
+    kind="join": issued on member join; missing the deadline kicks (the user
+    may rejoin and retry). kind="moderation": issued when a message is judged
+    violating with low confidence; missing the deadline bans permanently.
+
+    No secret token: the Mini App submits Telegram-signed initData, so the
+    verified user identity comes from the signature, keyed by user_id here.
+    """
+
+    __tablename__ = "join_verifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    kind: Mapped[str] = mapped_column(
+        String(32), default="join", server_default="join"
+    )
+    reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    prompt_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (Index("ix_join_verification_group_user", "group_id", "user_id", unique=True),)
+
+
+class UserProfileScreen(Base):
+    """Last screened profile signature per user, for on-message re-screening."""
+
+    __tablename__ = "user_profile_screens"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    profile_hash: Mapped[str] = mapped_column(String(64), default="")
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class SpeechStyleSample(Base):
+    """Raw utterances collected from the persona-mimic target user."""
+
+    __tablename__ = "speech_style_samples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    content: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_style_sample_group_user_id", "group_id", "user_id", "id"),
+    )
+
+
 class MessageVector(Base):
     """Active per-group dialogue history row."""
 
@@ -199,32 +289,3 @@ class StickerLibraryRecord(Base):
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (Index("ix_sticker_group_file", "group_id", "file_id", unique=True),)
-
-
-class ScheduledTaskRecord(Base):
-    __tablename__ = "scheduled_tasks"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    creator_user_id: Mapped[int] = mapped_column(BigInteger, default=0)
-    creator_name: Mapped[str] = mapped_column(String(255), default="")
-    task_type: Mapped[str] = mapped_column(String(32), default="reminder")
-    content: Mapped[str] = mapped_column(Text, default="")
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(32), default="pending")
-    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
-    source: Mapped[str] = mapped_column(String(64), default="natural_language")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_error: Mapped[str] = mapped_column(Text, default="")
-
-    __table_args__ = (
-        Index("ix_scheduled_tasks_group_status_due", "group_id", "status", "due_at"),
-        Index("ix_scheduled_tasks_status_due", "status", "due_at"),
-    )

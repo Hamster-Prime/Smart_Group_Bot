@@ -10,6 +10,7 @@ from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
 )
+from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.prompts import CASUAL_SYSTEM, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
@@ -104,6 +105,7 @@ class CasualService:
         input_limit: int,
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": build_defended_system(with_persona(CASUAL_SYSTEM))},
@@ -130,6 +132,11 @@ class CasualService:
                 ),
             }
         )
+        # Late-position identity block: history may contain stale bot names
+        # (users addressing an old identity); this must win over them.
+        identity_context = build_bot_identity_context()
+        if identity_context:
+            messages.append({"role": "system", "content": identity_context})
         messages.append(
             {
                 "role": "system",
@@ -150,6 +157,8 @@ class CasualService:
                 ),
             }
         )
+        if style_profile_context.strip():
+            messages.append({"role": "system", "content": style_profile_context.strip()})
         messages.append(
             {
                 "role": "system",
@@ -190,6 +199,7 @@ class CasualService:
         reply_targets_context: str = "",
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> dict[str, Any]:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         return {
@@ -207,6 +217,7 @@ class CasualService:
                 input_limit=input_limit,
                 is_mentioned=is_mentioned,
                 is_reply_to_bot=is_reply_to_bot,
+                style_profile_context=style_profile_context,
             )
         }
 
@@ -225,6 +236,7 @@ class CasualService:
         reply_targets_context: str = "",
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        style_profile_context: str = "",
     ) -> str:
         normalized_text, input_limit = self._normalize_input_text(text, merged_count=merged_count)
         if contains_prompt_injection(normalized_text):
@@ -244,6 +256,7 @@ class CasualService:
             input_limit=input_limit,
             is_mentioned=is_mentioned,
             is_reply_to_bot=is_reply_to_bot,
+            style_profile_context=style_profile_context,
         )
 
         log.info("casual request: history=%d merged=%d", len(history) if history else 0, merged_count)

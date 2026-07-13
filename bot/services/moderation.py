@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +16,34 @@ from bot.utils.prompts import MODERATION_SYSTEM
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class ModerationVerdict:
+    """LLM verdict for one message.
+
+    confidence is only meaningful when violated=True. Missing or invalid
+    confidence is treated as inconclusive low confidence, never upgraded into
+    a direct punishment.
+    """
+
+    violated: bool
+    reason: str
+    rule: ModerationRule | None
+    conclusive: bool
+    confidence: float = 0.0
+
+
+def _parse_confidence(value: object) -> tuple[float, bool]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0, False
+    try:
+        confidence = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0, False
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return 0.0, False
+    return confidence, True
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -99,6 +129,14 @@ def _salvage_moderation_fields(payload: str) -> dict | None:
     if rule:
         data["rule"] = rule
 
+    conf_match = re.search(
+        r'"confidence"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(?=[,}]|$)',
+        payload,
+        flags=re.IGNORECASE,
+    )
+    if conf_match:
+        data["confidence"] = float(conf_match.group(1))
+
     # Moderation decision must at least contain violated boolean.
     if "violated" not in data:
         return None
@@ -142,6 +180,23 @@ class ModerationService:
         self, session: AsyncSession, group_id: int, text: str
     ) -> tuple[bool, str, ModerationRule | None]:
         """使用 LLM 基于群规则判定，返回(是否违规, 原因, 命中规则)。"""
+        verdict = await self.evaluate(session, group_id, text)
+        return verdict.violated, verdict.reason, verdict.rule
+
+    async def check_rules_verbose(
+        self, session: AsyncSession, group_id: int, text: str
+    ) -> tuple[bool, str, ModerationRule | None, bool]:
+        """同 check_rules，但额外返回判定是否可信（conclusive）。"""
+        verdict = await self.evaluate(session, group_id, text)
+        return verdict.violated, verdict.reason, verdict.rule, verdict.conclusive
+
+    async def evaluate(
+        self, session: AsyncSession, group_id: int, text: str
+    ) -> ModerationVerdict:
+        """使用 LLM 基于群规则判定，返回带置信度的完整判定。
+
+        审核模型输出不可解析时按不违规处理，但 conclusive=False，
+        调用方不应据此写入"已审查通过"类缓存。"""
         stmt = select(ModerationRule).where(
             ModerationRule.group_id == group_id,
             ModerationRule.enabled == True,
@@ -152,7 +207,7 @@ class ModerationService:
 
         if not rules:
             log.info("审核通过 (无启用规则)")
-            return False, "", None
+            return ModerationVerdict(violated=False, reason="", rule=None, conclusive=True)
 
         rules_payload = [
             {
@@ -182,10 +237,20 @@ class ModerationService:
                 preview_truncated,
                 preview,
             )
-            return False, "", None
+            return ModerationVerdict(violated=False, reason="", rule=None, conclusive=False)
 
-        violated = bool(data.get("violated", data.get("violation", False)))
+        violated_value = data.get("violated", data.get("violation"))
+        if not isinstance(violated_value, bool):
+            log.warning("审核模型 violated 字段无效，按不违规处理")
+            return ModerationVerdict(
+                violated=False,
+                reason="",
+                rule=None,
+                conclusive=False,
+            )
+        violated = violated_value
         reason = clean_text(str(data.get("reason", "")).strip(), max_len=120)
+        confidence, confidence_valid = _parse_confidence(data.get("confidence"))
 
         hit_rule: ModerationRule | None = None
         rid = data.get("rule_id")
@@ -205,15 +270,28 @@ class ModerationService:
             if not reason:
                 reason = "命中群规（AI判定）"
             log.info(
-                "审核命中: group=%s rule_id=%s reason=%s",
+                "审核命中: group=%s rule_id=%s confidence=%.2f reason=%s",
                 group_id,
                 hit_rule.id if hit_rule else None,
+                confidence,
                 reason,
             )
-            return True, reason, hit_rule
+            return ModerationVerdict(
+                violated=True,
+                reason=reason,
+                rule=hit_rule,
+                conclusive=confidence_valid,
+                confidence=confidence,
+            )
 
         log.info("审核通过 (检查了 %d 条规则, AI判定)", len(rules))
-        return False, "", None
+        return ModerationVerdict(violated=False, reason="", rule=None, conclusive=True)
+
+    def is_high_confidence(self, verdict: ModerationVerdict) -> bool:
+        return bool(
+            verdict.conclusive
+            and verdict.confidence >= self.config.high_confidence_threshold
+        )
 
     async def record_violation(
         self,

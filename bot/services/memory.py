@@ -78,12 +78,13 @@ class MemoryService:
                     MessageVector.sender_id,
                     MessageVector.sender_name,
                     MessageVector.message_type,
+                    MessageVector.message_id,
                 ).order_by(
                     MessageVector.group_id.asc(),
                     MessageVector.id.asc(),
                 )
             )
-            for group_id, role, content, created_at, sender_id, sender_name, message_type in message_rows.all():
+            for group_id, role, content, created_at, sender_id, sender_name, message_type, message_id in message_rows.all():
                 text = str(content or "").strip()
                 if not text:
                     continue
@@ -95,6 +96,7 @@ class MemoryService:
                         sender_id=int(sender_id) if sender_id is not None else None,
                         sender_name=str(sender_name or ""),
                         message_type=str(message_type or "text"),
+                        message_id=str(message_id or ""),
                     )
                 )
 
@@ -130,6 +132,7 @@ class MemoryService:
         sender_id: int | None,
         sender_name: str,
         message_type: str,
+        message_id: str = "",
     ) -> dict[str, Any]:
         return {
             "role": (role or "user")[:16],
@@ -138,6 +141,8 @@ class MemoryService:
             "sender_id": sender_id,
             "sender_name": self._default_sender_name(role, sender_name),
             "message_type": (message_type or "text")[:64],
+            # Scoped DB key; lets compaction delete exactly the snapshotted rows.
+            "message_id": str(message_id or ""),
         }
 
     def _working(self, group_id: int) -> list[dict[str, Any]]:
@@ -176,6 +181,7 @@ class MemoryService:
             else now_shanghai_naive()
         )
 
+        scoped_id = self._scoped_message_id(group_id, message_id)
         inserted = await self._persist_message(
             group_id=group_id,
             role=role,
@@ -183,7 +189,7 @@ class MemoryService:
             user_id=user_id,
             sender_name=sender_name,
             message_type=message_type,
-            message_id=message_id,
+            scoped_message_id=scoped_id,
             created_at=normalized_created_at,
         )
         if inserted is not False:
@@ -195,6 +201,7 @@ class MemoryService:
                     sender_id=user_id,
                     sender_name=sender_name,
                     message_type=message_type,
+                    message_id=scoped_id,
                 )
             )
 
@@ -215,10 +222,10 @@ class MemoryService:
         user_id: int | None,
         sender_name: str,
         message_type: str,
-        message_id: str | None,
+        scoped_message_id: str,
         created_at: datetime,
     ) -> bool | None:
-        scoped_id = self._scoped_message_id(group_id, message_id)
+        scoped_id = scoped_message_id
         normalized_role = (role or "user")[:16]
         normalized_sender_name = self._default_sender_name(normalized_role, sender_name)
         normalized_message_type = (message_type or "text")[:64]
@@ -508,9 +515,25 @@ class MemoryService:
             )
         return blocks
 
-    async def _clear_group_history_records(self, group_id: int) -> None:
+    async def _clear_group_history_records(
+        self,
+        group_id: int,
+        *,
+        message_ids: list[str],
+    ) -> None:
+        """Delete only the snapshotted rows: messages that arrived while the
+        compression LLM call was in flight are not in the summary and must
+        survive."""
+        ids = [mid for mid in message_ids if mid]
         async with self._session_factory() as session:
-            await session.execute(delete(MessageVector).where(MessageVector.group_id == group_id))
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                await session.execute(
+                    delete(MessageVector).where(
+                        MessageVector.group_id == group_id,
+                        MessageVector.message_id.in_(chunk),
+                    )
+                )
             await session.commit()
 
     @staticmethod
@@ -586,17 +609,23 @@ class MemoryService:
 
             try:
                 await self._save_summary(group_id, compressed)
-                await self._clear_group_history_records(group_id)
+                await self._clear_group_history_records(
+                    group_id,
+                    message_ids=[str(item.get("message_id") or "") for item in history],
+                )
             except OperationalError as exc:
                 if not is_database_locked_error(exc):
                     raise
                 log.warning("memory compact skipped due sqlite lock: group=%s", group_id)
                 return False
-            self._history[group_id] = []
+            # add_message only appends, so the snapshot is a prefix of the
+            # working list; keep messages that arrived during the LLM await.
+            self._history[group_id] = self._working(group_id)[len(history):]
             log.info(
-                "memory context compacted: group=%s cleared_messages=%d summary_chars=%d",
+                "memory context compacted: group=%s cleared_messages=%d kept_messages=%d summary_chars=%d",
                 group_id,
                 len(history),
+                len(self._history[group_id]),
                 len(compressed),
             )
             return True

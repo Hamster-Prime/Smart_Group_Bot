@@ -88,6 +88,12 @@ class LLMService:
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
+        reasoning_effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+            # Some providers (gemini via litellm, older gateways) reject the
+            # param; drop_params keeps the request usable instead of erroring.
+            kwargs["drop_params"] = True
         resolved_api_base = cls._resolve_request_api_base(
             provider=getattr(cfg, "provider", ""),
             api_base=cfg.api_base,
@@ -120,6 +126,9 @@ class LLMService:
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
+        reasoning_effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
+        if reasoning_effort:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
         resolved_api_base = cls._resolve_request_api_base(
             provider=provider,
             api_base=cfg.api_base,
@@ -166,6 +175,7 @@ class LLMService:
                 retry_attempts=cfg.retry_attempts,
                 retry_backoff_sec=cfg.retry_backoff_sec,
                 retry_timeout_multiplier=cfg.retry_timeout_multiplier,
+                reasoning_effort=getattr(cfg, "reasoning_effort", ""),
             ),
             *cfg.fallbacks,
         ]
@@ -237,15 +247,18 @@ class LLMService:
             return 0
 
     @staticmethod
-    def _merge_stream_piece(existing: str, piece: str) -> str:
+    def _append_stream_piece(existing: str, piece: str) -> str:
+        """Streaming deltas are raw fragments: concatenate verbatim.
+
+        Never apply prefix/suffix dedup heuristics here — they swallow
+        legitimate repeats ("200" + "0" for 2000, repeated URL escapes).
+        Authoritative full texts arrive via *.done events and replace the
+        slot instead of being merged.
+        """
         if not piece:
             return existing
         if not existing:
             return piece
-        if piece.startswith(existing):
-            return piece
-        if existing.endswith(piece):
-            return existing
         return existing + piece
 
     @classmethod
@@ -256,11 +269,31 @@ class LLMService:
         output_index: Any,
         content_index: Any,
         piece: str,
+        replace: bool = False,
     ) -> None:
         if not piece:
             return
         slot = (cls._coerce_int(output_index), cls._coerce_int(content_index))
-        merged[slot] = cls._merge_stream_piece(merged.get(slot, ""), piece)
+        if replace:
+            merged[slot] = piece
+            return
+        merged[slot] = cls._append_stream_piece(merged.get(slot, ""), piece)
+
+    @classmethod
+    def _replace_stream_output_text(
+        cls,
+        merged: dict[tuple[int, int], str],
+        *,
+        output_index: Any,
+        text: str,
+    ) -> None:
+        """output_item.done carries the full joined text of one output item."""
+        if not text:
+            return
+        out_idx = cls._coerce_int(output_index)
+        for slot in [s for s in merged if s[0] == out_idx]:
+            del merged[slot]
+        merged[(out_idx, 0)] = text
 
     @staticmethod
     def _joined_stream_content_slots(merged: dict[tuple[int, int], str]) -> str:
@@ -294,7 +327,20 @@ class LLMService:
         return str(text)
 
     @classmethod
-    def _merge_stream_tool_calls(cls, merged: list[dict[str, Any]], delta_tool_calls: Any) -> None:
+    def _merge_stream_tool_calls(
+        cls,
+        merged: list[dict[str, Any]],
+        delta_tool_calls: Any,
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Accumulate streamed tool calls.
+
+        replace=False: fragments append verbatim (Chat Completions deltas,
+        function_call_arguments.delta). replace=True: the event carries the
+        full authoritative value (output_item.done, arguments.done) and
+        overwrites what the fragments built up.
+        """
         if not delta_tool_calls:
             return
 
@@ -325,21 +371,37 @@ class LLMService:
             raw_function = cls._get_value(raw_call, "function", {}) or {}
             function = entry.setdefault("function", {"name": "", "arguments": ""})
 
-            name_piece = str(cls._get_value(raw_function, "name", "") or "")
+            # Responses-API items carry name/arguments at the top level;
+            # Chat-Completions deltas nest them under "function".
+            name_piece = str(
+                cls._get_value(raw_function, "name", "")
+                or cls._get_value(raw_call, "name", "")
+                or ""
+            )
             if name_piece:
-                function["name"] = cls._merge_stream_piece(str(function.get("name", "") or ""), name_piece)
+                if replace:
+                    function["name"] = name_piece
+                else:
+                    function["name"] = cls._append_stream_piece(
+                        str(function.get("name", "") or ""), name_piece
+                    )
 
-            args_piece = cls._get_value(raw_function, "arguments", "")
+            args_piece = cls._get_value(raw_function, "arguments", None)
+            if args_piece in (None, ""):
+                args_piece = cls._get_value(raw_call, "arguments", "")
             if args_piece is None:
                 args_piece = ""
             if isinstance(args_piece, dict):
                 args_piece = json.dumps(args_piece, ensure_ascii=False)
             args_piece = str(args_piece)
             if args_piece:
-                function["arguments"] = cls._merge_stream_piece(
-                    str(function.get("arguments", "") or ""),
-                    args_piece,
-                )
+                if replace:
+                    function["arguments"] = args_piece
+                else:
+                    function["arguments"] = cls._append_stream_piece(
+                        str(function.get("arguments", "") or ""),
+                        args_piece,
+                    )
 
     @classmethod
     def _coerce_usage(cls, usage: Any) -> SimpleNamespace | None:
@@ -561,6 +623,7 @@ class LLMService:
                         output_index=self._get_value(chunk, "output_index", 0),
                         content_index=self._get_value(chunk, "content_index", 0),
                         piece=str(self._get_value(chunk, "text", "") or ""),
+                        replace=True,
                     )
                     continue
 
@@ -570,6 +633,7 @@ class LLMService:
                         output_index=self._get_value(chunk, "output_index", 0),
                         content_index=self._get_value(chunk, "content_index", 0),
                         piece=str(self._get_value(chunk, "refusal", "") or ""),
+                        replace=True,
                     )
                     continue
 
@@ -581,6 +645,7 @@ class LLMService:
                             output_index=self._get_value(chunk, "output_index", 0),
                             content_index=self._get_value(chunk, "content_index", 0),
                             piece=text_piece,
+                            replace=True,
                         )
                     continue
 
@@ -607,15 +672,28 @@ class LLMService:
                     output_item = self._get_value(chunk, "item", None)
                     item_type = self._string_value(self._get_value(output_item, "type", "") or "").strip().lower()
                     if item_type == "function_call":
-                        self._merge_stream_tool_calls(tool_calls, [output_item])
+                        self._merge_stream_tool_calls(
+                            tool_calls,
+                            [
+                                {
+                                    "index": self._get_value(chunk, "output_index", 0),
+                                    "id": self._get_value(output_item, "call_id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": self._get_value(output_item, "name", ""),
+                                        "arguments": self._get_value(output_item, "arguments", ""),
+                                    },
+                                }
+                            ],
+                            replace=True,
+                        )
                     else:
                         text_piece = self._responses_text_piece(self._get_value(output_item, "content", None))
                         if text_piece:
-                            self._merge_stream_content_slot(
+                            self._replace_stream_output_text(
                                 content_parts,
                                 output_index=self._get_value(chunk, "output_index", 0),
-                                content_index=0,
-                                piece=text_piece,
+                                text=text_piece,
                             )
                     continue
 
@@ -646,6 +724,7 @@ class LLMService:
                                 },
                             }
                         ],
+                        replace=True,
                     )
                     continue
 
@@ -720,6 +799,7 @@ class LLMService:
                         output_index=self._get_value(chunk, "output_index", 0),
                         content_index=self._get_value(chunk, "content_index", 0),
                         piece=str(self._get_value(chunk, "text", "") or ""),
+                        replace=True,
                     )
                     continue
 
@@ -729,6 +809,7 @@ class LLMService:
                         output_index=self._get_value(chunk, "output_index", 0),
                         content_index=self._get_value(chunk, "content_index", 0),
                         piece=str(self._get_value(chunk, "refusal", "") or ""),
+                        replace=True,
                     )
                     continue
 
@@ -740,6 +821,7 @@ class LLMService:
                             output_index=self._get_value(chunk, "output_index", 0),
                             content_index=self._get_value(chunk, "content_index", 0),
                             piece=text_piece,
+                            replace=True,
                         )
                     continue
 
@@ -766,15 +848,28 @@ class LLMService:
                     output_item = self._get_value(chunk, "item", None)
                     item_type = self._string_value(self._get_value(output_item, "type", "") or "").strip().lower()
                     if item_type == "function_call":
-                        self._merge_stream_tool_calls(tool_calls, [output_item])
+                        self._merge_stream_tool_calls(
+                            tool_calls,
+                            [
+                                {
+                                    "index": self._get_value(chunk, "output_index", 0),
+                                    "id": self._get_value(output_item, "call_id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": self._get_value(output_item, "name", ""),
+                                        "arguments": self._get_value(output_item, "arguments", ""),
+                                    },
+                                }
+                            ],
+                            replace=True,
+                        )
                     else:
                         text_piece = self._responses_text_piece(self._get_value(output_item, "content", None))
                         if text_piece:
-                            self._merge_stream_content_slot(
+                            self._replace_stream_output_text(
                                 content_parts,
                                 output_index=self._get_value(chunk, "output_index", 0),
-                                content_index=0,
-                                piece=text_piece,
+                                text=text_piece,
                             )
                     continue
 
@@ -805,6 +900,7 @@ class LLMService:
                                 },
                             }
                         ],
+                        replace=True,
                     )
                     continue
 

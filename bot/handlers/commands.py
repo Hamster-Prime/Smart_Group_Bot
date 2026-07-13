@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import html
 import logging
@@ -37,11 +37,7 @@ from bot.services.av_search import (
     AVSearchService,
     is_av_code_query,
 )
-from bot.services.scheduled_tasks import (
-    cancel_scheduled_task,
-    format_task_summary,
-    list_group_scheduled_tasks,
-)
+from bot.services.join_verification import maybe_send_private_verification
 from bot.services.llm import LLMService
 from bot.services.skills import SkillService
 from bot.utils.command_catalog import build_help_text
@@ -201,45 +197,6 @@ def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, Inl
         nav_row.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"lml:{page - 1}"))
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"lml:{page + 1}"))
-    if nav_row:
-        keyboard_rows.append(nav_row)
-    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-
-def _build_task_list_page(rows: list[object], *, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    total = len(rows)
-    total_pages = max(1, (total + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
-    page = min(max(page, 0), total_pages - 1)
-    start = page * _LIST_PAGE_SIZE
-    end = min(start + _LIST_PAGE_SIZE, total)
-
-    if not rows:
-        return "<b>定时任务列表</b>\n当前没有待执行任务。", None
-
-    lines = [
-        "<b>定时任务列表</b>",
-        f"共 {total} 条 | 页码: {page + 1}/{total_pages}",
-        "普通成员只能删除自己创建的任务，管理员可删除全部。",
-        "",
-    ]
-    keyboard_rows: list[list[InlineKeyboardButton]] = []
-    for row in rows[start:end]:
-        lines.append(format_task_summary(row))
-        lines.append("")
-        keyboard_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"🗑 删除任务 #{row.id}",
-                    callback_data=f"tsd:{row.id}:{page}",
-                )
-            ]
-        )
-
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"tsl:{page - 1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"tsl:{page + 1}"))
     if nav_row:
         keyboard_rows.append(nav_row)
     return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
@@ -716,11 +673,17 @@ async def _send_av_detail(
     return False
 
 
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
-    await _answer(message, settings, 
+    # New members arrive here via the group prompt's deep link; hand out the
+    # one-time Turnstile challenge link instead of the generic welcome.
+    if message.chat and message.chat.type == "private":
+        if await maybe_send_private_verification(message, session, settings):
+            return
+    await _answer(message, settings,
         "<b>智能群管机器人</b>\n"
         "欢迎使用。\n\n"
         "<b>核心功能</b>\n"
@@ -828,130 +791,6 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
     await _answer(message, settings, result.summary, auto_delete_minutes=0)
 
 
-@router.message(Command("task"))
-async def cmd_task(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>定时任务</b>\n请在群内使用 /task。", auto_delete_minutes=0)
-        return
-
-    args = (message.text or "").partition(" ")[2].strip()
-    if not args:
-        await _answer(
-            message,
-            settings,
-            "<b>/task 用法</b>\n"
-            "/task 今晚9点提醒我吃饭\n"
-            "/task 明天下午3点帮我查今天的科技新闻并概述\n"
-            "/task list\n\n"
-            "删除请使用 /tasks 或 /canceltask &lt;任务ID&gt;。",
-            auto_delete_minutes=0,
-        )
-        return
-    if args.lower() in {"list", "ls"}:
-        await cmd_tasks(message, session=session, settings=settings)
-        return
-
-    user_id = int(getattr(message.from_user, "id", 0) or 0)
-    sender_username = (getattr(message.from_user, "username", "") or "").strip()
-    skill = _build_skill_service(settings)
-    async with typing_action(message, enabled=settings.bot.enable_typing):
-        result = await skill.run_skill(
-            "task_manage",
-            {"request_text": args},
-            session=session,
-            sender_user_id=user_id,
-            sender_username=sender_username,
-            sender_is_owner=bool(user_id and is_super_admin_user_id(user_id, settings)),
-            sender_is_tg_admin=bool(
-                user_id and await is_group_admin_authorized(session, message.chat.id, user_id)
-            ),
-            message=message,
-            chat_id=message.chat.id,
-            current_user_text=args,
-        )
-    await _answer(message, settings, result.summary, auto_delete_minutes=0)
-
-
-@router.message(Command("tasks"))
-async def cmd_tasks(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>定时任务列表</b>\n请在群内使用 /tasks。", auto_delete_minutes=0)
-        return
-
-    rows = await list_group_scheduled_tasks(session, group_id=message.chat.id, limit=200)
-    text, keyboard = _build_task_list_page(rows, page=0)
-    await _answer(
-        message,
-        settings,
-        text,
-        auto_delete_minutes=0,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
-
-
-@router.message(Command("canceltask"))
-async def cmd_canceltask(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(
-            message,
-            settings,
-            "<b>取消定时任务</b>\n请在群内使用 /canceltask &lt;任务ID&gt;。",
-            auto_delete_minutes=0,
-        )
-        return
-
-    args = (message.text or "").partition(" ")[2].strip()
-    try:
-        task_id = int(args)
-    except (TypeError, ValueError):
-        await _answer(
-            message,
-            settings,
-            "<b>取消定时任务</b>\n用法：/canceltask &lt;任务ID&gt;",
-            auto_delete_minutes=0,
-        )
-        return
-
-    user_id = message.from_user.id if message.from_user else 0
-    allow_any = False
-    if user_id and is_super_admin_user_id(user_id, settings):
-        allow_any = True
-    elif user_id:
-        allow_any = await is_group_admin_authorized(session, message.chat.id, user_id)
-
-    row = await cancel_scheduled_task(
-        session,
-        group_id=message.chat.id,
-        task_id=task_id,
-        operator_user_id=user_id,
-        allow_any=allow_any,
-    )
-    if row is None:
-        await _answer(
-            message,
-            settings,
-            "<b>取消定时任务</b>\n未找到可取消的任务，或你没有权限取消该任务。",
-            auto_delete_minutes=0,
-        )
-        return
-
-    await _answer(
-        message,
-        settings,
-        "<b>定时任务已取消</b>\n"
-        f"<b>ID</b>: #{row.id}\n"
-        f"<b>内容</b>: {html.escape(row.content or '-')}",
-        auto_delete_minutes=0,
-    )
-
-
 @router.callback_query(F.data.startswith("lml:"))
 async def on_memory_list_paging(
     callback: CallbackQuery,
@@ -1039,114 +878,6 @@ async def on_memory_delete(
     await callback.answer(f"已删除记忆 #{memory_id}")
 
 
-@router.callback_query(F.data.startswith("tsl:"))
-async def on_task_list_paging(
-    callback: CallbackQuery,
-    settings: Settings,
-    session: AsyncSession | None = None,
-) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
-    if session is None:
-        await callback.answer("会话未就绪，请重新 /tasks", show_alert=True)
-        return
-
-    msg = callback.message
-    if not msg or not msg.chat:
-        await callback.answer("消息已失效", show_alert=True)
-        return
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer("当前群组未授权", show_alert=True)
-        return
-
-    page = _parse_int(callback.data.split(":")[1], default=0)
-    rows = await list_group_scheduled_tasks(session, group_id=msg.chat.id, limit=200)
-    text, keyboard = _build_task_list_page(rows, page=page)
-    try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            await callback.answer("列表刷新失败，请重试 /tasks", show_alert=True)
-            return
-    except Exception:
-        await callback.answer("列表刷新失败，请重试 /tasks", show_alert=True)
-        return
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("tsd:"))
-async def on_task_delete(
-    callback: CallbackQuery,
-    settings: Settings,
-    session: AsyncSession | None = None,
-) -> None:
-    if not callback.data:
-        await callback.answer()
-        return
-    if session is None:
-        await callback.answer("会话未就绪，请重新 /tasks", show_alert=True)
-        return
-
-    msg = callback.message
-    if not msg or not msg.chat:
-        await callback.answer("消息已失效", show_alert=True)
-        return
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer("当前群组未授权", show_alert=True)
-        return
-
-    user = callback.from_user
-    if not user:
-        await callback.answer("无法识别操作者", show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("参数错误", show_alert=True)
-        return
-    task_id = _parse_int(parts[1], default=0)
-    page_hint = _parse_int(parts[2], default=0)
-    if task_id <= 0:
-        await callback.answer("参数错误", show_alert=True)
-        return
-
-    allow_any = False
-    if is_super_admin_user_id(user.id, settings):
-        allow_any = True
-    elif await is_group_admin_authorized(session, msg.chat.id, user.id):
-        allow_any = True
-
-    row = await cancel_scheduled_task(
-        session,
-        group_id=msg.chat.id,
-        task_id=task_id,
-        operator_user_id=user.id,
-        allow_any=allow_any,
-    )
-    if row is None:
-        await callback.answer("任务不存在、已删除，或你没有权限删除它", show_alert=True)
-        return
-    await session.commit()
-
-    rows = await list_group_scheduled_tasks(session, group_id=msg.chat.id, limit=200)
-    if not rows:
-        await msg.edit_text("<b>定时任务列表</b>\n当前没有待执行任务。", reply_markup=None)
-        await callback.answer(f"已删除任务 #{task_id}")
-        return
-
-    total_pages = max(1, (len(rows) + _LIST_PAGE_SIZE - 1) // _LIST_PAGE_SIZE)
-    page = min(max(page_hint, 0), total_pages - 1)
-    text, keyboard = _build_task_list_page(rows, page=page)
-    try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
-    except Exception:
-        await callback.answer("删除成功，但列表刷新失败，请重试 /tasks", show_alert=True)
-        return
-    await callback.answer(f"已删除任务 #{task_id}")
-
-
-@router.message(Command("av"))
 async def cmd_av(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
@@ -1478,5 +1209,3 @@ async def on_av_seed_paging(
         await callback.answer("更新失败，请重新 /av", show_alert=True)
         return
     await callback.answer()
-
-

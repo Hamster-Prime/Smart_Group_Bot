@@ -82,14 +82,13 @@ def build_bot_runtime_profile_context(
     skill_labels = {
         "memory_manage": "永久记忆查看、添加与修改",
         "rule_manage": "群规查看与新增",
-        "task_manage": "定时任务创建与查看",
-        "scheduled_task": "定时任务创建与取消",
         "send_sticker": "按语义发送贴纸",
         "music_search": "音乐搜索、歌曲发送、播放链接、封面与歌词",
         "websearch": "联网搜索实时信息",
         "webfetch": "抓取网页正文",
         "bilibili_search": "B站搜索、视频详情、热门与排行榜",
         "weibo_search": "微博热搜、搜索与链接内容提取",
+        "sub2api_query": "本站模型网关查询：可用模型列表与指定模型测活（问模型能不能用时优先用它，不要联网搜索）",
         "doubao_tts": "文字转语音",
     }
 
@@ -130,7 +129,6 @@ def build_bot_runtime_profile_context(
         settings_attr="embed_model",
         llm_attr="embed_config",
     )
-    chat_bridge_cfg = getattr(getattr(settings, "bot", None), "chat_bridge_model", None)
     vision_same_as_main = _same_model_family(vision_cfg, main_cfg)
 
     for name in normalized_skills:
@@ -146,8 +144,8 @@ def build_bot_runtime_profile_context(
         f"registered_skills: {', '.join(normalized_skills) if normalized_skills else '(none)'}",
         f"user_visible_capabilities: {'；'.join(capabilities)}",
         (
-            "runtime_logic: 先做安全边界和内容审核；管理员和成员的语义管理请求会优先交给主回复模型调管理技能；"
-            "永久记忆/群规/定时任务的删除统一走 /lm、/rules、/tasks 等命令页内联按钮；"
+            "runtime_logic: 先做安全边界和内容审核；管理员的语义管理请求会优先交给主回复模型调管理技能；"
+            "永久记忆/群规的删除统一走 /lm、/rules 命令页内联按钮；"
             "普通对话会写入记忆并在需要时压缩；决策模型先判断是否回复；"
             "需要外部能力时调用技能；否则由主回复模型生成自然回复。"
         ),
@@ -165,9 +163,6 @@ def build_bot_runtime_profile_context(
         f"embed_model: {getattr(embed_cfg, 'model', '(unknown)')}",
         f"embed_fallbacks: {_format_fallback_models(embed_cfg)}",
     ]
-    if chat_bridge_cfg is not None:
-        lines.append(f"chat_bridge_model: {getattr(chat_bridge_cfg, 'model', '(unknown)')}")
-        lines.append(f"chat_bridge_fallbacks: {_format_fallback_models(chat_bridge_cfg)}")
     if "doubao_tts" in normalized_skills:
         tts_model = str(getattr(settings, "doubao_tts_model", "") or "").strip() or "(provider default)"
         lines.append(f"tts_model: {tts_model}")
