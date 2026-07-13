@@ -158,7 +158,22 @@ async def main() -> None:
         session_factory=session_factory,
         runtime_config=runtime_config,
     )
-    await verify_web.start()
+    try:
+        await verify_web.start()
+    except Exception:
+        proactive_runner.cancel()
+        verification_runner.cancel()
+        await asyncio.gather(
+            proactive_runner,
+            verification_runner,
+            return_exceptions=True,
+        )
+        try:
+            await bot.session.close()
+        except Exception:
+            log.exception("Bot HTTP session cleanup failed after Mini App startup error")
+        await engine.dispose()
+        raise
     verification_issues = {
         "turnstile": turnstile_key_configuration_issue(
             settings.join_verification_turnstile_site_key,
