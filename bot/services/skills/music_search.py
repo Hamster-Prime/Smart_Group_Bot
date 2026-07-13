@@ -532,7 +532,7 @@ class MusicSearchSkill:
         performer: str,
         caption_text: str,
         delivery_mode: str,
-        auto_delete_minutes: int,
+        auto_delete_seconds: int,
     ) -> bool:
         send_as_reply = delivery_mode == "reply"
         attempt = 0
@@ -549,7 +549,7 @@ class MusicSearchSkill:
                     sent = await message.reply_audio(**kwargs)
                 else:
                     sent = await message.answer_audio(**kwargs)
-                schedule_message_auto_delete(sent, auto_delete_minutes)
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -578,7 +578,7 @@ class MusicSearchSkill:
         reply_to_message_id: int | None = None,
         fallback_mention_user_id: int = 0,
         fallback_mention_name: str = "",
-        auto_delete_minutes: int = 0,
+        auto_delete_seconds: int = 0,
     ) -> bool:
         attempt = 0
         current_reply_to = reply_to_message_id
@@ -600,7 +600,7 @@ class MusicSearchSkill:
                     caption=current_caption or None,
                     parse_mode=current_parse_mode,
                 )
-                schedule_message_auto_delete(sent, auto_delete_minutes)
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -651,6 +651,9 @@ class MusicSearchSkill:
         performer = clean_text(str(target.get("performer", "")), max_len=200)
         caption_text = self._resolve_send_audio_caption(arguments, title=title, performer=performer)
         audio_url = clean_text(str(url_payload.get("url", "")), max_len=2000)
+        auto_delete_seconds = int(
+            getattr(context, "auto_delete_media_seconds", 0) or 0
+        )
 
         ok = False
         if context.message is not None:
@@ -661,7 +664,7 @@ class MusicSearchSkill:
                 performer=performer,
                 caption_text=caption_text,
                 delivery_mode=delivery_mode,
-                auto_delete_minutes=0,
+                auto_delete_seconds=auto_delete_seconds,
             )
         elif context.bot is not None and int(context.chat_id or 0):
             ok = await self._send_audio_to_chat(
@@ -671,7 +674,7 @@ class MusicSearchSkill:
                 title=title,
                 performer=performer,
                 caption_text=caption_text,
-                auto_delete_minutes=0,
+                auto_delete_seconds=auto_delete_seconds,
             )
 
         if not ok:

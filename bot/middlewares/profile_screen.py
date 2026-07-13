@@ -25,7 +25,7 @@ from bot.services.join_screening import (
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
-from bot.utils.telegram import answer_with_auto_delete
+from bot.utils.telegram import answer_with_auto_delete, configured_auto_delete_seconds
 
 log = logging.getLogger(__name__)
 
@@ -260,7 +260,9 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             await answer_with_auto_delete(
                 event,
                 notice,
-                auto_delete_minutes=settings.bot.auto_delete_minutes,
+                auto_delete_seconds=configured_auto_delete_seconds(
+                    settings, "moderation"
+                ),
             )
         except Exception:
             log.exception("[%s] profile screening notice failed", chat.id)

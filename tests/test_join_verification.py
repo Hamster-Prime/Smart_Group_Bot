@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 from bot.db.engine import init_db
+from bot.db.models import Group
 from bot.services.join_screening import add_global_ban, get_global_ban
 from bot.services.join_verification import (
     JoinVerificationSweeper,
@@ -17,14 +18,20 @@ from bot.services.join_verification import (
     build_private_challenge_keyboard,
     build_private_deep_link,
     claim_join_verification,
+    clear_turnstile_configuration_unavailable,
     delete_join_verification,
     get_join_verification,
     get_pending_verification_for_user,
     join_verification_ready,
+    join_verification_policy,
     list_expired_verifications,
     maybe_send_private_verification,
     moderation_challenge_ready,
+    mark_turnstile_configuration_unavailable,
+    parse_private_verify_group_id,
     upsert_join_verification,
+    verification_keys_for_provider,
+    verification_service_ready,
 )
 from bot.utils.timezone import now_shanghai_naive
 
@@ -86,9 +93,58 @@ class HelperTests(unittest.TestCase):
         settings.moderation.enabled = False
         self.assertFalse(moderation_challenge_ready(settings))
 
+    def test_group_join_verification_overrides_global_defaults(self) -> None:
+        settings = _settings(join_verification_enabled=False)
+        settings.join_verification_hcaptcha_site_key = "h-site"
+        settings.join_verification_hcaptcha_secret_key = "h-secret"
+
+        group_settings = {
+            "join_verification_enabled": True,
+            "join_verification_provider": "hcaptcha",
+        }
+        self.assertEqual(
+            join_verification_policy(settings, group_settings),
+            (True, "hcaptcha"),
+        )
+        self.assertTrue(join_verification_ready(settings, group_settings))
+        self.assertEqual(
+            verification_keys_for_provider(settings, "hcaptcha"),
+            ("h-site", "h-secret"),
+        )
+
+        settings.join_verification_enabled = True
+        self.assertFalse(
+            join_verification_ready(
+                settings,
+                {"join_verification_enabled": False},
+            )
+        )
+
+    def test_provider_runtime_blocks_are_isolated(self) -> None:
+        settings = _settings()
+        settings.join_verification_hcaptcha_site_key = "h-site"
+        settings.join_verification_hcaptcha_secret_key = "h-secret"
+        mark_turnstile_configuration_unavailable(
+            settings,
+            provider="hcaptcha",
+            reason="invalid hCaptcha secret",
+        )
+        try:
+            self.assertTrue(verification_service_ready(settings, "turnstile"))
+            self.assertFalse(verification_service_ready(settings, "hcaptcha"))
+        finally:
+            clear_turnstile_configuration_unavailable(
+                settings,
+                provider="hcaptcha",
+            )
+
     def test_mini_app_url_strips_trailing_slash(self) -> None:
         settings = _settings(join_verification_public_base_url="https://verify.example.com/")
         self.assertEqual(build_mini_app_url(settings), "https://verify.example.com/verify")
+        self.assertEqual(
+            build_mini_app_url(settings, "hcaptcha"),
+            "https://verify.example.com/verify?provider=hcaptcha",
+        )
 
     def test_deep_link_and_group_keyboard(self) -> None:
         self.assertEqual(
@@ -99,6 +155,14 @@ class HelperTests(unittest.TestCase):
         button = keyboard.inline_keyboard[0][0]
         self.assertEqual(button.url, "https://t.me/my_bot?start=verify")
         self.assertIsNone(getattr(button, "web_app", None))
+        scoped = build_group_prompt_keyboard("my_bot", -100123)
+        self.assertEqual(
+            scoped.inline_keyboard[0][0].url,
+            "https://t.me/my_bot?start=verify_n100123",
+        )
+        self.assertEqual(parse_private_verify_group_id("verify_n100123"), -100123)
+        self.assertEqual(parse_private_verify_group_id("verify_p42"), 42)
+        self.assertIsNone(parse_private_verify_group_id("verify_bad"))
 
     def test_private_keyboard_uses_web_app_button(self) -> None:
         keyboard = build_private_challenge_keyboard(_settings())
@@ -118,12 +182,14 @@ class VerificationStoreTests(_DbTestCase):
                 deadline_at=now_shanghai_naive() + timedelta(minutes=5),
                 display_name="新人",
                 prompt_message_id=42,
+                provider="hcaptcha",
             )
             await session.commit()
 
             row = await get_join_verification(session, -100, 1)
             self.assertEqual(row.display_name, "新人")
             self.assertEqual(row.prompt_message_id, 42)
+            self.assertEqual(row.provider, "hcaptcha")
 
             self.assertTrue(await delete_join_verification(session, -100, 1))
             await session.commit()
@@ -366,6 +432,50 @@ class JoinTriggersVerificationTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 911))
 
+    async def test_group_can_disable_verification_when_global_default_is_on(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                Group(
+                    id=-100,
+                    title="No Verification",
+                    settings={"join_verification_enabled": False},
+                )
+            )
+            await session.commit()
+
+        event = _join_event(user_id=919)
+        await self._run_join(event, _settings())
+
+        event.bot.restrict_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 919))
+
+    async def test_group_can_enable_hcaptcha_when_global_default_is_off(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                Group(
+                    id=-100,
+                    title="hCaptcha Group",
+                    settings={
+                        "join_verification_enabled": True,
+                        "join_verification_provider": "hcaptcha",
+                    },
+                )
+            )
+            await session.commit()
+
+        settings = _settings(join_verification_enabled=False)
+        settings.join_verification_hcaptcha_site_key = "h-site"
+        settings.join_verification_hcaptcha_secret_key = "h-secret"
+        event = _join_event(user_id=925)
+        await self._run_join(event, settings)
+
+        event.bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 925)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.provider, "hcaptcha")
+
     async def test_missing_turnstile_config_skips_verification(self) -> None:
         event = _join_event(user_id=912)
         await self._run_join(event, _settings(join_verification_turnstile_secret_key=""))
@@ -487,7 +597,7 @@ class ModerationChallengeTests(_DbTestCase):
         self.assertIn("疑似发布广告", prompt_call.args[1])
         self.assertEqual(prompt_call.kwargs["parse_mode"], "HTML")
         button = prompt_call.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.url, "https://t.me/my_bot?start=verify")
+        self.assertEqual(button.url, "https://t.me/my_bot?start=verify_n100")
 
 
 class PrivateStartTests(_DbTestCase):
@@ -507,6 +617,7 @@ class PrivateStartTests(_DbTestCase):
                 deadline_at=now_shanghai_naive() + timedelta(minutes=5),
             )
             await session.commit()
+            record = await get_join_verification(session, -100, 920)
 
             message = self._private_message(920)
             handled = await maybe_send_private_verification(message, session, _settings())
@@ -518,7 +629,10 @@ class PrivateStartTests(_DbTestCase):
             self.assertNotIn("消息审查真人验证", text)
             markup = message.answer.await_args.kwargs.get("reply_markup")
             button = markup.inline_keyboard[0][0]
-            self.assertEqual(button.web_app.url, "https://verify.example.com/verify")
+            self.assertEqual(
+                button.web_app.url,
+                f"https://verify.example.com/verify?verification_id={record.id}",
+            )
             self.assertIsNone(getattr(button, "url", None))
 
     async def test_moderation_record_gets_moderation_private_copy(self) -> None:
@@ -546,6 +660,65 @@ class PrivateStartTests(_DbTestCase):
             self.assertIn("疑似广告 &lt;链接&gt;", text)
             self.assertIn("超时将被封禁", text)
             self.assertNotIn("超时将被移出群聊", text)
+
+    async def test_group_scoped_start_selects_exact_pending_record(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=926,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=4),
+                provider="turnstile",
+            )
+            await upsert_join_verification(
+                session,
+                group_id=-200,
+                user_id=926,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                provider="hcaptcha",
+            )
+            await session.commit()
+            turnstile_record = await get_join_verification(session, -100, 926)
+            hcaptcha_record = await get_join_verification(session, -200, 926)
+
+            settings = _settings()
+            settings.join_verification_hcaptcha_site_key = "h-site"
+            settings.join_verification_hcaptcha_secret_key = "h-secret"
+
+            turnstile_message = self._private_message(926)
+            self.assertTrue(
+                await maybe_send_private_verification(
+                    turnstile_message,
+                    session,
+                    settings,
+                    group_id=-100,
+                )
+            )
+            turnstile_url = turnstile_message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0].web_app.url
+            self.assertEqual(
+                turnstile_url,
+                f"https://verify.example.com/verify?verification_id={turnstile_record.id}",
+            )
+
+            hcaptcha_message = self._private_message(926)
+            self.assertTrue(
+                await maybe_send_private_verification(
+                    hcaptcha_message,
+                    session,
+                    settings,
+                    group_id=-200,
+                )
+            )
+            hcaptcha_url = hcaptcha_message.answer.await_args.kwargs[
+                "reply_markup"
+            ].inline_keyboard[0][0].web_app.url
+            self.assertEqual(
+                hcaptcha_url,
+                "https://verify.example.com/verify?provider=hcaptcha"
+                f"&verification_id={hcaptcha_record.id}",
+            )
 
     async def test_user_without_pending_record_falls_through(self) -> None:
         async with self.session_factory() as session:
@@ -695,6 +868,47 @@ class SweeperTests(_DbTestCase):
             self.assertIsNotNone(record)
             self.assertGreater(record.deadline_at, now)
             self.assertIsNone(await get_global_ban(session, 933))
+
+    async def test_sweep_only_pauses_records_for_unavailable_provider(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=934,
+                deadline_at=now - timedelta(seconds=2),
+                provider="turnstile",
+            )
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=935,
+                deadline_at=now - timedelta(seconds=1),
+                provider="hcaptcha",
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        settings = _settings()
+        settings.join_verification_hcaptcha_site_key = "same-key"
+        settings.join_verification_hcaptcha_secret_key = "same-key"
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=settings,
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+        bot.ban_chat_member.assert_awaited_once_with(-100, 934)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 934))
+            hcaptcha_record = await get_join_verification(session, -100, 935)
+            self.assertIsNotNone(hcaptcha_record)
+            self.assertGreater(hcaptcha_record.deadline_at, now)
 
 
 class MemberLeaveCleanupTests(_DbTestCase):

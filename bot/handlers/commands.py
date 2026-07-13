@@ -18,10 +18,11 @@ from aiogram.types import (
     WebAppInfo,
 )
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group
+from bot.db.models import Admin, AuthorizedGroup, Group
 from bot.services.authz import (
     ensure_group_admin_permission,
     ensure_group_authorized,
@@ -38,11 +39,18 @@ from bot.services.av_search import (
     AVSearchService,
     is_av_code_query,
 )
-from bot.services.join_verification import maybe_send_private_verification
+from bot.services.join_verification import (
+    maybe_send_private_verification,
+    parse_private_verify_group_id,
+)
 from bot.services.llm import LLMService
 from bot.services.skills import SkillService
 from bot.utils.command_catalog import build_help_text
-from bot.utils.telegram import answer_with_auto_delete, typing_action
+from bot.utils.telegram import (
+    answer_with_auto_delete,
+    configured_auto_delete_seconds,
+    typing_action,
+)
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -58,13 +66,17 @@ async def _answer(
     settings: Settings,
     text: str,
     *,
-    auto_delete_minutes: int | None = None,
+    auto_delete_seconds: int | None = None,
     **kwargs: object,
 ) -> None:
     await answer_with_auto_delete(
         message,
         text,
-        auto_delete_minutes=settings.bot.auto_delete_minutes if auto_delete_minutes is None else auto_delete_minutes,
+        auto_delete_seconds=(
+            configured_auto_delete_seconds(settings, "management")
+            if auto_delete_seconds is None
+            else auto_delete_seconds
+        ),
         **kwargs,
     )
 
@@ -680,9 +692,16 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
     if not await ensure_group_authorized(message, session, settings):
         return
     # New members arrive here via the group prompt's deep link; hand out the
-    # one-time Turnstile challenge link instead of the generic welcome.
+    # exact group's one-time challenge instead of the generic welcome.
     if message.chat and message.chat.type == "private":
-        if await maybe_send_private_verification(message, session, settings):
+        command_parts = str(message.text or "").split(maxsplit=1)
+        payload = command_parts[1] if len(command_parts) == 2 else ""
+        if await maybe_send_private_verification(
+            message,
+            session,
+            settings,
+            group_id=parse_private_verify_group_id(payload),
+        ):
             return
     await _answer(message, settings,
         "<b>智能群管机器人</b>\n"
@@ -704,15 +723,29 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
 
 
 @router.message(Command("settings"))
-async def cmd_settings(message: Message, settings: Settings) -> None:
-    if not await ensure_super_admin(message, settings):
+async def cmd_settings(
+    message: Message,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    user_id = int(getattr(message.from_user, "id", 0) or 0)
+    allowed = bool(user_id and is_super_admin_user_id(user_id, settings))
+    if not allowed and user_id and session is not None:
+        allowed = bool(await session.scalar(
+            select(Admin.id)
+            .join(AuthorizedGroup, AuthorizedGroup.group_id == Admin.group_id)
+            .where(Admin.user_id == user_id)
+            .limit(1)
+        ))
+    if not allowed:
+        await _answer(message, settings, "你没有可管理的已授权群组。")
         return
     if not message.chat or message.chat.type != "private":
         await _answer(
             message,
             settings,
             "<b>设置中心</b>\n请私聊机器人后使用 /settings。",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
             retry_tls_record_error=True,
         )
         return
@@ -722,7 +755,7 @@ async def cmd_settings(message: Message, settings: Settings) -> None:
             message,
             settings,
             "<b>设置中心不可用</b>\n请先配置 MINIAPP_PUBLIC_BASE_URL 并重启。",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
             retry_tls_record_error=True,
         )
         return
@@ -740,7 +773,7 @@ async def cmd_settings(message: Message, settings: Settings) -> None:
         message,
         settings,
         "<b>Bot 设置中心</b>",
-        auto_delete_minutes=0,
+        auto_delete_seconds=0,
         reply_markup=keyboard,
         retry_tls_record_error=True,
     )
@@ -753,7 +786,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
     if not await ensure_group_admin_permission(message, session, settings):
         return
     if not message.chat or message.chat.type not in ("group", "supergroup"):
-        await _answer(message, settings, "<b>永久记忆</b>\n请在群内使用 /lm。", auto_delete_minutes=0)
+        await _answer(message, settings, "<b>永久记忆</b>\n请在群内使用 /lm。", auto_delete_seconds=0)
         return
 
     args = (message.text or "").partition(" ")[2].strip()
@@ -765,7 +798,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
             message,
             settings,
             text,
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
@@ -789,7 +822,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
                 "/lm：查看永久记忆\n"
                 "/lm add &lt;内容&gt;\n"
                 "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;",
-                auto_delete_minutes=0,
+                auto_delete_seconds=0,
             )
             return
         request_text = f"添加一条永久记忆：{content}"
@@ -802,7 +835,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
                 settings,
                 "<b>/lm replace 用法</b>\n"
                 "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;",
-                auto_delete_minutes=0,
+                auto_delete_seconds=0,
             )
             return
         request_text = f"把永久记忆 {parts[0].strip()} 改成 {parts[1].strip()}"
@@ -815,7 +848,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
             "/lm add &lt;内容&gt;\n"
             "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;\n\n"
             "删除请直接使用 /lm 列表里的按钮。",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
         return
 
@@ -832,7 +865,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
             chat_id=message.chat.id,
             current_user_text=request_text,
         )
-    await _answer(message, settings, result.summary, auto_delete_minutes=0)
+    await _answer(message, settings, result.summary, auto_delete_seconds=0)
 
 
 @router.callback_query(F.data.startswith("lml:"))
@@ -942,7 +975,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>最高管理员命令（群内）</b>\n"
             "4. /av enable（启用本群 AV 查询）\n"
             "5. /av disable（停用本群 AV 查询）",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
         return
 
@@ -953,7 +986,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 message,
                 settings,
                 "<b>AV 开关</b>\n请在目标群内发送：/av enable 或 /av disable",
-                auto_delete_minutes=0,
+                auto_delete_seconds=0,
             )
             return
         if not await ensure_super_admin(message, settings):
@@ -977,7 +1010,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 开关</b>\n"
             f"<b>群ID</b>: {message.chat.id}\n"
             f"<b>结果</b>: {state_text}（{status_line}）",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
         return
 
@@ -988,13 +1021,13 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 message,
                 settings,
                 "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
-                auto_delete_minutes=0,
+                auto_delete_seconds=0,
             )
             return
 
     svc = AVSearchService(settings)
     if not svc.enabled:
-        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。", auto_delete_minutes=0)
+        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。", auto_delete_seconds=0)
         return
 
     owner_user_id = message.from_user.id if message.from_user else 0
@@ -1031,7 +1064,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                         message,
                         settings,
                         "<b>AV 查询</b>\n详情发送失败，请稍后重试。",
-                        auto_delete_minutes=0,
+                        auto_delete_seconds=0,
                     )
                 return
 
@@ -1044,7 +1077,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 查询结果</b>\n"
             f"关键词: {html.escape(query)}\n"
             "未找到匹配内容。",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
         return
 

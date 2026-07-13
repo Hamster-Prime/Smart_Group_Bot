@@ -52,6 +52,7 @@ from bot.services.sticker_library import sticker_library
 from bot.utils.security import format_history_message_line
 from bot.utils.telegram import (
     answer_with_auto_delete,
+    configured_auto_delete_seconds,
     extract_reply_context,
     extract_message_text,
     has_explicit_bot_mention,
@@ -1352,7 +1353,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             plan.text,
                             delivery_mode=plan.delivery_mode,
                             reply_to_message_id=plan.reply_to_message_id,
-                            auto_delete_minutes=0,
+                            auto_delete_seconds=configured_auto_delete_seconds(
+                                settings, "media"
+                            ),
                             uid=str(user_id or group_id),
                         )
                         tts_results.append(voice_ok)
@@ -1377,7 +1380,9 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             stream=bool(settings.bot.enable_streaming and len(delivery_plans) == 1),
                             stream_chunk_size=settings.bot.stream_chunk_size,
                             stream_interval=settings.bot.stream_edit_interval_sec,
-                            auto_delete_minutes=0,
+                            auto_delete_seconds=configured_auto_delete_seconds(
+                                settings, "reply"
+                            ),
                         )
                         text_results.append(text_ok)
                     sent_reply_messages = [
@@ -1765,7 +1770,9 @@ async def on_group_message(
                     await answer_with_auto_delete(
                         message,
                         notice,
-                        auto_delete_minutes=settings.bot.auto_delete_minutes,
+                        auto_delete_seconds=configured_auto_delete_seconds(
+                            settings, "moderation"
+                        ),
                     )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=warn | 已回复=是 | 总耗时=%dms",
@@ -1789,7 +1796,9 @@ async def on_group_message(
                     await answer_with_auto_delete(
                         message,
                         notice,
-                        auto_delete_minutes=settings.bot.auto_delete_minutes,
+                        auto_delete_seconds=configured_auto_delete_seconds(
+                            settings, "moderation"
+                        ),
                     )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=delete | 已回复=是 | 总耗时=%dms",
@@ -1824,7 +1833,9 @@ async def on_group_message(
                 await answer_with_auto_delete(
                     message,
                     notice,
-                    auto_delete_minutes=settings.bot.auto_delete_minutes,
+                    auto_delete_seconds=configured_auto_delete_seconds(
+                        settings, "moderation"
+                    ),
                 )
                 log.info(
                     "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",

@@ -28,7 +28,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
             sent = await answer_with_auto_delete(
                 message,
                 "打开设置中心",
-                auto_delete_minutes=0,
+                auto_delete_seconds=0,
                 retry_tls_record_error=True,
             )
 
@@ -48,7 +48,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()) as sleep_mock:
             with self.assertRaises(TelegramNetworkError):
-                await answer_with_auto_delete(message, "打开设置中心", auto_delete_minutes=0)
+                await answer_with_auto_delete(message, "打开设置中心", auto_delete_seconds=0)
 
         message.answer.assert_awaited_once()
         sleep_mock.assert_not_awaited()
@@ -68,7 +68,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
                 await answer_with_auto_delete(
                     message,
                     "打开设置中心",
-                    auto_delete_minutes=0,
+                    auto_delete_seconds=0,
                     retry_tls_record_error=True,
                 )
 
@@ -88,7 +88,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        sent = await answer_with_auto_delete(message, "<内容>今天群聊总结</内容>", auto_delete_minutes=0)
+        sent = await answer_with_auto_delete(message, "<内容>今天群聊总结</内容>", auto_delete_seconds=0)
 
         self.assertEqual(sent.message_id, 88)
         self.assertEqual(message.answer.await_count, 2)
@@ -116,7 +116,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
             reply_to_message_id=321,
             fallback_mention_user_id=42,
             fallback_mention_name="Alice",
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
 
         self.assertTrue(ok)
@@ -190,7 +190,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
             delivery_mode="reply",
             reply_to_message_id=321,
             stream=False,
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
 
         self.assertTrue(ok)
@@ -223,7 +223,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
             delivery_mode="reply",
             reply_to_message_id=321,
             stream=False,
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         )
 
         self.assertTrue(ok)

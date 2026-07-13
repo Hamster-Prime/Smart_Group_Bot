@@ -14,6 +14,7 @@ from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.services import memory_holder
 from bot.services.join_verification import (
     JoinVerificationSweeper,
+    VERIFICATION_PROVIDERS,
     verification_service_ready,
     warn_if_bot_cannot_verify,
 )
@@ -21,7 +22,10 @@ from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.proactive import ProactiveTopicService
 from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
-from bot.services.runtime_config import turnstile_key_configuration_issue
+from bot.services.runtime_config import (
+    hcaptcha_key_configuration_issue,
+    turnstile_key_configuration_issue,
+)
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
 
@@ -155,21 +159,32 @@ async def main() -> None:
         runtime_config=runtime_config,
     )
     await verify_web.start()
-    turnstile_issue = turnstile_key_configuration_issue(
-        settings.join_verification_turnstile_site_key,
-        settings.join_verification_turnstile_secret_key,
-    )
-    if turnstile_issue:
-        log.error(
-            "%s；已暂停签发新的真人质询，请在 /settings 更正后重试。",
-            turnstile_issue,
-        )
-    elif verification_service_ready(settings):
+    verification_issues = {
+        "turnstile": turnstile_key_configuration_issue(
+            settings.join_verification_turnstile_site_key,
+            settings.join_verification_turnstile_secret_key,
+        ),
+        "hcaptcha": hcaptcha_key_configuration_issue(
+            settings.join_verification_hcaptcha_site_key,
+            settings.join_verification_hcaptcha_secret_key,
+        ),
+    }
+    for provider, issue in verification_issues.items():
+        if issue:
+            log.error(
+                "%s；已暂停使用 %s 签发真人质询，请在 /settings 更正后重试。",
+                issue,
+                provider,
+            )
+    if any(
+        verification_service_ready(settings, provider)
+        for provider in VERIFICATION_PROVIDERS
+    ):
         await warn_if_bot_cannot_verify(bot, settings, session_factory)
-    elif settings.moderation.enabled:
+    elif settings.moderation.enabled or settings.join_verification_enabled:
         log.warning(
-            "消息审核已启用，但 Turnstile 密钥或公网验证地址不完整；"
-            "低置信度命中将无法发起真人质询，并回退到原群规动作。"
+            "真人验证密钥或公网验证地址不完整；入群验证不会签发，"
+            "低置信度审核也将回退到原群规动作。"
         )
     log.info("Bot starting...")
 

@@ -11,12 +11,16 @@ from bot.db.models import Admin, AuthorizedGroup
 
 
 def _schedule_auto_delete(sent: Message | None, settings: Settings) -> None:
-    minutes = int(getattr(settings.bot, "auto_delete_minutes", 0) or 0)
-    if not sent or minutes <= 0:
+    categories = {
+        str(item or "").strip().lower()
+        for item in getattr(settings.bot, "auto_delete_categories", [])
+    }
+    seconds = int(getattr(settings.bot, "auto_delete_seconds", 0) or 0)
+    if not sent or seconds <= 0 or "management" not in categories:
         return
 
     async def _delete_later() -> None:
-        await asyncio.sleep(minutes * 60)
+        await asyncio.sleep(seconds)
         try:
             await sent.delete()
         except Exception:
@@ -165,4 +169,3 @@ async def ensure_group_admin_permission(
     sent = await message.answer("你没有群管理权限，请联系最高管理员授权。")
     _schedule_auto_delete(sent, settings)
     return False
-

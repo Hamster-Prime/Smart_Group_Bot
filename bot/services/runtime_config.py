@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 CONFIG_SCHEMA_VERSION = 1
 _STATIC_SECRET_PATHS = (
     "verification.turnstile_secret_key",
+    "verification.hcaptcha_secret_key",
     "tts.app_key",
     "tts.access_key",
     "sub2api.api_key",
@@ -177,6 +178,8 @@ class ModelSettingsConfig(StrictModel):
 
 
 class BotBehaviorConfig(StrictModel):
+    model_config = ConfigDict(extra="forbid")
+
     parse_mode: str = Field(default="HTML", max_length=32)
     drop_pending_updates: bool = True
     inbound_debounce_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
@@ -184,7 +187,12 @@ class BotBehaviorConfig(StrictModel):
     enable_streaming: bool = True
     stream_chunk_size: int = Field(default=36, ge=8, le=4096)
     stream_edit_interval_sec: float = Field(default=1.0, ge=0.3, le=30.0)
-    auto_delete_minutes: int = Field(default=0, ge=0, le=10080)
+    auto_delete_seconds: int = Field(default=0, ge=0, le=604800)
+    auto_delete_categories: list[
+        Literal["reply", "management", "moderation", "media", "proactive"]
+    ] = Field(default_factory=lambda: ["management", "moderation"])
+    # Accepted only while reading records written before the seconds migration.
+    auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
     decision_context_items: int = Field(default=5, ge=0, le=20)
     max_context_tokens: int = Field(default=256000, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
@@ -195,6 +203,13 @@ class BotBehaviorConfig(StrictModel):
     proactive_quiet_hours_start: int = Field(default=0, ge=0, le=23)
     proactive_quiet_hours_end: int = Field(default=9, ge=0, le=23)
     proactive_retry_minutes: int = Field(default=30, ge=5, le=1440)
+
+    @model_validator(mode="after")
+    def _migrate_auto_delete_minutes(self) -> BotBehaviorConfig:
+        if self.auto_delete_seconds <= 0 and self.auto_delete_minutes:
+            self.auto_delete_seconds = int(self.auto_delete_minutes) * 60
+        self.auto_delete_categories = list(dict.fromkeys(self.auto_delete_categories))
+        return self
 
 
 class ModerationSettingsConfig(StrictModel):
@@ -208,12 +223,21 @@ class VerificationSettingsConfig(StrictModel):
     enabled: bool = False
     timeout_seconds: int = Field(default=600, ge=60, le=86400)
     check_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
+    provider: Literal["turnstile", "hcaptcha"] = "turnstile"
     turnstile_site_key: str = Field(default="", max_length=255)
     turnstile_secret_key: str = Field(default="", max_length=1024)
+    hcaptcha_site_key: str = Field(default="", max_length=255)
+    hcaptcha_secret_key: str = Field(default="", max_length=1024)
 
-    @field_validator("turnstile_site_key", "turnstile_secret_key", mode="before")
+    @field_validator(
+        "turnstile_site_key",
+        "turnstile_secret_key",
+        "hcaptcha_site_key",
+        "hcaptcha_secret_key",
+        mode="before",
+    )
     @classmethod
-    def _clean_turnstile_key(cls, value: object) -> str:
+    def _clean_challenge_key(cls, value: object) -> str:
         return str(value or "").strip()
 
 
@@ -225,6 +249,17 @@ def turnstile_key_configuration_issue(
     secret = str(secret_key or "").strip()
     if site and secret and site == secret:
         return "Turnstile Secret Key 不能与 Site Key 相同；请填写 Cloudflare 控制台中的 Secret Key"
+    return ""
+
+
+def hcaptcha_key_configuration_issue(
+    site_key: str,
+    secret_key: str,
+) -> str:
+    site = str(site_key or "").strip()
+    secret = str(secret_key or "").strip()
+    if site and secret and site == secret:
+        return "hCaptcha Secret Key 不能与 Site Key 相同；请填写 hCaptcha 控制台中的 Secret Key"
     return ""
 
 
@@ -371,6 +406,7 @@ class RuntimeConfig(StrictModel):
     def extract_secrets(self) -> dict[str, str]:
         values = {
             "verification.turnstile_secret_key": self.verification.turnstile_secret_key,
+            "verification.hcaptcha_secret_key": self.verification.hcaptcha_secret_key,
             "tts.app_key": self.tts.app_key,
             "tts.access_key": self.tts.access_key,
             "sub2api.api_key": self.sub2api.api_key,
@@ -387,6 +423,9 @@ class RuntimeConfig(StrictModel):
         clone = self.model_copy(deep=True)
         clone.verification.turnstile_secret_key = secrets.get(
             "verification.turnstile_secret_key", ""
+        )
+        clone.verification.hcaptcha_secret_key = secrets.get(
+            "verification.hcaptcha_secret_key", ""
         )
         clone.tts.app_key = secrets.get("tts.app_key", "")
         clone.tts.access_key = secrets.get("tts.access_key", "")
@@ -433,12 +472,21 @@ class RuntimeConfig(StrictModel):
         *,
         apply_prompts: bool = True,
     ) -> None:
-        if self.verification.enabled:
+        verification = self.verification
+        if verification.provider == "hcaptcha":
+            challenge_label = "hCaptcha"
+            challenge_site_key = verification.hcaptcha_site_key
+            challenge_secret_key = verification.hcaptcha_secret_key
+        else:
+            challenge_label = "Turnstile"
+            challenge_site_key = verification.turnstile_site_key
+            challenge_secret_key = verification.turnstile_secret_key
+        if verification.enabled:
             missing = [
                 label
                 for label, value in (
-                    ("Turnstile Site Key", self.verification.turnstile_site_key),
-                    ("Turnstile Secret Key", self.verification.turnstile_secret_key),
+                    (f"{challenge_label} Site Key", challenge_site_key),
+                    (f"{challenge_label} Secret Key", challenge_secret_key),
                     ("MINIAPP_PUBLIC_BASE_URL", settings.miniapp_public_base_url),
                 )
                 if not str(value or "").strip()
@@ -541,7 +589,9 @@ class RuntimeConfig(StrictModel):
         settings.bot.enable_streaming = bot.enable_streaming
         settings.bot.stream_chunk_size = bot.stream_chunk_size
         settings.bot.stream_edit_interval_sec = bot.stream_edit_interval_sec
-        settings.bot.auto_delete_minutes = bot.auto_delete_minutes
+        settings.bot.auto_delete_seconds = bot.auto_delete_seconds
+        settings.bot.auto_delete_minutes = bot.auto_delete_seconds // 60
+        settings.bot.auto_delete_categories = list(bot.auto_delete_categories)
         settings.bot.decision_context_items = bot.decision_context_items
         settings.bot.max_context_tokens = bot.max_context_tokens
         settings.bot.max_output_tokens = bot.max_output_tokens
@@ -559,8 +609,11 @@ class RuntimeConfig(StrictModel):
         settings.join_verification_enabled = self.verification.enabled
         settings.join_verification_timeout_seconds = self.verification.timeout_seconds
         settings.join_verification_check_interval_seconds = self.verification.check_interval_seconds
+        settings.join_verification_provider = self.verification.provider
         settings.join_verification_turnstile_site_key = self.verification.turnstile_site_key
         settings.join_verification_turnstile_secret_key = self.verification.turnstile_secret_key
+        settings.join_verification_hcaptcha_site_key = self.verification.hcaptcha_site_key
+        settings.join_verification_hcaptcha_secret_key = self.verification.hcaptcha_secret_key
 
         tts = self.tts
         settings.doubao_tts_enabled = tts.enabled
@@ -827,6 +880,24 @@ class RuntimeConfigManager:
             )
             if turnstile_issue and not unchanged_legacy_issue:
                 raise ValueError(turnstile_issue)
+            hcaptcha_issue = hcaptcha_key_configuration_issue(
+                candidate.verification.hcaptcha_site_key,
+                candidate.verification.hcaptcha_secret_key,
+            )
+            current_hcaptcha_issue = hcaptcha_key_configuration_issue(
+                current.verification.hcaptcha_site_key,
+                current.verification.hcaptcha_secret_key,
+            )
+            unchanged_hcaptcha_issue = bool(
+                current_hcaptcha_issue
+                and hcaptcha_issue
+                and candidate.verification.hcaptcha_site_key
+                == current.verification.hcaptcha_site_key
+                and candidate.verification.hcaptcha_secret_key
+                == current.verification.hcaptcha_secret_key
+            )
+            if hcaptcha_issue and not unchanged_hcaptcha_issue:
+                raise ValueError(hcaptcha_issue)
             candidate.apply_to_settings(
                 self.settings.model_copy(deep=True),
                 apply_prompts=False,
@@ -1084,7 +1155,12 @@ def build_legacy_runtime_config(
             enable_streaming=settings.bot_enable_streaming,
             stream_chunk_size=settings.bot_stream_chunk_size,
             stream_edit_interval_sec=settings.bot_stream_edit_interval_sec,
-            auto_delete_minutes=settings.bot_auto_delete_minutes,
+            auto_delete_seconds=(
+                int(settings.bot_auto_delete_seconds)
+                if "bot_auto_delete_seconds" in getattr(settings, "model_fields_set", set())
+                else int(settings.bot_auto_delete_seconds)
+                or max(0, int(settings.bot_auto_delete_minutes)) * 60
+            ),
             decision_context_items=settings.bot_decision_context_items,
             max_context_tokens=settings.max_context_tokens,
             max_output_tokens=settings.max_output_tokens,
@@ -1101,8 +1177,11 @@ def build_legacy_runtime_config(
             enabled=settings.join_verification_enabled,
             timeout_seconds=settings.join_verification_timeout_seconds,
             check_interval_seconds=settings.join_verification_check_interval_seconds,
+            provider=settings.join_verification_provider,
             turnstile_site_key=settings.join_verification_turnstile_site_key,
             turnstile_secret_key=settings.join_verification_turnstile_secret_key,
+            hcaptcha_site_key=settings.join_verification_hcaptcha_site_key,
+            hcaptcha_secret_key=settings.join_verification_hcaptcha_secret_key,
         ),
         tts=TTSSettingsConfig(
             enabled=settings.doubao_tts_enabled,

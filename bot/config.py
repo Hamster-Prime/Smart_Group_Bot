@@ -85,7 +85,12 @@ class BotConfig(BaseModel):
     enable_streaming: bool = True
     stream_chunk_size: int = 36
     stream_edit_interval_sec: float = 1.0
+    auto_delete_seconds: int = 0
+    # Deprecated compatibility alias for integrations that still set minutes.
     auto_delete_minutes: int = 0
+    auto_delete_categories: list[str] = Field(
+        default_factory=lambda: ["management", "moderation"]
+    )
     decision_context_items: int = 5
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = 180
@@ -123,7 +128,7 @@ class ModerationConfig(BaseModel):
     enabled: bool = True
     warn_threshold: int = 3
     # 违规判定置信度 >= 该值时直接按规则动作处理；低于该值时删除消息并
-    # 要求 Turnstile 质询（质询依赖入群验证的 Turnstile/公网地址配置）。
+    # 要求真人质询（质询依赖所选验证服务和公网地址配置）。
     high_confidence_threshold: float = Field(default=0.9, allow_inf_nan=False)
     # 低置信度质询限时（秒），超时自动封禁。
     challenge_timeout_seconds: int = 600
@@ -193,6 +198,8 @@ class Settings(BaseSettings):
     bot_enable_streaming: bool = True
     bot_stream_chunk_size: int = 36
     bot_stream_edit_interval_sec: float = 1.0
+    bot_auto_delete_seconds: int = 0
+    # Legacy one-time migration input. Runtime settings use seconds.
     bot_auto_delete_minutes: int = 0
     bot_decision_context_items: int = 5
     bot_proactive_default_enabled: bool = False
@@ -245,12 +252,15 @@ class Settings(BaseSettings):
     av_fc2_base_url: str = "https://adult.contents.fc2.com"
 
     # 入群验证：新成员先全员禁言，私聊 bot 获取链接并通过
-    # Cloudflare Turnstile 真人质询后恢复权限。
+    # 通过所选真人验证服务后恢复权限。
     join_verification_enabled: bool = False
     join_verification_timeout_seconds: int = 600
     join_verification_check_interval_seconds: float = 30.0
+    join_verification_provider: Literal["turnstile", "hcaptcha"] = "turnstile"
     join_verification_turnstile_site_key: str = ""
     join_verification_turnstile_secret_key: str = ""
+    join_verification_hcaptcha_site_key: str = ""
+    join_verification_hcaptcha_secret_key: str = ""
     # 验证页面对外可访问的地址（反代/隧道后的 https 地址）。
     join_verification_public_base_url: str = ""
     join_verification_listen_host: str = "0.0.0.0"
@@ -646,7 +656,14 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.enable_streaming = settings.bot_enable_streaming
     settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
-    settings.bot.auto_delete_minutes = max(0, settings.bot_auto_delete_minutes)
+    configured_auto_delete_seconds = int(settings.bot_auto_delete_seconds or 0)
+    explicit_seconds = "bot_auto_delete_seconds" in getattr(
+        settings, "model_fields_set", set()
+    )
+    if not explicit_seconds and configured_auto_delete_seconds <= 0 and settings.bot_auto_delete_minutes > 0:
+        configured_auto_delete_seconds = int(settings.bot_auto_delete_minutes) * 60
+    settings.bot.auto_delete_seconds = max(0, configured_auto_delete_seconds)
+    settings.bot.auto_delete_minutes = settings.bot.auto_delete_seconds // 60
     settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
     settings.bot.proactive_default_enabled = settings.bot_proactive_default_enabled
     settings.bot.proactive_idle_minutes = max(180, int(settings.bot_proactive_idle_minutes))
@@ -664,15 +681,27 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.join_verification_check_interval_seconds = max(
         5.0, float(settings.join_verification_check_interval_seconds)
     )
+    if settings.join_verification_provider not in {"turnstile", "hcaptcha"}:
+        settings.join_verification_provider = "turnstile"
     settings.join_verification_listen_port = min(
         65535, max(1, int(settings.join_verification_listen_port))
     )
     if settings.join_verification_enabled:
+        if settings.join_verification_provider == "hcaptcha":
+            challenge_site_key = settings.join_verification_hcaptcha_site_key
+            challenge_secret_key = settings.join_verification_hcaptcha_secret_key
+            challenge_site_name = "JOIN_VERIFICATION_HCAPTCHA_SITE_KEY"
+            challenge_secret_name = "JOIN_VERIFICATION_HCAPTCHA_SECRET_KEY"
+        else:
+            challenge_site_key = settings.join_verification_turnstile_site_key
+            challenge_secret_key = settings.join_verification_turnstile_secret_key
+            challenge_site_name = "JOIN_VERIFICATION_TURNSTILE_SITE_KEY"
+            challenge_secret_name = "JOIN_VERIFICATION_TURNSTILE_SECRET_KEY"
         missing = [
             name
             for name, value in (
-                ("JOIN_VERIFICATION_TURNSTILE_SITE_KEY", settings.join_verification_turnstile_site_key),
-                ("JOIN_VERIFICATION_TURNSTILE_SECRET_KEY", settings.join_verification_turnstile_secret_key),
+                (challenge_site_name, challenge_site_key),
+                (challenge_secret_name, challenge_secret_key),
                 ("JOIN_VERIFICATION_PUBLIC_BASE_URL", settings.join_verification_public_base_url),
             )
             if not value.strip()

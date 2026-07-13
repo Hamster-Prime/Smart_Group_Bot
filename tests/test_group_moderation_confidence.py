@@ -18,7 +18,7 @@ def _settings() -> SimpleNamespace:
             vision_model="",
             embed_model="",
             max_context_tokens=0,
-            auto_delete_minutes=0,
+            auto_delete_seconds=0,
         ),
         moderation=SimpleNamespace(enabled=True, warn_threshold=3),
         skill_sticker_file_ids="",

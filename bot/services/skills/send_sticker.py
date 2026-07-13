@@ -86,7 +86,7 @@ class SendStickerSkill:
                 message,
                 sticker=sticker_file_id,
                 delivery_mode=delivery_mode,
-                auto_delete_minutes=0,
+                auto_delete_seconds=context.auto_delete_media_seconds,
             )
             await sticker_library.mark_sent(session, group_id, sticker_file_id)
         except Exception as exc:

@@ -35,6 +35,7 @@ from bot.utils.security import (
     sanitize_history_for_llm,
     wrap_untrusted_multiline,
 )
+from bot.utils.telegram import configured_auto_delete_seconds
 
 log = logging.getLogger(__name__)
 
@@ -900,6 +901,11 @@ class SkillService:
             sender_is_tg_admin=sender_is_tg_admin,
             current_user_text=current_user_text,
             default_sticker_file_ids=self.default_sticker_file_ids,
+            auto_delete_media_seconds=(
+                configured_auto_delete_seconds(self.settings, "media")
+                if self.settings is not None
+                else 0
+            ),
         )
         return await self._run_tool(name=name, arguments=arguments or {}, context=context)
 
@@ -960,6 +966,11 @@ class SkillService:
             sender_is_tg_admin=sender_is_tg_admin,
             current_user_text=user_text,
             default_sticker_file_ids=self.default_sticker_file_ids,
+            auto_delete_media_seconds=(
+                configured_auto_delete_seconds(self.settings, "media")
+                if self.settings is not None
+                else 0
+            ),
         )
         last_success_summary = ""
         recent_tool_results: list[dict[str, Any]] = []

@@ -4,22 +4,30 @@ from unittest.mock import AsyncMock, patch
 
 from bot.config import Settings
 from bot.handlers import commands
+from bot.utils.telegram import configured_auto_delete_seconds
 
 
-def _settings(auto_delete_minutes: int = 1) -> Settings:
+def _settings(auto_delete_seconds: int = 1) -> Settings:
     settings = Settings(_env_file=None)
-    settings.bot.auto_delete_minutes = auto_delete_minutes
+    settings.bot.auto_delete_seconds = auto_delete_seconds
+    settings.bot.auto_delete_categories = ["management"]
     return settings
 
 
 class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_category_policy_uses_seconds(self) -> None:
+        settings = _settings(auto_delete_seconds=7)
+        settings.bot.auto_delete_categories = ["moderation"]
+        self.assertEqual(configured_auto_delete_seconds(settings, "moderation"), 7)
+        self.assertEqual(configured_auto_delete_seconds(settings, "reply"), 0)
+
     async def test_answer_uses_explicit_auto_delete_override(self) -> None:
-        settings = _settings(auto_delete_minutes=3)
+        settings = _settings(auto_delete_seconds=3)
 
         with patch("bot.handlers.commands.answer_with_auto_delete", new=AsyncMock()) as answer_mock:
-            await commands._answer(SimpleNamespace(), settings, "hello", auto_delete_minutes=0)
+            await commands._answer(SimpleNamespace(), settings, "hello", auto_delete_seconds=0)
 
-        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_minutes"], 0)
+        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(
@@ -38,7 +46,7 @@ class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await commands.cmd_lm(message, session=object(), settings=settings)
 
-        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_minutes"], 0)
+        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
 
 
 if __name__ == "__main__":

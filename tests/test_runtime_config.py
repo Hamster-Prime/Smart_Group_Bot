@@ -145,6 +145,42 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.settings.join_verification_enabled)
         self.assertEqual(self.manager.revision, 1)
 
+    async def test_hcaptcha_can_be_selected_and_keeps_turnstile_secrets(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["verification"].update(
+            {
+                "enabled": True,
+                "provider": "hcaptcha",
+                "hcaptcha_site_key": "h-site",
+                "turnstile_site_key": "cf-site",
+            }
+        )
+        await self.manager.save(
+            payload,
+            expected_revision=1,
+            updated_by=42,
+            secret_changes={
+                "verification.hcaptcha_secret_key": {
+                    "action": "replace",
+                    "value": "h-secret",
+                },
+                "verification.turnstile_secret_key": {
+                    "action": "replace",
+                    "value": "cf-secret",
+                },
+            },
+        )
+        self.assertEqual(self.settings.join_verification_provider, "hcaptcha")
+        self.assertEqual(self.settings.join_verification_hcaptcha_secret_key, "h-secret")
+        self.assertEqual(self.manager.config.verification.turnstile_secret_key, "cf-secret")
+
+    async def test_legacy_auto_delete_minutes_migrate_to_seconds(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["bot"].pop("auto_delete_seconds", None)
+        payload["bot"]["auto_delete_minutes"] = 3
+        await self.manager.save(payload, expected_revision=1, updated_by=42)
+        self.assertEqual(self.settings.bot.auto_delete_seconds, 180)
+
     async def test_turnstile_secret_cannot_equal_site_key(self) -> None:
         payload = self.manager.config.public_payload()
         payload["verification"]["enabled"] = True

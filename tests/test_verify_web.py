@@ -21,7 +21,11 @@ from bot.services.join_verification import (
     get_join_verification,
     upsert_join_verification,
 )
-from bot.services.verify_web import VerifyWebServer, verify_turnstile_token
+from bot.services.verify_web import (
+    VerifyWebServer,
+    verify_hcaptcha_token,
+    verify_turnstile_token,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 BOT_TOKEN = "42:TEST_TOKEN"
@@ -64,9 +68,10 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             edit_message_text=AsyncMock(),
             send_message=AsyncMock(),
         )
+        self.settings = _settings()
         server = VerifyWebServer(
             bot=self.bot,
-            settings=_settings(),
+            settings=self.settings,
             session_factory=self.session_factory,
         )
         self.client = TestClient(TestServer(server.build_app()))
@@ -88,25 +93,39 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         minutes: int = 5,
         kind: str = VERIFICATION_KIND_JOIN,
         reason: str = "",
-    ) -> None:
+        provider: str = "turnstile",
+        group_id: int = -100,
+    ) -> int:
         async with self.session_factory() as session:
             await upsert_join_verification(
                 session,
-                group_id=-100,
+                group_id=group_id,
                 user_id=user_id,
                 deadline_at=now_shanghai_naive() + timedelta(minutes=minutes),
                 kind=kind,
                 reason=reason,
                 display_name="新人",
                 prompt_message_id=777,
+                provider=provider,
             )
             await session.commit()
+            record = await get_join_verification(session, group_id, user_id)
+            return int(record.id)
 
-    async def _submit(self, user_id: int, *, init_data: str | None = None, turnstile: str = "cf-tok"):
+    async def _submit(
+        self,
+        user_id: int,
+        *,
+        init_data: str | None = None,
+        turnstile: str = "cf-tok",
+        verification_id: int = 0,
+    ):
         return await self.client.post(
             "/verify",
             json={
-                "turnstile_token": turnstile,
+                "challenge_token": turnstile,
+                "provider": "turnstile",
+                "verification_id": verification_id,
                 "init_data": _signed_init_data(user_id) if init_data is None else init_data,
             },
         )
@@ -128,8 +147,11 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-sitekey="site-key"', body)
         self.assertIn("challenges.cloudflare.com/turnstile/v0/api.js", body)
         self.assertIn("telegram.org/js/telegram-web-app.js", body)
-        self.assertIn('data-error-callback="onTurnstileError"', body)
-        self.assertIn("resetTurnstile", body)
+        self.assertIn('data-error-callback="onChallengeError"', body)
+        self.assertIn("resetChallenge", body)
+        self.assertIn('script-src', resp.headers["Content-Security-Policy"])
+        self.assertIn("'nonce-", resp.headers["Content-Security-Policy"])
+        self.assertIn('<script nonce="', body)
 
     async def test_siteverify_error_codes_are_preserved(self) -> None:
         class FakeResponse:
@@ -172,6 +194,155 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(passed)
         self.assertEqual(errors, ["invalid-input-secret"])
+
+    async def test_hcaptcha_page_and_submission_use_selected_provider(self) -> None:
+        settings = _settings()
+        settings.join_verification_hcaptcha_site_key = "h-site"
+        settings.join_verification_hcaptcha_secret_key = "h-secret"
+        server = VerifyWebServer(
+            bot=self.bot,
+            settings=settings,
+            session_factory=self.session_factory,
+        )
+        client = TestClient(TestServer(server.build_app()))
+        await client.start_server()
+        try:
+            page = await client.get("/verify?provider=hcaptcha")
+            body = await page.text()
+            self.assertIn("h-captcha", body)
+            self.assertIn('data-size="compact"', body)
+            self.assertIn("js.hcaptcha.com/1/api.js", body)
+            self.assertIn('const provider = "hcaptcha"', body)
+
+            verification_id = await self._seed(user_id=120, provider="hcaptcha")
+            with patch(
+                "bot.services.verify_web.verify_hcaptcha_token",
+                new=AsyncMock(return_value=(True, [])),
+            ) as verify_mock:
+                response = await client.post(
+                    "/verify",
+                    json={
+                        "challenge_token": "h-token",
+                        "provider": "hcaptcha",
+                        "verification_id": verification_id,
+                        "init_data": _signed_init_data(120),
+                    },
+                )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(verify_mock.await_args.kwargs["hcaptcha_token"], "h-token")
+        finally:
+            await client.close()
+
+    async def test_hcaptcha_siteverify_payload_includes_site_key_and_remote_ip(self) -> None:
+        captured: dict = {}
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self, *, content_type=None):
+                return {"success": True}
+
+        class FakeClientSession:
+            def __init__(self, *, timeout):
+                captured["timeout"] = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def post(self, url, *, data):
+                captured["url"] = url
+                captured["data"] = data
+                return FakeResponse()
+
+        with patch("bot.services.verify_web.aiohttp.ClientSession", FakeClientSession):
+            passed, errors = await verify_hcaptcha_token(
+                secret_key="h-secret",
+                hcaptcha_token="h-token",
+                remote_ip="203.0.113.2",
+                site_key="h-site",
+            )
+
+        self.assertTrue(passed)
+        self.assertEqual(errors, [])
+        self.assertEqual(captured["url"], "https://api.hcaptcha.com/siteverify")
+        self.assertEqual(
+            captured["data"],
+            {
+                "secret": "h-secret",
+                "response": "h-token",
+                "remoteip": "203.0.113.2",
+                "sitekey": "h-site",
+            },
+        )
+
+    async def test_stale_provider_page_is_rejected_before_siteverify(self) -> None:
+        await self._seed(user_id=121)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            response = await self.client.post(
+                "/verify",
+                json={
+                    "challenge_token": "token",
+                    "provider": "hcaptcha",
+                    "init_data": _signed_init_data(121),
+                },
+            )
+        self.assertEqual(response.status, 409)
+        verify_mock.assert_not_awaited()
+
+    async def test_verification_id_selects_exact_group_record(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        turnstile_id = await self._seed(
+            user_id=122,
+            group_id=-100,
+            provider="turnstile",
+        )
+        hcaptcha_id = await self._seed(
+            user_id=122,
+            group_id=-200,
+            provider="hcaptcha",
+        )
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as turnstile_mock:
+            response = await self._submit(122, verification_id=turnstile_id)
+
+        self.assertEqual(response.status, 200)
+        turnstile_mock.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 122))
+            self.assertIsNotNone(await get_join_verification(session, -200, 122))
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as hcaptcha_mock:
+            response = await self.client.post(
+                "/verify",
+                json={
+                    "challenge_token": "h-token",
+                    "provider": "hcaptcha",
+                    "verification_id": hcaptcha_id,
+                    "init_data": _signed_init_data(122),
+                },
+            )
+
+        self.assertEqual(response.status, 200)
+        hcaptcha_mock.assert_awaited_once()
 
     async def test_successful_submit_restores_permissions(self) -> None:
         await self._seed(user_id=102)

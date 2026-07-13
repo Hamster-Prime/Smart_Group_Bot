@@ -27,6 +27,7 @@ class SkillContext:
     sender_is_tg_admin: bool = False
     current_user_text: str = ""
     default_sticker_file_ids: list[str] = field(default_factory=list)
+    auto_delete_media_seconds: int = 0
     handled: bool = False
     sticker_sent: bool = False
     sticker_file_id: str = ""

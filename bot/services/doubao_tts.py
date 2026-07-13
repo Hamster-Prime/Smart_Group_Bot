@@ -829,7 +829,7 @@ class DoubaoTTSService:
         index: int,
         delivery_mode: str,
         reply_to_message_id: int | None,
-        auto_delete_minutes: int,
+        auto_delete_seconds: int,
         caption: str = "",
         parse_mode: str | None = None,
     ) -> bool:
@@ -901,7 +901,7 @@ class DoubaoTTSService:
                             parse_mode=parse_mode,
                             title="Doubao TTS",
                         )
-                schedule_message_auto_delete(sent, auto_delete_minutes)
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -930,7 +930,7 @@ class DoubaoTTSService:
         *,
         delivery_mode: str = "reply",
         reply_to_message_id: int | None = None,
-        auto_delete_minutes: int = 0,
+        auto_delete_seconds: int = 0,
         uid: str = "",
         emotion: str = "",
         emotion_scale: int | None = None,
@@ -974,7 +974,7 @@ class DoubaoTTSService:
                 index=idx,
                 delivery_mode=delivery_mode,
                 reply_to_message_id=reply_to_message_id if idx == 0 else None,
-                auto_delete_minutes=auto_delete_minutes,
+                auto_delete_seconds=auto_delete_seconds,
             )
             if not ok:
                 return False
@@ -989,7 +989,7 @@ class DoubaoTTSService:
         reply_to_message_id: int | None = None,
         fallback_mention_user_id: int = 0,
         fallback_mention_name: str = "",
-        auto_delete_minutes: int = 0,
+        auto_delete_seconds: int = 0,
         uid: str = "",
         emotion: str = "",
         emotion_scale: int | None = None,
@@ -1060,7 +1060,7 @@ class DoubaoTTSService:
                             parse_mode=current_parse_mode,
                             title="Doubao TTS",
                         )
-                    schedule_message_auto_delete(sent, auto_delete_minutes)
+                    schedule_message_auto_delete(sent, auto_delete_seconds)
                     break
                 except TelegramRetryAfter as exc:
                     wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2

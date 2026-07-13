@@ -19,7 +19,7 @@
   const confirmTitle = document.getElementById("confirm-title");
   const confirmMessage = document.getElementById("confirm-message");
 
-  const NAV_ITEMS = [
+  const ALL_NAV_ITEMS = [
     { id: "overview", label: "概览", icon: "layout-dashboard", subtitle: "运行状态与启动参数" },
     { id: "models", label: "模型", icon: "boxes", subtitle: "供应商、角色与回退链" },
     { id: "bot", label: "Bot", icon: "bot", subtitle: "消息、上下文与主动发言" },
@@ -29,6 +29,7 @@
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转" },
     { id: "prompts", label: "Prompts", icon: "file-code-2", subtitle: "模型系统提示词" },
     { id: "groups", label: "群组", icon: "users", subtitle: "逐群行为覆盖" },
+    { id: "access", label: "权限封禁", icon: "shield-user", subtitle: "群授权、管理员与全局封禁" },
   ];
 
   const ROLE_META = {
@@ -58,6 +59,8 @@
     "av_enabled",
     "mute_all_replies",
     "at_reply_mode",
+    "join_verification_enabled",
+    "join_verification_provider",
     "tts_mode",
     "proactive_enabled",
     "proactive_task_brief",
@@ -67,6 +70,7 @@
   ]);
 
   const state = {
+    session: null,
     activeTab: "overview",
     document: null,
     config: null,
@@ -79,8 +83,16 @@
     loading: true,
     saving: false,
     groupSaving: new Set(),
+    groupResources: new Map(),
+    access: null,
     promptKey: "decision",
   };
+
+  function navItems() {
+    return state.session?.can_manage_global
+      ? ALL_NAV_ITEMS
+      : ALL_NAV_ITEMS.filter(item => item.id === "groups");
+  }
 
   class ApiError extends Error {
     constructor(message, status, body) {
@@ -243,9 +255,12 @@
   }
 
   function updateNavigation() {
-    desktopNav.innerHTML = NAV_ITEMS.map(navMarkup).join("");
-    mobileNav.innerHTML = NAV_ITEMS.map(navMarkup).join("");
-    const active = NAV_ITEMS.find(item => item.id === state.activeTab) || NAV_ITEMS[0];
+    const items = navItems();
+    const mobileScrollLeft = mobileNav.scrollLeft;
+    desktopNav.innerHTML = items.map(navMarkup).join("");
+    mobileNav.innerHTML = items.map(navMarkup).join("");
+    mobileNav.scrollLeft = mobileScrollLeft;
+    const active = items.find(item => item.id === state.activeTab) || items[0];
     pageTitle.textContent = active.label;
     pageSubtitle.textContent = active.subtitle;
   }
@@ -254,17 +269,20 @@
     updateNavigation();
     const dirty = configDirty();
     const restart = restartChanges();
+    saveButton.hidden = !state.session?.can_manage_global;
     saveButton.disabled = !dirty || state.saving || state.loading;
     reloadButton.disabled = state.saving || state.loading || state.groupSaving.size > 0;
     saveButton.innerHTML = state.saving
       ? `<span class="spinner spinner-compact"></span><span>保存中</span>`
       : `${icon("save")}<span>保存配置</span>`;
+    saveState.hidden = !state.session?.can_manage_global;
     saveState.className = `save-state${dirty ? " dirty" : ""}`;
     saveState.textContent = dirty ? (restart.length ? "有未保存更改，含重启项" : "有未保存更改") : `修订 ${state.document?.revision ?? "-"}`;
     const masterKey = state.document?.bootstrap?.master_key_configured;
-    sidebarStatus.innerHTML = `
+    sidebarStatus.innerHTML = state.session?.can_manage_global ? `
       <div class="status-line"><span class="status-dot"></span><span>运行时配置 · r${escapeHtml(state.document?.revision ?? "-")}</span></div>
-      <div class="status-line"><span class="status-dot${masterKey ? "" : " warning"}"></span><span>密钥加密 ${masterKey ? "已就绪" : "未配置"}</span></div>`;
+      <div class="status-line"><span class="status-dot${masterKey ? "" : " warning"}"></span><span>密钥加密 ${masterKey ? "已就绪" : "未配置"}</span></div>`
+      : `<div class="status-line"><span class="status-dot"></span><span>群管理员模式</span></div>`;
     refreshIcons();
   }
 
@@ -543,6 +561,12 @@
   }
 
   function renderBot() {
+    const deleteCategories = new Set(state.config.bot.auto_delete_categories || []);
+    const categoryToggle = (value, label) => `
+      <label class="choice-row">
+        <input type="checkbox" data-auto-delete-category="${value}"${deleteCategories.has(value) ? " checked" : ""}>
+        <span>${escapeHtml(label)}</span>
+      </label>`;
     return `
       ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。")}
       <datalist id="parse-modes"><option value="HTML"></option><option value="Markdown"></option><option value="MarkdownV2"></option></datalist>
@@ -552,12 +576,19 @@
           <div class="field-grid three">
             ${field("bot.parse_mode", "消息解析格式", { maxlength: 32, list: "parse-modes", placeholder: "留空发送纯文本" })}
             ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true })}
-            ${field("bot.auto_delete_minutes", "自动删除（分钟）", { type: "number", min: 0, max: 10080, step: 1, required: true, hint: "0 表示不自动删除" })}
+            ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除" })}
             ${toggle("bot.drop_pending_updates", "启动时丢弃待处理消息", "避免重启后集中处理历史更新")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
             ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}
             ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true })}
+          </div>
+          <div class="choice-grid full-width-control">
+            ${categoryToggle("reply", "普通 AI 回复")}
+            ${categoryToggle("management", "命令与管理提示")}
+            ${categoryToggle("moderation", "审核通知")}
+            ${categoryToggle("media", "语音、音乐与贴纸")}
+            ${categoryToggle("proactive", "主动话题")}
           </div>
         </section>
         <section class="settings-section">
@@ -584,6 +615,7 @@
   }
 
   function renderSafety() {
+    const provider = state.config.verification.provider || "turnstile";
     return `
       ${pageHead("审核与验证", "管理违规判定、低置信度质询和新成员验证。")}
       <div class="section-stack">
@@ -597,14 +629,21 @@
           </div>
         </section>
         <section class="settings-section">
-          ${sectionHead("入群验证")}
+          ${sectionHead("入群验证默认值", "未单独配置的群组使用这里的开关和验证服务；群组管理员可在群组页覆盖。")}
           <div class="field-grid three">
-            ${toggle("verification.enabled", "启用新成员验证", "通过 Turnstile 后恢复群权限")}
+            ${toggle("verification.enabled", "默认启用新成员验证", "通过当前选择的人机验证服务后恢复群权限")}
             ${field("verification.timeout_seconds", "验证超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${field("verification.check_interval_seconds", "状态检查间隔（秒）", { type: "number", min: 5, max: 3600, step: 0.1, required: true })}
+            ${field("verification.provider", "默认验证服务", { type: "select", options: [
+              { value: "turnstile", label: "Cloudflare Turnstile" },
+              { value: "hcaptcha", label: "hCaptcha" },
+            ] })}
             ${field("verification.turnstile_site_key", "Turnstile Site Key", { maxlength: 255 })}
             ${secretField("verification.turnstile_secret_key", "Turnstile Secret Key", "必须填写 Cloudflare 控制台中的 Secret Key，不能重复 Site Key；空白不会覆盖已保存值")}
+            ${field("verification.hcaptcha_site_key", "hCaptcha Site Key", { maxlength: 255 })}
+            ${secretField("verification.hcaptcha_secret_key", "hCaptcha Secret Key", "空白不会覆盖已保存值")}
           </div>
+          <div class="notice info">${icon("refresh-cw")}<span>默认使用 ${provider === "hcaptcha" ? "hCaptcha" : "Cloudflare Turnstile"}；两套密钥可同时保留并随时切换，群组可单独选择服务。</span></div>
         </section>
       </div>`;
   }
@@ -742,6 +781,10 @@
       av_enabled: settings.av_enabled ?? false,
       mute_all_replies: settings.mute_all_replies ?? false,
       at_reply_mode: settings.at_reply_mode ?? false,
+      join_verification_enabled: settings.join_verification_enabled == null ? null : Boolean(settings.join_verification_enabled),
+      join_verification_provider: ["turnstile", "hcaptcha"].includes(settings.join_verification_provider)
+        ? settings.join_verification_provider
+        : null,
       tts_mode: ["off", "on", "always"].includes(settings.tts_mode) ? settings.tts_mode : "off",
       proactive_enabled: settings.proactive_enabled == null ? null : Boolean(settings.proactive_enabled),
       proactive_task_brief: String(settings.proactive_task_brief || ""),
@@ -790,6 +833,23 @@
             ${groupToggle(group, "mute_all_replies", "暂停全部回复", "", saving)}
             ${groupToggle(group, "at_reply_mode", "仅 @ 时回复", "", saving)}
             <div class="field">
+              <label class="field-label" for="group-${attr(group.id)}-join-verification-enabled">入群验证</label>
+              <select id="group-${attr(group.id)}-join-verification-enabled" data-group-id="${attr(group.id)}" data-group-key="join_verification_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                <option value=""${group.settings.join_verification_enabled == null ? " selected" : ""}>继承全局默认</option>
+                <option value="true"${group.settings.join_verification_enabled === true ? " selected" : ""}>开启</option>
+                <option value="false"${group.settings.join_verification_enabled === false ? " selected" : ""}>关闭</option>
+              </select>
+              <span class="field-hint">验证服务在下方单独选择</span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="group-${attr(group.id)}-join-verification-provider">入群验证服务</label>
+              <select id="group-${attr(group.id)}-join-verification-provider" data-group-id="${attr(group.id)}" data-group-key="join_verification_provider" data-kind="nullable-string"${saving ? " disabled" : ""}>
+                <option value=""${group.settings.join_verification_provider == null ? " selected" : ""}>继承全局默认</option>
+                <option value="turnstile"${group.settings.join_verification_provider === "turnstile" ? " selected" : ""}>Cloudflare Turnstile</option>
+                <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
+              </select>
+            </div>
+            <div class="field">
               <label class="field-label" for="group-${attr(group.id)}-proactive">主动发言</label>
               <select id="group-${attr(group.id)}-proactive" data-group-id="${attr(group.id)}" data-group-key="proactive_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
                 <option value=""${group.settings.proactive_enabled == null ? " selected" : ""}>继承全局默认</option>
@@ -824,8 +884,93 @@
               <span class="field-hint">已采样 ${escapeHtml(group.settings.mimic_sample_count)} 条，最近蒸馏点 ${escapeHtml(group.settings.mimic_distilled_at_count)} 条</span>
             </div>
           </div>
+          <div class="subsection group-resource-panel" data-group-resource-panel="${attr(group.id)}">
+            <div class="subsection-head">
+              <strong>群规、永久记忆与成员策略</strong>
+              <button class="secondary-button" type="button" data-action="load-group-resources" data-group-id="${attr(group.id)}">${icon("list-tree")}管理</button>
+            </div>
+            ${renderGroupResources(group)}
+          </div>
         </div>
       </article>`;
+  }
+
+  function renderGroupResources(group) {
+    const resource = state.groupResources.get(String(group.id));
+    if (!resource) return `<p class="field-hint">打开后可直接管理群规、永久记忆、警告记录、群内封禁、审核豁免和回复静默名单。</p>`;
+    if (resource.loading) return `<div class="loading-inline"><span class="spinner spinner-small"></span><span>正在加载</span></div>`;
+    if (resource.error) return `<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(resource.error)}</span></div>`;
+    const itemRows = (items, type, text) => items.map(item => `
+      <div class="resource-row">
+        <span>${escapeHtml(text(item))}</span>
+        <span class="resource-row-actions">
+          ${type === "memories" ? `<button class="mini-icon-button" type="button" data-action="edit-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id)}" aria-label="编辑" title="编辑">${icon("pencil")}</button>` : ""}
+          ${(type !== "warnings" || !item.is_banned) ? `<button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id ?? item.user_id)}" aria-label="${type === "warnings" ? "清零警告" : "删除"}" title="${type === "warnings" ? "清零警告" : "删除"}">${icon("trash-2")}</button>` : ""}
+        </span>
+      </div>`).join("") || `<p class="field-hint">暂无记录</p>`;
+    return `
+      <div class="resource-grid">
+        <section>
+          <h4>群规</h4>
+          <form class="inline-resource-form" data-resource-form="rules" data-group-id="${attr(group.id)}">
+            <select name="rule_type"><option value="keyword">关键词</option><option value="regex">正则</option><option value="llm">语义</option></select>
+            <input name="pattern" maxlength="1000" placeholder="规则内容" required>
+            <select name="action"><option value="warn">警告</option><option value="delete">删消息</option><option value="ban">封禁</option></select>
+            <button class="icon-button" type="submit" aria-label="新增群规" title="新增群规">${icon("plus")}</button>
+          </form>
+          ${resource.rules.map(rule => `
+            <form class="rule-resource-form" data-rule-edit-form data-group-id="${attr(group.id)}" data-rule-id="${attr(rule.id)}">
+              <select name="rule_type" aria-label="群规类型">
+                <option value="keyword"${rule.rule_type === "keyword" ? " selected" : ""}>关键词</option>
+                <option value="regex"${rule.rule_type === "regex" ? " selected" : ""}>正则</option>
+                <option value="llm"${rule.rule_type === "llm" ? " selected" : ""}>语义</option>
+              </select>
+              <input name="pattern" maxlength="1000" value="${attr(rule.pattern)}" aria-label="群规内容" required>
+              <select name="action" aria-label="命中动作">
+                <option value="warn"${rule.action === "warn" ? " selected" : ""}>警告</option>
+                <option value="delete"${rule.action === "delete" ? " selected" : ""}>删消息</option>
+                <option value="ban"${rule.action === "ban" ? " selected" : ""}>封禁</option>
+              </select>
+              <label class="compact-check"><input name="enabled" type="checkbox"${rule.enabled ? " checked" : ""}><span>启用</span></label>
+              <button class="mini-icon-button" type="submit" aria-label="保存群规" title="保存群规">${icon("save")}</button>
+              <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="rules" data-resource-id="${attr(rule.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
+            </form>`).join("") || `<p class="field-hint">暂无记录</p>`}
+        </section>
+        <section>
+          <h4>永久记忆</h4>
+          <form class="inline-resource-form" data-resource-form="memories" data-group-id="${attr(group.id)}">
+            <input name="content" maxlength="4000" placeholder="新增永久记忆" required>
+            <button class="icon-button" type="submit" aria-label="新增记忆" title="新增记忆">${icon("plus")}</button>
+          </form>
+          ${itemRows(resource.memories, "memories", item => `#${item.id} ${item.content}`)}
+        </section>
+        <section>
+          <h4>警告与封禁记录</h4>
+          ${itemRows(resource.warnings, "warnings", item => `${item.user_id} · ${item.count} 次${item.is_banned ? " · 已封禁（请在下方解封）" : ""}`)}
+        </section>
+        <section>
+          <h4>群内封禁</h4>
+          ${userIdForm(group.id, "bans", "输入用户 ID 后封禁")}
+          ${itemRows(resource.bans, "bans", item => `${item.user_id} · 已封禁`)}
+        </section>
+        <section>
+          <h4>AI 审核豁免</h4>
+          ${userIdForm(group.id, "moderation-exemptions", "新增豁免用户 ID")}
+          ${itemRows(resource.exemptions, "moderation-exemptions", item => String(item.user_id))}
+        </section>
+        <section>
+          <h4>回复静默名单</h4>
+          ${userIdForm(group.id, "reply-mutes", "新增静默用户 ID")}
+          ${itemRows(resource.reply_mutes, "reply-mutes", item => String(item.user_id))}
+        </section>
+      </div>`;
+  }
+
+  function userIdForm(groupId, type, placeholder) {
+    return `<form class="inline-resource-form" data-resource-form="${type}" data-group-id="${attr(groupId)}">
+      <input name="user_id" type="number" step="1" placeholder="${attr(placeholder)}" required>
+      <button class="icon-button" type="submit" aria-label="新增" title="新增">${icon("plus")}</button>
+    </form>`;
   }
 
   function renderGroups() {
@@ -835,13 +980,61 @@
         <div class="error-state">${icon("circle-x")}<p>${escapeHtml(state.groupsError)}</p></div>`;
     }
     return `
-      ${pageHead("群组设置", "逐群配置回复、语音、主动发言与内容检索。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size ? " disabled" : ""}>${icon("refresh-cw")}刷新群组</button>`)}
+      ${pageHead("群组设置", "逐群配置入群验证、回复、语音、主动发言与内容检索。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size ? " disabled" : ""}>${icon("refresh-cw")}刷新群组</button>`)}
       <div class="group-toolbar">
         <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" autocomplete="off"></div>
         <span class="badge info">${state.groups.length} 个群组</span>
       </div>
       <div class="group-list">
         ${state.groups.map(renderGroupCard).join("") || `<div class="empty-state">${icon("users")}<p>暂无可管理群组</p></div>`}
+      </div>`;
+  }
+
+  function renderAccess() {
+    const access = state.access;
+    if (!access) return `
+      ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。")}
+      <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
+    if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
+    if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
+    const rows = (items, type, label, idKey = "user_id") => items.map(item => {
+      const resourceId = type === "admins"
+        ? `${item.group_id}:${item.user_id}`
+        : item[idKey];
+      return `
+      <div class="resource-row"><span>${escapeHtml(label(item))}</span>
+      <button class="mini-icon-button danger" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}" aria-label="删除" title="删除">${icon("trash-2")}</button></div>`;
+    }).join("") || `<p class="field-hint">暂无记录</p>`;
+    return `
+      ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
+      <div class="resource-grid access-grid">
+        <section class="settings-section">
+          ${sectionHead("授权群组")}
+          <form class="inline-resource-form" data-access-form="authorized-groups">
+            <input name="group_id" type="number" step="1" placeholder="群 ID" required>
+            <input name="title" maxlength="255" placeholder="群名称（可选）">
+            <button class="icon-button" type="submit" aria-label="授权群组" title="授权群组">${icon("plus")}</button>
+          </form>
+          ${rows(access.authorized_groups, "authorized-groups", item => `${item.title || "未命名群组"} · ${item.group_id}`, "group_id")}
+        </section>
+        <section class="settings-section">
+          ${sectionHead("群管理员")}
+          <form class="inline-resource-form" data-access-form="admins">
+            <select name="group_id" required>${access.authorized_groups.map(item => `<option value="${attr(item.group_id)}">${escapeHtml(item.title || item.group_id)}</option>`).join("")}</select>
+            <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
+            <button class="icon-button" type="submit" aria-label="授权管理员" title="授权管理员">${icon("plus")}</button>
+          </form>
+          ${rows(access.admins, "admins", item => `${item.user_id} · ${item.group_id}`)}
+        </section>
+        <section class="settings-section">
+          ${sectionHead("全局封禁")}
+          <form class="inline-resource-form" data-access-form="global-bans">
+            <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
+            <input name="reason" maxlength="1000" placeholder="封禁原因">
+            <button class="icon-button" type="submit" aria-label="封禁用户" title="封禁用户">${icon("plus")}</button>
+          </form>
+          ${rows(access.global_bans, "global-bans", item => `${item.user_id} · ${item.reason || "手动封禁"}`)}
+        </section>
       </div>`;
   }
 
@@ -857,8 +1050,10 @@
       logging: renderLogging,
       prompts: renderPrompts,
       groups: renderGroups,
+      access: renderAccess,
     };
-    content.innerHTML = renderers[state.activeTab]();
+    const renderer = renderers[state.activeTab] || renderGroups;
+    content.innerHTML = renderer();
     content.scrollTop = 0;
     refreshIcons();
   }
@@ -887,7 +1082,17 @@
   function applySettingsDocument(document) {
     state.document = document;
     state.config = clone(document.config);
+    if (state.config?.bot?.auto_delete_seconds == null && state.config?.bot?.auto_delete_minutes != null) {
+      state.config.bot.auto_delete_seconds = Number(state.config.bot.auto_delete_minutes || 0) * 60;
+    }
+    if (state.config?.bot) delete state.config.bot.auto_delete_minutes;
+    if (state.config?.verification) {
+      state.config.verification.provider ||= "turnstile";
+      state.config.verification.hcaptcha_site_key ||= "";
+      state.config.verification.hcaptcha_secret_key ||= "";
+    }
     state.baseline = clone(document.config);
+    state.baseline = clone(state.config);
     state.configuredSecrets = new Set(document.configured_secrets || []);
     state.secretChanges = {};
   }
@@ -914,12 +1119,21 @@
     if (!keepTab) state.activeTab = "overview";
     content.innerHTML = `<div class="loading-state"><span class="spinner"></span><p>正在加载设置</p></div>`;
     try {
-      const [settingsResult, groupsResult] = await Promise.allSettled([
-        apiFetch("/api/v1/settings"),
-        apiFetch("/api/v1/groups"),
-      ]);
-      if (settingsResult.status === "rejected") throw settingsResult.reason;
-      applySettingsDocument(settingsResult.value);
+      const sessionResult = await apiFetch("/api/v1/session");
+      state.session = sessionResult.session;
+      if (!state.session?.can_manage_global) state.activeTab = "groups";
+      const requests = [apiFetch("/api/v1/groups")];
+      if (state.session?.can_manage_global) requests.unshift(apiFetch("/api/v1/settings"));
+      const results = await Promise.allSettled(requests);
+      const settingsResult = state.session?.can_manage_global ? results[0] : null;
+      const groupsResult = state.session?.can_manage_global ? results[1] : results[0];
+      if (settingsResult?.status === "rejected") throw settingsResult.reason;
+      if (settingsResult?.status === "fulfilled") applySettingsDocument(settingsResult.value);
+      else {
+        state.document = { revision: 0, bootstrap: {}, restart_required_paths: [] };
+        state.config = {};
+        state.baseline = {};
+      }
       if (groupsResult.status === "fulfilled") {
         applyGroupsDocument(groupsResult.value);
       } else {
@@ -948,9 +1162,73 @@
     }
   }
 
+  async function loadGroupResources(groupId) {
+    const key = String(groupId);
+    state.groupResources.set(key, { loading: true });
+    renderContent();
+    try {
+      const base = `/api/v1/groups/${encodeURIComponent(groupId)}`;
+      const [rules, memories, warnings, bans, exemptions, replyMutes] = await Promise.all([
+        apiFetch(`${base}/rules`),
+        apiFetch(`${base}/memories`),
+        apiFetch(`${base}/warnings`),
+        apiFetch(`${base}/bans`),
+        apiFetch(`${base}/moderation-exemptions`),
+        apiFetch(`${base}/reply-mutes`),
+      ]);
+      state.groupResources.set(key, {
+        rules: rules.rules || [],
+        memories: memories.memories || [],
+        warnings: warnings.warnings || [],
+        bans: bans.bans || [],
+        exemptions: exemptions.exemptions || [],
+        reply_mutes: replyMutes.reply_mutes || [],
+      });
+    } catch (error) {
+      state.groupResources.set(key, { error: error.message || "群管理数据加载失败" });
+    }
+    renderContent();
+  }
+
+  async function loadAccess() {
+    state.access = { loading: true };
+    renderContent();
+    try {
+      const groupsResult = await apiFetch("/api/v1/authorized-groups");
+      const authorizedGroups = groupsResult.authorized_groups || [];
+      const loadGlobalBans = async () => {
+        const all = [];
+        let offset = 0;
+        for (let page = 0; page < 100; page += 1) {
+          const result = await apiFetch(`/api/v1/global-bans?limit=500&offset=${offset}`);
+          all.push(...(result.global_bans || []));
+          if (result.next_offset == null || Number(result.next_offset) <= offset) break;
+          offset = Number(result.next_offset);
+        }
+        return all;
+      };
+      const [adminResults, bansResult] = await Promise.all([
+        Promise.all(authorizedGroups.map(async group => {
+          const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.group_id)}/admins`);
+          return (result.admins || []).map(admin => ({ ...admin, group_id: group.group_id }));
+        })),
+        loadGlobalBans(),
+      ]);
+      state.access = {
+        authorized_groups: authorizedGroups,
+        admins: adminResults.flat(),
+        global_bans: bansResult,
+      };
+    } catch (error) {
+      state.access = { error: error.message || "权限数据加载失败", authorized_groups: [], admins: [], global_bans: [] };
+    }
+    renderContent();
+  }
+
   function stripSecrets(config) {
     const payload = clone(config);
     payload.verification.turnstile_secret_key = "";
+    payload.verification.hcaptcha_secret_key = "";
     payload.tts.app_key = "";
     payload.tts.access_key = "";
     payload.sub2api.api_key = "";
@@ -982,6 +1260,14 @@
         === String(state.config.verification.turnstile_site_key || "").trim()
     ) {
       return "Turnstile Secret Key 不能与 Site Key 相同";
+    }
+    const pendingHcaptchaSecret = state.secretChanges["verification.hcaptcha_secret_key"];
+    if (
+      pendingHcaptchaSecret?.action === "replace"
+      && String(pendingHcaptchaSecret.value || "").trim()
+        === String(state.config.verification.hcaptcha_site_key || "").trim()
+    ) {
+      return "hCaptcha Secret Key 不能与 Site Key 相同";
     }
     const nullPath = findNullNumber(state.config);
     if (nullPath) return `${nullPath} 需要填写有效数字`;
@@ -1183,6 +1469,7 @@
       if (target.value === "") return null;
       return target.value === "true";
     }
+    if (kind === "nullable-string") return target.value === "" ? null : target.value;
     if (kind === "lower-string") return target.value.trim().toLowerCase();
     return target.value;
   }
@@ -1256,6 +1543,13 @@
 
   content.addEventListener("change", event => {
     const target = event.target;
+    if (target.matches("[data-auto-delete-category]")) {
+      const selected = [...content.querySelectorAll("[data-auto-delete-category]:checked")]
+        .map(control => control.dataset.autoDeleteCategory);
+      state.config.bot.auto_delete_categories = selected;
+      updateChrome();
+      return;
+    }
     if (target.matches("[data-path]")) {
       setPath(state.config, target.dataset.path, readControlValue(target));
       updateChrome();
@@ -1348,8 +1642,18 @@
       return;
     }
     if (action === "select-prompt") {
+      const promptList = content.querySelector(".prompt-list");
+      const promptScrollLeft = promptList?.scrollLeft || 0;
       state.promptKey = button.dataset.promptKey;
       renderContent();
+      const nextPromptList = content.querySelector(".prompt-list");
+      if (nextPromptList) {
+        nextPromptList.scrollLeft = promptScrollLeft;
+        nextPromptList.querySelector(".prompt-button.active")?.scrollIntoView({
+          block: "nearest",
+          inline: "nearest",
+        });
+      }
       return;
     }
     if (action === "clear-prompt") {
@@ -1363,6 +1667,70 @@
       saveGroup(button.dataset.groupId);
       return;
     }
+    if (action === "load-group-resources") {
+      loadGroupResources(button.dataset.groupId);
+      return;
+    }
+    if (action === "load-access") {
+      loadAccess();
+      return;
+    }
+    if (action === "delete-access") {
+      const type = button.dataset.accessType;
+      const id = button.dataset.accessId;
+      let url = `/api/v1/${type}/${encodeURIComponent(id)}`;
+      if (type === "admins") {
+        const [groupId, userId] = String(id).split(":", 2);
+        url = `/api/v1/groups/${encodeURIComponent(groupId)}/admins/${encodeURIComponent(userId)}`;
+      }
+      if (!await askConfirmation("确认操作", type === "global-bans" ? "确认解封该用户？" : "确认移除这条授权？")) return;
+      try {
+        await apiFetch(url, { method: "DELETE" });
+        await loadAccess();
+        await reloadGroups();
+        showToast("操作已完成");
+      } catch (error) {
+        showToast(error.message || "操作失败", "error");
+      }
+      return;
+    }
+    if (action === "delete-group-resource") {
+      const groupId = button.dataset.groupId;
+      const type = button.dataset.resourceType;
+      const id = button.dataset.resourceId;
+      if (!await askConfirmation("删除记录", "确认删除这条群管理记录？")) return;
+      try {
+        await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}/${encodeURIComponent(id)}`, { method: "DELETE" });
+        await loadGroupResources(groupId);
+        showToast("已删除");
+      } catch (error) {
+        showToast(error.message || "删除失败", "error");
+      }
+      return;
+    }
+    if (action === "edit-group-resource") {
+      const groupId = button.dataset.groupId;
+      const type = button.dataset.resourceType;
+      const resource = state.groupResources.get(String(groupId));
+      const item = (resource?.[type] || []).find(row => String(row.id) === String(button.dataset.resourceId));
+      if (!item) return;
+      const nextValue = window.prompt(
+        type === "rules" ? "修改群规内容" : "修改永久记忆",
+        type === "rules" ? item.pattern : item.content,
+      );
+      if (nextValue == null || !nextValue.trim()) return;
+      try {
+        await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}/${encodeURIComponent(item.id)}`, {
+          method: "PATCH",
+          body: JSON.stringify(type === "rules" ? { pattern: nextValue } : { content: nextValue }),
+        });
+        await loadGroupResources(groupId);
+        showToast("已更新");
+      } catch (error) {
+        showToast(error.message || "更新失败", "error");
+      }
+      return;
+    }
     if (action === "reload-groups") {
       if (state.groupSaving.size) return;
       if (anyGroupDirty() && !await askConfirmation("刷新群组", "刷新会丢弃所有未保存的群组设置。")) return;
@@ -1370,8 +1738,69 @@
     }
   });
 
+  content.addEventListener("submit", async event => {
+    const ruleEditForm = event.target.closest("[data-rule-edit-form]");
+    if (ruleEditForm) {
+      event.preventDefault();
+      if (!ruleEditForm.reportValidity()) return;
+      const values = Object.fromEntries(new FormData(ruleEditForm).entries());
+      values.enabled = ruleEditForm.elements.enabled.checked;
+      try {
+        await apiFetch(`/api/v1/groups/${encodeURIComponent(ruleEditForm.dataset.groupId)}/rules/${encodeURIComponent(ruleEditForm.dataset.ruleId)}`, {
+          method: "PATCH",
+          body: JSON.stringify(values),
+        });
+        await loadGroupResources(ruleEditForm.dataset.groupId);
+        showToast("群规已更新");
+      } catch (error) {
+        showToast(error.message || "群规更新失败", "error");
+      }
+      return;
+    }
+    const accessForm = event.target.closest("[data-access-form]");
+    if (accessForm) {
+      event.preventDefault();
+      if (!accessForm.reportValidity()) return;
+      const type = accessForm.dataset.accessForm;
+      const values = Object.fromEntries(new FormData(accessForm).entries());
+      for (const key of ["group_id", "user_id"]) if (values[key] != null) values[key] = Number(values[key]);
+      let url = `/api/v1/${type}`;
+      if (type === "admins") {
+        url = `/api/v1/groups/${encodeURIComponent(values.group_id)}/admins`;
+        delete values.group_id;
+      }
+      try {
+        await apiFetch(url, { method: "POST", body: JSON.stringify(values) });
+        await loadAccess();
+        await reloadGroups();
+        showToast("操作已完成");
+      } catch (error) {
+        showToast(error.message || "操作失败", "error");
+      }
+      return;
+    }
+    const form = event.target.closest("[data-resource-form]");
+    if (!form) return;
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    const groupId = form.dataset.groupId;
+    const type = form.dataset.resourceForm;
+    const values = Object.fromEntries(new FormData(form).entries());
+    if (values.user_id != null) values.user_id = Number(values.user_id);
+    try {
+      await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}`, {
+        method: "POST",
+        body: JSON.stringify(values),
+      });
+      await loadGroupResources(groupId);
+      showToast("已新增");
+    } catch (error) {
+      showToast(error.message || "新增失败", "error");
+    }
+  });
+
   function switchTab(tab) {
-    if (!NAV_ITEMS.some(item => item.id === tab)) return;
+    if (!navItems().some(item => item.id === tab)) return;
     state.activeTab = tab;
     app.classList.remove("sidebar-open");
     sidebar.classList.remove("mobile-open");

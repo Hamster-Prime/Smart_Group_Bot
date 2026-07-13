@@ -27,7 +27,7 @@
   │
   ├─ 内容审核 (keyword / regex / LLM 三级检测，带置信度)
   │     ├─ 高置信度命中 → warn / delete / ban（按规则独立配置）
-  │     └─ 低置信度命中 → 删消息 + Turnstile 真人质询
+  │     └─ 低置信度命中 → 删消息 + 可选验证码真人质询
   │
   ├─ 管理意图路由 (manage_intent)
   │     └─ memory_manage / rule_manage → 直接执行
@@ -79,15 +79,15 @@
 
 命中动作：`warn`（警告）、`delete`（删除消息）、`ban`（累计 3 次警告后踢出）。支持按用户设置 AI 审核豁免，支持全群「仅审核不回复」模式。管理员可用 `/clearwarnings` 清空某用户的累计违规次数。
 
-**置信度分级**：审核模型输出 0.0–1.0 的置信度。高置信度（默认 ≥0.9）命中直接执行规则动作；低置信度命中不直接处罚，而是删除消息并发起 Turnstile 真人质询——通过质询即恢复，超时未通过则封禁。审核输出不可解析时按不违规处理且不写入已审核缓存。
+**置信度分级**：审核模型输出 0.0–1.0 的置信度。高置信度（默认 ≥0.9）命中直接执行规则动作；低置信度命中不直接处罚，而是删除消息并发起真人质询（可在 Mini App 中切换 Cloudflare Turnstile/hCaptcha）——通过质询即恢复，超时未通过则封禁。审核输出不可解析时按不违规处理且不写入已审核缓存。
 
-### 入群验证（Turnstile 真人质询）
+### 入群验证（Turnstile / hCaptcha 真人质询）
 
-在设置中心开启入群验证后，新成员入群会先被禁言，需点击群内按钮跳转 bot 私聊，在 Telegram Mini App 内完成 Cloudflare Turnstile 质询后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
+入群验证按群配置：每个群都能单独关闭、开启或继承全局默认，并可分别选择 Cloudflare Turnstile 或 hCaptcha。新成员入群后会先被禁言，需点击群内按钮跳转 bot 私聊，在 Telegram Mini App 内完成该群所选验证码后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
 
 ### 资料筛查与全局封禁
 
-新成员入群时用群规审查其昵称/用户名/简介，命中即自动加入全局封禁名单；此后每条群消息都会复查发送者可见资料（含 /help、视频、纯媒体消息），改名无法逃避。全局封禁的用户在任意授权群发言即被删消息+封禁。最高管理员通过 `/ban`、`/unban`、`/banlist` 管理名单；`/unban` 同时清空违规次数并永久豁免资料审查。
+新成员入群时用群规审查其昵称/用户名/简介，命中即自动加入全局封禁名单；此后每条群消息都会复查发送者可见资料（含 `/help`、视频、纯媒体消息），改名无法逃避。全局封禁的用户在任意授权群发言即被删消息并封禁。最高管理员可在 Mini App 或通过 `/ban`、`/unban`、`/banlist` 管理名单；`/unban` 同时清空违规次数并永久豁免资料审查。群管理员可在 Mini App 中维护自己群的本地封禁，不会获得全局封禁名单访问权。
 
 ### 永久记忆
 
@@ -220,11 +220,13 @@ docker compose up -d
 启动后，最高管理员私聊 bot 发送 `/settings`，在 Telegram Mini App 中配置：
 
 - 模型供应商、API 密钥、角色模型、fallback、推理等级和重试参数
-- Bot 回复、流式输出、上下文、主动话题和消息保留策略
-- 审核、Turnstile、TTS、音乐、Sub2API、AV 和贴纸池
-- 日志输出、全部 LLM 提示词，以及每个授权群的功能开关、主动话题继承和说话风格画像
+- Bot 回复、流式输出、上下文、主动话题和按消息类别、秒数配置的自动删除策略
+- 审核、Cloudflare Turnstile/hCaptcha、TTS、音乐、Sub2API、AV 和贴纸池
+- 日志输出、全部 LLM 提示词，以及每个授权群的功能开关、群规、永久记忆、警告/封禁、审核豁免、回复静默名单和说话风格画像
 
 配置保存在数据库中并对后续请求热生效。第三方密钥使用 `CONFIG_MASTER_KEY` 加密，API 只返回“已配置”状态，不回传明文。全局配置使用 revision 防止多个页面互相覆盖。
+
+被授权的群管理员也可在私聊中发送 `/settings`。其 Mini App 只返回自己负责的群组和群级资源，无法读取其他群组、全局运行配置、密钥、授权关系或全局封禁名单。
 
 `.env` 只保留无法由 Mini App 自举的项目：
 
@@ -273,7 +275,7 @@ Smart_Group_Bot/
 │   │   ├── reply_output.py     # 回复解析与输出
 │   │   ├── proactive.py        # 主动话题
 │   │   ├── join_screening.py   # 入群资料筛查 + 全局封禁
-│   │   ├── join_verification.py# 入群验证 / 审核质询（Turnstile）
+│   │   ├── join_verification.py# 入群验证 / 审核质询（Turnstile / hCaptcha）
 │   │   ├── verify_web.py       # 内置验证页服务（aiohttp + Mini App）
 │   │   ├── runtime_config.py   # 数据库运行时配置、加密和热应用
 │   │   ├── speech_style.py     # 说话风格模仿（/mimic）

@@ -185,6 +185,12 @@ async def init_db(
             await _sqlite_ensure_column(
                 conn,
                 "join_verifications",
+                "provider",
+                "provider VARCHAR(32) NOT NULL DEFAULT 'turnstile'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "join_verifications",
                 "reason",
                 "reason TEXT NOT NULL DEFAULT ''",
             )

@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -13,7 +14,15 @@ from sqlalchemy import select
 
 from bot.config import Settings
 from bot.db.engine import init_db
-from bot.db.models import AuthorizedGroup, Group, SpeechStyleSample
+from bot.db.models import (
+    Admin,
+    AuthorizedGroup,
+    Group,
+    GroupPermanentMemory,
+    ModerationRule,
+    SpeechStyleSample,
+    UserWarning,
+)
 from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.verify_web import VerifyWebServer
 
@@ -69,7 +78,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             legacy_raw_env={},
         )
         await self.manager.initialize()
-        self.bot = SimpleNamespace(token=BOT_TOKEN)
+        self.bot = SimpleNamespace(
+            token=BOT_TOKEN,
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(),
+            restrict_chat_member=AsyncMock(),
+        )
         server = VerifyWebServer(
             bot=self.bot,
             settings=self.settings,
@@ -143,6 +157,123 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(user_id=99),
         )
         self.assertEqual(ordinary_user.status, 403)
+
+    async def test_group_admin_is_scoped_to_own_authorized_group(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    AuthorizedGroup(group_id=-401, authorized_by=42),
+                    AuthorizedGroup(group_id=-402, authorized_by=42),
+                    Group(id=-401, title="Own Group", settings={}),
+                    Group(id=-402, title="Other Group", settings={}),
+                    Admin(group_id=-401, user_id=99, role="admin"),
+                ]
+            )
+            await session.commit()
+
+        session_response = await self.client.get(
+            "/api/v1/session",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(session_response.status, 200)
+        self.assertEqual((await session_response.json())["session"]["role"], "group_admin")
+
+        groups_response = await self.client.get(
+            "/api/v1/groups",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(groups_response.status, 200)
+        self.assertEqual(
+            [group["id"] for group in (await groups_response.json())["groups"]],
+            [-401],
+        )
+        global_response = await self.client.get(
+            "/api/v1/settings",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(global_response.status, 403)
+        guessed = await self.client.get(
+            "/api/v1/groups/-402/rules",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(guessed.status, 403)
+
+    async def test_group_admin_can_manage_rules_and_memories(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-501, authorized_by=42))
+            session.add(Group(id=-501, title="Managed Group", settings={}))
+            session.add(Admin(group_id=-501, user_id=99, role="admin"))
+            await session.commit()
+
+        created_rule = await self.client.post(
+            "/api/v1/groups/-501/rules",
+            headers=self._headers(user_id=99),
+            json={"rule_type": "keyword", "pattern": "spam", "action": "delete"},
+        )
+        self.assertEqual(created_rule.status, 200)
+        rule_id = (await created_rule.json())["rule"]["id"]
+        created_memory = await self.client.post(
+            "/api/v1/groups/-501/memories",
+            headers=self._headers(user_id=99),
+            json={"content": "Alice is the project lead"},
+        )
+        self.assertEqual(created_memory.status, 200)
+        memory_id = (await created_memory.json())["memory"]["id"]
+
+        async with self.session_factory() as session:
+            self.assertEqual((await session.get(ModerationRule, rule_id)).group_id, -501)
+            self.assertEqual((await session.get(GroupPermanentMemory, memory_id)).group_id, -501)
+
+    async def test_group_admin_can_manage_group_bans_without_global_access(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-502, authorized_by=42))
+            session.add(Group(id=-502, title="Ban Group", settings={}))
+            session.add(Admin(group_id=-502, user_id=99, role="admin"))
+            await session.commit()
+
+        created = await self.client.post(
+            "/api/v1/groups/-502/bans",
+            headers=self._headers(user_id=99),
+            json={"user_id": 7001},
+        )
+        self.assertEqual(created.status, 200)
+        self.bot.ban_chat_member.assert_awaited_once_with(-502, 7001)
+
+        listed = await self.client.get(
+            "/api/v1/groups/-502/bans",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(listed.status, 200)
+        self.assertEqual((await listed.json())["bans"][0]["user_id"], 7001)
+
+        removed = await self.client.delete(
+            "/api/v1/groups/-502/bans/7001",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(removed.status, 200)
+        self.bot.unban_chat_member.assert_awaited_once_with(-502, 7001, only_if_banned=True)
+        self.bot.restrict_chat_member.assert_awaited_once()
+
+    async def test_failed_group_ban_does_not_leave_false_database_state(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-503, authorized_by=42))
+            session.add(Group(id=-503, title="Failure Group", settings={}))
+            session.add(Admin(group_id=-503, user_id=99, role="admin"))
+            await session.commit()
+        self.bot.ban_chat_member.side_effect = RuntimeError("telegram unavailable")
+
+        response = await self.client.post(
+            "/api/v1/groups/-503/bans",
+            headers=self._headers(user_id=99),
+            json={"user_id": 7002},
+        )
+        self.assertEqual(response.status, 502)
+        async with self.session_factory() as session:
+            row = await session.scalar(select(UserWarning).where(
+                UserWarning.group_id == -503,
+                UserWarning.user_id == 7002,
+            ))
+        self.assertIsNone(row)
 
     async def test_global_settings_save_is_masked_and_applies_live(self) -> None:
         response = await self.client.get(
@@ -293,6 +424,50 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(inherited.status, 200)
         self.assertIsNone((await inherited.json())["group"]["settings"]["proactive_enabled"])
+
+    async def test_group_join_verification_supports_override_and_inheritance(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-250, authorized_by=42))
+            session.add(Group(id=-250, title="Captcha Group", settings={}))
+            await session.commit()
+
+        group_document = await self._group_document(-250)
+        explicit = await self.client.put(
+            "/api/v1/groups/-250/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {
+                    "join_verification_enabled": True,
+                    "join_verification_provider": "hcaptcha",
+                },
+            },
+        )
+        self.assertEqual(explicit.status, 200)
+        explicit_group = (await explicit.json())["group"]
+        self.assertTrue(explicit_group["settings"]["join_verification_enabled"])
+        self.assertEqual(
+            explicit_group["settings"]["join_verification_provider"],
+            "hcaptcha",
+        )
+
+        inherited = await self.client.put(
+            "/api/v1/groups/-250/settings",
+            headers=self._headers(),
+            json={
+                "revision": explicit_group["revision"],
+                "settings": {
+                    "join_verification_enabled": None,
+                    "join_verification_provider": None,
+                },
+            },
+        )
+        self.assertEqual(inherited.status, 200)
+        inherited_settings = (await inherited.json())["group"]["settings"]
+        self.assertIsNone(inherited_settings["join_verification_enabled"])
+        self.assertIsNone(inherited_settings["join_verification_provider"])
 
     async def test_mimic_target_and_profile_are_visually_configurable(self) -> None:
         async with self.session_factory() as session:

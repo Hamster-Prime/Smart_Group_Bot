@@ -114,13 +114,36 @@ def sanitize_outgoing_text(text: str) -> str:
     return cleaned.strip()
 
 
-def schedule_message_auto_delete(sent: Message | None, auto_delete_minutes: int) -> None:
+AUTO_DELETE_CATEGORIES = frozenset(
+    {"reply", "management", "moderation", "media", "proactive"}
+)
+
+
+def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
+    """Resolve the global seconds-based retention policy for one message class."""
+    normalized = str(category or "").strip().lower()
+    if normalized not in AUTO_DELETE_CATEGORIES:
+        return 0
+    enabled = {
+        str(item or "").strip().lower()
+        for item in getattr(settings.bot, "auto_delete_categories", [])
+    }
+    if normalized not in enabled:
+        return 0
+    seconds = int(getattr(settings.bot, "auto_delete_seconds", 0) or 0)
+    if seconds <= 0:
+        # Keep integrations that still populate the deprecated alias working
+        # while all persisted/runtime configuration uses seconds.
+        seconds = int(getattr(settings.bot, "auto_delete_minutes", 0) or 0) * 60
+    return max(0, seconds)
+
+
+def schedule_message_auto_delete(sent: Message | None, auto_delete_seconds: int) -> None:
     """Best-effort delayed delete for outgoing bot messages."""
-    minutes = int(auto_delete_minutes or 0)
-    if not sent or minutes <= 0:
+    delay_seconds = int(auto_delete_seconds or 0)
+    if not sent or delay_seconds <= 0:
         return
 
-    delay_seconds = minutes * 60
     chat_id = sent.chat.id
     message_id = sent.message_id
 
@@ -157,7 +180,7 @@ async def answer_with_auto_delete(
     message: Message,
     text: str,
     *,
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
     retry_tls_record_error: bool = False,
     **kwargs: object,
 ) -> Message:
@@ -195,7 +218,7 @@ async def answer_with_auto_delete(
         fallback_kwargs["parse_mode"] = None
         plain_text = html.escape(payload)
         sent = await _answer_with_network_retry(plain_text, fallback_kwargs)
-    schedule_message_auto_delete(sent, auto_delete_minutes)
+    schedule_message_auto_delete(sent, auto_delete_seconds)
     return sent
 
 
@@ -203,11 +226,11 @@ async def reply_sticker_with_auto_delete(
     message: Message,
     *,
     sticker: str,
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
     **kwargs: object,
 ) -> Message:
     sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    schedule_message_auto_delete(sent, auto_delete_minutes)
+    schedule_message_auto_delete(sent, auto_delete_seconds)
     return sent
 
 
@@ -216,14 +239,14 @@ async def send_sticker_with_auto_delete(
     *,
     sticker: str,
     delivery_mode: str = "reply",
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
     **kwargs: object,
 ) -> Message:
     if (delivery_mode or "").strip().lower() == "message":
         sent = await message.answer_sticker(sticker=sticker, **kwargs)
     else:
         sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    schedule_message_auto_delete(sent, auto_delete_minutes)
+    schedule_message_auto_delete(sent, auto_delete_seconds)
     return sent
 
 
@@ -368,7 +391,10 @@ async def ensure_admin(message: Message, settings: Settings | None = None) -> bo
 
     sent = await message.answer("仅群管理员可使用该命令。")
     if settings:
-        schedule_message_auto_delete(sent, settings.bot.auto_delete_minutes)
+        schedule_message_auto_delete(
+            sent,
+            configured_auto_delete_seconds(settings, "management"),
+        )
     return False
 
 
@@ -591,7 +617,7 @@ async def send_reply(
     stream: bool = False,
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
 ) -> bool:
     """Send reply in normal mode or stream-like incremental edits.
 
@@ -630,7 +656,7 @@ async def send_reply(
                         sent = await message.reply(body, parse_mode=parse_mode)
                 else:
                     sent = await message.answer(body, parse_mode=parse_mode)
-                schedule_message_auto_delete(sent, auto_delete_minutes)
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -796,7 +822,7 @@ async def send_reply_messages(
     stream: bool = False,
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
 ) -> list[bool]:
     normalized = [str(item or "").strip() for item in texts if str(item or "").strip()]
     if not normalized:
@@ -817,7 +843,7 @@ async def send_reply_messages(
             stream=use_stream,
             stream_chunk_size=stream_chunk_size,
             stream_interval=stream_interval,
-            auto_delete_minutes=auto_delete_minutes,
+            auto_delete_seconds=auto_delete_seconds,
         )
         results.append(ok)
     return results
@@ -831,7 +857,7 @@ async def send_chat_message(
     reply_to_message_id: int | None = None,
     fallback_mention_user_id: int = 0,
     fallback_mention_name: str = "",
-    auto_delete_minutes: int = 0,
+    auto_delete_seconds: int = 0,
 ) -> bool:
     payload = sanitize_outgoing_text((text or "").strip())
     payload = sanitize_outgoing_mentions(payload)
@@ -863,7 +889,7 @@ async def send_chat_message(
                     parse_mode=current_parse_mode,
                     reply_to_message_id=current_reply_id,
                 )
-                schedule_message_auto_delete(sent, auto_delete_minutes)
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2

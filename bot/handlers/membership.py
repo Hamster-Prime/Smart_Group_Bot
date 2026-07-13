@@ -11,7 +11,7 @@ from aiogram.types import ChatMemberUpdated
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import JoinVerification
+from bot.db.models import Group, JoinVerification
 from bot.services.admin_status import invalidate_admin_status_cache
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.join_screening import (
@@ -31,6 +31,7 @@ from bot.services.join_verification import (
     delete_join_verification,
     get_join_verification,
     join_verification_ready,
+    join_verification_policy,
     restore_member_permissions,
     restrict_new_member,
     upsert_join_verification,
@@ -106,6 +107,7 @@ async def _start_join_verification(
     *,
     user_id: int,
     display_name: str,
+    provider: str,
 ) -> None:
     """Mute the new member and post the private-chat deep link; failure fails open.
 
@@ -129,7 +131,10 @@ async def _start_join_verification(
             group_id,
             text,
             parse_mode="HTML",
-            reply_markup=build_group_prompt_keyboard(get_bot_identity().username),
+            reply_markup=build_group_prompt_keyboard(
+                get_bot_identity().username,
+                group_id,
+            ),
         )
         prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
     except Exception:
@@ -148,6 +153,7 @@ async def _start_join_verification(
         deadline_at=deadline,
         display_name=display_name,
         prompt_message_id=prompt_message_id,
+        provider=provider,
     )
     log.info("join verification issued | group=%s user=%s", group_id, user_id)
 
@@ -252,13 +258,17 @@ async def on_member_join(
         return
 
     async def _maybe_start_verification() -> None:
-        if join_verification_ready(settings):
+        group = await session.get(Group, group_id)
+        group_settings = group.settings if group is not None else None
+        enabled, provider = join_verification_policy(settings, group_settings)
+        if enabled and join_verification_ready(settings, group_settings):
             await _start_join_verification(
                 event,
                 session,
                 settings,
                 user_id=user_id,
                 display_name=user.full_name or "",
+                provider=provider,
             )
 
     if not settings.moderation.enabled:

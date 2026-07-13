@@ -140,8 +140,18 @@ async def is_join_screening_exempt(session: AsyncSession, user_id: int) -> bool:
     return row is not None
 
 
-async def list_global_bans(session: AsyncSession, *, limit: int = 50) -> list[GlobalBan]:
-    stmt = select(GlobalBan).order_by(GlobalBan.created_at.desc()).limit(max(1, limit))
+async def list_global_bans(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[GlobalBan]:
+    stmt = (
+        select(GlobalBan)
+        .order_by(GlobalBan.created_at.desc())
+        .offset(max(0, int(offset)))
+        .limit(max(1, int(limit)))
+    )
     with session.no_autoflush:
         result = await session.execute(stmt)
     return list(result.scalars().all())

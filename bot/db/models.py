@@ -206,8 +206,7 @@ class JoinScreeningExemption(Base):
 
 
 class JoinVerification(Base):
-    """Pending Turnstile verification; the user stays fully restricted until
-    they pass the Cloudflare challenge inside the Telegram Mini App.
+    """Pending provider verification; the user stays restricted until passing.
 
     kind="join": issued on member join; missing the deadline kicks (the user
     may rejoin and retry). kind="moderation": issued when a message is judged
@@ -224,6 +223,11 @@ class JoinVerification(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     kind: Mapped[str] = mapped_column(
         String(32), default="join", server_default="join"
+    )
+    # Snapshot the provider selected when this challenge was issued. This
+    # keeps an in-flight page valid when the global or group default changes.
+    provider: Mapped[str] = mapped_column(
+        String(32), default="turnstile", server_default="turnstile"
     )
     reason: Mapped[str] = mapped_column(Text, default="", server_default="")
     display_name: Mapped[str] = mapped_column(String(255), default="")

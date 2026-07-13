@@ -10,7 +10,8 @@ from bot.utils.command_catalog import build_command_guide_context
 
 def _settings() -> Settings:
     settings = Settings(_env_file=None)
-    settings.bot.auto_delete_minutes = 3
+    settings.bot.auto_delete_seconds = 3
+    settings.bot.auto_delete_categories = ["management"]
     return settings
 
 
@@ -37,6 +38,24 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("command: /clearwarnings", guide)
         self.assertIn("清空某用户的累计违规次数", guide)
+
+    async def test_settings_entry_allows_authorized_group_admin(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=99, type="private"),
+            from_user=SimpleNamespace(id=99),
+        )
+        settings = _settings()
+        settings.miniapp_public_base_url = "https://bot.example.com"
+        session = SimpleNamespace(scalar=AsyncMock(return_value=1))
+        with patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock:
+            await commands.cmd_settings(message, settings=settings, session=session)
+
+        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
+        keyboard = answer_mock.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            keyboard.inline_keyboard[0][0].web_app.url,
+            "https://bot.example.com/settings",
+        )
 
     async def test_clearwarnings_calls_warning_reset_for_target(self) -> None:
         message = SimpleNamespace(
@@ -133,7 +152,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         ):
             await commands.cmd_lm(message, session=object(), settings=settings)
 
-        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_minutes"], 0)
+        self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
         self.assertIn("永久记忆", answer_mock.await_args.args[2])
 
     async def test_addrule_uses_rule_manage_skill(self) -> None:

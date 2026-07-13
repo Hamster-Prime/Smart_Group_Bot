@@ -51,7 +51,11 @@ from bot.services.proactive import (
     set_cooldown_task_enabled,
 )
 from bot.services.skills import SkillService
-from bot.utils.telegram import answer_with_auto_delete, is_group
+from bot.utils.telegram import (
+    answer_with_auto_delete,
+    configured_auto_delete_seconds,
+    is_group,
+)
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -125,7 +129,7 @@ async def _answer(
     await answer_with_auto_delete(
         message,
         text,
-        auto_delete_minutes=settings.bot.auto_delete_minutes,
+        auto_delete_seconds=configured_auto_delete_seconds(settings, "management"),
         **kwargs,
     )
 

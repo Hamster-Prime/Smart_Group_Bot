@@ -21,7 +21,7 @@ from bot.services.memory import MemoryService
 from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, sanitize_history_for_llm
-from bot.utils.telegram import send_chat_message
+from bot.utils.telegram import configured_auto_delete_seconds, send_chat_message
 
 log = logging.getLogger(__name__)
 
@@ -525,7 +525,9 @@ class ProactiveTopicService:
                 self.bot,
                 group_id,
                 reply,
-                auto_delete_minutes=0,
+                auto_delete_seconds=configured_auto_delete_seconds(
+                    self.settings, "media"
+                ),
                 uid=str(group_id),
             )
             if not sent_ok:
@@ -537,7 +539,9 @@ class ProactiveTopicService:
             self.bot,
             group_id,
             reply,
-            auto_delete_minutes=0,
+            auto_delete_seconds=configured_auto_delete_seconds(
+                self.settings, "proactive"
+            ),
         )
 
     async def _commit_fresh_settings(
