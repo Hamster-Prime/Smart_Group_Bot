@@ -603,7 +603,7 @@
             ${field("verification.timeout_seconds", "验证超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${field("verification.check_interval_seconds", "状态检查间隔（秒）", { type: "number", min: 5, max: 3600, step: 0.1, required: true })}
             ${field("verification.turnstile_site_key", "Turnstile Site Key", { maxlength: 255 })}
-            ${secretField("verification.turnstile_secret_key", "Turnstile Secret Key", "空白不会覆盖已保存的密钥")}
+            ${secretField("verification.turnstile_secret_key", "Turnstile Secret Key", "必须填写 Cloudflare 控制台中的 Secret Key，不能重复 Site Key；空白不会覆盖已保存值")}
           </div>
         </section>
       </div>`;
@@ -974,6 +974,14 @@
       for (const fallback of role.fallbacks || []) {
         if (!known.has(fallback.provider)) return `${ROLE_META[roleName].label}的回退供应商不存在`;
       }
+    }
+    const pendingTurnstileSecret = state.secretChanges["verification.turnstile_secret_key"];
+    if (
+      pendingTurnstileSecret?.action === "replace"
+      && String(pendingTurnstileSecret.value || "").trim()
+        === String(state.config.verification.turnstile_site_key || "").trim()
+    ) {
+      return "Turnstile Secret Key 不能与 Site Key 相同";
     }
     const nullPath = findNullNumber(state.config);
     if (nullPath) return `${nullPath} 需要填写有效数字`;

@@ -186,7 +186,7 @@ class BotBehaviorConfig(StrictModel):
     stream_edit_interval_sec: float = Field(default=1.0, ge=0.3, le=30.0)
     auto_delete_minutes: int = Field(default=0, ge=0, le=10080)
     decision_context_items: int = Field(default=5, ge=0, le=20)
-    max_context_tokens: int = Field(default=4096, ge=1024, le=2_000_000)
+    max_context_tokens: int = Field(default=256000, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
@@ -210,6 +210,22 @@ class VerificationSettingsConfig(StrictModel):
     check_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
     turnstile_site_key: str = Field(default="", max_length=255)
     turnstile_secret_key: str = Field(default="", max_length=1024)
+
+    @field_validator("turnstile_site_key", "turnstile_secret_key", mode="before")
+    @classmethod
+    def _clean_turnstile_key(cls, value: object) -> str:
+        return str(value or "").strip()
+
+
+def turnstile_key_configuration_issue(
+    site_key: str,
+    secret_key: str,
+) -> str:
+    site = str(site_key or "").strip()
+    secret = str(secret_key or "").strip()
+    if site and secret and site == secret:
+        return "Turnstile Secret Key 不能与 Site Key 相同；请填写 Cloudflare 控制台中的 Secret Key"
+    return ""
 
 
 class TTSSettingsConfig(StrictModel):
@@ -793,6 +809,24 @@ class RuntimeConfigManager:
                 if path in allowed_paths and value
             }
             candidate = candidate.with_secrets(secrets)
+            turnstile_issue = turnstile_key_configuration_issue(
+                candidate.verification.turnstile_site_key,
+                candidate.verification.turnstile_secret_key,
+            )
+            current_turnstile_issue = turnstile_key_configuration_issue(
+                current.verification.turnstile_site_key,
+                current.verification.turnstile_secret_key,
+            )
+            unchanged_legacy_issue = bool(
+                current_turnstile_issue
+                and turnstile_issue
+                and candidate.verification.turnstile_site_key
+                == current.verification.turnstile_site_key
+                and candidate.verification.turnstile_secret_key
+                == current.verification.turnstile_secret_key
+            )
+            if turnstile_issue and not unchanged_legacy_issue:
+                raise ValueError(turnstile_issue)
             candidate.apply_to_settings(
                 self.settings.model_copy(deep=True),
                 apply_prompts=False,

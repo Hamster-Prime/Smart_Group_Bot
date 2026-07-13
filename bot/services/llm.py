@@ -3,14 +3,29 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
 
 log = logging.getLogger(__name__)
+
+_PROVIDER_CREDENTIAL_ENV_KEYS = {
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openai": ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY"),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+}
+_PROVIDER_OFFICIAL_HOSTS = {
+    "gemini": {"generativelanguage.googleapis.com"},
+    "openai": {"api.openai.com"},
+    "anthropic": {"api.anthropic.com"},
+    "openrouter": {"openrouter.ai"},
+}
 
 # Disable extra LiteLLM debug logs.
 litellm.suppress_debug_info = True
@@ -216,6 +231,31 @@ class LLMService:
             ),
             *cfg.fallbacks,
         ]
+
+    @staticmethod
+    def chat_configuration_issue(cfg: ChatEndpointConfig) -> str:
+        """Return a deterministic credential issue without probing the provider."""
+        if str(cfg.api_key or "").strip():
+            return ""
+
+        provider = str(getattr(cfg, "provider", "") or "").strip().lower()
+        model_prefix = str(cfg.model or "").partition("/")[0].strip().lower()
+        if provider != "openai_compatible" and model_prefix in _PROVIDER_CREDENTIAL_ENV_KEYS:
+            provider = model_prefix
+
+        ambient_keys = _PROVIDER_CREDENTIAL_ENV_KEYS.get(provider)
+        if ambient_keys is None:
+            return ""
+        if any(str(os.getenv(name, "") or "").strip() for name in ambient_keys):
+            return ""
+
+        api_base = str(cfg.api_base or "").strip()
+        if api_base:
+            hostname = str(urlparse(api_base).hostname or "").strip().lower()
+            if hostname not in _PROVIDER_OFFICIAL_HOSTS.get(provider, set()):
+                # Custom gateways may intentionally be keyless.
+                return ""
+        return f"{provider} provider has no API key"
 
     @staticmethod
     def _normalize_content_text(content: Any) -> str:
@@ -969,19 +1009,47 @@ class LLMService:
             return escaped, False
         return escaped[:limit], True
 
+    @staticmethod
+    def model_input_token_limit(cfg: ChatEndpointConfig) -> int:
+        try:
+            info = litellm.get_model_info(model=cfg.model)
+            return max(0, int((info or {}).get("max_input_tokens") or 0))
+        except Exception:
+            return 0
+
     def _context_window_total(self, cfg: ChatEndpointConfig | None = None) -> int:
         if self.max_context_tokens > 0:
             return self.max_context_tokens
-        try:
-            return int(litellm.get_max_tokens(model=(cfg.model if cfg is not None else self.main.model)) or 0)
-        except Exception:
-            return 0
+        return self.model_input_token_limit(cfg or self.main)
 
     @staticmethod
     def _format_prompt_usage(used_tokens: int, total_tokens: int) -> str:
         if total_tokens > 0:
             return f"{max(0, int(used_tokens))}/{int(total_tokens)}"
         return f"{max(0, int(used_tokens))}/?"
+
+    def _count_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        cfg: ChatEndpointConfig | None = None,
+    ) -> tuple[int, bool]:
+        kwargs: dict[str, Any] = {
+            "model": (cfg.model if cfg is not None else self.main.model),
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        try:
+            return int(litellm.token_counter(**kwargs)), True
+        except Exception:
+            fallback = 0
+            for msg in messages:
+                fallback += len(str(msg.get("content", "")))
+            if tools:
+                fallback += len(str(tools))
+            return fallback, False
 
     def count_prompt_tokens(
         self,
@@ -990,21 +1058,7 @@ class LLMService:
         tools: list[dict[str, Any]] | None = None,
         cfg: ChatEndpointConfig | None = None,
     ) -> int:
-        kwargs: dict[str, Any] = {
-            "model": (cfg.model if cfg is not None else self.main.model),
-            "messages": messages,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        try:
-            return int(litellm.token_counter(**kwargs))
-        except Exception:
-            fallback = 0
-            for msg in messages:
-                fallback += len(str(msg.get("content", "")))
-            if tools:
-                fallback += len(str(tools))
-            return fallback
+        return self._count_prompt_tokens(messages, tools=tools, cfg=cfg)[0]
 
     def prompt_usage_text(
         self,
@@ -1211,12 +1265,56 @@ class LLMService:
     ) -> Any | None:
         label_cn = self._label_cn(label)
         total_attempts = self._retry_attempts(cfg)
+        prompt_tokens, token_count_exact = self._count_prompt_tokens(
+            messages,
+            tools=tools,
+            cfg=cfg,
+        )
+        configured_context = self.max_context_tokens
+        required_tokens = prompt_tokens + max(0, int(cfg.max_tokens or 0))
+        if token_count_exact and configured_context > 0 and required_tokens > configured_context:
+            log.error(
+                "LLM request exceeds configured context budget | stage=%s | model=%s | "
+                "prompt_tokens=%d output_tokens=%d total=%d/%d | skipping_model",
+                label_cn,
+                cfg.model,
+                prompt_tokens,
+                cfg.max_tokens,
+                required_tokens,
+                configured_context,
+            )
+            return None
+        model_input_limit = self.model_input_token_limit(cfg)
+        if token_count_exact and model_input_limit > 0 and prompt_tokens > model_input_limit:
+            log.error(
+                "LLM prompt exceeds model input limit | stage=%s | model=%s | "
+                "prompt_tokens=%d/%d | skipping_model",
+                label_cn,
+                cfg.model,
+                prompt_tokens,
+                model_input_limit,
+            )
+            return None
+        configuration_issue = self.chat_configuration_issue(cfg)
+        if configuration_issue:
+            log.error(
+                "LLM unavailable | stage=%s | model=%s | reason=%s | skipping_model",
+                label_cn,
+                cfg.model,
+                configuration_issue,
+            )
+            return None
 
         for attempt in range(1, total_attempts + 1):
             stream = self._should_stream_upstream(label, cfg)
             kwargs = self._build_chat_kwargs(cfg, stream=stream)
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
-            prompt_usage = self.prompt_usage_text(messages, tools=tools, cfg=cfg)
+            prompt_usage = self.prompt_usage_text(
+                messages,
+                tools=tools,
+                cfg=cfg,
+                used_tokens=prompt_tokens,
+            )
             log.info(
                 "LLM request | stage=%s | model=%s | endpoint=%s | attempt=%d/%d | prompt_tokens=%s | messages=%d | tools=%d | timeout=%.1fs | stream=%s",
                 label_cn,
@@ -1244,11 +1342,26 @@ class LLMService:
                         timeout_sec=timeout_sec,
                     )
                 else:
-                    request = (
-                        litellm.acompletion(messages=messages, tools=tools, tool_choice=tool_choice, **kwargs)
-                        if tools
-                        else litellm.acompletion(messages=messages, **kwargs)
-                    )
+                    if tools:
+                        tool_kwargs: dict[str, Any] = {
+                            "tools": tools,
+                            "tool_choice": tool_choice,
+                        }
+                        if not any(
+                            isinstance(tool, dict)
+                            and str(tool.get("type", "")).strip().lower() == "mcp"
+                            for tool in tools
+                        ):
+                            # LiteLLM 1.92 imports its optional Proxy/MCP stack
+                            # before it checks that these are ordinary function tools.
+                            tool_kwargs["_skip_mcp_handler"] = True
+                        request = litellm.acompletion(
+                            messages=messages,
+                            **tool_kwargs,
+                            **kwargs,
+                        )
+                    else:
+                        request = litellm.acompletion(messages=messages, **kwargs)
                     raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
                     if stream:
                         resp = await self._await_with_timeout(

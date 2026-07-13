@@ -21,6 +21,7 @@ from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.proactive import ProactiveTopicService
 from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
+from bot.services.runtime_config import turnstile_key_configuration_issue
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
 
@@ -55,6 +56,18 @@ async def main() -> None:
         embed=settings.bot.embed_model,
         max_context_tokens=settings.bot.max_context_tokens,
     )
+    main_candidates = llm._chat_candidates(settings.bot.main_model)
+    if main_candidates and all(llm.chat_configuration_issue(item) for item in main_candidates):
+        log.warning(
+            "AI 模型尚不可用：主模型及其回退均缺少所需凭据；"
+            "请由最高管理员私聊 bot 发送 /settings 完成模型配置。"
+        )
+    if settings.bot.max_context_tokens <= 4096:
+        log.warning(
+            "当前最大上下文仅 %d Token，可能小于内置提示词；"
+            "请在 /settings 的 Bot 行为中调高上下文预算。",
+            settings.bot.max_context_tokens,
+        )
     memory = MemoryService(
         settings.bot,
         llm,
@@ -104,9 +117,11 @@ async def main() -> None:
         bot=bot,
         session_factory=session_factory,
         check_interval_seconds=settings.join_verification_check_interval_seconds,
+        settings=settings,
     )
-    # Always drain persisted deadlines. Operators may disable a flow or remove
-    # its web configuration while records from an earlier run still exist.
+    # Persisted deadlines are drained while verification is healthy. If the
+    # shared Turnstile config is unavailable, the sweeper preserves records
+    # and refreshes their grace window instead of punishing users.
     verification_runner = asyncio.create_task(
         sweeper.run_forever(),
         name="verification-sweeper",
@@ -140,7 +155,16 @@ async def main() -> None:
         runtime_config=runtime_config,
     )
     await verify_web.start()
-    if verification_service_ready(settings):
+    turnstile_issue = turnstile_key_configuration_issue(
+        settings.join_verification_turnstile_site_key,
+        settings.join_verification_turnstile_secret_key,
+    )
+    if turnstile_issue:
+        log.error(
+            "%s；已暂停签发新的真人质询，请在 /settings 更正后重试。",
+            turnstile_issue,
+        )
+    elif verification_service_ready(settings):
         await warn_if_bot_cannot_verify(bot, settings, session_factory)
     elif settings.moderation.enabled:
         log.warning(

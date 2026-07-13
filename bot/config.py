@@ -115,7 +115,7 @@ class BotConfig(BaseModel):
         timeout_sec=12.0,
     )
     embed_model: EmbedConfig = EmbedConfig()
-    max_context_tokens: int = 4096
+    max_context_tokens: int = 256000
     max_output_tokens: int = 2048
 
 
@@ -186,7 +186,7 @@ class Settings(BaseSettings):
     llm_retry_backoff_sec: float = 0.8
     llm_retry_timeout_multiplier: float = 1.35
 
-    max_context_tokens: int = 4096
+    max_context_tokens: int = 256000
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
     bot_enable_typing: bool = True

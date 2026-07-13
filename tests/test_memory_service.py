@@ -136,6 +136,17 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    async def test_context_budget_is_capped_by_known_model_input_limit(self) -> None:
+        llm = _StubLLM()
+        llm.model_input_token_limit = lambda _cfg: 8192
+        memory = MemoryService(
+            BotConfig(max_context_tokens=256000, max_output_tokens=2048),
+            llm,
+            session_factory=object(),  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(memory.max_context, 10240)
+
     async def test_bootstrap_converts_legacy_utc_message_timestamps_to_shanghai(self) -> None:
         tmpdir = self._workspace_tmpdir()
         try:
@@ -269,6 +280,49 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(memory.get_history(12345), [])
             self.assertEqual(await memory._get_summary(12345), "压缩后摘要")
             self.assertFalse(any(msg.get("role") == "user" for msg in prompt_history))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_failed_compaction_preserves_raw_history_and_database_rows(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _StubLLM(),
+                session_factory=session_factory,
+            )
+            memory._count_tokens = lambda _messages: memory.max_context  # type: ignore[method-assign]
+            group_id = 12345
+
+            await memory.add_message(
+                group_id,
+                "user",
+                "must-survive-failed-compression",
+                message_id="preserved-message",
+            )
+
+            self.assertFalse(await memory.compact_if_needed(group_id))
+            self.assertEqual(
+                [item["content"] for item in memory.get_history(group_id)],
+                ["must-survive-failed-compression"],
+            )
+            self.assertEqual(await memory._get_summary(group_id), "")
+
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector).where(MessageVector.group_id == group_id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].content, "must-survive-failed-compression")
+            await engine.dispose()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

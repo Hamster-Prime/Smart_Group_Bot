@@ -21,7 +21,7 @@ from bot.services.join_verification import (
     get_join_verification,
     upsert_join_verification,
 )
-from bot.services.verify_web import VerifyWebServer
+from bot.services.verify_web import VerifyWebServer, verify_turnstile_token
 from bot.utils.timezone import now_shanghai_naive
 
 BOT_TOKEN = "42:TEST_TOKEN"
@@ -115,6 +115,10 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         resp = await self.client.get("/healthz")
         self.assertEqual(resp.status, 200)
 
+    async def test_non_object_submit_body_gets_400(self) -> None:
+        resp = await self.client.post("/verify", json=["invalid"])
+        self.assertEqual(resp.status, 400)
+
     async def test_challenge_page_renders_turnstile_and_webapp_sdk(self) -> None:
         resp = await self.client.get("/verify")
         body = await resp.text()
@@ -124,12 +128,56 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-sitekey="site-key"', body)
         self.assertIn("challenges.cloudflare.com/turnstile/v0/api.js", body)
         self.assertIn("telegram.org/js/telegram-web-app.js", body)
+        self.assertIn('data-error-callback="onTurnstileError"', body)
+        self.assertIn("resetTurnstile", body)
+
+    async def test_siteverify_error_codes_are_preserved(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self, *, content_type=None):
+                return {
+                    "success": False,
+                    "error-codes": ["invalid-input-secret"],
+                }
+
+        class FakeClientSession:
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def post(self, _url, *, data):
+                self.data = data
+                return FakeResponse()
+
+        with patch(
+            "bot.services.verify_web.aiohttp.ClientSession",
+            FakeClientSession,
+        ):
+            passed, errors = await verify_turnstile_token(
+                secret_key="wrong-secret",
+                turnstile_token="token",
+            )
+
+        self.assertFalse(passed)
+        self.assertEqual(errors, ["invalid-input-secret"])
 
     async def test_successful_submit_restores_permissions(self) -> None:
         await self._seed(user_id=102)
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ) as verify_mock:
             resp = await self._submit(102)
 
@@ -153,7 +201,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ):
             resp = await self._submit(109)
 
@@ -173,7 +221,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         forged = _signed_init_data(103, bot_token="43:WRONG_TOKEN")
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ) as verify_mock:
             resp = await self._submit(103, init_data=forged)
 
@@ -187,7 +235,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         await self._seed(user_id=104)
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=False),
+            new=AsyncMock(return_value=(False, [])),
         ):
             resp = await self._submit(104)
 
@@ -203,7 +251,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_without_pending_record_gets_404(self) -> None:
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ) as verify_mock:
             resp = await self._submit(105)
         self.assertEqual(resp.status, 404)
@@ -214,7 +262,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         await self._seed(user_id=106, minutes=-1)
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ):
             resp = await self._submit(106)
         self.assertEqual(resp.status, 404)
@@ -226,13 +274,13 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             reason="低置信度命中",
         )
 
-        async def expire_while_verifying(**_kwargs) -> bool:
+        async def expire_while_verifying(**_kwargs) -> tuple[bool, list[str]]:
             async with self.session_factory() as session:
                 record = await get_join_verification(session, -100, 110)
                 self.assertIsNotNone(record)
                 record.deadline_at = now_shanghai_naive() - timedelta(seconds=1)
                 await session.commit()
-            return True
+            return True, []
 
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
@@ -268,7 +316,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ) as verify_mock:
             resp = await self._submit(111)
 
@@ -286,13 +334,13 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         both_verifying = asyncio.Event()
         verification_count = 0
 
-        async def verify_concurrently(**_kwargs) -> bool:
+        async def verify_concurrently(**_kwargs) -> tuple[bool, list[str]]:
             nonlocal verification_count
             verification_count += 1
             if verification_count == 2:
                 both_verifying.set()
             await both_verifying.wait()
-            return True
+            return True, []
 
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
@@ -316,12 +364,42 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         await self._seed(user_id=108)
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=(True, [])),
         ):
             resp = await self._submit(999)  # signed as another user
         self.assertEqual(resp.status, 404)
         async with self.session_factory() as session:
             self.assertIsNotNone(await get_join_verification(session, -100, 108))
+
+    async def test_invalid_turnstile_secret_returns_configuration_error(self) -> None:
+        await self._seed(user_id=112)
+        before = now_shanghai_naive()
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(False, ["invalid-input-secret"])),
+        ):
+            resp = await self._submit(112)
+
+        self.assertEqual(resp.status, 503)
+        self.assertIn("Secret Key 无效", (await resp.json())["error"])
+        self.bot.restrict_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 112)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, before)
+
+    async def test_turnstile_upstream_failure_returns_service_unavailable(self) -> None:
+        await self._seed(user_id=113)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(False, ["siteverify-unavailable"])),
+        ):
+            resp = await self._submit(113)
+
+        self.assertEqual(resp.status, 503)
+        self.assertIn("暂时不可用", (await resp.json())["error"])
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 113))
 
 
 if __name__ == "__main__":

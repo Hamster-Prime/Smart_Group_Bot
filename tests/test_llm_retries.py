@@ -104,6 +104,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
     def _make_llm(self) -> LLMService:
         main = ModelConfig(
             model="openai/gpt-4.1",
+            api_key="test-key",
             timeout_sec=1.0,
             retry_attempts=2,
             retry_backoff_sec=0.0,
@@ -111,6 +112,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
             fallbacks=[
                 ChatEndpointConfig(
                     model="openai/gpt-4.1-mini",
+                    api_key="test-key",
                     timeout_sec=1.0,
                     retry_attempts=2,
                     retry_backoff_sec=0.0,
@@ -120,6 +122,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         decision = ModelConfig(
             model="openai/gpt-4.1-mini",
+            api_key="test-key",
             timeout_sec=1.0,
             retry_attempts=2,
             retry_backoff_sec=0.0,
@@ -127,6 +130,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         embed = EmbedConfig(
             model="openai/text-embedding-3-small",
+            api_key="test-key",
             timeout_sec=1.0,
             retry_attempts=2,
             retry_backoff_sec=0.0,
@@ -173,6 +177,105 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_completion.await_args_list[1].kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_completion.await_args_list[2].kwargs["model"], "openai/gpt-4.1-mini")
 
+    async def test_missing_native_provider_key_skips_retries_and_uses_fallback(self) -> None:
+        main = ModelConfig(
+            model="gemini/gemini-2.0-flash",
+            provider="gemini",
+            retry_attempts=2,
+            retry_backoff_sec=0.0,
+            fallbacks=[
+                ChatEndpointConfig(
+                    model="openai/local-model",
+                    provider="openai_compatible",
+                    api_base="http://localhost:8000/v1",
+                    retry_attempts=2,
+                    retry_backoff_sec=0.0,
+                )
+            ],
+        )
+        llm = LLMService(main, main, compress=main)
+        mock_completion = AsyncMock(return_value=_chat_resp(content="fallback-ok"))
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""},
+                clear=False,
+            ),
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "fallback-ok")
+        mock_completion.assert_awaited_once()
+        self.assertEqual(mock_completion.await_args.kwargs["model"], "openai/local-model")
+
+    def test_official_provider_base_still_requires_a_key(self) -> None:
+        cfg = ChatEndpointConfig(
+            model="gemini/gemini-2.0-flash",
+            provider="gemini",
+            api_base="https://generativelanguage.googleapis.com/v1beta",
+        )
+        with patch.dict(
+            "os.environ",
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""},
+            clear=False,
+        ):
+            self.assertEqual(
+                LLMService.chat_configuration_issue(cfg),
+                "gemini provider has no API key",
+            )
+
+    async def test_native_provider_can_use_ambient_key(self) -> None:
+        main = ModelConfig(
+            model="gemini/gemini-2.0-flash",
+            provider="gemini",
+            retry_attempts=1,
+        )
+        llm = LLMService(main, main, compress=main)
+        mock_completion = AsyncMock(return_value=_chat_resp(content="ok"))
+
+        with (
+            patch.dict("os.environ", {"GEMINI_API_KEY": "ambient-key"}, clear=False),
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "ok")
+        mock_completion.assert_awaited_once()
+
+    async def test_prompt_over_context_limit_is_not_sent(self) -> None:
+        llm = self._make_llm()
+        llm.max_context_tokens = 100
+        mock_completion = AsyncMock(return_value=_chat_resp(content="should-not-run"))
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=101),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "")
+        mock_completion.assert_not_awaited()
+
+    async def test_inexact_token_fallback_is_not_used_for_hard_rejection(self) -> None:
+        llm = self._make_llm()
+        llm.max_context_tokens = 100
+        mock_completion = AsyncMock(return_value=_chat_resp(content="ok"))
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", side_effect=RuntimeError("unknown model")),
+        ):
+            result = await llm.generate("sys", "x" * 200)
+
+        self.assertEqual(result, "ok")
+        mock_completion.assert_awaited_once()
+
     async def test_complete_with_tools_accepts_empty_content_when_tool_calls_exist(self) -> None:
         llm = self._make_llm()
         mock_completion = AsyncMock(
@@ -212,6 +315,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(resp)
         self.assertEqual(mock_completion.await_count, 2)
+        self.assertTrue(mock_completion.await_args_list[0].kwargs["_skip_mcp_handler"])
+        self.assertTrue(mock_completion.await_args_list[1].kwargs["_skip_mcp_handler"])
         self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["name"], "websearch")
 
     async def test_generate_normalizes_anthropic_text_blocks(self) -> None:

@@ -69,6 +69,14 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(join_verification_ready(_settings(join_verification_enabled=False)))
         self.assertFalse(join_verification_ready(_settings(join_verification_turnstile_site_key="")))
         self.assertFalse(join_verification_ready(_settings(join_verification_turnstile_secret_key=" ")))
+        self.assertFalse(
+            join_verification_ready(
+                _settings(
+                    join_verification_turnstile_site_key="same-key",
+                    join_verification_turnstile_secret_key="same-key",
+                )
+            )
+        )
         self.assertFalse(join_verification_ready(_settings(join_verification_public_base_url="")))
 
     def test_moderation_challenge_ready_does_not_require_join_feature(self) -> None:
@@ -651,6 +659,42 @@ class SweeperTests(_DbTestCase):
         sweeper = JoinVerificationSweeper(bot=bot, session_factory=self.session_factory)
         self.assertEqual(await sweeper.sweep_once(), 0)
         bot.ban_chat_member.assert_not_awaited()
+
+    async def test_sweep_preserves_records_when_turnstile_config_is_invalid(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=933,
+                deadline_at=now - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="待质询",
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        settings = _settings(
+            join_verification_turnstile_site_key="same-key",
+            join_verification_turnstile_secret_key="same-key",
+        )
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=settings,
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 0)
+        bot.ban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 933)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, now)
+            self.assertIsNone(await get_global_ban(session, 933))
 
 
 class MemberLeaveCleanupTests(_DbTestCase):

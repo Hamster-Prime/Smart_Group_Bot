@@ -57,6 +57,8 @@ log = logging.getLogger(__name__)
 _MODERATION_CHALLENGE_LOCKS: weakref.WeakValueDictionary[
     tuple[int, int], asyncio.Lock
 ] = weakref.WeakValueDictionary()
+_TURNSTILE_BLOCKED_CONFIG: tuple[str, str, str] | None = None
+_TURNSTILE_BLOCK_REASON = ""
 
 # Constant /start payload for the group deep link. Mini App (web_app) buttons
 # are only allowed in private chats, so the group prompt sends the user to a
@@ -64,6 +66,45 @@ _MODERATION_CHALLENGE_LOCKS: weakref.WeakValueDictionary[
 START_VERIFY_PAYLOAD = "verify"
 VERIFICATION_KIND_JOIN = "join"
 VERIFICATION_KIND_MODERATION = "moderation"
+
+
+def _turnstile_config_fingerprint(settings: Settings) -> tuple[str, str, str]:
+    return (
+        settings.join_verification_turnstile_site_key.strip(),
+        settings.join_verification_turnstile_secret_key.strip(),
+        settings.join_verification_public_base_url.strip().rstrip("/"),
+    )
+
+
+def mark_turnstile_configuration_unavailable(
+    settings: Settings,
+    *,
+    reason: str,
+) -> None:
+    """Block challenges for the current Turnstile config until it changes."""
+    global _TURNSTILE_BLOCKED_CONFIG, _TURNSTILE_BLOCK_REASON
+    _TURNSTILE_BLOCKED_CONFIG = _turnstile_config_fingerprint(settings)
+    _TURNSTILE_BLOCK_REASON = (reason or "Turnstile 配置不可用").strip()
+
+
+def clear_turnstile_configuration_unavailable(settings: Settings) -> None:
+    """Clear a runtime block after the same configuration verifies successfully."""
+    global _TURNSTILE_BLOCKED_CONFIG, _TURNSTILE_BLOCK_REASON
+    if _TURNSTILE_BLOCKED_CONFIG == _turnstile_config_fingerprint(settings):
+        _TURNSTILE_BLOCKED_CONFIG = None
+        _TURNSTILE_BLOCK_REASON = ""
+
+
+def turnstile_runtime_configuration_issue(settings: Settings) -> str:
+    """Return the active runtime block, automatically clearing it after edits."""
+    global _TURNSTILE_BLOCKED_CONFIG, _TURNSTILE_BLOCK_REASON
+    if _TURNSTILE_BLOCKED_CONFIG is None:
+        return ""
+    if _TURNSTILE_BLOCKED_CONFIG != _turnstile_config_fingerprint(settings):
+        _TURNSTILE_BLOCKED_CONFIG = None
+        _TURNSTILE_BLOCK_REASON = ""
+        return ""
+    return _TURNSTILE_BLOCK_REASON
 
 _FULL_RESTRICT = ChatPermissions(
     can_send_messages=False,
@@ -103,10 +144,14 @@ _FULL_ALLOW = ChatPermissions(
 
 def turnstile_verification_configured(settings: Settings) -> bool:
     """Return whether the shared Turnstile Mini App has complete config."""
+    site_key = settings.join_verification_turnstile_site_key.strip()
+    secret_key = settings.join_verification_turnstile_secret_key.strip()
     return bool(
-        settings.join_verification_turnstile_site_key.strip()
-        and settings.join_verification_turnstile_secret_key.strip()
+        site_key
+        and secret_key
+        and site_key != secret_key
         and settings.join_verification_public_base_url.strip()
+        and not turnstile_runtime_configuration_issue(settings)
     )
 
 
@@ -391,6 +436,29 @@ async def list_expired_verifications(
     return list(result.scalars().all())
 
 
+async def extend_pending_verification_deadlines(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    now: datetime | None = None,
+) -> int:
+    """Give all pending users a fresh window while verification is unavailable."""
+    current = now or now_shanghai_naive()
+    result = await session.execute(select(JoinVerification))
+    extended = 0
+    for record in result.scalars().all():
+        timeout_seconds = (
+            settings.moderation.challenge_timeout_seconds
+            if record.kind == VERIFICATION_KIND_MODERATION
+            else settings.join_verification_timeout_seconds
+        )
+        target = current + timedelta(seconds=max(60, int(timeout_seconds)))
+        if record.deadline_at < target:
+            record.deadline_at = target
+            extended += 1
+    return extended
+
+
 async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     try:
         await bot.restrict_chat_member(chat_id, user_id, permissions=_FULL_RESTRICT)
@@ -663,10 +731,13 @@ class JoinVerificationSweeper:
         bot: Bot,
         session_factory: async_sessionmaker[AsyncSession],
         check_interval_seconds: float = 30.0,
+        settings: Settings | None = None,
     ) -> None:
         self.bot = bot
         self.session_factory = session_factory
         self.check_interval_seconds = max(5.0, float(check_interval_seconds))
+        self.settings = settings
+        self._paused_for_configuration = False
 
     async def run_forever(self) -> None:
         log.info("verification sweeper started")
@@ -682,6 +753,25 @@ class JoinVerificationSweeper:
     async def sweep_once(self) -> int:
         async with self.session_factory() as session:
             now = now_shanghai_naive()
+            if self.settings is not None and not verification_service_ready(self.settings):
+                extended = await extend_pending_verification_deadlines(
+                    session,
+                    settings=self.settings,
+                    now=now,
+                )
+                await session.commit()
+                if not self._paused_for_configuration:
+                    log.warning(
+                        "verification timeout enforcement paused | reason=%s pending_extended=%d",
+                        turnstile_runtime_configuration_issue(self.settings)
+                        or "Turnstile 配置不完整",
+                        extended,
+                    )
+                self._paused_for_configuration = True
+                return 0
+            if self._paused_for_configuration:
+                log.info("verification timeout enforcement resumed")
+                self._paused_for_configuration = False
             expired = await list_expired_verifications(session, now=now)
             if not expired:
                 return 0

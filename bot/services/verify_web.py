@@ -31,8 +31,11 @@ from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     VERIFICATION_KIND_MODERATION,
     claim_join_verification,
+    clear_turnstile_configuration_unavailable,
     delete_join_verification,
+    extend_pending_verification_deadlines,
     get_pending_verification_for_user,
+    mark_turnstile_configuration_unavailable,
     restore_member_permissions,
 )
 from bot.services.runtime_config import RuntimeConfigManager
@@ -42,6 +45,17 @@ from bot.web.settings_api import register_settings_routes
 log = logging.getLogger(__name__)
 
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+TURNSTILE_ERROR_SECRET_INVALID = "invalid-input-secret"
+TURNSTILE_ERROR_SECRET_MISSING = "missing-input-secret"
+TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE = "siteverify-unavailable"
+_TURNSTILE_CONFIGURATION_ERRORS = {
+    TURNSTILE_ERROR_SECRET_INVALID,
+    TURNSTILE_ERROR_SECRET_MISSING,
+}
+_TURNSTILE_SERVICE_ERRORS = {
+    TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE,
+    "internal-error",
+}
 _SETTINGS_STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
 _SETTINGS_CSP = (
     "default-src 'self'; "
@@ -83,12 +97,31 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="card">
   <h1>真人验证</h1>
   <p>完成下方人机验证后即可在群内发言。</p>
-  <div class="cf-turnstile" data-sitekey="{site_key}" data-callback="onTurnstileSuccess"></div>
+  <div class="cf-turnstile" data-sitekey="{site_key}" data-callback="onTurnstileSuccess"
+       data-error-callback="onTurnstileError" data-expired-callback="onTurnstileExpired"></div>
   <div id="status"></div>
 </div>
 <script>
 const tg = window.Telegram ? window.Telegram.WebApp : null;
 if (tg) {{ tg.ready(); tg.expand(); }}
+
+function resetTurnstile() {{
+  if (window.turnstile) window.turnstile.reset();
+}}
+
+function onTurnstileError() {{
+  const status = document.getElementById("status");
+  status.textContent = "❌ 验证组件暂时不可用，请稍后重试。";
+  status.className = "err";
+  setTimeout(resetTurnstile, 1000);
+}}
+
+function onTurnstileExpired() {{
+  const status = document.getElementById("status");
+  status.textContent = "验证已过期，请重新完成验证。";
+  status.className = "err";
+  resetTurnstile();
+}}
 
 async function onTurnstileSuccess(token) {{
   const status = document.getElementById("status");
@@ -113,10 +146,12 @@ async function onTurnstileSuccess(token) {{
     }} else {{
       status.textContent = "❌ " + (data.error || "验证失败，请重试。");
       status.className = "err";
+      resetTurnstile();
     }}
   }} catch (e) {{
-    status.textContent = "❌ 网络错误，请关闭后重试。";
+    status.textContent = "❌ 网络错误，请稍后重试。";
     status.className = "err";
+    resetTurnstile();
   }}
 }}
 </script>
@@ -130,7 +165,7 @@ async def verify_turnstile_token(
     turnstile_token: str,
     remote_ip: str = "",
     timeout_sec: float = 10.0,
-) -> bool:
+) -> tuple[bool, list[str]]:
     """Server-side validation against Cloudflare's siteverify endpoint."""
     payload: dict[str, str] = {
         "secret": secret_key,
@@ -142,17 +177,28 @@ async def verify_turnstile_token(
         timeout = aiohttp.ClientTimeout(total=max(1.0, timeout_sec))
         async with aiohttp.ClientSession(timeout=timeout) as client:
             async with client.post(TURNSTILE_VERIFY_URL, data=payload) as resp:
+                if resp.status == 429 or resp.status >= 500:
+                    log.warning("turnstile siteverify unavailable | status=%s", resp.status)
+                    return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
                 data = await resp.json(content_type=None)
     except Exception:
         log.exception("turnstile siteverify request failed")
-        return False
-    success = bool(isinstance(data, dict) and data.get("success"))
+        return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
+    if not isinstance(data, dict):
+        log.warning("turnstile siteverify returned invalid payload")
+        return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
+    success = bool(data.get("success"))
+    errors = [
+        str(item)
+        for item in (data.get("error-codes") or [])
+        if str(item).strip()
+    ]
     if not success:
         log.info(
             "turnstile siteverify rejected | errors=%s",
-            (data or {}).get("error-codes") if isinstance(data, dict) else data,
+            errors or data,
         )
-    return success
+    return success, errors
 
 
 class VerifyWebServer:
@@ -248,8 +294,10 @@ class VerifyWebServer:
             body = await request.json()
         except Exception:
             body = {}
-        turnstile_token = str((body or {}).get("turnstile_token") or "")
-        init_data = str((body or {}).get("init_data") or "")
+        if not isinstance(body, dict):
+            body = {}
+        turnstile_token = str(body.get("turnstile_token") or "")
+        init_data = str(body.get("init_data") or "")
         if not turnstile_token or not init_data:
             return web.json_response({"ok": False, "error": "缺少验证参数"}, status=400)
 
@@ -280,13 +328,44 @@ class VerifyWebServer:
                 status=404,
             )
 
-        passed = await verify_turnstile_token(
+        passed, turnstile_errors = await verify_turnstile_token(
             secret_key=self.settings.join_verification_turnstile_secret_key,
             turnstile_token=turnstile_token,
             remote_ip=request.headers.get("CF-Connecting-IP", request.remote or ""),
         )
         if not passed:
+            configuration_errors = _TURNSTILE_CONFIGURATION_ERRORS.intersection(
+                turnstile_errors
+            )
+            if configuration_errors:
+                mark_turnstile_configuration_unavailable(
+                    self.settings,
+                    reason="Turnstile Secret Key 无效",
+                )
+                async with self.session_factory() as session:
+                    await extend_pending_verification_deadlines(
+                        session,
+                        settings=self.settings,
+                    )
+                    await session.commit()
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "验证服务配置错误：Turnstile Secret Key 无效，请联系管理员",
+                    },
+                    status=503,
+                )
+            if _TURNSTILE_SERVICE_ERRORS.intersection(turnstile_errors):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "验证服务暂时不可用，请稍后重试",
+                    },
+                    status=503,
+                )
             return web.json_response({"ok": False, "error": "人机验证未通过，请重试"}, status=403)
+
+        clear_turnstile_configuration_unavailable(self.settings)
 
         async with self.session_factory() as session:
             # Re-check under a fresh session: the sweeper may have kicked the

@@ -46,6 +46,9 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_start_persists_defaults_and_applies_them(self) -> None:
         self.assertEqual(self.manager.revision, 1)
         self.assertEqual(self.settings.bot.main_model.model, "gemini/gemini-2.0-flash")
+        self.assertEqual(self.settings.bot.main_model.max_tokens, 2048)
+        self.assertEqual(self.settings.bot.max_context_tokens, 256000)
+        self.assertEqual(self.settings.bot.max_output_tokens, 2048)
         async with self.session_factory() as session:
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertIsNotNone(row)
@@ -141,6 +144,41 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(self.settings.join_verification_enabled)
         self.assertEqual(self.manager.revision, 1)
+
+    async def test_turnstile_secret_cannot_equal_site_key(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["verification"]["enabled"] = True
+        payload["verification"]["turnstile_site_key"] = "same-key"
+
+        with self.assertRaisesRegex(ValueError, "不能与 Site Key 相同"):
+            await self.manager.save(
+                payload,
+                expected_revision=1,
+                updated_by=42,
+                secret_changes={
+                    "verification.turnstile_secret_key": {
+                        "action": "replace",
+                        "value": "same-key",
+                    }
+                },
+            )
+
+        self.assertEqual(self.manager.revision, 1)
+
+    async def test_existing_same_key_config_can_save_unrelated_changes(self) -> None:
+        self.manager.config.verification.turnstile_site_key = "same-key"
+        self.manager.config.verification.turnstile_secret_key = "same-key"
+        payload = self.manager.config.public_payload()
+        payload["bot"]["enable_typing"] = False
+
+        await self.manager.save(
+            payload,
+            expected_revision=1,
+            updated_by=42,
+        )
+
+        self.assertFalse(self.settings.bot.enable_typing)
+        self.assertEqual(self.manager.revision, 2)
 
     async def test_invalid_moderation_prompt_is_rejected_before_save(self) -> None:
         payload = self.manager.config.public_payload()

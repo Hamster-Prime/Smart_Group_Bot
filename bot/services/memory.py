@@ -44,10 +44,9 @@ class MemoryService:
         if session_factory is None:
             raise ValueError("MemoryService requires session_factory")
 
-        self.max_context = max(1024, int(config.max_context_tokens))
-        self.max_output = max(256, int(config.max_output_tokens))
         self.llm = llm
         self._session_factory = session_factory
+        self._apply_token_budgets(config)
 
         self._history: dict[int, list[dict[str, Any]]] = {}
         self._summary_cache: dict[int, str] = {}
@@ -62,8 +61,22 @@ class MemoryService:
 
     def reconfigure(self, config: BotConfig) -> None:
         """Apply new token budgets without discarding in-memory history."""
-        self.max_context = max(1024, int(config.max_context_tokens))
+        self._apply_token_budgets(config)
+
+    def _apply_token_budgets(self, config: BotConfig) -> None:
         self.max_output = max(256, int(config.max_output_tokens))
+        configured_context = max(1024, int(config.max_context_tokens))
+        model_limit_fn = getattr(self.llm, "model_input_token_limit", None)
+        model_input_limit = 0
+        if callable(model_limit_fn):
+            model_input_limit = max(0, int(model_limit_fn(self.llm.main) or 0))
+        if model_input_limit > 0:
+            self.max_context = min(
+                configured_context,
+                model_input_limit + self.max_output,
+            )
+        else:
+            self.max_context = configured_context
         self._llm_reserve_tokens = max(1024, self.max_output // 2)
 
     async def bootstrap(self) -> None:
@@ -606,12 +619,13 @@ class MemoryService:
             )
             compressed = (await self.llm.compress(get_prompt("compress"), payload)).strip()
             if not compressed:
-                fallback_lines = history_lines[-10:]
-                merged = old_summary.strip()
-                delta = "\n".join(fallback_lines)
-                compressed = (f"{merged}\n{delta}" if merged else delta).strip()
-                if len(compressed) > 2000:
-                    compressed = compressed[-2000:]
+                log.warning(
+                    "memory compact skipped because compression returned empty: "
+                    "group=%s preserved_messages=%d",
+                    group_id,
+                    len(history),
+                )
+                return False
 
             try:
                 await self._save_summary(group_id, compressed)
