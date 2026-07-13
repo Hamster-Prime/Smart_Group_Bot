@@ -11,7 +11,7 @@ from bot.utils.conversation_context import (
     format_recent_group_context,
 )
 from bot.utils.bot_identity import build_bot_identity_context
-from bot.utils.prompts import CASUAL_SYSTEM, with_persona
+from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -108,7 +108,10 @@ class CasualService:
         style_profile_context: str = "",
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": build_defended_system(with_persona(CASUAL_SYSTEM))},
+            {
+                "role": "system",
+                "content": build_defended_system(with_persona(get_prompt("casual"))),
+            },
         ]
 
         _ = intent_type

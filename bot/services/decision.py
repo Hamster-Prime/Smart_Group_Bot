@@ -5,7 +5,7 @@ import re
 
 from bot.services.llm import LLMService
 from bot.utils.bot_identity import build_bot_identity_context
-from bot.utils.prompts import DECISION_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -101,7 +101,7 @@ class DecisionService:
             f"[CURRENT_MESSAGE]\n{wrap_untrusted('current_message', normalized, max_len=1800)}"
         )
 
-        result = await self.llm.decision(build_defended_system(DECISION_SYSTEM), context)
+        result = await self.llm.decision(build_defended_system(get_prompt("decision")), context)
         result = result.strip().lower()
         log.info(
             "decision llm returned=%s mention=%s msg_type=%s merged=%s",

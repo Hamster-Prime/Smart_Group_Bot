@@ -14,6 +14,7 @@ class CommandEntry:
 
 _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/help", "/help", "查看完整帮助", "用户问你有哪些命令、怎么用、功能总览", "核心入口"),
+    CommandEntry("/settings", "/settings", "打开可视化设置中心", "最高管理员要配置机器人", "核心入口"),
     CommandEntry("/lm", "/lm", "查看永久记忆列表，支持翻页和删除", "用户想查看、删除永久记忆，或找不到某条记忆", "核心入口"),
     CommandEntry("/lm add", "/lm add <内容>", "新增一条永久记忆", "用户想显式通过命令写入永久记忆", "核心入口"),
     CommandEntry(
@@ -57,6 +58,7 @@ def build_help_text() -> str:
         "<b>命令总览</b>\n\n"
         "<b>核心入口</b>\n"
         "/help：查看帮助\n"
+        "/settings：最高管理员打开可视化设置中心\n"
         "/lm：永久记忆列表，支持翻页和删除\n"
         "/lm add &lt;内容&gt;：新增永久记忆\n"
         "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;：修改永久记忆\n"

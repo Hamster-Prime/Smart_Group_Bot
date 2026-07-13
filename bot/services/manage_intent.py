@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from bot.utils.prompts import MANAGE_INTENT_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
@@ -180,7 +180,9 @@ class ManagementIntentService:
             "[CURRENT_MESSAGE]\n"
             f"{wrap_untrusted('current_message', clean_text(text, max_len=1200), max_len=1200)}"
         )
-        raw = await self.llm.decision(build_defended_system(MANAGE_INTENT_SYSTEM), prompt)
+        raw = await self.llm.decision(
+            build_defended_system(get_prompt("manage_intent")), prompt
+        )
         return self._extract_json(raw)
 
     @staticmethod

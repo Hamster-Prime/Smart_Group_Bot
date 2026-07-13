@@ -22,7 +22,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Group, SpeechStyleSample
-from bot.utils.prompts import STYLE_DISTILL_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.security import clean_multiline_text, clean_text
 
 log = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ class SpeechStyleService:
                 f"[新一批消息，共{len(corpus_lines)}条]\n" + "\n".join(corpus_lines)
             )
             try:
-                profile = await self.llm.compress(STYLE_DISTILL_SYSTEM, payload)
+                profile = await self.llm.compress(get_prompt("style_distill"), payload)
             except Exception:
                 log.exception("speech style distill failed | group=%s", group_id)
                 profile = ""

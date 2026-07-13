@@ -25,7 +25,7 @@ from bot.utils.conversation_context import (
     format_recent_group_context,
 )
 from bot.utils.bot_identity import build_bot_identity_context
-from bot.utils.prompts import SKILL_TOOL_SYSTEM, with_persona
+from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.runtime_context import build_bot_runtime_profile_context, build_current_time_context
 from bot.utils.security import (
     build_defended_system,
@@ -217,7 +217,10 @@ class SkillService:
         style_profile_context: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_defended_system(with_persona(SKILL_TOOL_SYSTEM))},
+            {
+                "role": "system",
+                "content": build_defended_system(with_persona(get_prompt("skill_tools"))),
+            },
         ]
         if history:
             messages.extend(sanitize_history_for_llm(history, max_items=len(history)))

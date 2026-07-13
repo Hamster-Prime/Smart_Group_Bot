@@ -17,7 +17,7 @@ from bot.config import BotConfig
 from bot.db.sqlite_session import is_database_locked_error
 from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVector
 from bot.services.llm import LLMService
-from bot.utils.prompts import COMPRESS_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.security import format_history_message_line
 from bot.utils.timezone import format_shanghai_timestamp, now_shanghai_naive, to_shanghai_naive
 
@@ -59,6 +59,12 @@ class MemoryService:
             self.max_context,
             self.max_output,
         )
+
+    def reconfigure(self, config: BotConfig) -> None:
+        """Apply new token budgets without discarding in-memory history."""
+        self.max_context = max(1024, int(config.max_context_tokens))
+        self.max_output = max(256, int(config.max_output_tokens))
+        self._llm_reserve_tokens = max(1024, self.max_output // 2)
 
     async def bootstrap(self) -> None:
         """Load cached summaries and active per-group dialogue history from DB."""
@@ -598,7 +604,7 @@ class MemoryService:
                 "Please write an updated Chinese summary that keeps durable facts, preferences, "
                 "agreements, unfinished tasks, and any recent context that still matters."
             )
-            compressed = (await self.llm.compress(COMPRESS_SYSTEM, payload)).strip()
+            compressed = (await self.llm.compress(get_prompt("compress"), payload)).strip()
             if not compressed:
                 fallback_lines = history_lines[-10:]
                 merged = old_summary.strip()

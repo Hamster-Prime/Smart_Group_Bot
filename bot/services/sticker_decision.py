@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.llm import LLMService
 from bot.services.sticker_library import sticker_library
-from bot.utils.prompts import STICKER_DECISION_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
@@ -223,7 +223,9 @@ class StickerDecisionService:
             f"{wrap_untrusted('sticker_candidates', self._format_candidates(candidates), max_len=8000)}"
         )
 
-        raw = await self.llm.generate(build_defended_system(STICKER_DECISION_SYSTEM), context)
+        raw = await self.llm.generate(
+            build_defended_system(get_prompt("sticker_decision")), context
+        )
         data = _parse_sticker_decision_json(raw)
         if not data:
             log.warning("sticker decision parse failed, fallback no-send")

@@ -28,6 +28,7 @@ REQUIRED_MODULES = (
     "pydantic",
     "pydantic_settings",
     "dotenv",
+    "cryptography",
 )
 
 
@@ -64,8 +65,8 @@ def preflight() -> None:
         example = Path(".env.example")
         if example.exists():
             shutil.copy(example, env_path)
-            log.warning("Created .env from .env.example, please fill BOT_TOKEN first")
-            print("\nPlease edit .env and set BOT_TOKEN, then retry.\n")
+            log.warning("Created .env from .env.example; fill the bootstrap settings first")
+            print("\nPlease edit .env and set BOT_TOKEN, SUPER_ADMIN_ID, CONFIG_MASTER_KEY and MINIAPP_PUBLIC_BASE_URL.\n")
             sys.exit(1)
         log.error("Missing .env and .env.example")
         sys.exit(1)
@@ -79,7 +80,13 @@ def preflight() -> None:
         print("\nPlease set a valid BOT_TOKEN in .env and retry.\n")
         sys.exit(1)
     if not os.getenv("SUPER_ADMIN_ID", "").strip():
-        log.warning("SUPER_ADMIN_ID is empty, group authorization commands will be unavailable")
+        print("\nPlease set SUPER_ADMIN_ID so the settings Mini App can authenticate you.\n")
+        sys.exit(1)
+    if not os.getenv("CONFIG_MASTER_KEY", "").strip():
+        print("\nPlease set a stable CONFIG_MASTER_KEY before storing secrets.\n")
+        sys.exit(1)
+    if not os.getenv("MINIAPP_PUBLIC_BASE_URL", "").strip():
+        log.warning("MINIAPP_PUBLIC_BASE_URL is empty; /settings and verification buttons will be unavailable")
 
     Path("data").mkdir(exist_ok=True)
     log.info("Preflight passed")

@@ -5,7 +5,7 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
-from bot.utils.prompts import REPLY_MODE_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
@@ -166,7 +166,9 @@ class ReplyModeService:
             f"{wrap_untrusted('assistant_draft_reply', clean_text(assistant_reply, max_len=1200), max_len=1200)}"
         )
 
-        raw = await self.llm.decision(build_defended_system(REPLY_MODE_SYSTEM), context)
+        raw = await self.llm.decision(
+            build_defended_system(get_prompt("reply_mode")), context
+        )
         result = _extract_mode_from_line(raw or "")
         if result in _VALID_REPLY_MODES:
             log.info("reply mode decided=%s merged=%s", result, merged_count > 1)
@@ -228,7 +230,9 @@ class ReplyModeService:
             draft_lines.append(wrap_untrusted(f"assistant_draft_reply_{idx}", reply, max_len=1200))
         context += "\n".join(draft_lines)
 
-        raw = await self.llm.decision(build_defended_system(REPLY_MODE_SYSTEM), context)
+        raw = await self.llm.decision(
+            build_defended_system(get_prompt("reply_mode")), context
+        )
         parsed = _extract_modes_from_payload(raw or "", expected_count=len(replies))
         if parsed:
             log.info(

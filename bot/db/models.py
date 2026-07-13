@@ -150,6 +150,38 @@ class AuthorizedGroup(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class RuntimeConfigRecord(Base):
+    """Validated global runtime configuration stored as one JSON document."""
+
+    __tablename__ = "runtime_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class RuntimeConfigSecret(Base):
+    """Encrypted secret values referenced by the runtime configuration."""
+
+    __tablename__ = "runtime_config_secrets"
+
+    name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    ciphertext: Mapped[str] = mapped_column(Text, default="")
+    updated_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GlobalBan(Base):
     """Ban registry; enforced on join and on every message."""
 

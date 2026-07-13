@@ -140,30 +140,42 @@ def _parse_int(raw: str | None, *, default: int, min_value: int = 1) -> int:
     return max(min_value, val)
 
 
-def configure_logging(*, force: bool = False) -> None:
+def configure_logging(*, force: bool = False, config: Any | None = None) -> None:
     """Configure a compact, context-aware logging pipeline."""
     root = logging.getLogger()
     if root.handlers and not force:
         return
 
-    log_level = _parse_level(os.getenv("LOG_LEVEL"), default=logging.INFO)
+    log_level = _parse_level(
+        getattr(config, "level", None) if config is not None else os.getenv("LOG_LEVEL"),
+        default=logging.INFO,
+    )
     third_party_level = _parse_level(
-        os.getenv("LOG_THIRD_PARTY_LEVEL"),
+        getattr(config, "third_party_level", None)
+        if config is not None
+        else os.getenv("LOG_THIRD_PARTY_LEVEL"),
         default=logging.WARNING,
     )
-    color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
-    log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
-    log_file_path_raw = (os.getenv("LOG_FILE_PATH") or "bot.log").strip() or "bot.log"
-    log_file_max_bytes = _parse_int(
-        os.getenv("LOG_FILE_MAX_BYTES"),
-        default=5 * 1024 * 1024,
-        min_value=1024,
-    )
-    log_file_backup_count = _parse_int(
-        os.getenv("LOG_FILE_BACKUP_COUNT"),
-        default=3,
-        min_value=1,
-    )
+    if config is not None:
+        color_mode = str(getattr(config, "color", "on") or "on").strip().lower()
+        log_to_file = bool(getattr(config, "to_file", False))
+        log_file_path_raw = str(getattr(config, "file_path", "bot.log") or "bot.log").strip()
+        log_file_max_bytes = max(1024, int(getattr(config, "file_max_bytes", 5 * 1024 * 1024)))
+        log_file_backup_count = max(1, int(getattr(config, "file_backup_count", 3)))
+    else:
+        color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
+        log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
+        log_file_path_raw = (os.getenv("LOG_FILE_PATH") or "bot.log").strip() or "bot.log"
+        log_file_max_bytes = _parse_int(
+            os.getenv("LOG_FILE_MAX_BYTES"),
+            default=5 * 1024 * 1024,
+            min_value=1024,
+        )
+        log_file_backup_count = _parse_int(
+            os.getenv("LOG_FILE_BACKUP_COUNT"),
+            default=3,
+            min_value=1,
+        )
 
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):

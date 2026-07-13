@@ -1,5 +1,9 @@
+# Legacy one-time migration input.
+#
+# When runtime_config is absent, these values are imported into the database.
+# After that, this file is ignored and all changes belong in the Mini App.
+
 [bot]
-token_env = "BOT_TOKEN"
 parse_mode = "HTML"
 drop_pending_updates = true
 

@@ -39,6 +39,26 @@ class LLMService:
         self.embed_config = embed or EmbedConfig()
         self.max_context_tokens = max(0, int(max_context_tokens or 0))
 
+    def reconfigure(
+        self,
+        main: ModelConfig,
+        decision: ModelConfig,
+        compress: ModelConfig | None = None,
+        *,
+        moderation: ModelConfig | None = None,
+        vision: ModelConfig | None = None,
+        embed: EmbedConfig | None = None,
+        max_context_tokens: int | None = None,
+    ) -> None:
+        """Replace model endpoints for requests started after this call."""
+        self.main = main
+        self.vision_config = vision or main
+        self.decision_config = decision
+        self.moderation_config = moderation or decision
+        self.compress_config = compress or main
+        self.embed_config = embed or EmbedConfig()
+        self.max_context_tokens = max(0, int(max_context_tokens or 0))
+
     @classmethod
     def _resolve_request_api_base(
         cls,

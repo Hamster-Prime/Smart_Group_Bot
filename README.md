@@ -48,7 +48,7 @@
 
 ## 模型角色
 
-项目通过 LiteLLM 接入多供应商，支持 fallback 链自动降级。以下角色均可独立配置供应商和模型，未配置则自动复用主模型。每个角色支持独立的 `*_REASONING_EFFORT` 配置（none/minimal/low/medium/high，默认 main=low、其余=none）：
+项目通过 LiteLLM 接入多供应商，支持 fallback 链自动降级。以下角色均可在设置中心独立选择供应商、模型、推理强度和回退链；未指定的辅助角色自动复用上级模型：
 
 | 角色 | 用途 | 默认模型 |
 |:---|:---|:---|
@@ -83,7 +83,7 @@
 
 ### 入群验证（Turnstile 真人质询）
 
-`JOIN_VERIFICATION_ENABLED=true` 时，新成员入群后先被禁言，需点击群内按钮跳转 bot 私聊，在私聊内通过 Telegram Mini App 完成 Cloudflare Turnstile 质询后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证，验证页不暴露域名。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
+在设置中心开启入群验证后，新成员入群会先被禁言，需点击群内按钮跳转 bot 私聊，在 Telegram Mini App 内完成 Cloudflare Turnstile 质询后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
 
 ### 资料筛查与全局封禁
 
@@ -128,16 +128,7 @@
 
 ### 日志
 
-日志行携带流程上下文（trace_id），支持彩色输出和文件轮转：
-
-| 配置项 | 说明 |
-|:---|:---|
-| `LOG_LEVEL` | 日志级别 |
-| `LOG_COLOR` | on / off / auto |
-| `LOG_TO_FILE` | 是否写入文件 |
-| `LOG_FILE_PATH` | 文件路径 |
-| `LOG_FILE_MAX_BYTES` | 单文件最大字节（超出轮转） |
-| `LOG_FILE_BACKUP_COUNT` | 保留历史文件数 |
+日志行携带流程上下文（trace_id），支持彩色输出和文件轮转。应用级别、第三方库级别、颜色、文件路径、轮转大小和保留数量均在设置中心管理。
 
 ---
 
@@ -148,6 +139,7 @@
 | 命令 | 说明 |
 |:---|:---|
 | `/help` | 查看完整帮助 |
+| `/settings` | 最高管理员打开可视化设置中心 |
 | `/lm` | 永久记忆列表（翻页 + 内联删除） |
 | `/lm add <内容>` | 新增永久记忆 |
 | `/lm replace <#ID或关键词> => <新内容>` | 修改永久记忆 |
@@ -208,7 +200,8 @@ pip install -e .
 
 # 配置
 cp .env.example .env
-# 编辑 .env，至少填写 BOT_TOKEN、SUPER_ADMIN_ID、MAIN_PROVIDER_NAME、MAIN_MODEL
+# 编辑 .env，只填写启动所需的 BOT_TOKEN、SUPER_ADMIN_ID、
+# CONFIG_MASTER_KEY、DATABASE_URL 和 MINIAPP_* 地址
 
 # 启动
 python start.py
@@ -224,79 +217,30 @@ docker compose up -d
 
 ## 配置说明
 
-### 供应商配置
+启动后，最高管理员私聊 bot 发送 `/settings`，在 Telegram Mini App 中配置：
+
+- 模型供应商、API 密钥、角色模型、fallback、推理等级和重试参数
+- Bot 回复、流式输出、上下文、主动话题和消息保留策略
+- 审核、Turnstile、TTS、音乐、Sub2API、AV 和贴纸池
+- 日志输出、全部 LLM 提示词，以及每个授权群的功能开关、主动话题继承和说话风格画像
+
+配置保存在数据库中并对后续请求热生效。第三方密钥使用 `CONFIG_MASTER_KEY` 加密，API 只返回“已配置”状态，不回传明文。全局配置使用 revision 防止多个页面互相覆盖。
+
+`.env` 只保留无法由 Mini App 自举的项目：
 
 ```env
-# 格式：MODEL_PROVIDER_<NAME>_PROVIDER / API_KEY / API_BASE / STREAM
-# 支持 provider: gemini / openai / anthropic / openai_compatible
-# API_BASE 后缀自动检测端点格式
-
-MODEL_PROVIDER_GEMINI_PROVIDER=gemini
-MODEL_PROVIDER_GEMINI_API_KEY=xxx
-
-MODEL_PROVIDER_ARK_PROVIDER=openai_compatible
-MODEL_PROVIDER_ARK_API_KEY=xxx
-MODEL_PROVIDER_ARK_API_BASE=https://ark.example.com/v1/chat/completions
-```
-
-### 模型分配
-
-```env
-MAIN_PROVIDER_NAME=ARK
-MAIN_MODEL=your-chat-model
-MAIN_FALLBACKS=GEMINI:gemini-2.0-flash
-
-# 以下可选，留空则复用主模型配置
-DECISION_PROVIDER_NAME=
-DECISION_MODEL=
-MODERATION_PROVIDER_NAME=
-MODERATION_MODEL=
-VISION_PROVIDER_NAME=
-VISION_MODEL=
-
-# 每角色 reasoning effort（none/minimal/low/medium/high，留空则不发送该参数）
-MAIN_REASONING_EFFORT=low
-DECISION_REASONING_EFFORT=none
-MODERATION_REASONING_EFFORT=none
-```
-
-### 运行时
-
-```env
-BOT_ENABLE_TYPING=true          # 发送前显示「正在输入」
-BOT_ENABLE_STREAMING=true       # 流式回复
-BOT_INBOUND_DEBOUNCE_SECONDS=5  # 入站消息合并等待时间
-BOT_AUTO_DELETE_MINUTES=0       # 自动删除 bot 消息（分钟），0=关闭
-BOT_DECISION_CONTEXT_ITEMS=5    # 决策模型可见的历史条数
-
-# 主动话题
-BOT_PROACTIVE_DEFAULT_ENABLED=false
-BOT_PROACTIVE_IDLE_MINUTES=180
-BOT_PROACTIVE_QUIET_HOURS_START=0
-BOT_PROACTIVE_QUIET_HOURS_END=9
-```
-
-### 入群验证 / 审核质询（Turnstile）
-
-```env
-JOIN_VERIFICATION_ENABLED=false
-JOIN_VERIFICATION_TIMEOUT_SECONDS=600
-JOIN_VERIFICATION_TURNSTILE_SITE_KEY=
-JOIN_VERIFICATION_TURNSTILE_SECRET_KEY=
-# 验证页对外可访问的 https 地址（Cloudflare Tunnel / 反代到监听端口）
-JOIN_VERIFICATION_PUBLIC_BASE_URL=
-JOIN_VERIFICATION_LISTEN_PORT=8480
-```
-
-开启后需要 bot 是带「封禁用户」权限的群管理员。Turnstile 参数由入群验证和低置信度审核质询共用；审核置信度阈值在 `config.toml` 的 `[moderation] high_confidence_threshold` 配置（默认 0.9）。
-
-### 数据库
-
-```env
+BOT_TOKEN=
+SUPER_ADMIN_ID=
+CONFIG_MASTER_KEY=
 DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
+MINIAPP_PUBLIC_BASE_URL=https://bot.example.com
+MINIAPP_LISTEN_HOST=0.0.0.0
+MINIAPP_LISTEN_PORT=8480
 ```
 
-完整配置项参见 `.env.example`。
+`CONFIG_MASTER_KEY` 可用 `openssl rand -hex 32` 生成，并需随数据库备份一起妥善保管。
+
+升级旧版本时，如果数据库尚无运行时配置，现有 `.env` 和 `config.toml` 业务项会导入一次；创建数据库配置记录后，后续启动不再用文件覆盖 Mini App 设置。确认设置中心内容无误后，可清理旧文件中的模型、功能和第三方密钥值；Docker 部署保留空的 `config.toml` 占位即可。
 
 ---
 
@@ -306,7 +250,7 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 Smart_Group_Bot/
 ├── bot/
 │   ├── __main__.py             # 入口（python -m bot）
-│   ├── config.py               # 配置加载（.env + config.toml）
+│   ├── config.py               # 启动配置和模型配置类型
 │   ├── loader.py               # Bot / Dispatcher 初始化
 │   ├── handlers/
 │   │   ├── commands.py         # 命令处理（/start /help /lm /av 等）
@@ -331,6 +275,7 @@ Smart_Group_Bot/
 │   │   ├── join_screening.py   # 入群资料筛查 + 全局封禁
 │   │   ├── join_verification.py# 入群验证 / 审核质询（Turnstile）
 │   │   ├── verify_web.py       # 内置验证页服务（aiohttp + Mini App）
+│   │   ├── runtime_config.py   # 数据库运行时配置、加密和热应用
 │   │   ├── speech_style.py     # 说话风格模仿（/mimic）
 │   │   ├── admin_status.py     # 管理员身份缓存（仅缓存非管理员结果）
 │   │   ├── sticker_decision.py # 贴纸决策模块
@@ -356,16 +301,17 @@ Smart_Group_Bot/
 │   │   ├── models.py           # ORM 模型
 │   │   ├── engine.py           # 数据库引擎
 │   │   └── sqlite_session.py   # SQLite 并发处理
-│   └── utils/
-│       ├── bot_identity.py     # 运行时 bot 身份块
-│       ├── command_catalog.py  # 命令注册表
-│       ├── conversation_context.py
-│       ├── logging_setup.py    # 日志配置
-│       ├── prompts.py          # 提示词加载
-│       ├── runtime_context.py  # 运行时上下文构建
-│       ├── security.py         # 输入安全处理
-│       ├── telegram.py         # Telegram 工具函数
-│       └── timezone.py         # 时区工具
+│   ├── utils/
+│   │   ├── bot_identity.py     # 运行时 bot 身份块
+│   │   ├── command_catalog.py  # 命令注册表
+│   │   ├── conversation_context.py
+│   │   ├── logging_setup.py    # 日志配置
+│   │   ├── prompts.py          # 提示词加载
+│   │   ├── runtime_context.py  # 运行时上下文构建
+│   │   ├── security.py         # 输入安全处理
+│   │   ├── telegram.py         # Telegram 工具函数
+│   │   └── timezone.py         # 时区工具
+│   └── web/                    # 设置 Mini App 页面、鉴权和 API
 ├── prompt/                     # 各模块提示词（Markdown）
 │   ├── persona.md              # 人设
 │   ├── decision.md             # 决策提示词
@@ -378,8 +324,8 @@ Smart_Group_Bot/
 │   ├── style_distill.md        # 风格蒸馏提示词
 │   └── compress.md             # 上下文压缩提示词
 ├── tests/                      # 测试（pytest）
-├── config.toml                 # 可选 TOML 配置覆盖
-├── .env.example                # 环境变量模板
+├── config.toml                 # 旧版本一次性迁移输入，导入后忽略
+├── .env.example                # 最小启动配置模板
 ├── pyproject.toml
 ├── Dockerfile
 ├── docker-compose.yml
@@ -397,6 +343,7 @@ Smart_Group_Bot/
 | SQLAlchemy 2.x (async) | 数据库 ORM |
 | aiosqlite | SQLite 异步驱动 |
 | Pydantic v2 | 配置模型 |
+| cryptography | 数据库密钥加密 |
 | DuckDuckGo (ddgs) | 联网搜索 |
 | aiohttp | HTTP 客户端 |
 
@@ -405,4 +352,3 @@ Smart_Group_Bot/
 ## 开源协议
 
 [MIT](LICENSE)
-

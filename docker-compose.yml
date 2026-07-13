@@ -4,8 +4,9 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+      # Legacy one-time import only; ignored after runtime_config is created.
       - ./config.toml:/app/config.toml:ro
     ports:
-      # 入群验证页（Cloudflare Turnstile），对应 JOIN_VERIFICATION_LISTEN_PORT
+      # Telegram settings and verification Mini App.
       - "8480:8480"
     restart: unless-stopped

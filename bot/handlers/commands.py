@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    WebAppInfo,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -700,6 +701,49 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
     if not await ensure_group_authorized(message, session, settings):
         return
     await _answer(message, settings, build_help_text())
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, settings: Settings) -> None:
+    if not await ensure_super_admin(message, settings):
+        return
+    if not message.chat or message.chat.type != "private":
+        await _answer(
+            message,
+            settings,
+            "<b>设置中心</b>\n请私聊机器人后使用 /settings。",
+            auto_delete_minutes=0,
+            retry_tls_record_error=True,
+        )
+        return
+    base_url = settings.miniapp_public_base_url.strip().rstrip("/")
+    if not base_url:
+        await _answer(
+            message,
+            settings,
+            "<b>设置中心不可用</b>\n请先配置 MINIAPP_PUBLIC_BASE_URL 并重启。",
+            auto_delete_minutes=0,
+            retry_tls_record_error=True,
+        )
+        return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="打开设置中心",
+                    web_app=WebAppInfo(url=f"{base_url}/settings"),
+                )
+            ]
+        ]
+    )
+    await _answer(
+        message,
+        settings,
+        "<b>Bot 设置中心</b>",
+        auto_delete_minutes=0,
+        reply_markup=keyboard,
+        retry_tls_record_error=True,
+    )
 
 
 @router.message(Command("lm"))

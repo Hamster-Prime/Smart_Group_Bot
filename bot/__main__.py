@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from bot.config import load_settings
+from bot.config import load_bootstrap_settings
 from bot.db.engine import init_db
 from bot.handlers import admin, commands, group, membership
 from bot.loader import create_bot, dp
@@ -20,6 +20,7 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.proactive import ProactiveTopicService
+from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
 
@@ -28,12 +29,22 @@ log = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    settings = load_settings()
+    settings = load_bootstrap_settings()
+    if not settings.bot.token:
+        raise ValueError("BOT_TOKEN is required")
 
     engine, session_factory = await init_db(settings.database_url)
 
+    runtime_config = RuntimeConfigManager(
+        session_factory=session_factory,
+        settings=settings,
+    )
+    await runtime_config.initialize()
+    configure_logging(force=True, config=runtime_config.config.logging)
+
     dp["settings"] = settings
     dp["session_factory"] = session_factory
+    dp["runtime_config"] = runtime_config
 
     llm = LLMService(
         settings.bot.main_model,
@@ -100,17 +111,37 @@ async def main() -> None:
         sweeper.run_forever(),
         name="verification-sweeper",
     )
-    verify_web = None
-    if verification_service_ready(settings):
-        from bot.services.verify_web import VerifyWebServer
 
-        await warn_if_bot_cannot_verify(bot, settings, session_factory)
-        verify_web = VerifyWebServer(
-            bot=bot,
-            settings=settings,
-            session_factory=session_factory,
+    async def apply_runtime_update(_config: RuntimeConfig) -> None:
+        llm.reconfigure(
+            settings.bot.main_model,
+            settings.bot.decision_model,
+            settings.bot.compress_model,
+            moderation=settings.bot.moderation_model,
+            vision=settings.bot.vision_model,
+            embed=settings.bot.embed_model,
+            max_context_tokens=settings.bot.max_context_tokens,
         )
-        await verify_web.start()
+        memory.reconfigure(settings.bot)
+        sweeper.check_interval_seconds = max(
+            5.0,
+            float(settings.join_verification_check_interval_seconds),
+        )
+        configure_logging(force=True, config=runtime_config.config.logging)
+
+    runtime_config.set_apply_callback(apply_runtime_update)
+
+    from bot.services.verify_web import VerifyWebServer
+
+    verify_web = VerifyWebServer(
+        bot=bot,
+        settings=settings,
+        session_factory=session_factory,
+        runtime_config=runtime_config,
+    )
+    await verify_web.start()
+    if verification_service_ready(settings):
+        await warn_if_bot_cannot_verify(bot, settings, session_factory)
     elif settings.moderation.enabled:
         log.warning(
             "消息审核已启用，但 Turnstile 密钥或公网验证地址不完整；"
@@ -138,11 +169,10 @@ async def main() -> None:
         await asyncio.gather(proactive_runner, return_exceptions=True)
         verification_runner.cancel()
         await asyncio.gather(verification_runner, return_exceptions=True)
-        if verify_web is not None:
-            try:
-                await verify_web.stop()
-            except Exception:
-                log.exception("verification web server shutdown failed")
+        try:
+            await verify_web.stop()
+        except Exception:
+            log.exception("Mini App web server shutdown failed")
         try:
             await group.flush_pending_inbound_batches()
         except Exception:

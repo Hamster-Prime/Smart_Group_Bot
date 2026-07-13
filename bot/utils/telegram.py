@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager, suppress
 
 from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import Message
 
 from bot.config import Settings
@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 TG_MESSAGE_LIMIT = 4096
 TG_STREAM_SAFE_LIMIT = 3800
 CHAT_SEND_PARALLEL = 3
+TG_TLS_RECORD_RETRY_DELAY = 0.35
 _SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 _MENTION_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_/])@([A-Za-z][A-Za-z0-9_]{4,31})")
 _TG_USER_LINK_HTML_RE = re.compile(
@@ -157,12 +158,34 @@ async def answer_with_auto_delete(
     text: str,
     *,
     auto_delete_minutes: int = 0,
+    retry_tls_record_error: bool = False,
     **kwargs: object,
 ) -> Message:
     payload = sanitize_outgoing_text(text or "")
     safe_text = sanitize_outgoing_mentions(payload)
+
+    async def _answer_with_network_retry(body: str, options: dict[str, object]) -> Message:
+        try:
+            return await message.answer(body, **options)
+        except TelegramNetworkError as exc:
+            detail = str(exc).lower()
+            is_tls_record_error = (
+                "decryption_failed_or_bad_record_mac" in detail
+                or "bad record mac" in detail
+            )
+            if not retry_tls_record_error or not is_tls_record_error:
+                raise
+            log.warning(
+                "telegram TLS record error chat_id=%s; retrying sendMessage once in %.2fs: %s",
+                getattr(getattr(message, "chat", None), "id", "unknown"),
+                TG_TLS_RECORD_RETRY_DELAY,
+                exc,
+            )
+            await asyncio.sleep(TG_TLS_RECORD_RETRY_DELAY)
+            return await message.answer(body, **options)
+
     try:
-        sent = await message.answer(safe_text, **kwargs)
+        sent = await _answer_with_network_retry(safe_text, dict(kwargs))
     except TelegramBadRequest as exc:
         detail = str(exc).lower()
         if "can't parse entities" not in detail:
@@ -171,7 +194,7 @@ async def answer_with_auto_delete(
         fallback_kwargs = dict(kwargs)
         fallback_kwargs["parse_mode"] = None
         plain_text = html.escape(payload)
-        sent = await message.answer(plain_text, **fallback_kwargs)
+        sent = await _answer_with_network_retry(plain_text, fallback_kwargs)
     schedule_message_auto_delete(sent, auto_delete_minutes)
     return sent
 

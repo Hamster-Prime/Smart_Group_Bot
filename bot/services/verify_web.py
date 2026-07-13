@@ -1,8 +1,8 @@
-"""Built-in HTTP server for join and moderation Turnstile challenges.
+"""Built-in HTTP server for settings and Turnstile Mini Apps.
 
-Serves two endpoints on JOIN_VERIFICATION_LISTEN_HOST:PORT (put it behind a
-reverse proxy / Cloudflare Tunnel and expose it as
-JOIN_VERIFICATION_PUBLIC_BASE_URL):
+The shared server listens on MINIAPP_LISTEN_HOST:PORT and is exposed through
+MINIAPP_PUBLIC_BASE_URL. It hosts the administrator settings application plus
+the join/moderation verification challenge.
 
 - GET  /verify: the Mini App page embedding the Turnstile widget. Opened
   inside Telegram via a web_app button — the URL is never shown to the user.
@@ -11,11 +11,14 @@ JOIN_VERIFICATION_PUBLIC_BASE_URL):
   safe_parse_webapp_init_data), which authenticates the user without any
   link token; the Turnstile token is validated against Cloudflare's
   siteverify API. Both must pass before the member's restriction is lifted.
+- GET /settings and /api/v1/*: the super-admin configuration application and
+  authenticated database-backed settings API.
 """
 from __future__ import annotations
 
 import html
 import logging
+from pathlib import Path
 
 import aiohttp
 from aiohttp import web
@@ -32,11 +35,21 @@ from bot.services.join_verification import (
     get_pending_verification_for_user,
     restore_member_permissions,
 )
+from bot.services.runtime_config import RuntimeConfigManager
 from bot.utils.timezone import now_shanghai_naive
+from bot.web.settings_api import register_settings_routes
 
 log = logging.getLogger(__name__)
 
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+_SETTINGS_STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
+_SETTINGS_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' https://telegram.org; "
+    "style-src 'self'; connect-src 'self'; "
+    "img-src 'self' data:; font-src 'self'; "
+    "object-src 'none'; base-uri 'none'; form-action 'self'"
+)
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -151,10 +164,12 @@ class VerifyWebServer:
         bot: Bot,
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
+        runtime_config: RuntimeConfigManager | None = None,
     ) -> None:
         self.bot = bot
         self.settings = settings
         self.session_factory = session_factory
+        self.runtime_config = runtime_config
         self._runner: web.AppRunner | None = None
 
     def build_app(self) -> web.Application:
@@ -162,6 +177,20 @@ class VerifyWebServer:
         app.router.add_get("/verify", self.handle_challenge_page)
         app.router.add_post("/verify", self.handle_challenge_submit)
         app.router.add_get("/healthz", self.handle_health)
+        if self.runtime_config is not None:
+            app.router.add_get("/settings", self.handle_settings_page)
+            app.router.add_static(
+                "/settings-assets/",
+                _SETTINGS_STATIC_DIR,
+                name="settings-assets",
+            )
+            register_settings_routes(
+                app,
+                bot_token=self.bot.token,
+                settings=self.settings,
+                manager=self.runtime_config,
+                session_factory=self.session_factory,
+            )
         return app
 
     async def start(self) -> None:
@@ -170,14 +199,14 @@ class VerifyWebServer:
         await self._runner.setup()
         site = web.TCPSite(
             self._runner,
-            host=self.settings.join_verification_listen_host,
-            port=self.settings.join_verification_listen_port,
+            host=self.settings.miniapp_listen_host,
+            port=self.settings.miniapp_listen_port,
         )
         await site.start()
         log.info(
-            "join verification web server listening on %s:%s",
-            self.settings.join_verification_listen_host,
-            self.settings.join_verification_listen_port,
+            "Mini App web server listening on %s:%s",
+            self.settings.miniapp_listen_host,
+            self.settings.miniapp_listen_port,
         )
 
     async def stop(self) -> None:
@@ -186,7 +215,25 @@ class VerifyWebServer:
             self._runner = None
 
     async def handle_health(self, _request: web.Request) -> web.Response:
-        return web.json_response({"ok": True})
+        return web.json_response(
+            {
+                "ok": True,
+                "config_revision": self.runtime_config.revision
+                if self.runtime_config is not None
+                else None,
+            }
+        )
+
+    async def handle_settings_page(self, _request: web.Request) -> web.StreamResponse:
+        return web.FileResponse(
+            _SETTINGS_STATIC_DIR / "index.html",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": _SETTINGS_CSP,
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def handle_challenge_page(self, _request: web.Request) -> web.Response:
         # The page is static: user identity arrives with the POSTed initData,

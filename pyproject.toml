@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
+    "cryptography>=41.0",
     "ddgs>=9.0",
 ]
 
@@ -21,3 +22,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["bot*"]
+
+[tool.setuptools.package-data]
+bot = ["web/static/*"]

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig, Settings
 from bot.services.memory import MemoryService
-from bot.utils.prompts import PROACTIVE_TOPIC_SYSTEM, with_persona
+from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, sanitize_history_for_llm
 from bot.utils.telegram import send_chat_message
@@ -293,7 +293,10 @@ def build_proactive_prompt_payload(
 ) -> dict[str, list[dict[str, str]]]:
     normalized_brief = clean_text(task_brief, max_len=500)
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": build_defended_system(with_persona(PROACTIVE_TOPIC_SYSTEM))},
+        {
+            "role": "system",
+            "content": build_defended_system(with_persona(get_prompt("proactive_topic"))),
+        },
         {"role": "system", "content": build_current_time_context()},
     ]
     if history:
@@ -321,7 +324,6 @@ class ProactiveTopicService:
         self.llm = llm
 
     async def run_forever(self) -> None:
-        interval = float(self.settings.bot.proactive_check_interval_seconds or 60.0)
         while True:
             try:
                 await self.run_once()
@@ -329,6 +331,10 @@ class ProactiveTopicService:
                 raise
             except Exception:
                 log.exception("proactive topic loop failed")
+            interval = max(
+                15.0,
+                float(self.settings.bot.proactive_check_interval_seconds or 60.0),
+            )
             await asyncio.sleep(interval)
 
     async def run_once(self) -> None:

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import ModerationConfig
 from bot.db.models import ModerationExemption, ModerationRule, UserWarning, Violation
 from bot.services.llm import LLMService
-from bot.utils.prompts import MODERATION_SYSTEM
+from bot.utils.prompts import get_prompt
 from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 
 log = logging.getLogger(__name__)
@@ -220,7 +220,9 @@ class ModerationService:
         ]
         rules_json = json.dumps(rules_payload, ensure_ascii=False, indent=2)
 
-        system_prompt = build_defended_system(MODERATION_SYSTEM.format(rules_json=rules_json))
+        system_prompt = build_defended_system(
+            get_prompt("moderation").format(rules_json=rules_json)
+        )
         user_input = wrap_untrusted("待审核消息", clean_text(text, max_len=1200), max_len=1200)
         llm_raw = await self.llm.moderation(system_prompt, user_input)
         data = _parse_moderation_json(llm_raw)

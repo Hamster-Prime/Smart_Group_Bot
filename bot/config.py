@@ -134,6 +134,10 @@ class Settings(BaseSettings):
 
     bot_token: str = ""
     super_admin_id: int = 0
+    config_master_key: str = ""
+    miniapp_public_base_url: str = ""
+    miniapp_listen_host: str = ""
+    miniapp_listen_port: int = 0
 
     @field_validator("super_admin_id", mode="before")
     @classmethod
@@ -787,4 +791,47 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.max_output_tokens = settings.max_output_tokens
     settings.bot.main_model.max_tokens = max(1, settings.max_output_tokens)
 
+    return settings
+
+
+def load_bootstrap_settings() -> Settings:
+    """Load only values required before the database-backed config is available.
+
+    Runtime options are applied by ``RuntimeConfigManager`` after the database
+    is initialized. Legacy join-verification web variables remain accepted so
+    existing deployments can migrate without changing their reverse proxy in
+    the same release.
+    """
+    settings = Settings()
+    settings.bot.token = settings.bot_token.strip()
+
+    public_base_url = (
+        settings.miniapp_public_base_url
+        or settings.join_verification_public_base_url
+    ).strip().rstrip("/")
+    listen_host = (
+        settings.miniapp_listen_host
+        or settings.join_verification_listen_host
+        or "0.0.0.0"
+    ).strip()
+    listen_port = min(
+        65535,
+        max(
+            1,
+            int(
+                settings.miniapp_listen_port
+                or settings.join_verification_listen_port
+                or 8480
+            ),
+        ),
+    )
+
+    settings.miniapp_public_base_url = public_base_url
+    settings.miniapp_listen_host = listen_host
+    settings.miniapp_listen_port = listen_port
+    # Existing verification code consumes these aliases. They now describe the
+    # shared Mini App server instead of verification-specific infrastructure.
+    settings.join_verification_public_base_url = public_base_url
+    settings.join_verification_listen_host = listen_host
+    settings.join_verification_listen_port = listen_port
     return settings

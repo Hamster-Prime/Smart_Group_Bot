@@ -2,13 +2,79 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from bot.utils import telegram
 from bot.utils.telegram import answer_with_auto_delete, send_chat_message, send_reply, send_reply_messages
 
 
 class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_answer_with_auto_delete_can_retry_tls_record_error_once(self) -> None:
+        sent_message = SimpleNamespace(message_id=87, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(
+                side_effect=[
+                    TelegramNetworkError(
+                        method=SimpleNamespace(),
+                        message="ClientOSError: SSL bad record mac",
+                    ),
+                    sent_message,
+                ]
+            ),
+        )
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            sent = await answer_with_auto_delete(
+                message,
+                "打开设置中心",
+                auto_delete_minutes=0,
+                retry_tls_record_error=True,
+            )
+
+        self.assertIs(sent, sent_message)
+        self.assertEqual(message.answer.await_count, 2)
+        sleep_mock.assert_awaited_once_with(telegram.TG_TLS_RECORD_RETRY_DELAY)
+
+    async def test_answer_with_auto_delete_does_not_retry_tls_error_by_default(self) -> None:
+        error = TelegramNetworkError(
+            method=SimpleNamespace(),
+            message="ClientOSError: SSL bad record mac",
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(side_effect=error),
+        )
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            with self.assertRaises(TelegramNetworkError):
+                await answer_with_auto_delete(message, "打开设置中心", auto_delete_minutes=0)
+
+        message.answer.assert_awaited_once()
+        sleep_mock.assert_not_awaited()
+
+    async def test_answer_with_auto_delete_does_not_retry_other_network_error(self) -> None:
+        error = TelegramNetworkError(
+            method=SimpleNamespace(),
+            message="Request timeout error",
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(side_effect=error),
+        )
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            with self.assertRaises(TelegramNetworkError):
+                await answer_with_auto_delete(
+                    message,
+                    "打开设置中心",
+                    auto_delete_minutes=0,
+                    retry_tls_record_error=True,
+                )
+
+        message.answer.assert_awaited_once()
+        sleep_mock.assert_not_awaited()
+
     async def test_answer_with_auto_delete_retries_plain_text_on_entity_parse_error(self) -> None:
         message = SimpleNamespace(
             answer=AsyncMock(
