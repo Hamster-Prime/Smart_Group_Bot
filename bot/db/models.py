@@ -239,7 +239,10 @@ class JoinVerification(Base):
         server_default=func.now(),
     )
 
-    __table_args__ = (Index("ix_join_verification_group_user", "group_id", "user_id", unique=True),)
+    __table_args__ = (
+        Index("ix_join_verification_group_user", "group_id", "user_id", unique=True),
+        {"sqlite_autoincrement": True},
+    )
 
 
 class UserProfileScreen(Base):

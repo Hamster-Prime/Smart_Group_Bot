@@ -6,7 +6,8 @@ import math
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import case, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ModerationConfig
@@ -318,21 +319,48 @@ class ModerationService:
         self, session: AsyncSession, group_id: int, user_id: int
     ) -> tuple[int, bool]:
         """增加警告次数，返回(当前次数, 是否应封禁)。"""
-        stmt = select(UserWarning).where(
-            UserWarning.group_id == group_id,
-            UserWarning.user_id == user_id,
-        )
-        result = await session.execute(stmt)
-        warn = result.scalar_one_or_none()
+        threshold = max(1, int(self.config.warn_threshold))
 
-        if warn is None:
-            warn = UserWarning(group_id=group_id, user_id=user_id, count=1)
-            session.add(warn)
-        else:
-            warn.count += 1
+        async def increment_existing() -> tuple[int, bool] | None:
+            next_count = UserWarning.count + 1
+            result = await session.execute(
+                update(UserWarning)
+                .where(
+                    UserWarning.group_id == group_id,
+                    UserWarning.user_id == user_id,
+                )
+                .values(
+                    count=next_count,
+                    is_banned=case(
+                        (next_count >= threshold, True),
+                        else_=UserWarning.is_banned,
+                    ),
+                )
+                .returning(UserWarning.count, UserWarning.is_banned)
+            )
+            row = result.first()
+            if row is None:
+                return None
+            return int(row[0]), bool(row[1])
 
-        should_ban = warn.count >= self.config.warn_threshold
-        if should_ban:
-            warn.is_banned = True
+        incremented = await increment_existing()
+        if incremented is not None:
+            return incremented
 
-        return warn.count, should_ban
+        should_ban = threshold <= 1
+        try:
+            async with session.begin_nested():
+                warning = UserWarning(
+                    group_id=group_id,
+                    user_id=user_id,
+                    count=1,
+                    is_banned=should_ban,
+                )
+                session.add(warning)
+                await session.flush()
+            return 1, should_ban
+        except IntegrityError:
+            incremented = await increment_existing()
+            if incremented is None:
+                raise
+            return incremented

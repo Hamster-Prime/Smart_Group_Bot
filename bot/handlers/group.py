@@ -8,23 +8,36 @@ import json
 import logging
 import re
 import time
+import weakref
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.types import Message
-from sqlalchemy import select
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group, ModerationRule, ReplyMute
+from bot.db.models import (
+    Group,
+    ModerationExemption,
+    ModerationRule,
+    ReplyMute,
+    UserWarning,
+    Violation,
+)
 from bot.db.sqlite_session import is_database_locked_error
 from bot.services import memory_holder
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.at_reply import is_at_reply_enabled
-from bot.services.authz import ensure_group_authorized, is_super_admin_user_id
+from bot.services.authz import (
+    ensure_group_authorized,
+    is_group_authorized,
+    is_super_admin_user_id,
+)
+from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import (
@@ -41,8 +54,11 @@ from bot.services.speech_style import (
 from bot.services.llm import LLMService
 from bot.services.join_verification import (
     begin_moderation_challenge,
+    delete_join_verification,
     moderation_challenge_ready,
+    restore_member_permissions,
 )
+from bot.services.join_screening import is_globally_banned
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
@@ -87,6 +103,21 @@ _PENDING_REPLY_QUESTION_RE = re.compile(
     r"[?？]|什么|哪个|哪款|怎么|咋|如何|为什么|为啥|推荐|求推荐|帮我|有没有|是不是|行不行|可不可以|能不能|最好用|值不值得|吗|呢|么|嘛",
     re.IGNORECASE,
 )
+_MODERATION_ACTION_CALLBACK_PREFIX = "mact"
+_MODERATION_ACTION_BASES = {"warn", "ban_warning", "ban_applied"}
+_MODERATION_ACTION_MARKERS = ("direct", "reverted")
+_MODERATION_USER_LOCKS: weakref.WeakValueDictionary[
+    tuple[int, int], asyncio.Lock
+] = weakref.WeakValueDictionary()
+
+
+def _moderation_user_lock(group_id: int, user_id: int) -> asyncio.Lock:
+    key = (int(group_id), int(user_id))
+    lock = _MODERATION_USER_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MODERATION_USER_LOCKS[key] = lock
+    return lock
 
 
 @dataclass(slots=True)
@@ -266,6 +297,678 @@ def _build_moderation_notice(
         ]
     )
     return "\n".join(lines)
+
+
+def _build_moderation_action_keyboard(violation_id: int) -> InlineKeyboardMarkup:
+    prefix = _MODERATION_ACTION_CALLBACK_PREFIX
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="直接封禁",
+                    callback_data=f"{prefix}:ban:{violation_id}",
+                ),
+                InlineKeyboardButton(
+                    text="误封解除",
+                    callback_data=f"{prefix}:undo:{violation_id}",
+                ),
+                InlineKeyboardButton(
+                    text="永久豁免",
+                    callback_data=f"{prefix}:exempt:{violation_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def _parse_moderation_action_state(value: str) -> tuple[str, set[str]]:
+    base = (value or "").strip().lower()
+    markers: set[str] = set()
+    while base:
+        matched = False
+        for marker in _MODERATION_ACTION_MARKERS:
+            suffix = f"_{marker}"
+            if base.endswith(suffix):
+                markers.add(marker)
+                base = base[: -len(suffix)]
+                matched = True
+                break
+        if not matched:
+            break
+    return base, markers
+
+
+async def _append_violation_action_marker(
+    session: AsyncSession,
+    *,
+    violation: Violation,
+    current_state: str,
+    marker: str,
+) -> str | None:
+    new_state = f"{current_state}_{marker}"
+    result = await session.execute(
+        update(Violation)
+        .where(
+            Violation.id == violation.id,
+            Violation.group_id == violation.group_id,
+            Violation.action_taken == current_state,
+        )
+        .values(action_taken=new_state)
+    )
+    return new_state if int(result.rowcount or 0) == 1 else None
+
+
+async def _rollback_failed_automatic_ban(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    violation_id: int,
+    warning_count: int,
+) -> bool:
+    violation_rollback = await session.execute(
+        update(Violation)
+        .where(
+            Violation.id == violation_id,
+            Violation.group_id == group_id,
+            Violation.action_taken == "ban_applied",
+        )
+        .values(action_taken="ban_warning")
+    )
+    warning_rollback = await session.execute(
+        update(UserWarning)
+        .where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == user_id,
+            UserWarning.count == warning_count,
+            UserWarning.is_banned.is_(True),
+        )
+        .values(is_banned=False)
+    )
+    rollback_clean = (
+        int(violation_rollback.rowcount or 0) == 1
+        and int(warning_rollback.rowcount or 0) == 1
+    )
+    if not rollback_clean:
+        await session.rollback()
+        return False
+    await session.commit()
+    return True
+
+
+async def _apply_counted_moderation_ban(
+    *,
+    moderation: ModerationService,
+    session: AsyncSession,
+    message: Message,
+    group_id: int,
+    user_id: int,
+    input_text: str,
+    rule: ModerationRule | None,
+    message_deleted: bool,
+) -> tuple[int, int, bool, str]:
+    async with _moderation_user_lock(group_id, user_id):
+        count, should_ban = await moderation.add_warning(session, group_id, user_id)
+        violation = await moderation.record_violation(
+            session,
+            group_id,
+            user_id,
+            input_text,
+            "ban_applied" if should_ban else "ban_warning",
+            rule,
+        )
+        await session.flush()
+        violation_id = int(violation.id)
+        await session.commit()
+
+        try:
+            if not message_deleted:
+                await message.delete()
+        except Exception:
+            pass
+
+        ban_enforced = False
+        ban_failure_note = ""
+        if should_ban:
+            try:
+                banned = await message.chat.ban(user_id)
+                if banned is False:
+                    raise RuntimeError("Telegram returned false")
+                ban_enforced = True
+            except Exception:
+                log.exception(
+                    "[%s] moderation automatic ban failed | user=%s violation=%s",
+                    group_id,
+                    user_id,
+                    violation_id,
+                )
+                try:
+                    rollback_clean = await _rollback_failed_automatic_ban(
+                        session,
+                        group_id=group_id,
+                        user_id=user_id,
+                        violation_id=violation_id,
+                        warning_count=count,
+                    )
+                except Exception:
+                    await session.rollback()
+                    rollback_clean = False
+                    log.exception(
+                        "[%s] moderation automatic ban rollback failed | "
+                        "user=%s violation=%s",
+                        group_id,
+                        user_id,
+                        violation_id,
+                    )
+                ban_failure_note = (
+                    "\n⚠️ Telegram 自动封禁失败，已保留警告，可由管理员重试。"
+                    if rollback_clean
+                    else "\n⚠️ Telegram 自动封禁失败且状态已变化，请管理员检查。"
+                )
+        return count, violation_id, ban_enforced, ban_failure_note
+
+
+async def _moderation_direct_ban(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    violation: Violation,
+    current_state: str,
+    markers: set[str],
+) -> None:
+    violation_id = int(violation.id)
+    group_id = int(violation.group_id)
+    target_id = int(violation.user_id)
+    if is_super_admin_user_id(target_id, settings):
+        await callback.answer("不能封禁最高管理员", show_alert=True)
+        return
+    if await is_globally_banned(session, target_id):
+        await callback.answer("该用户已处于全局封禁，需由最高管理员处理", show_alert=True)
+        return
+    if "direct" in markers:
+        await callback.answer("该事件已执行过直接封禁", show_alert=True)
+        return
+
+    claimed_state = await _append_violation_action_marker(
+        session,
+        violation=violation,
+        current_state=current_state,
+        marker="direct",
+    )
+    if claimed_state is None:
+        await session.rollback()
+        await callback.answer("事件状态已变化，请重新点击", show_alert=True)
+        return
+
+    result = await session.execute(
+        select(UserWarning).where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == target_id,
+        )
+    )
+    warning = result.scalar_one_or_none()
+    previous_warning = (
+        (max(0, int(warning.count or 0)), bool(warning.is_banned))
+        if warning is not None
+        else None
+    )
+    if warning is None:
+        warning = UserWarning(
+            group_id=group_id,
+            user_id=target_id,
+            count=0,
+            is_banned=True,
+        )
+        session.add(warning)
+    else:
+        warning_lock = await session.execute(
+            update(UserWarning)
+            .where(
+                UserWarning.id == warning.id,
+                UserWarning.count == previous_warning[0],
+                UserWarning.is_banned.is_(previous_warning[1]),
+            )
+            .values(is_banned=True)
+        )
+        if int(warning_lock.rowcount or 0) != 1:
+            await session.rollback()
+            await callback.answer("警告状态已变化，请重新点击", show_alert=True)
+            return
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    try:
+        banned = await callback.bot.ban_chat_member(group_id, target_id)
+        if banned is False:
+            raise RuntimeError("Telegram returned false")
+    except Exception:
+        await session.rollback()
+        try:
+            violation_rollback = await session.execute(
+                update(Violation)
+                .where(
+                    Violation.id == violation_id,
+                    Violation.group_id == group_id,
+                    Violation.action_taken == claimed_state,
+                )
+                .values(action_taken=current_state)
+            )
+            warning_restored = True
+            if previous_warning is None:
+                warning_rollback = await session.execute(
+                    delete(UserWarning).where(
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == target_id,
+                        UserWarning.count == 0,
+                        UserWarning.is_banned.is_(True),
+                    )
+                )
+                warning_restored = int(warning_rollback.rowcount or 0) == 1
+            elif not previous_warning[1]:
+                warning_rollback = await session.execute(
+                    update(UserWarning)
+                    .where(
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == target_id,
+                        UserWarning.count == previous_warning[0],
+                        UserWarning.is_banned.is_(True),
+                    )
+                    .values(is_banned=False)
+                )
+                warning_restored = int(warning_rollback.rowcount or 0) == 1
+            rollback_clean = (
+                int(violation_rollback.rowcount or 0) == 1 and warning_restored
+            )
+            if rollback_clean:
+                await session.commit()
+            else:
+                await session.rollback()
+        except Exception:
+            await session.rollback()
+            rollback_clean = False
+            log.exception(
+                "moderation direct ban rollback failed | group=%s user=%s violation=%s",
+                group_id,
+                target_id,
+                violation_id,
+            )
+        log.exception(
+            "moderation direct ban failed | group=%s user=%s violation=%s",
+            group_id,
+            target_id,
+            violation_id,
+        )
+        await callback.answer(
+            "Telegram 封禁失败，数据库状态已恢复"
+            if rollback_clean
+            else "Telegram 封禁失败，状态已并发变化，请人工检查",
+            show_alert=True,
+        )
+        return
+
+    try:
+        await delete_join_verification(session, group_id, target_id)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "moderation direct ban persistence failed | group=%s user=%s violation=%s",
+            group_id,
+            target_id,
+            violation_id,
+        )
+        await callback.answer("用户已被 Telegram 封禁，但状态保存失败", show_alert=True)
+        return
+
+    await callback.answer("已在当前群直接封禁该用户", show_alert=True)
+
+
+async def _moderation_undo_false_positive(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    violation: Violation,
+    *,
+    base_state: str,
+    current_state: str,
+    markers: set[str],
+) -> None:
+    if "reverted" in markers:
+        await callback.answer("该事件已撤销，无需重复操作", show_alert=True)
+        return
+    violation_id = int(violation.id)
+
+    if base_state == "warn":
+        claimed_state = await _append_violation_action_marker(
+            session,
+            violation=violation,
+            current_state=current_state,
+            marker="reverted",
+        )
+        if claimed_state is None:
+            await session.rollback()
+            await callback.answer("事件状态已变化，请重新点击", show_alert=True)
+            return
+        await session.commit()
+        await callback.answer("已撤销本次误判；该警告未产生封禁计数", show_alert=True)
+        return
+
+    group_id = int(violation.group_id)
+    target_id = int(violation.user_id)
+    result = await session.execute(
+        select(UserWarning).where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == target_id,
+        )
+    )
+    warning = result.scalar_one_or_none()
+    previous_count = max(0, int(warning.count or 0)) if warning else 0
+    previous_banned = bool(warning.is_banned) if warning else False
+    if warning is not None:
+        warning_lock = await session.execute(
+            update(UserWarning)
+            .where(
+                UserWarning.id == warning.id,
+                UserWarning.count == previous_count,
+                UserWarning.is_banned.is_(previous_banned),
+            )
+            .values(count=previous_count)
+        )
+        if int(warning_lock.rowcount or 0) != 1:
+            await session.rollback()
+            await callback.answer("警告状态已变化，请重新点击", show_alert=True)
+            return
+
+    states_result = await session.execute(
+        select(Violation.id, Violation.action_taken)
+        .where(
+            Violation.group_id == group_id,
+            Violation.user_id == target_id,
+        )
+        .order_by(Violation.id.desc())
+    )
+    states = list(states_result.all())
+    active_counted_ids: list[int] = []
+    for row_id, state in states:
+        row_base, row_markers = _parse_moderation_action_state(str(state or ""))
+        if "reverted" in row_markers or row_base not in {"ban_warning", "ban_applied"}:
+            continue
+        active_counted_ids.append(int(row_id))
+        if len(active_counted_ids) >= previous_count:
+            break
+
+    belongs_to_current_generation = bool(
+        previous_count > 0
+        and len(active_counted_ids) == previous_count
+        and violation_id in active_counted_ids
+    )
+    claimed_state = await _append_violation_action_marker(
+        session,
+        violation=violation,
+        current_state=current_state,
+        marker="reverted",
+    )
+    if claimed_state is None:
+        await session.rollback()
+        await callback.answer("事件状态已变化，请重新点击", show_alert=True)
+        return
+    if not belongs_to_current_generation:
+        await session.commit()
+        await callback.answer(
+            "该事件已不属于当前警告周期，未修改现有计数",
+            show_alert=True,
+        )
+        return
+
+    new_count = max(0, previous_count - 1)
+
+    # A deliberate direct ban may be recorded on any of the user's violation
+    # rows in the active warning generation. Older rows must not keep a user
+    # banned after /clearwarnings or a manual unban started a new generation.
+    generation_floor = min(active_counted_ids)
+    has_direct_ban_marker = any(
+        int(row_id) >= generation_floor
+        and "direct" in row_markers
+        and "reverted" not in row_markers
+        for row_id, state in states
+        for _row_base, row_markers in [_parse_moderation_action_state(str(state or ""))]
+    )
+    globally_banned = await is_globally_banned(session, target_id)
+    threshold = max(1, int(settings.moderation.warn_threshold))
+    should_restore = bool(
+        base_state == "ban_applied"
+        and previous_banned
+        and new_count < threshold
+        and not has_direct_ban_marker
+        and not globally_banned
+    )
+    remaining_banned = previous_banned and not should_restore
+    if new_count <= 0 and not remaining_banned:
+        warning_update = await session.execute(
+            delete(UserWarning).where(
+                UserWarning.id == warning.id,
+                UserWarning.count == previous_count,
+                UserWarning.is_banned.is_(previous_banned),
+            )
+        )
+    else:
+        warning_update = await session.execute(
+            update(UserWarning)
+            .where(
+                UserWarning.id == warning.id,
+                UserWarning.count == previous_count,
+                UserWarning.is_banned.is_(previous_banned),
+            )
+            .values(count=new_count, is_banned=remaining_banned)
+        )
+    if int(warning_update.rowcount or 0) != 1:
+        await session.rollback()
+        await callback.answer("警告状态已变化，请重新点击", show_alert=True)
+        return
+
+    restored = False
+    if should_restore:
+        unbanned = False
+        try:
+            await callback.bot.unban_chat_member(group_id, target_id, only_if_banned=True)
+            unbanned = True
+            restored = await restore_member_permissions(callback.bot, group_id, target_id)
+            if not restored:
+                raise RuntimeError("permission restore failed")
+        except Exception:
+            if unbanned:
+                try:
+                    await callback.bot.ban_chat_member(group_id, target_id)
+                except Exception:
+                    log.exception(
+                        "moderation undo compensation ban failed | group=%s user=%s",
+                        group_id,
+                        target_id,
+                    )
+            await session.rollback()
+            log.exception(
+                "moderation auto-ban undo failed | group=%s user=%s violation=%s",
+                group_id,
+                target_id,
+                violation_id,
+            )
+            await callback.answer("解除自动封禁失败，本次计数未撤销", show_alert=True)
+            return
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "moderation undo persistence failed | group=%s user=%s violation=%s",
+            group_id,
+            target_id,
+            violation_id,
+        )
+        if restored:
+            try:
+                await callback.bot.ban_chat_member(group_id, target_id)
+                compensation = "已重新封禁"
+            except Exception:
+                compensation = "重新封禁也失败，请立即人工处理"
+                log.exception(
+                    "moderation undo persistence compensation failed | group=%s user=%s",
+                    group_id,
+                    target_id,
+                )
+            await callback.answer(
+                f"撤销状态保存失败，{compensation}",
+                show_alert=True,
+            )
+            return
+        await callback.answer("撤销状态保存失败，请稍后重试", show_alert=True)
+        return
+    suffix = "，并已解除自动封禁" if restored else ""
+    if (has_direct_ban_marker or globally_banned) and remaining_banned:
+        suffix = "；现有封禁保持不变"
+    await callback.answer(
+        f"已撤销本次封禁计数，当前为 {new_count} 次{suffix}",
+        show_alert=True,
+    )
+
+
+async def _moderation_add_permanent_exemption(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    violation: Violation,
+) -> None:
+    operator_id = int(callback.from_user.id)
+    result = await session.execute(
+        select(ModerationExemption).where(
+            ModerationExemption.group_id == violation.group_id,
+            ModerationExemption.user_id == violation.user_id,
+        )
+    )
+    if result.scalar_one_or_none() is not None:
+        await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
+        return
+
+    session.add(
+        ModerationExemption(
+            group_id=violation.group_id,
+            user_id=violation.user_id,
+            created_by=operator_id,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
+        return
+    await callback.answer("已永久豁免该用户的当前群 AI 审核", show_alert=True)
+
+
+@router.callback_query(F.data.startswith(f"{_MODERATION_ACTION_CALLBACK_PREFIX}:"))
+async def on_moderation_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    if session is None:
+        await callback.answer("会话未就绪，请等待下一次审核通知", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[0] != _MODERATION_ACTION_CALLBACK_PREFIX:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    action = parts[1]
+    if action not in {"ban", "undo", "exempt"}:
+        await callback.answer("不支持的审核操作", show_alert=True)
+        return
+    try:
+        violation_id = int(parts[2])
+    except (TypeError, ValueError):
+        violation_id = 0
+    if violation_id <= 0:
+        await callback.answer("审核事件无效", show_alert=True)
+        return
+
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    user = callback.from_user
+    if chat is None or getattr(chat, "type", "") not in {"group", "supergroup"}:
+        await callback.answer("该操作只能在原群审核通知中执行", show_alert=True)
+        return
+    if user is None:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return
+
+    group_id = int(chat.id)
+    if not await is_group_authorized(session, group_id):
+        await callback.answer("当前群组未授权，不能执行审核操作", show_alert=True)
+        return
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=int(user.id),
+    ):
+        await callback.answer("仅群管理员及以上权限可执行该操作", show_alert=True)
+        return
+
+    violation = await session.get(Violation, violation_id)
+    if violation is None or int(violation.group_id) != group_id:
+        await callback.answer("审核事件不存在或不属于当前群", show_alert=True)
+        return
+    target_id = int(violation.user_id)
+    await session.commit()
+
+    async with _moderation_user_lock(group_id, target_id):
+        violation = await session.get(Violation, violation_id, populate_existing=True)
+        if violation is None or int(violation.group_id) != group_id:
+            await callback.answer("审核事件不存在或不属于当前群", show_alert=True)
+            return
+        base_state, markers = _parse_moderation_action_state(violation.action_taken)
+        if base_state not in _MODERATION_ACTION_BASES:
+            await callback.answer("该审核事件不支持此操作", show_alert=True)
+            return
+
+        current_state = str(violation.action_taken or "")
+        try:
+            if action == "ban":
+                await _moderation_direct_ban(
+                    callback,
+                    session,
+                    settings,
+                    violation,
+                    current_state,
+                    markers,
+                )
+            elif action == "undo":
+                await _moderation_undo_false_positive(
+                    callback,
+                    session,
+                    settings,
+                    violation,
+                    base_state=base_state,
+                    current_state=current_state,
+                    markers=markers,
+                )
+            else:
+                await _moderation_add_permanent_exemption(callback, session, violation)
+        except Exception:
+            await session.rollback()
+            log.exception(
+                "moderation callback failed | action=%s group=%s violation=%s",
+                action,
+                group_id,
+                violation_id,
+            )
+            await callback.answer("审核操作失败，请稍后重试", show_alert=True)
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
@@ -1665,8 +2368,15 @@ async def on_group_message(
     moderation_started = time.perf_counter()
     if settings.moderation.enabled:
         mod = ModerationService(settings.moderation, llm)
-        auto_exempt_moderation = sender_is_tg_admin or sender_identity.is_chat
-        auto_exempt_reason = "tg_admin_auto_exempt" if sender_is_tg_admin else "sender_chat_auto_exempt"
+        auto_exempt_moderation = (
+            sender_is_owner or sender_is_tg_admin or sender_identity.is_chat
+        )
+        if sender_is_owner:
+            auto_exempt_reason = "owner_auto_exempt"
+        elif sender_is_tg_admin:
+            auto_exempt_reason = "tg_admin_auto_exempt"
+        else:
+            auto_exempt_reason = "sender_chat_auto_exempt"
         manual_exempt = False
         if auto_exempt_moderation:
             log.info(
@@ -1759,8 +2469,18 @@ async def on_group_message(
                         action,
                     )
 
-                await mod.record_violation(session, group_id, user_id, input_text, action, rule)
                 if action == "warn":
+                    violation = await mod.record_violation(
+                        session,
+                        group_id,
+                        user_id,
+                        input_text,
+                        "warn",
+                        rule,
+                    )
+                    await session.flush()
+                    violation_id = int(violation.id)
+                    await session.commit()
                     notice = _build_moderation_notice(
                         warn_target=warn_target,
                         reason=reason,
@@ -1773,6 +2493,7 @@ async def on_group_message(
                         auto_delete_seconds=configured_auto_delete_seconds(
                             settings, "moderation"
                         ),
+                        reply_markup=_build_moderation_action_keyboard(violation_id),
                     )
                     log.info(
                         "[%s]【结束】审核拦截 | 动作=warn | 已回复=是 | 总耗时=%dms",
@@ -1782,6 +2503,14 @@ async def on_group_message(
                     return
 
                 if action == "delete":
+                    await mod.record_violation(
+                        session,
+                        group_id,
+                        user_id,
+                        input_text,
+                        "delete",
+                        rule,
+                    )
                     try:
                         if not message_deleted:
                             await message.delete()
@@ -1807,8 +2536,19 @@ async def on_group_message(
                     )
                     return
 
-                count, should_ban = await mod.add_warning(session, group_id, user_id)
                 warn_threshold = max(1, settings.moderation.warn_threshold)
+                count, violation_id, ban_enforced, ban_failure_note = (
+                    await _apply_counted_moderation_ban(
+                        moderation=mod,
+                        session=session,
+                        message=message,
+                        group_id=group_id,
+                        user_id=user_id,
+                        input_text=input_text,
+                        rule=rule,
+                        message_deleted=message_deleted,
+                    )
+                )
                 notice = _build_moderation_notice(
                     warn_target=warn_target,
                     reason=reason,
@@ -1816,31 +2556,20 @@ async def on_group_message(
                     hit_action=action,
                     count=count,
                     threshold=warn_threshold,
-                    should_ban=should_ban,
-                )
-
-                try:
-                    if not message_deleted:
-                        await message.delete()
-                except Exception:
-                    pass
-
-                if should_ban:
-                    try:
-                        await message.chat.ban(user_id)
-                    except Exception:
-                        pass
+                    should_ban=ban_enforced,
+                ) + ban_failure_note
                 await answer_with_auto_delete(
                     message,
                     notice,
                     auto_delete_seconds=configured_auto_delete_seconds(
                         settings, "moderation"
                     ),
+                    reply_markup=_build_moderation_action_keyboard(violation_id),
                 )
                 log.info(
                     "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",
                     group_id,
-                    should_ban,
+                    ban_enforced,
                     count,
                     warn_threshold,
                     int((time.perf_counter() - flow_started) * 1000),

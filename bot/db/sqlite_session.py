@@ -10,7 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
-_SQLITE_WRITE_LOCK = asyncio.Lock()
+def _sqlite_write_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_smart_group_bot_sqlite_write_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, "_smart_group_bot_sqlite_write_lock", lock)
+    return lock
 
 
 def is_database_locked_error(exc: BaseException) -> bool:
@@ -28,7 +34,7 @@ def _statement_is_write(statement: Any) -> bool:
 class SQLiteSafeAsyncSession(AsyncSession):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._sqlite_write_lock_held = False
+        self._sqlite_write_lock_held: asyncio.Lock | None = None
 
     def _uses_sqlite(self) -> bool:
         try:
@@ -46,8 +52,9 @@ class SQLiteSafeAsyncSession(AsyncSession):
         if not self._uses_sqlite() or self._sqlite_write_lock_held:
             return
         started = time.perf_counter()
-        await _SQLITE_WRITE_LOCK.acquire()
-        self._sqlite_write_lock_held = True
+        lock = _sqlite_write_lock()
+        await lock.acquire()
+        self._sqlite_write_lock_held = lock
         waited_ms = int((time.perf_counter() - started) * 1000)
         if waited_ms >= 100:
             log.info("sqlite write serialized | op=%s wait_ms=%d", op, waited_ms)
@@ -55,8 +62,9 @@ class SQLiteSafeAsyncSession(AsyncSession):
     def _release_write_lock(self) -> None:
         if not self._sqlite_write_lock_held:
             return
-        self._sqlite_write_lock_held = False
-        _SQLITE_WRITE_LOCK.release()
+        lock = self._sqlite_write_lock_held
+        self._sqlite_write_lock_held = None
+        lock.release()
 
     async def execute(
         self,

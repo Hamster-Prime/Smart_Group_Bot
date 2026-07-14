@@ -5,15 +5,17 @@ import html
 import logging
 from datetime import timedelta
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import IS_NOT_MEMBER, IS_MEMBER, ChatMemberUpdatedFilter
-from aiogram.types import ChatMemberUpdated
+from aiogram.types import CallbackQuery, ChatMemberUpdated
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
-from bot.db.models import Group, JoinVerification
+from bot.db.models import Group, JoinVerification, UserWarning
 from bot.services.admin_status import invalidate_admin_status_cache
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
+from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.join_screening import (
     add_global_ban,
     build_join_profile_text,
@@ -24,15 +26,25 @@ from bot.services.join_screening import (
     screen_member_profile_verbose,
 )
 from bot.services.join_verification import (
+    VERIFICATION_CALLBACK_APPROVE,
+    VERIFICATION_CALLBACK_PREFIX,
+    VERIFICATION_CALLBACK_REJECT,
+    VERIFICATION_CALLBACK_START,
     VERIFICATION_KIND_MODERATION,
+    ban_member,
     build_group_prompt_keyboard,
     build_group_prompt_text,
+    build_private_deep_link,
     claim_join_verification,
     delete_join_verification,
     get_join_verification,
     join_verification_ready,
     join_verification_policy,
+    kick_member,
+    mark_group_banned,
+    parse_verification_callback_data,
     restore_member_permissions,
+    rollback_group_ban,
     restrict_new_member,
     upsert_join_verification,
 )
@@ -73,12 +85,14 @@ async def _ban_and_notify(
     user_id: int,
     display_name: str,
     reason: str,
-) -> None:
+) -> bool:
     try:
-        await event.chat.ban(user_id)
+        banned = await event.chat.ban(user_id)
+        if banned is False:
+            raise RuntimeError("Telegram returned false")
     except Exception:
         log.exception("join screening ban failed | group=%s user=%s", event.chat.id, user_id)
-        return
+        return False
     shown = html.escape(display_name or str(user_id))
     reason_text = html.escape(reason or "入群资料命中群规")
     try:
@@ -90,6 +104,7 @@ async def _ban_and_notify(
         )
     except Exception:
         log.exception("join screening notice failed | group=%s", event.chat.id)
+    return True
 
 
 def _invalidate_admin_cache(event: ChatMemberUpdated) -> None:
@@ -131,10 +146,7 @@ async def _start_join_verification(
             group_id,
             text,
             parse_mode="HTML",
-            reply_markup=build_group_prompt_keyboard(
-                get_bot_identity().username,
-                group_id,
-            ),
+            reply_markup=build_group_prompt_keyboard(user_id),
         )
         prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
     except Exception:
@@ -161,11 +173,18 @@ async def _start_join_verification(
 async def _enforce_pending_moderation_challenge(
     event: ChatMemberUpdated,
     session: AsyncSession,
+    settings: Settings,
     record: JoinVerification,
     *,
     display_name: str,
 ) -> None:
     """Keep an unresolved message challenge intact across leave/rejoin."""
+    if is_super_admin_user_id(record.user_id, settings):
+        await delete_join_verification(session, record.group_id, record.user_id)
+        await session.commit()
+        await restore_member_permissions(event.bot, record.group_id, record.user_id)
+        return
+
     now = now_shanghai_naive()
     if record.deadline_at <= now:
         claimed = await claim_join_verification(
@@ -178,20 +197,40 @@ async def _enforce_pending_moderation_challenge(
         )
         if not claimed:
             return
-        await add_global_ban(
+        ban_state = await mark_group_banned(
             session,
+            record.group_id,
             record.user_id,
-            reason=f"消息审查质询超时: {record.reason or '疑似命中群规'}"[:500],
-            source="moderation_challenge_timeout",
-            created_by=0,
         )
         await session.commit()
-        await _ban_and_notify(
+        enforced = await _ban_and_notify(
             event,
             user_id=record.user_id,
             display_name=display_name,
             reason="消息审查真人验证超时",
         )
+        if not enforced:
+            rolled_back = await rollback_group_ban(
+                session,
+                record.group_id,
+                record.user_id,
+                ban_state,
+            )
+            if rolled_back and not (ban_state and ban_state[1]):
+                await upsert_join_verification(
+                    session,
+                    group_id=record.group_id,
+                    user_id=record.user_id,
+                    deadline_at=_verification_retry_deadline(settings, record.kind),
+                    kind=record.kind,
+                    provider=record.provider,
+                    reason=record.reason,
+                    display_name=display_name or record.display_name,
+                    prompt_message_id=record.prompt_message_id,
+                )
+            await session.commit()
+            if rolled_back:
+                await restrict_new_member(event.bot, record.group_id, record.user_id)
         return
 
     # End the read transaction before the Telegram call. A concurrent web
@@ -210,6 +249,290 @@ async def _enforce_pending_moderation_challenge(
         "moderation challenge re-enforced after rejoin | group=%s user=%s",
         record.group_id,
         record.user_id,
+    )
+
+
+def _verification_snapshot(record: JoinVerification) -> dict[str, object]:
+    return {
+        "group_id": int(record.group_id),
+        "user_id": int(record.user_id),
+        "kind": str(record.kind),
+        "provider": str(record.provider),
+        "reason": str(record.reason or ""),
+        "display_name": str(record.display_name or ""),
+        "prompt_message_id": int(record.prompt_message_id or 0),
+    }
+
+
+def _verification_retry_deadline(
+    settings: Settings,
+    kind: str,
+):
+    timeout_seconds = (
+        settings.moderation.challenge_timeout_seconds
+        if kind == VERIFICATION_KIND_MODERATION
+        else settings.join_verification_timeout_seconds
+    )
+    return now_shanghai_naive() + timedelta(seconds=max(60, int(timeout_seconds)))
+
+
+async def _requeue_verification(
+    session: AsyncSession,
+    settings: Settings,
+    snapshot: dict[str, object],
+) -> None:
+    kind = str(snapshot["kind"])
+    await upsert_join_verification(
+        session,
+        group_id=int(snapshot["group_id"]),
+        user_id=int(snapshot["user_id"]),
+        deadline_at=_verification_retry_deadline(settings, kind),
+        kind=kind,
+        provider=str(snapshot["provider"]),
+        reason=str(snapshot["reason"]),
+        display_name=str(snapshot["display_name"]),
+        prompt_message_id=int(snapshot["prompt_message_id"]),
+    )
+    await session.commit()
+
+
+async def _verification_callback_record(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    target_user_id: int,
+) -> JoinVerification | None:
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    if message is None or chat is None or chat.type not in ("group", "supergroup"):
+        await callback.answer("验证消息已失效", show_alert=True)
+        return None
+
+    record = await get_join_verification(session, int(chat.id), target_user_id)
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    if (
+        record is None
+        or int(record.prompt_message_id or 0) != message_id
+        or record.deadline_at <= now_shanghai_naive()
+    ):
+        await callback.answer("验证已失效、过期或已处理", show_alert=True)
+        return None
+    return record
+
+
+async def _edit_verification_prompt(
+    callback: CallbackQuery,
+    *,
+    text: str,
+) -> None:
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    if message is None or chat is None:
+        return
+    try:
+        await callback.bot.edit_message_text(
+            chat_id=chat.id,
+            message_id=message.message_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        log.debug(
+            "verification admin prompt edit failed | group=%s message=%s",
+            chat.id,
+            message.message_id,
+            exc_info=True,
+        )
+
+
+async def _callback_bot_username(callback: CallbackQuery) -> str:
+    username = get_bot_identity().username
+    if username:
+        return username
+    try:
+        me = await callback.bot.me()
+    except Exception:
+        return ""
+    return str(getattr(me, "username", "") or "").strip().lstrip("@")
+
+
+async def _handle_verification_start_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    target_user_id: int,
+) -> None:
+    operator = callback.from_user
+    if operator is None or int(operator.id) != target_user_id:
+        await callback.answer("仅受验证用户本人可点击", show_alert=True)
+        return
+
+    record = await _verification_callback_record(callback, session, target_user_id)
+    if record is None:
+        return
+    username = await _callback_bot_username(callback)
+    if not username:
+        await callback.answer("验证入口暂时不可用，请稍后重试", show_alert=True)
+        return
+    await callback.answer(
+        url=build_private_deep_link(username, int(record.group_id)),
+    )
+
+
+async def _handle_verification_admin_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    action: str,
+    target_user_id: int,
+) -> None:
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    if message is None or chat is None or chat.type not in ("group", "supergroup"):
+        await callback.answer("验证消息已失效", show_alert=True)
+        return
+    if operator is None:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return
+    group_id = int(chat.id)
+    operator_id = int(operator.id)
+    if not await is_group_authorized(session, group_id):
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=operator_id,
+    ):
+        await callback.answer("仅群管理员及以上权限可操作", show_alert=True)
+        return
+
+    record = await _verification_callback_record(callback, session, target_user_id)
+    if record is None:
+        return
+    if action == VERIFICATION_CALLBACK_REJECT and is_super_admin_user_id(
+        target_user_id, settings
+    ):
+        await callback.answer("不能封禁最高管理员", show_alert=True)
+        return
+    if action == VERIFICATION_CALLBACK_APPROVE:
+        locally_banned = bool(
+            await session.scalar(
+                select(UserWarning.id).where(
+                    UserWarning.group_id == group_id,
+                    UserWarning.user_id == target_user_id,
+                    UserWarning.is_banned.is_(True),
+                )
+            )
+        )
+        if locally_banned or await is_globally_banned(session, target_user_id):
+            await callback.answer("该用户已被封禁，请先解封后再通过", show_alert=True)
+            return
+
+    snapshot = _verification_snapshot(record)
+    claimed = await claim_join_verification(
+        session,
+        verification_id=int(record.id),
+        deadline_at=record.deadline_at,
+        kind=record.kind,
+        now=now_shanghai_naive(),
+        expired=False,
+    )
+    if not claimed:
+        await session.rollback()
+        await callback.answer("验证已由其他操作处理", show_alert=True)
+        return
+
+    kind = str(snapshot["kind"])
+    shown = html.escape(str(snapshot["display_name"] or target_user_id))
+    if action == VERIFICATION_CALLBACK_APPROVE:
+        await session.commit()
+        restored = await restore_member_permissions(callback.bot, group_id, target_user_id)
+        if not restored:
+            await _requeue_verification(session, settings, snapshot)
+            await callback.answer("权限恢复失败，验证已保留待处理", show_alert=True)
+            return
+        approved_text = (
+            f"✅ <b>{shown}</b> 已由管理员直接通过消息审查验证，发言权限已恢复。"
+            if kind == VERIFICATION_KIND_MODERATION
+            else f"✅ <b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
+        )
+        await _edit_verification_prompt(callback, text=approved_text)
+        await callback.answer("已直接通过验证")
+        return
+
+    ban_state = None
+    if kind == VERIFICATION_KIND_MODERATION:
+        ban_state = await mark_group_banned(session, group_id, target_user_id)
+    await session.commit()
+
+    if kind == VERIFICATION_KIND_MODERATION:
+        enforced = await ban_member(callback.bot, group_id, target_user_id)
+        if not enforced:
+            rolled_back = await rollback_group_ban(
+                session,
+                group_id,
+                target_user_id,
+                ban_state,
+            )
+            requeued = rolled_back and not (ban_state and ban_state[1])
+            if requeued:
+                await _requeue_verification(session, settings, snapshot)
+            else:
+                await session.commit()
+            log.warning(
+                "moderation verification admin ban failed | group=%s user=%s "
+                "state_restored=%s",
+                group_id,
+                target_user_id,
+                rolled_back,
+            )
+            await callback.answer(
+                "封禁失败，验证已保留待处理"
+                if requeued
+                else "Telegram 封禁失败，群内状态已变化，请人工检查",
+                show_alert=True,
+            )
+            return
+        rejected_text = (
+            f"🚫 <b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
+        )
+    else:
+        enforced = await kick_member(callback.bot, group_id, target_user_id)
+        if not enforced:
+            await _requeue_verification(session, settings, snapshot)
+            await callback.answer("移出群聊失败，验证已保留待处理", show_alert=True)
+            return
+        rejected_text = (
+            f"❌ <b>{shown}</b> 的入群验证已被管理员拒绝，已移出群聊。"
+        )
+    await _edit_verification_prompt(callback, text=rejected_text)
+    await callback.answer("已直接拒绝验证")
+
+
+@router.callback_query(F.data.startswith(f"{VERIFICATION_CALLBACK_PREFIX}:"))
+async def on_verification_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    parsed = parse_verification_callback_data(callback.data or "")
+    if parsed is None:
+        await callback.answer("验证按钮参数错误", show_alert=True)
+        return
+    action, target_user_id = parsed
+    if action == VERIFICATION_CALLBACK_START:
+        await _handle_verification_start_callback(callback, session, target_user_id)
+        return
+    await _handle_verification_admin_callback(
+        callback,
+        session,
+        settings,
+        action=action,
+        target_user_id=target_user_id,
     )
 
 
@@ -252,6 +575,7 @@ async def on_member_join(
         await _enforce_pending_moderation_challenge(
             event,
             session,
+            settings,
             pending,
             display_name=user.full_name or "",
         )

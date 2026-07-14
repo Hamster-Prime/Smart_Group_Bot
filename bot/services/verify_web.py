@@ -19,9 +19,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import logging
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -33,7 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import UserWarning
+from bot.db.models import JoinVerification, UserWarning
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     VERIFICATION_KIND_MODERATION,
@@ -73,12 +75,50 @@ _HCAPTCHA_CONFIGURATION_ERRORS = {
     "sitekey-secret-mismatch",
     "not-using-dummy-passcode",
 }
+_HCAPTCHA_REPLAY_ERRORS = {
+    "already-seen-response",
+    "invalid-or-already-seen-response",
+}
 _TURNSTILE_SERVICE_ERRORS = {
     TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE,
     "internal-error",
 }
 _COMPLETED_VERIFICATION_TTL_SECONDS = 5 * 60
+_ACTIVE_VERIFICATION_TTL_SECONDS = 2 * 60
+_VERIFICATION_WAIT_TIMEOUT_SECONDS = 60.0
+_VERIFICATION_CACHE_MAX_ENTRIES = 2048
 _SETTINGS_STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
+
+_VerificationFingerprint = tuple[int, int, str, str, str, str, int]
+
+
+@dataclass(slots=True)
+class _ActiveVerification:
+    started_at: float
+    fingerprint: _VerificationFingerprint
+    future: asyncio.Future[bool]
+    participants: int = 1
+
+
+def _public_ip(value: object) -> str:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return ""
+    return address.compressed if address.is_global else ""
+
+
+def _client_public_ip(request: web.Request) -> str:
+    peer = str(request.remote or "").strip()
+    try:
+        peer_address = ipaddress.ip_address(peer)
+    except ValueError:
+        return ""
+    if peer_address.is_global:
+        return peer_address.compressed
+    if peer_address.is_loopback or peer_address.is_private:
+        return _public_ip(request.headers.get("CF-Connecting-IP"))
+    return ""
 
 
 def _verification_config_tag(
@@ -313,9 +353,12 @@ async def verify_hcaptcha_token(
     errors = [str(item) for item in raw_errors if str(item).strip()]
     success = bool(data.get("success"))
     if not success:
+        token = (hcaptcha_token or "").strip()
         log.info(
-            "hcaptcha siteverify rejected | errors=%s",
-            errors or {key: value for key, value in data.items() if key != "response"},
+            "hcaptcha siteverify rejected | errors=%s token_len=%s token_shape=%s",
+            errors or ["unknown"],
+            len(token),
+            "p1" if token.startswith("P1_") else "other",
         )
     return success, errors
 
@@ -336,38 +379,205 @@ class VerifyWebServer:
         self.session_factory = session_factory
         self.runtime_config = runtime_config
         self._runner: web.AppRunner | None = None
-        self._completed_verifications: dict[tuple[int, int], float] = {}
+        self._completed_verifications: dict[
+            tuple[int, int], tuple[float, _VerificationFingerprint]
+        ] = {}
+        # Keep short-lived idempotence only after the row is consumed. The
+        # fingerprint prevents a legacy/recovered database from treating a
+        # different issuance that happens to reuse an ID as completed.
+        self._active_verifications: dict[
+            tuple[int, int], _ActiveVerification
+        ] = {}
 
-    def _verification_completed(self, verification_id: int, user_id: int) -> bool:
-        if verification_id <= 0:
-            return False
-        now = time.monotonic()
-        cutoff = now - _COMPLETED_VERIFICATION_TTL_SECONDS
-        stale = [
-            key
-            for key, completed_at in self._completed_verifications.items()
-            if completed_at < cutoff
-        ]
-        for key in stale:
-            self._completed_verifications.pop(key, None)
-        return (int(verification_id), int(user_id)) in self._completed_verifications
+    @staticmethod
+    def _verification_fingerprint(
+        record: JoinVerification,
+    ) -> _VerificationFingerprint:
+        return (
+            int(record.group_id),
+            int(record.user_id),
+            str(record.kind),
+            normalize_verification_provider(record.provider),
+            str(record.created_at),
+            str(record.deadline_at),
+            int(record.prompt_message_id or 0),
+        )
 
-    def _mark_verification_completed(self, verification_id: int, user_id: int) -> None:
-        if verification_id > 0:
-            self._completed_verifications[(int(verification_id), int(user_id))] = (
-                time.monotonic()
-            )
-
-    async def _wait_for_completed_verification(
+    def _verification_completed(
         self,
         verification_id: int,
         user_id: int,
+        fingerprint: _VerificationFingerprint,
     ) -> bool:
-        for _attempt in range(10):
-            if self._verification_completed(verification_id, user_id):
-                return True
-            await asyncio.sleep(0.1)
-        return self._verification_completed(verification_id, user_id)
+        completed_fingerprint = self._completed_verification_fingerprint(
+            verification_id,
+            user_id,
+        )
+        if completed_fingerprint is None:
+            return False
+        return completed_fingerprint == fingerprint
+
+    def _completed_verification_fingerprint(
+        self,
+        verification_id: int,
+        user_id: int,
+    ) -> _VerificationFingerprint | None:
+        if verification_id <= 0:
+            return None
+        self._prune_verification_caches()
+        completed = self._completed_verifications.get(
+            (int(verification_id), int(user_id))
+        )
+        return completed[1] if completed is not None else None
+
+    async def _completed_member_is_unrestricted(
+        self,
+        fingerprint: _VerificationFingerprint,
+        user_id: int,
+    ) -> bool:
+        try:
+            member = await self.bot.get_chat_member(fingerprint[0], user_id)
+        except Exception:
+            return False
+        status = str(getattr(member, "status", "") or "")
+        return status in {"member", "administrator", "creator"} or (
+            status == "restricted"
+            and bool(getattr(member, "can_send_messages", False))
+        )
+
+    def _prune_verification_caches(self) -> None:
+        now = time.monotonic()
+        completed_cutoff = now - _COMPLETED_VERIFICATION_TTL_SECONDS
+        for key, completed in list(self._completed_verifications.items()):
+            if completed[0] < completed_cutoff:
+                self._completed_verifications.pop(key, None)
+
+        active_cutoff = now - _ACTIVE_VERIFICATION_TTL_SECONDS
+        for key, active in list(self._active_verifications.items()):
+            if active.started_at < active_cutoff:
+                if not active.future.done():
+                    active.future.set_result(False)
+                self._active_verifications.pop(key, None)
+
+        for cache in (self._completed_verifications, self._active_verifications):
+            overflow = len(cache) - _VERIFICATION_CACHE_MAX_ENTRIES
+            if overflow <= 0:
+                continue
+            oldest = sorted(
+                cache.items(),
+                key=lambda item: (
+                    item[1][0]
+                    if isinstance(item[1], tuple)
+                    else item[1].started_at
+                ),
+            )[:overflow]
+            for key, value in oldest:
+                if isinstance(value, _ActiveVerification) and not value.future.done():
+                    value.future.set_result(False)
+                cache.pop(key, None)
+
+    def _active_verification(
+        self,
+        verification_id: int,
+        user_id: int,
+    ) -> _ActiveVerification | None:
+        if verification_id <= 0:
+            return None
+        self._prune_verification_caches()
+        return self._active_verifications.get(
+            (int(verification_id), int(user_id))
+        )
+
+    def _enter_verification_active(
+        self,
+        verification_id: int,
+        user_id: int,
+        fingerprint: _VerificationFingerprint,
+    ) -> tuple[_ActiveVerification, bool]:
+        self._prune_verification_caches()
+        key = (int(verification_id), int(user_id))
+        current = self._active_verifications.get(key)
+        if current is not None and current.fingerprint == fingerprint:
+            current.participants += 1
+            return current, True
+
+        if current is not None and not current.future.done():
+            current.future.set_result(False)
+        active = _ActiveVerification(
+            started_at=time.monotonic(),
+            fingerprint=fingerprint,
+            future=asyncio.get_running_loop().create_future(),
+        )
+        self._active_verifications[key] = active
+        self._prune_verification_caches()
+        return active, False
+
+    def _leave_verification_active(
+        self,
+        verification_id: int,
+        user_id: int,
+        active: _ActiveVerification,
+    ) -> None:
+        key = (int(verification_id), int(user_id))
+        current = self._active_verifications.get(key)
+        if current is not active:
+            return
+        current.participants -= 1
+        if current.participants <= 0:
+            if not current.future.done():
+                current.future.set_result(False)
+            self._active_verifications.pop(key, None)
+
+    def _fail_verification_active(
+        self,
+        verification_id: int,
+        user_id: int,
+        fingerprint: _VerificationFingerprint,
+    ) -> None:
+        key = (int(verification_id), int(user_id))
+        active = self._active_verifications.get(key)
+        if active is not None and active.fingerprint == fingerprint:
+            if not active.future.done():
+                active.future.set_result(False)
+            self._active_verifications.pop(key, None)
+
+    def _mark_verification_completed(
+        self,
+        verification_id: int,
+        user_id: int,
+        fingerprint: _VerificationFingerprint,
+    ) -> None:
+        if verification_id > 0:
+            self._prune_verification_caches()
+            self._completed_verifications[(int(verification_id), int(user_id))] = (
+                time.monotonic(),
+                fingerprint,
+            )
+            active = self._active_verifications.get(
+                (int(verification_id), int(user_id))
+            )
+            if active is not None and active.fingerprint == fingerprint:
+                if not active.future.done():
+                    active.future.set_result(True)
+                self._active_verifications.pop(
+                    (int(verification_id), int(user_id)),
+                    None,
+                )
+            self._prune_verification_caches()
+
+    async def _wait_for_completed_verification(
+        self,
+        active: _ActiveVerification,
+    ) -> bool:
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    asyncio.shield(active.future),
+                    timeout=_VERIFICATION_WAIT_TIMEOUT_SECONDS,
+                )
+            )
+        except TimeoutError:
+            return False
 
     def build_app(self) -> web.Application:
         app = web.Application()
@@ -534,19 +744,22 @@ class VerifyWebServer:
                 {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
             )
         user_id = int(web_user.id)
-        if self._verification_completed(verification_id, user_id):
-            return web.json_response({"ok": True})
 
         async with self.session_factory() as session:
-            record = (
-                await get_pending_verification_by_id_for_user(
+            newer_record = None
+            if verification_id:
+                record = await get_pending_verification_by_id_for_user(
                     session,
                     verification_id,
                     user_id,
                 )
-                if verification_id
-                else await get_pending_verification_for_user(session, user_id)
-            )
+                if record is None:
+                    newer_record = await get_pending_verification_for_user(
+                        session,
+                        user_id,
+                    )
+            else:
+                record = await get_pending_verification_for_user(session, user_id)
             locally_banned = bool(
                 record
                 and await session.scalar(
@@ -558,7 +771,34 @@ class VerifyWebServer:
                 )
             )
         if record is None:
-            if self._verification_completed(verification_id, user_id):
+            if newer_record is not None:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "验证入口已更新，请关闭页面后从最新消息重新打开",
+                    },
+                    status=409,
+                )
+            completed_fingerprint = self._completed_verification_fingerprint(
+                verification_id,
+                user_id,
+            )
+            if (
+                completed_fingerprint is not None
+                and await self._completed_member_is_unrestricted(
+                    completed_fingerprint,
+                    user_id,
+                )
+            ):
+                return web.json_response({"ok": True})
+            active = self._active_verification(
+                verification_id,
+                user_id,
+            )
+            if (
+                active is not None
+                and await self._wait_for_completed_verification(active)
+            ):
                 return web.json_response({"ok": True})
             return web.json_response(
                 {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
@@ -575,6 +815,8 @@ class VerifyWebServer:
                 status=403,
             )
 
+        record_fingerprint = self._verification_fingerprint(record)
+        verification_id = int(record.id)
         provider = normalize_verification_provider(record.provider)
         if page_provider != provider:
             return web.json_response(
@@ -592,8 +834,29 @@ class VerifyWebServer:
                 {"ok": False, "error": "验证服务暂时不可用，请联系管理员"}, status=503
             )
         site_key, secret_key = verification_keys_for_provider(self.settings, provider)
+        active, joined_existing_active = self._enter_verification_active(
+            verification_id,
+            user_id,
+            record_fingerprint,
+        )
+        active_released = False
 
-        remote_ip = request.headers.get("CF-Connecting-IP", request.remote or "")
+        def release_active() -> None:
+            nonlocal active_released
+            if active_released:
+                return
+            self._leave_verification_active(
+                verification_id,
+                user_id,
+                active,
+            )
+            active_released = True
+
+        request_task = asyncio.current_task()
+        if request_task is not None:
+            request_task.add_done_callback(lambda _task: release_active())
+
+        remote_ip = _client_public_ip(request)
         if provider == "hcaptcha":
             passed, verification_errors = await verify_hcaptcha_token(
                 secret_key=secret_key,
@@ -608,20 +871,32 @@ class VerifyWebServer:
                 remote_ip=remote_ip,
             )
         if _verification_config_tag(self.settings, provider) != current_config_tag:
+            release_active()
             return web.json_response(
                 {"ok": False, "error": "验证配置已更新，请重新打开验证页面"},
                 status=409,
             )
         if not passed:
-            if (
-                provider == "hcaptcha"
-                and "already-seen-response" in verification_errors
-                and await self._wait_for_completed_verification(
-                    verification_id,
-                    user_id,
-                )
+            replay_error = provider == "hcaptcha" and bool(
+                _HCAPTCHA_REPLAY_ERRORS.intersection(verification_errors)
+            )
+            if replay_error and joined_existing_active:
+                release_active()
+            if replay_error and joined_existing_active and await self._wait_for_completed_verification(
+                active
             ):
-                return web.json_response({"ok": True})
+                # Fingerprints are second-granular, so a reissued record can
+                # collide with an older completion. The winning submission
+                # always consumes the row, so a still-pending row proves the
+                # completion belongs to a previous issuance, not this one.
+                async with self.session_factory() as session:
+                    still_pending = await get_pending_verification_by_id_for_user(
+                        session,
+                        verification_id,
+                        user_id,
+                    )
+                if still_pending is None:
+                    return web.json_response({"ok": True})
             configuration_error_codes = (
                 _HCAPTCHA_CONFIGURATION_ERRORS
                 if provider == "hcaptcha"
@@ -631,6 +906,7 @@ class VerifyWebServer:
                 verification_errors
             )
             if configuration_errors:
+                release_active()
                 mark_turnstile_configuration_unavailable(
                     self.settings,
                     reason=f"{provider} Secret Key 无效",
@@ -651,6 +927,7 @@ class VerifyWebServer:
                     status=503,
                 )
             if _TURNSTILE_SERVICE_ERRORS.intersection(verification_errors):
+                release_active()
                 return web.json_response(
                     {
                         "ok": False,
@@ -658,7 +935,11 @@ class VerifyWebServer:
                     },
                     status=503,
                 )
-            return web.json_response({"ok": False, "error": "人机验证未通过，请重试"}, status=403)
+            release_active()
+            return web.json_response(
+                {"ok": False, "error": "人机验证未通过，请重试"},
+                status=403,
+            )
 
         clear_turnstile_configuration_unavailable(self.settings, provider=provider)
 
@@ -678,10 +959,8 @@ class VerifyWebServer:
                 or current.deadline_at != record.deadline_at
                 or current.deadline_at <= now
             ):
-                if await self._wait_for_completed_verification(
-                    verification_id,
-                    user_id,
-                ):
+                release_active()
+                if await self._wait_for_completed_verification(active):
                     return web.json_response({"ok": True})
                 return web.json_response(
                     {"ok": False, "error": "验证已过期或失效，请联系群管理员"},
@@ -690,6 +969,12 @@ class VerifyWebServer:
             if await is_globally_banned(session, user_id):
                 await delete_join_verification(session, current.group_id, user_id)
                 await session.commit()
+                self._fail_verification_active(
+                    verification_id,
+                    user_id,
+                    record_fingerprint,
+                )
+                active_released = True
                 return web.json_response(
                     {"ok": False, "error": "该账号已被管理员封禁，请联系管理员"},
                     status=403,
@@ -701,6 +986,12 @@ class VerifyWebServer:
                     UserWarning.is_banned == True,  # noqa: E712
                 )
             ):
+                self._fail_verification_active(
+                    verification_id,
+                    user_id,
+                    record_fingerprint,
+                )
+                active_released = True
                 return web.json_response(
                     {"ok": False, "error": "该用户已被本群管理员封禁，请联系管理员"},
                     status=403,
@@ -716,10 +1007,8 @@ class VerifyWebServer:
             )
             if not claimed:
                 await session.rollback()
-                if await self._wait_for_completed_verification(
-                    verification_id,
-                    user_id,
-                ):
+                release_active()
+                if await self._wait_for_completed_verification(active):
                     return web.json_response({"ok": True})
                 return web.json_response(
                     {"ok": False, "error": "验证已失效，请重新打开验证入口"},
@@ -735,6 +1024,70 @@ class VerifyWebServer:
             # pass back and let the sweeper kick a verified member.
             await session.commit()
 
+        terminal_task = asyncio.create_task(
+            self._finish_claimed_verification(
+                verification_id=verification_id,
+                user_id=user_id,
+                fingerprint=record_fingerprint,
+                group_id=group_id,
+                prompt_message_id=prompt_message_id,
+                display_name=display_name,
+                kind=kind,
+                reason=reason,
+                provider=provider,
+            )
+        )
+        try:
+            response = await asyncio.shield(terminal_task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(terminal_task)
+            except Exception:
+                await asyncio.shield(
+                    self._recover_claimed_verification(
+                        verification_id=verification_id,
+                        user_id=user_id,
+                        fingerprint=record_fingerprint,
+                        group_id=group_id,
+                        prompt_message_id=prompt_message_id,
+                        display_name=display_name,
+                        kind=kind,
+                        reason=reason,
+                        provider=provider,
+                    )
+                )
+            raise
+        except Exception:
+            await asyncio.shield(
+                self._recover_claimed_verification(
+                    verification_id=verification_id,
+                    user_id=user_id,
+                    fingerprint=record_fingerprint,
+                    group_id=group_id,
+                    prompt_message_id=prompt_message_id,
+                    display_name=display_name,
+                    kind=kind,
+                    reason=reason,
+                    provider=provider,
+                )
+            )
+            raise
+        active_released = True
+        return response
+
+    async def _finish_claimed_verification(
+        self,
+        *,
+        verification_id: int,
+        user_id: int,
+        fingerprint: _VerificationFingerprint,
+        group_id: int,
+        prompt_message_id: int,
+        display_name: str,
+        kind: str,
+        reason: str,
+        provider: str,
+    ) -> web.Response:
         restored = await restore_member_permissions(self.bot, group_id, user_id)
         log.info(
             "verification passed | kind=%s group=%s user=%s restored=%s",
@@ -777,6 +1130,11 @@ class VerifyWebServer:
                 kind=kind,
                 restored=False,
             )
+            self._fail_verification_active(
+                verification_id,
+                user_id,
+                fingerprint,
+            )
             return web.json_response(
                 {
                     "ok": False,
@@ -785,7 +1143,11 @@ class VerifyWebServer:
                 },
                 status=502,
             )
-        self._mark_verification_completed(verification_id, user_id)
+        self._mark_verification_completed(
+            verification_id,
+            user_id,
+            fingerprint,
+        )
         await self._announce_pass(
             group_id=group_id,
             user_id=user_id,
@@ -795,6 +1157,65 @@ class VerifyWebServer:
             restored=True,
         )
         return web.json_response({"ok": True})
+
+    async def _recover_claimed_verification(
+        self,
+        *,
+        verification_id: int,
+        user_id: int,
+        fingerprint: _VerificationFingerprint,
+        group_id: int,
+        prompt_message_id: int,
+        display_name: str,
+        kind: str,
+        reason: str,
+        provider: str,
+    ) -> None:
+        try:
+            restored = await self._completed_member_is_unrestricted(
+                fingerprint,
+                user_id,
+            ) or await restore_member_permissions(self.bot, group_id, user_id)
+            if restored:
+                self._mark_verification_completed(
+                    verification_id,
+                    user_id,
+                    fingerprint,
+                )
+                return
+
+            timeout_seconds = (
+                self.settings.moderation.challenge_timeout_seconds
+                if kind == VERIFICATION_KIND_MODERATION
+                else self.settings.join_verification_timeout_seconds
+            )
+            async with self.session_factory() as session:
+                await upsert_join_verification(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                    deadline_at=now_shanghai_naive()
+                    + timedelta(seconds=max(60, int(timeout_seconds))),
+                    kind=kind,
+                    reason=reason,
+                    display_name=display_name,
+                    prompt_message_id=prompt_message_id,
+                    provider=provider,
+                )
+                await session.commit()
+        except Exception:
+            log.exception(
+                "verification terminal recovery failed | kind=%s group=%s user=%s",
+                kind,
+                group_id,
+                user_id,
+            )
+        finally:
+            self._fail_verification_active(
+                verification_id,
+                user_id,
+                fingerprint,
+            )
 
     async def _announce_pass(
         self,

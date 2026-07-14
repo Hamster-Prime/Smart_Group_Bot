@@ -27,7 +27,12 @@ def _settings() -> SimpleNamespace:
 
 def _message() -> SimpleNamespace:
     return SimpleNamespace(
-        chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+        chat=SimpleNamespace(
+            id=-10001,
+            type="supergroup",
+            title="test",
+            ban=AsyncMock(),
+        ),
         from_user=SimpleNamespace(
             id=42,
             is_bot=False,
@@ -46,8 +51,21 @@ def _message() -> SimpleNamespace:
 
 
 class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, moderation_service: SimpleNamespace, **extra_patches):
-        message = _message()
+    async def _run(
+        self,
+        moderation_service: SimpleNamespace,
+        *,
+        message: SimpleNamespace | None = None,
+        **extra_patches,
+    ):
+        message = message or _message()
+        session = SimpleNamespace(
+            flush=AsyncMock(),
+            commit=AsyncMock(),
+            rollback=AsyncMock(),
+            execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)),
+        )
+        message._test_session = session
         group_row = SimpleNamespace(settings={"mute_all_replies": True})
         patches = [
             patch(
@@ -91,7 +109,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patcher)
             await group.on_group_message(
                 message,
-                session=object(),
+                session=session,
                 settings=_settings(),
             )
         return message
@@ -137,7 +155,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             is_user_exempt=AsyncMock(return_value=False),
             evaluate=AsyncMock(return_value=verdict),
             is_high_confidence=lambda _verdict: True,
-            record_violation=AsyncMock(),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=321)),
         )
         begin = AsyncMock(return_value=True)
         answer = AsyncMock()
@@ -153,6 +171,129 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         moderation.record_violation.assert_awaited_once()
         self.assertEqual(moderation.record_violation.await_args.args[4], "warn")
         answer.assert_awaited_once()
+        message._test_session.flush.assert_awaited_once()
+        message._test_session.commit.assert_awaited_once()
+        keyboard = answer.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.callback_data for button in keyboard.inline_keyboard[0]],
+            ["mact:ban:321", "mact:undo:321", "mact:exempt:321"],
+        )
+
+    async def test_super_admin_is_automatically_exempt_from_moderation(self) -> None:
+        message = _message()
+        message.from_user.id = 1
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(),
+        )
+
+        await self._run(moderation, message=message)
+
+        moderation.is_user_exempt.assert_not_awaited()
+        moderation.evaluate.assert_not_awaited()
+
+    async def test_counted_ban_policy_warning_uses_durable_event_state(self) -> None:
+        rule = SimpleNamespace(
+            id=9,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.99,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            add_warning=AsyncMock(return_value=(2, False)),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=654)),
+        )
+        answer = AsyncMock()
+
+        message = await self._run(
+            moderation,
+            answer=patch("bot.handlers.group.answer_with_auto_delete", new=answer),
+        )
+
+        self.assertEqual(moderation.record_violation.await_args.args[4], "ban_warning")
+        message.chat.ban.assert_not_awaited()
+        keyboard = answer.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][1].callback_data, "mact:undo:654")
+
+    async def test_auto_ban_uses_applied_event_state(self) -> None:
+        rule = SimpleNamespace(
+            id=10,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.99,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            add_warning=AsyncMock(return_value=(3, True)),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=655)),
+        )
+        answer = AsyncMock()
+
+        message = await self._run(
+            moderation,
+            answer=patch("bot.handlers.group.answer_with_auto_delete", new=answer),
+        )
+
+        self.assertEqual(moderation.record_violation.await_args.args[4], "ban_applied")
+        message.chat.ban.assert_awaited_once_with(42)
+        self.assertEqual(
+            answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+            "mact:ban:655",
+        )
+
+    async def test_failed_auto_ban_reverts_to_warning_state(self) -> None:
+        rule = SimpleNamespace(
+            id=11,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.99,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            add_warning=AsyncMock(return_value=(3, True)),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=656)),
+        )
+        answer = AsyncMock()
+
+        failed_message = _message()
+        failed_message.chat.ban.return_value = False
+        message = await self._run(
+            moderation,
+            message=failed_message,
+            answer=patch("bot.handlers.group.answer_with_auto_delete", new=answer),
+        )
+
+        self.assertEqual(message._test_session.execute.await_count, 2)
+        self.assertEqual(message._test_session.commit.await_count, 2)
+        self.assertIn("自动封禁失败", answer.await_args.args[1])
 
     async def test_invalid_confidence_never_falls_back_to_direct_action(self) -> None:
         verdict = ModerationVerdict(

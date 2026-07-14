@@ -96,6 +96,75 @@ async def _sqlite_migrate_join_verifications(conn) -> bool:
     return True
 
 
+async def _sqlite_migrate_join_verification_autoincrement(conn) -> bool:
+    """Make verification IDs monotonic while preserving pending rows.
+
+    Older SQLite databases used a plain INTEGER primary key, so deleting the
+    last pending row allowed the next issuance to reuse its ID. That collides
+    with the web server's short-lived idempotence cache.
+    """
+    result = await conn.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'join_verifications'"
+        )
+    )
+    row = result.first()
+    table_sql = str(row[0] or "") if row else ""
+    if not table_sql or "AUTOINCREMENT" in table_sql.upper():
+        return False
+
+    await conn.execute(
+        text("DROP TABLE IF EXISTS join_verifications_autoincrement")
+    )
+    await conn.execute(
+        text(
+            "CREATE TABLE join_verifications_autoincrement ("
+            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+            "group_id BIGINT NOT NULL, "
+            "user_id BIGINT NOT NULL, "
+            "kind VARCHAR(32) NOT NULL DEFAULT 'join', "
+            "provider VARCHAR(32) NOT NULL DEFAULT 'turnstile', "
+            "reason TEXT NOT NULL DEFAULT '', "
+            "display_name VARCHAR(255) NOT NULL, "
+            "prompt_message_id BIGINT NOT NULL, "
+            "deadline_at DATETIME NOT NULL, "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO join_verifications_autoincrement "
+            "(id, group_id, user_id, kind, provider, reason, display_name, "
+            "prompt_message_id, deadline_at, created_at) "
+            "SELECT id, group_id, user_id, kind, provider, reason, display_name, "
+            "prompt_message_id, deadline_at, created_at FROM join_verifications"
+        )
+    )
+    await conn.execute(text("DROP TABLE join_verifications"))
+    await conn.execute(
+        text(
+            "ALTER TABLE join_verifications_autoincrement "
+            "RENAME TO join_verifications"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX ix_join_verification_group_user "
+            "ON join_verifications (group_id, user_id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX ix_join_verifications_user_id "
+            "ON join_verifications (user_id)"
+        )
+    )
+    log.info("Migrated: enabled AUTOINCREMENT for join_verifications")
+    return True
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -194,6 +263,7 @@ async def init_db(
                 "reason",
                 "reason TEXT NOT NULL DEFAULT ''",
             )
+            await _sqlite_migrate_join_verification_autoincrement(conn)
 
     session_factory = async_sessionmaker(
         engine,

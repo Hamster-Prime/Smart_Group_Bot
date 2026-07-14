@@ -18,11 +18,13 @@ from bot.services.join_screening import add_global_ban
 from bot.services.join_verification import (
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
+    delete_join_verification,
     get_join_verification,
     upsert_join_verification,
 )
 from bot.services.verify_web import (
     VerifyWebServer,
+    _client_public_ip,
     verify_hcaptcha_token,
     verify_turnstile_token,
 )
@@ -65,16 +67,17 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.bot = SimpleNamespace(
             token=BOT_TOKEN,
             restrict_chat_member=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
             edit_message_text=AsyncMock(),
             send_message=AsyncMock(),
         )
         self.settings = _settings()
-        server = VerifyWebServer(
+        self.server = VerifyWebServer(
             bot=self.bot,
             settings=self.settings,
             session_factory=self.session_factory,
         )
-        self.client = TestClient(TestServer(server.build_app()))
+        self.client = TestClient(TestServer(self.server.build_app()))
         await self.client.start_server()
 
     async def asyncTearDown(self) -> None:
@@ -129,6 +132,36 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
                 "init_data": _signed_init_data(user_id) if init_data is None else init_data,
             },
         )
+
+    async def _submit_hcaptcha(
+        self,
+        user_id: int,
+        *,
+        verification_id: int,
+        token: str = "h-token",
+    ):
+        return await self.client.post(
+            "/verify",
+            json={
+                "challenge_token": token,
+                "provider": "hcaptcha",
+                "verification_id": verification_id,
+                "init_data": _signed_init_data(user_id),
+            },
+        )
+
+    async def _force_verification_id(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        verification_id: int,
+    ) -> None:
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, group_id, user_id)
+            self.assertIsNotNone(record)
+            record.id = verification_id
+            await session.commit()
 
     async def test_health_endpoint(self) -> None:
         resp = await self.client.get("/healthz")
@@ -230,6 +263,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(response.status, 200)
             self.assertEqual(verify_mock.await_args.kwargs["hcaptcha_token"], "h-token")
+            self.assertEqual(verify_mock.await_args.kwargs["remote_ip"], "")
         finally:
             await client.close()
 
@@ -283,6 +317,19 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
                 "sitekey": "h-site",
             },
         )
+
+    def test_client_ip_trusts_proxy_header_only_from_private_peer(self) -> None:
+        proxied = SimpleNamespace(
+            remote="127.0.0.1",
+            headers={"CF-Connecting-IP": "8.8.8.8"},
+        )
+        direct = SimpleNamespace(
+            remote="1.1.1.1",
+            headers={"CF-Connecting-IP": "8.8.8.8"},
+        )
+
+        self.assertEqual(_client_public_ip(proxied), "8.8.8.8")
+        self.assertEqual(_client_public_ip(direct), "1.1.1.1")
 
     async def test_stale_provider_page_is_rejected_before_siteverify(self) -> None:
         await self._seed(user_id=121)
@@ -532,6 +579,221 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.restrict_chat_member.await_count, 1)
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 107))
+
+    async def test_hcaptcha_concurrent_replay_is_idempotent_for_same_record(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        verification_id = await self._seed(user_id=127, provider="hcaptcha")
+        second_started = asyncio.Event()
+        verification_count = 0
+
+        async def verify_concurrently(**_kwargs) -> tuple[bool, list[str]]:
+            nonlocal verification_count
+            verification_count += 1
+            if verification_count == 1:
+                await second_started.wait()
+                return True, []
+            second_started.set()
+            return False, ["invalid-or-already-seen-response"]
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(side_effect=verify_concurrently),
+        ) as verify_mock:
+            first, second = await asyncio.gather(
+                self._submit_hcaptcha(127, verification_id=verification_id),
+                self._submit_hcaptcha(127, verification_id=verification_id),
+            )
+
+        self.assertEqual((first.status, second.status), (200, 200))
+        self.assertEqual(verify_mock.await_count, 2)
+        self.bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 127))
+
+    async def test_duplicate_submit_waits_while_permissions_are_being_restored(self) -> None:
+        verification_id = await self._seed(user_id=130)
+        restore_started = asyncio.Event()
+        allow_restore = asyncio.Event()
+
+        async def delayed_restore(*_args, **_kwargs) -> bool:
+            restore_started.set()
+            await allow_restore.wait()
+            return True
+
+        with (
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(True, [])),
+            ) as verify_mock,
+            patch(
+                "bot.services.verify_web.restore_member_permissions",
+                new=AsyncMock(side_effect=delayed_restore),
+            ),
+        ):
+            first = asyncio.create_task(
+                self._submit(130, verification_id=verification_id)
+            )
+            await restore_started.wait()
+            repeated = asyncio.create_task(
+                self._submit(130, verification_id=verification_id)
+            )
+            await asyncio.sleep(1.2)
+            self.assertFalse(repeated.done())
+            allow_restore.set()
+            first_response, repeated_response = await asyncio.gather(first, repeated)
+
+        self.assertEqual((first_response.status, repeated_response.status), (200, 200))
+        verify_mock.assert_awaited_once()
+
+    async def test_reused_id_still_runs_new_hcaptcha_verification(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        first_id = await self._seed(user_id=125, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            first = await self._submit_hcaptcha(125, verification_id=first_id)
+        self.assertEqual(first.status, 200)
+
+        second_id = await self._seed(user_id=125, provider="hcaptcha")
+        self.assertGreater(second_id, first_id)
+        await self._force_verification_id(
+            group_id=-100,
+            user_id=125,
+            verification_id=first_id,
+        )
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as verify_mock:
+            second = await self._submit_hcaptcha(125, verification_id=first_id)
+
+        self.assertEqual(second.status, 200)
+        verify_mock.assert_awaited_once()
+        self.assertEqual(self.bot.restrict_chat_member.await_count, 2)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 125))
+
+    async def test_reused_id_cannot_accept_old_completion_on_hcaptcha_replay(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        first_id = await self._seed(user_id=126, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            first = await self._submit_hcaptcha(126, verification_id=first_id)
+        self.assertEqual(first.status, 200)
+
+        second_id = await self._seed(user_id=126, provider="hcaptcha")
+        self.assertGreater(second_id, first_id)
+        await self._force_verification_id(
+            group_id=-100,
+            user_id=126,
+            verification_id=first_id,
+        )
+        with (
+            patch(
+                "bot.services.verify_web.verify_hcaptcha_token",
+                new=AsyncMock(return_value=(False, ["already-seen-response"])),
+            ) as verify_mock,
+        ):
+            second = await asyncio.wait_for(
+                self._submit_hcaptcha(126, verification_id=first_id),
+                timeout=1.0,
+            )
+
+        self.assertEqual(second.status, 403)
+        verify_mock.assert_awaited_once()
+        self.assertEqual(self.bot.restrict_chat_member.await_count, 1)
+        self.assertEqual(self.server._active_verifications, {})
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 126))
+
+    async def test_old_completed_id_cannot_hide_newer_pending_record(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        old_id = await self._seed(user_id=128)
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            completed = await self._submit(128, verification_id=old_id)
+        self.assertEqual(completed.status, 200)
+
+        other_user_id = await self._seed(user_id=999, group_id=-200)
+        new_id = await self._seed(user_id=128, provider="hcaptcha")
+        self.assertGreater(other_user_id, old_id)
+        self.assertNotEqual(new_id, old_id)
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            stale = await self._submit(128, verification_id=old_id)
+
+        self.assertEqual(stale.status, 409)
+        verify_mock.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 128))
+
+    async def test_reused_id_after_new_generation_ended_cannot_use_old_cache(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        old_id = await self._seed(user_id=131, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            completed = await self._submit_hcaptcha(131, verification_id=old_id)
+        self.assertEqual(completed.status, 200)
+
+        new_id = await self._seed(user_id=131, provider="hcaptcha")
+        self.assertGreater(new_id, old_id)
+        await self._force_verification_id(
+            group_id=-100,
+            user_id=131,
+            verification_id=old_id,
+        )
+        async with self.session_factory() as session:
+            self.assertTrue(await delete_join_verification(session, -100, 131))
+            await session.commit()
+        self.bot.get_chat_member.return_value = SimpleNamespace(status="left")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            stale = await self._submit_hcaptcha(131, verification_id=old_id)
+
+        self.assertEqual(stale.status, 404)
+        verify_mock.assert_not_awaited()
+
+    async def test_invalid_hcaptcha_response_keeps_pending_record(self) -> None:
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        verification_id = await self._seed(user_id=129, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(False, ["invalid-input-response"])),
+        ) as verify_mock:
+            response = await self._submit_hcaptcha(
+                129,
+                verification_id=verification_id,
+            )
+
+        self.assertEqual(response.status, 403)
+        verify_mock.assert_awaited_once()
+        self.bot.restrict_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 129))
 
     async def test_restore_response_loss_is_confirmed_from_member_state(self) -> None:
         verification_id = await self._seed(user_id=123)

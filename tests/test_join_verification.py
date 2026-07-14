@@ -1,22 +1,31 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
+from sqlalchemy import select
+
+from bot.handlers import membership
 from bot.db.engine import init_db
-from bot.db.models import Group
+from bot.db.models import Group, UserWarning
 from bot.services.join_screening import add_global_ban, get_global_ban
 from bot.services.join_verification import (
     JoinVerificationSweeper,
+    VERIFICATION_CALLBACK_APPROVE,
+    VERIFICATION_CALLBACK_REJECT,
+    VERIFICATION_CALLBACK_START,
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
+    ban_member,
     begin_moderation_challenge,
     build_group_prompt_keyboard,
     build_mini_app_url,
     build_private_challenge_keyboard,
     build_private_deep_link,
+    build_verification_callback_data,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
@@ -24,11 +33,13 @@ from bot.services.join_verification import (
     get_pending_verification_for_user,
     join_verification_ready,
     join_verification_policy,
+    kick_member,
     list_expired_verifications,
     maybe_send_private_verification,
     moderation_challenge_ready,
     mark_turnstile_configuration_unavailable,
     parse_private_verify_group_id,
+    restrict_new_member,
     upsert_join_verification,
     verification_keys_for_provider,
     verification_service_ready,
@@ -145,20 +156,29 @@ class HelperTests(unittest.TestCase):
             build_mini_app_url(settings, "hcaptcha"),
             "https://verify.example.com/verify?provider=hcaptcha",
         )
+        self.assertEqual(
+            build_mini_app_url(settings, "turnstile", 7),
+            "https://verify.example.com/verify?provider=turnstile&verification_id=7",
+        )
 
     def test_deep_link_and_group_keyboard(self) -> None:
         self.assertEqual(
             build_private_deep_link("@my_bot"),
             "https://t.me/my_bot?start=verify",
         )
-        keyboard = build_group_prompt_keyboard("my_bot")
-        button = keyboard.inline_keyboard[0][0]
-        self.assertEqual(button.url, "https://t.me/my_bot?start=verify")
-        self.assertIsNone(getattr(button, "web_app", None))
-        scoped = build_group_prompt_keyboard("my_bot", -100123)
+        keyboard = build_group_prompt_keyboard(123456)
+        self.assertEqual(len(keyboard.inline_keyboard), 2)
         self.assertEqual(
-            scoped.inline_keyboard[0][0].url,
-            "https://t.me/my_bot?start=verify_n100123",
+            keyboard.inline_keyboard[0][0].callback_data,
+            "jv:v:123456",
+        )
+        self.assertEqual(
+            keyboard.inline_keyboard[1][0].callback_data,
+            "jv:a:123456",
+        )
+        self.assertEqual(
+            keyboard.inline_keyboard[1][1].callback_data,
+            "jv:r:123456",
         )
         self.assertEqual(parse_private_verify_group_id("verify_n100123"), -100123)
         self.assertEqual(parse_private_verify_group_id("verify_p42"), 42)
@@ -169,6 +189,20 @@ class HelperTests(unittest.TestCase):
         button = keyboard.inline_keyboard[0][0]
         self.assertIsNone(getattr(button, "url", None))
         self.assertEqual(button.web_app.url, "https://verify.example.com/verify")
+
+
+class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_false_bot_api_results_are_treated_as_failures(self) -> None:
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(return_value=False),
+            ban_chat_member=AsyncMock(return_value=False),
+            unban_chat_member=AsyncMock(return_value=True),
+        )
+
+        self.assertFalse(await restrict_new_member(bot, -100, 42))
+        self.assertFalse(await ban_member(bot, -100, 42))
+        self.assertFalse(await kick_member(bot, -100, 42))
+        bot.unban_chat_member.assert_not_awaited()
 
 
 class VerificationStoreTests(_DbTestCase):
@@ -268,6 +302,33 @@ class VerificationStoreTests(_DbTestCase):
             await session.commit()
             row = await get_pending_verification_for_user(session, 3)
             self.assertEqual(row.group_id, -100)
+
+    async def test_deleted_verification_ids_are_not_reused(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=41,
+                deadline_at=now + timedelta(minutes=5),
+            )
+            await session.commit()
+            first = await get_join_verification(session, -100, 41)
+            first_id = int(first.id)
+            await delete_join_verification(session, -100, 41)
+            await session.commit()
+
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=42,
+                deadline_at=now + timedelta(minutes=5),
+            )
+            await session.commit()
+            second = await get_join_verification(session, -100, 42)
+
+        self.assertGreater(int(second.id), first_id)
+
 
     async def test_list_expired_only_returns_past_deadlines(self) -> None:
         now = now_shanghai_naive()
@@ -371,6 +432,79 @@ class VerificationStoreTests(_DbTestCase):
             self.assertIsNone(await get_join_verification(session, -100, 8))
 
 
+class JoinVerificationSchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_table_is_migrated_without_losing_pending_rows(self) -> None:
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE join_verifications (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    group_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    kind VARCHAR(32) NOT NULL DEFAULT 'join',
+                    provider VARCHAR(32) NOT NULL DEFAULT 'turnstile',
+                    reason TEXT NOT NULL DEFAULT '',
+                    display_name VARCHAR(255) NOT NULL,
+                    prompt_message_id BIGINT NOT NULL,
+                    deadline_at DATETIME NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE UNIQUE INDEX ix_join_verification_group_user
+                    ON join_verifications (group_id, user_id);
+                CREATE INDEX ix_join_verifications_user_id
+                    ON join_verifications (user_id);
+                INSERT INTO join_verifications (
+                    id, group_id, user_id, kind, provider, reason,
+                    display_name, prompt_message_id, deadline_at
+                ) VALUES (
+                    41, -100, 51, 'join', 'hcaptcha', '', '待验证用户', 777,
+                    '2099-01-01 00:00:00'
+                );
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        engine = None
+        try:
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{db_path}")
+            async with engine.connect() as conn:
+                result = await conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'join_verifications'"
+                )
+                table_sql = str(result.scalar_one())
+            self.assertIn("AUTOINCREMENT", table_sql.upper())
+
+            async with session_factory() as session:
+                preserved = await get_join_verification(session, -100, 51)
+                self.assertIsNotNone(preserved)
+                self.assertEqual(preserved.id, 41)
+                self.assertEqual(preserved.provider, "hcaptcha")
+                await delete_join_verification(session, -100, 51)
+                await upsert_join_verification(
+                    session,
+                    group_id=-100,
+                    user_id=52,
+                    deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                )
+                await session.commit()
+                replacement = await get_join_verification(session, -100, 52)
+                self.assertGreater(replacement.id, 41)
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(f"{db_path}{suffix}")
+                except OSError:
+                    pass
+
+
 def _join_event(*, user_id: int = 900, full_name: str = "新人", username: str = "newbie") -> SimpleNamespace:
     user = SimpleNamespace(
         id=user_id,
@@ -417,7 +551,9 @@ class JoinTriggersVerificationTests(_DbTestCase):
         event.bot.send_message.assert_awaited_once()
         markup = event.bot.send_message.await_args.kwargs.get("reply_markup")
         self.assertIsNotNone(markup)
-        self.assertTrue(markup.inline_keyboard[0][0].url.startswith("https://t.me/"))
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "jv:v:910")
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "jv:a:910")
+        self.assertEqual(markup.inline_keyboard[1][1].callback_data, "jv:r:910")
 
         async with self.session_factory() as session:
             row = await get_join_verification(session, -100, 910)
@@ -596,8 +732,515 @@ class ModerationChallengeTests(_DbTestCase):
         self.assertIn("低置信度", prompt_call.args[1])
         self.assertIn("疑似发布广告", prompt_call.args[1])
         self.assertEqual(prompt_call.kwargs["parse_mode"], "HTML")
-        button = prompt_call.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.url, "https://t.me/my_bot?start=verify_n100")
+        keyboard = prompt_call.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "jv:v:918")
+        self.assertEqual(keyboard.inline_keyboard[1][0].callback_data, "jv:a:918")
+        self.assertEqual(keyboard.inline_keyboard[1][1].callback_data, "jv:r:918")
+
+    async def test_expired_rejoin_requeues_when_group_ban_fails(self) -> None:
+        settings = _settings()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=919,
+                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="疑似广告",
+                display_name="可疑用户",
+                prompt_message_id=819,
+            )
+            await session.commit()
+            record = await get_join_verification(session, -100, 919)
+
+            event = SimpleNamespace(
+                chat=SimpleNamespace(
+                    id=-100,
+                    ban=AsyncMock(return_value=False),
+                ),
+                bot=SimpleNamespace(send_message=AsyncMock()),
+            )
+            with patch(
+                "bot.handlers.membership.restrict_new_member",
+                new=AsyncMock(return_value=True),
+            ) as restrict:
+                await membership._enforce_pending_moderation_challenge(
+                    event,
+                    session,
+                    settings,
+                    record,
+                    display_name="可疑用户",
+                )
+
+        restrict.assert_awaited_once_with(event.bot, -100, 919)
+        async with self.session_factory() as session:
+            retry = await get_join_verification(session, -100, 919)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 919,
+                )
+            )
+            self.assertIsNotNone(retry)
+            self.assertGreater(retry.deadline_at, now_shanghai_naive())
+            self.assertIsNone(warning)
+
+    async def test_super_admin_pending_challenge_is_cleared_on_rejoin(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=1,
+                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+            )
+            await session.commit()
+            record = await get_join_verification(session, -100, 1)
+            event = SimpleNamespace(
+                chat=SimpleNamespace(id=-100, ban=AsyncMock()),
+                bot=SimpleNamespace(
+                    restrict_chat_member=AsyncMock(return_value=True),
+                    get_chat_member=AsyncMock(),
+                ),
+            )
+
+            await membership._enforce_pending_moderation_challenge(
+                event,
+                session,
+                _settings(super_admin_id=1),
+                record,
+                display_name="Owner",
+            )
+
+        event.chat.ban.assert_not_awaited()
+        event.bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 1))
+
+
+def _verification_callback(
+    *,
+    action: str,
+    target_user_id: int,
+    operator_id: int,
+    message_id: int,
+) -> SimpleNamespace:
+    bot = SimpleNamespace(
+        me=AsyncMock(return_value=SimpleNamespace(username="my_bot")),
+        edit_message_text=AsyncMock(),
+    )
+    return SimpleNamespace(
+        data=build_verification_callback_data(action, target_user_id),
+        from_user=SimpleNamespace(id=operator_id),
+        message=SimpleNamespace(
+            message_id=message_id,
+            chat=SimpleNamespace(id=-100, type="supergroup"),
+        ),
+        bot=bot,
+        answer=AsyncMock(),
+    )
+
+
+class VerificationCallbackTests(_DbTestCase):
+    async def _add_record(
+        self,
+        *,
+        user_id: int,
+        message_id: int,
+        kind: str = VERIFICATION_KIND_JOIN,
+        reason: str = "",
+    ):
+        deadline = now_shanghai_naive() + timedelta(minutes=5)
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=user_id,
+                deadline_at=deadline,
+                kind=kind,
+                reason=reason,
+                display_name=f"用户{user_id}",
+                prompt_message_id=message_id,
+            )
+            await session.commit()
+        return deadline
+
+    async def test_target_user_callback_opens_scoped_private_link(self) -> None:
+        await self._add_record(user_id=940, message_id=840)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_START,
+            target_user_id=940,
+            operator_id=940,
+            message_id=840,
+        )
+
+        async with self.session_factory() as session:
+            await membership.on_verification_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        callback.answer.assert_awaited_once_with(
+            url="https://t.me/my_bot?start=verify_n100"
+        )
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 940))
+
+    async def test_non_target_user_cannot_open_verification(self) -> None:
+        await self._add_record(user_id=941, message_id=841)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_START,
+            target_user_id=941,
+            operator_id=999,
+            message_id=841,
+        )
+
+        async with self.session_factory() as session:
+            await membership.on_verification_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        self.assertTrue(callback.answer.await_args.kwargs["show_alert"])
+        self.assertIn("本人", callback.answer.await_args.args[0])
+        callback.bot.me.assert_not_awaited()
+
+    async def test_stale_prompt_cannot_open_verification(self) -> None:
+        await self._add_record(user_id=942, message_id=842)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_START,
+            target_user_id=942,
+            operator_id=942,
+            message_id=999,
+        )
+
+        async with self.session_factory() as session:
+            await membership.on_verification_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        self.assertTrue(callback.answer.await_args.kwargs["show_alert"])
+        self.assertIn("失效", callback.answer.await_args.args[0])
+
+    async def test_non_admin_cannot_approve(self) -> None:
+        await self._add_record(user_id=943, message_id=843)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_APPROVE,
+            target_user_id=943,
+            operator_id=10,
+            message_id=843,
+        )
+
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=False),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        self.assertIn("群管理员", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 943))
+
+    async def test_admin_approve_restores_and_consumes_record_once(self) -> None:
+        await self._add_record(user_id=944, message_id=844)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_APPROVE,
+            target_user_id=944,
+            operator_id=11,
+            message_id=844,
+        )
+        auth = AsyncMock(return_value=True)
+        restore = AsyncMock(return_value=True)
+
+        with (
+            patch("bot.handlers.membership.is_group_admin_or_higher", new=auth),
+            patch("bot.handlers.membership.restore_member_permissions", new=restore),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        restore.assert_awaited_once_with(callback.bot, -100, 944)
+        callback.bot.edit_message_text.assert_awaited_once()
+        self.assertIsNone(
+            callback.bot.edit_message_text.await_args.kwargs["reply_markup"]
+        )
+        self.assertEqual(callback.answer.await_count, 2)
+        self.assertIn("失效", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 944))
+
+    async def test_admin_approve_preserves_record_when_user_is_banned(self) -> None:
+        await self._add_record(user_id=945, message_id=845)
+        await self._add_record(user_id=946, message_id=846)
+        async with self.session_factory() as session:
+            await add_global_ban(session, 945, reason="global")
+            session.add(UserWarning(group_id=-100, user_id=946, count=3, is_banned=True))
+            await session.commit()
+
+        restore = AsyncMock(return_value=True)
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.membership.restore_member_permissions", new=restore),
+        ):
+            for target, message_id in ((945, 845), (946, 846)):
+                callback = _verification_callback(
+                    action=VERIFICATION_CALLBACK_APPROVE,
+                    target_user_id=target,
+                    operator_id=11,
+                    message_id=message_id,
+                )
+                async with self.session_factory() as session:
+                    await membership.on_verification_callback(
+                        callback,
+                        session=session,
+                        settings=_settings(),
+                    )
+                self.assertIn("已被封禁", callback.answer.await_args.args[0])
+
+        restore.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 945))
+            self.assertIsNotNone(await get_join_verification(session, -100, 946))
+
+    async def test_admin_approve_requeues_when_restore_fails(self) -> None:
+        old_deadline = await self._add_record(user_id=947, message_id=847)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_APPROVE,
+            target_user_id=947,
+            operator_id=11,
+            message_id=847,
+        )
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.restore_member_permissions",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 947)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, old_deadline)
+            self.assertEqual(record.prompt_message_id, 847)
+        callback.bot.edit_message_text.assert_not_awaited()
+
+    async def test_admin_reject_join_kicks_without_global_ban(self) -> None:
+        await self._add_record(user_id=948, message_id=848)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=948,
+            operator_id=11,
+            message_id=848,
+        )
+        kick = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.membership.kick_member", new=kick),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        kick.assert_awaited_once_with(callback.bot, -100, 948)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 948))
+            self.assertIsNone(await get_global_ban(session, 948))
+
+    async def test_admin_reject_join_requeues_when_kick_fails(self) -> None:
+        old_deadline = await self._add_record(user_id=949, message_id=849)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=949,
+            operator_id=11,
+            message_id=849,
+        )
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.kick_member",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 949)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, old_deadline)
+        callback.bot.edit_message_text.assert_not_awaited()
+
+    async def test_admin_reject_moderation_only_bans_current_group(self) -> None:
+        await self._add_record(
+            user_id=950,
+            message_id=850,
+            kind=VERIFICATION_KIND_MODERATION,
+            reason="疑似广告",
+        )
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=950,
+            operator_id=12,
+            message_id=850,
+        )
+        ban = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.membership.ban_member", new=ban),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        ban.assert_awaited_once_with(callback.bot, -100, 950)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 950))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 950,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
+            self.assertIsNone(await get_global_ban(session, 950))
+
+    async def test_admin_reject_moderation_requeues_when_ban_fails(self) -> None:
+        old_deadline = await self._add_record(
+            user_id=952,
+            message_id=852,
+            kind=VERIFICATION_KIND_MODERATION,
+            reason="疑似广告",
+        )
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=952,
+            operator_id=12,
+            message_id=852,
+        )
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.ban_member",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 952)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 952,
+                )
+            )
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, old_deadline)
+            self.assertIsNone(warning)
+            self.assertIsNone(await get_global_ban(session, 952))
+
+    async def test_admin_reject_cannot_ban_super_admin_target(self) -> None:
+        await self._add_record(
+            user_id=951,
+            message_id=851,
+            kind=VERIFICATION_KIND_MODERATION,
+            reason="疑似广告",
+        )
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=951,
+            operator_id=12,
+            message_id=851,
+        )
+        ban = AsyncMock(return_value=True)
+        kick = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.membership.ban_member", new=ban),
+            patch("bot.handlers.membership.kick_member", new=kick),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(super_admin_id=951),
+                )
+
+        ban.assert_not_awaited()
+        kick.assert_not_awaited()
+        self.assertTrue(callback.answer.await_args.kwargs["show_alert"])
+        self.assertIn("最高管理员", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 951))
+            self.assertIsNone(await get_global_ban(session, 951))
 
 
 class PrivateStartTests(_DbTestCase):
@@ -631,7 +1274,8 @@ class PrivateStartTests(_DbTestCase):
             button = markup.inline_keyboard[0][0]
             self.assertEqual(
                 button.web_app.url,
-                f"https://verify.example.com/verify?verification_id={record.id}",
+                "https://verify.example.com/verify?provider=turnstile"
+                f"&verification_id={record.id}",
             )
             self.assertIsNone(getattr(button, "url", None))
 
@@ -699,7 +1343,8 @@ class PrivateStartTests(_DbTestCase):
             ].inline_keyboard[0][0].web_app.url
             self.assertEqual(
                 turnstile_url,
-                f"https://verify.example.com/verify?verification_id={turnstile_record.id}",
+                "https://verify.example.com/verify?provider=turnstile"
+                f"&verification_id={turnstile_record.id}",
             )
 
             hcaptcha_message = self._private_message(926)
@@ -765,6 +1410,45 @@ class PrivateStartTests(_DbTestCase):
 
 
 class SweeperTests(_DbTestCase):
+    async def test_expired_super_admin_challenge_restores_instead_of_banning(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=1,
+                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+                prompt_message_id=776,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(),
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=_settings(super_admin_id=1),
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+
+        bot.ban_chat_member.assert_not_awaited()
+        bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 1))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 1,
+                )
+            )
+            self.assertIsNone(warning)
+
     async def test_sweep_handles_join_and_moderation_timeouts_differently(self) -> None:
         now = now_shanghai_naive()
         async with self.session_factory() as session:
@@ -818,10 +1502,79 @@ class SweeperTests(_DbTestCase):
             self.assertIsNone(await get_join_verification(session, -100, 932))
             self.assertIsNotNone(await get_join_verification(session, -100, 931))
             self.assertIsNone(await get_global_ban(session, 930))
-            moderation_ban = await get_global_ban(session, 932)
+            self.assertIsNone(await get_global_ban(session, 932))
+            moderation_ban = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 932,
+                )
+            )
             self.assertIsNotNone(moderation_ban)
-            self.assertEqual(moderation_ban.source, "moderation_challenge_timeout")
-            self.assertIn("疑似诈骗链接", moderation_ban.reason)
+            self.assertTrue(moderation_ban.is_banned)
+
+    async def test_failed_moderation_timeout_ban_requeues_and_restores_state(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=936,
+                deadline_at=now - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="疑似诈骗链接",
+                prompt_message_id=779,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=RuntimeError("no permission")),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        sweeper = JoinVerificationSweeper(bot=bot, session_factory=self.session_factory)
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 936)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 936,
+                )
+            )
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, now)
+            self.assertIsNone(warning)
+        bot.edit_message_text.assert_not_awaited()
+
+    async def test_failed_join_timeout_kick_requeues_without_finalizing(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=937,
+                deadline_at=now - timedelta(seconds=1),
+                prompt_message_id=780,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=False),
+            unban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(),
+        )
+        sweeper = JoinVerificationSweeper(bot=bot, session_factory=self.session_factory)
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+
+        bot.unban_chat_member.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 937)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, now)
 
     async def test_sweep_noop_when_nothing_expired(self) -> None:
         bot = SimpleNamespace(

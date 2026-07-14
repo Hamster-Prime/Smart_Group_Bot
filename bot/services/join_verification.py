@@ -2,8 +2,8 @@
 
 Join flow (per-group policy):
 - A new member passes ban-check + profile screening, then gets fully muted
-  via restrict_chat_member. The group prompt carries a deep link into the
-  bot's private chat.
+  via restrict_chat_member. The group prompt carries a target-locked callback
+  that redirects the affected member into the bot's private chat.
 - /start in private chat sends a Mini App button (web_app); tapping it opens
   the challenge page inside Telegram — no visible URL, no browser jump.
 - The page embeds the selected Turnstile or hCaptcha widget and submits its token together
@@ -20,8 +20,8 @@ Moderation-challenge flow (kind="moderation"):
 - A message judged violating with LOW confidence is deleted, the sender is
   fully muted, and the same private-chat deep link + Mini App challenge is
   issued (begin_moderation_challenge).
-- Passing restores permissions; missing the deadline bans permanently and
-  records the user in the global ban registry (/unban lifts it).
+- Passing restores permissions; missing the deadline bans the user in the
+  current group until a group administrator lifts that ban.
 
 Pending records live in join_verifications; a background sweeper enforces
 deadlines even across bot restarts.
@@ -43,14 +43,14 @@ from aiogram.types import (
     Message,
     WebAppInfo,
 )
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import JoinVerification
-from bot.services.join_screening import add_global_ban
+from bot.db.models import JoinVerification, UserWarning
+from bot.services.authz import is_super_admin_user_id
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -62,13 +62,26 @@ _BLOCKED_VERIFICATION_CONFIGS: dict[
     tuple[int, str], tuple[Settings, tuple[str, str, str, str], str]
 ] = {}
 
-# Constant /start payload for the group deep link. Mini App (web_app) buttons
-# are only allowed in private chats, so the group prompt sends the user to a
-# private chat first, where the actual Mini App button lives.
+# Constant /start payload used after the target-locked group callback. Mini App
+# (web_app) buttons are only allowed in private chats, so the callback redirects
+# the affected user there before the actual challenge button is shown.
 START_VERIFY_PAYLOAD = "verify"
 VERIFICATION_KIND_JOIN = "join"
 VERIFICATION_KIND_MODERATION = "moderation"
 VERIFICATION_PROVIDERS = frozenset({"turnstile", "hcaptcha"})
+VERIFICATION_CALLBACK_PREFIX = "jv"
+VERIFICATION_CALLBACK_START = "v"
+VERIFICATION_CALLBACK_APPROVE = "a"
+VERIFICATION_CALLBACK_REJECT = "r"
+VERIFICATION_CALLBACK_ACTIONS = frozenset(
+    {
+        VERIFICATION_CALLBACK_START,
+        VERIFICATION_CALLBACK_APPROVE,
+        VERIFICATION_CALLBACK_REJECT,
+    }
+)
+
+_GroupBanState = tuple[int, bool] | None
 
 
 def normalize_verification_provider(value: object, *, default: str = "turnstile") -> str:
@@ -77,6 +90,66 @@ def normalize_verification_provider(value: object, *, default: str = "turnstile"
         return provider
     fallback = str(default or "turnstile").strip().lower()
     return fallback if fallback in VERIFICATION_PROVIDERS else "turnstile"
+
+
+async def mark_group_banned(
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+) -> _GroupBanState:
+    warning = await session.scalar(
+        select(UserWarning).where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == user_id,
+        )
+    )
+    if warning is None:
+        session.add(
+            UserWarning(
+                group_id=group_id,
+                user_id=user_id,
+                count=0,
+                is_banned=True,
+            )
+        )
+        return None
+    previous = (max(0, int(warning.count or 0)), bool(warning.is_banned))
+    warning.is_banned = True
+    return previous
+
+
+async def rollback_group_ban(
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+    previous: _GroupBanState,
+) -> bool:
+    """Undo our local-ban write only when no concurrent update replaced it."""
+    if previous is None:
+        result = await session.execute(
+            delete(UserWarning).where(
+                UserWarning.group_id == group_id,
+                UserWarning.user_id == user_id,
+                UserWarning.count == 0,
+                UserWarning.is_banned.is_(True),
+            )
+        )
+        return int(result.rowcount or 0) == 1
+
+    previous_count, was_banned = previous
+    if was_banned:
+        return True
+    result = await session.execute(
+        update(UserWarning)
+        .where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == user_id,
+            UserWarning.count == previous_count,
+            UserWarning.is_banned.is_(True),
+        )
+        .values(is_banned=False)
+    )
+    return int(result.rowcount or 0) == 1
 
 
 def verification_provider(
@@ -287,12 +360,17 @@ def build_mini_app_url(
     base = settings.join_verification_public_base_url.strip().rstrip("/")
     url = f"{base}/verify"
     query: dict[str, str] = {}
+    has_verification_id = verification_id is not None and int(verification_id) > 0
     if (
         provider is not None
-        and normalize_verification_provider(provider) != verification_provider(settings)
+        and (
+            has_verification_id
+            or normalize_verification_provider(provider)
+            != verification_provider(settings)
+        )
     ):
         query["provider"] = normalize_verification_provider(provider)
-    if verification_id is not None and int(verification_id) > 0:
+    if has_verification_id:
         query["verification_id"] = str(int(verification_id))
     if not query:
         return url
@@ -347,18 +425,55 @@ def build_group_prompt_text(
     )
 
 
-def build_group_prompt_keyboard(
-    bot_username: str,
-    group_id: int | None = None,
-) -> InlineKeyboardMarkup:
+def build_verification_callback_data(action: str, user_id: int) -> str:
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in VERIFICATION_CALLBACK_ACTIONS:
+        raise ValueError(f"unsupported verification callback action: {action}")
+    return f"{VERIFICATION_CALLBACK_PREFIX}:{normalized_action}:{int(user_id)}"
+
+
+def parse_verification_callback_data(value: str) -> tuple[str, int] | None:
+    parts = str(value or "").split(":")
+    if len(parts) != 3 or parts[0] != VERIFICATION_CALLBACK_PREFIX:
+        return None
+    action = parts[1].strip().lower()
+    if action not in VERIFICATION_CALLBACK_ACTIONS:
+        return None
+    try:
+        user_id = int(parts[2])
+    except (TypeError, ValueError):
+        return None
+    return (action, user_id) if user_id > 0 else None
+
+
+def build_group_prompt_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔐 私聊完成验证",
-                    url=build_private_deep_link(bot_username, group_id),
+                    text="🔐 开始验证",
+                    callback_data=build_verification_callback_data(
+                        VERIFICATION_CALLBACK_START,
+                        user_id,
+                    ),
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ 管理员通过",
+                    callback_data=build_verification_callback_data(
+                        VERIFICATION_CALLBACK_APPROVE,
+                        user_id,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="❌ 管理员拒绝",
+                    callback_data=build_verification_callback_data(
+                        VERIFICATION_CALLBACK_REJECT,
+                        user_id,
+                    ),
+                ),
+            ],
         ]
     )
 
@@ -639,8 +754,12 @@ async def extend_pending_verification_deadlines(
 
 async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     try:
-        await bot.restrict_chat_member(chat_id, user_id, permissions=_FULL_RESTRICT)
-        return True
+        restricted = await bot.restrict_chat_member(
+            chat_id,
+            user_id,
+            permissions=_FULL_RESTRICT,
+        )
+        return restricted is not False
     except Exception:
         log.exception("join verification restrict failed | chat=%s user=%s", chat_id, user_id)
         return False
@@ -707,9 +826,11 @@ async def restore_member_permissions(bot: Bot, chat_id: int, user_id: int) -> bo
 async def kick_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     """Kick (not permanently ban): the user may rejoin and verify again."""
     try:
-        await bot.ban_chat_member(chat_id, user_id)
-        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        return True
+        banned = await bot.ban_chat_member(chat_id, user_id)
+        if banned is False:
+            return False
+        unbanned = await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        return unbanned is not False
     except Exception:
         log.exception("join verification kick failed | chat=%s user=%s", chat_id, user_id)
         return False
@@ -718,8 +839,8 @@ async def kick_member(bot: Bot, chat_id: int, user_id: int) -> bool:
 async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     """Permanently ban a member; unlike kick_member this never unbans."""
     try:
-        await bot.ban_chat_member(chat_id, user_id)
-        return True
+        banned = await bot.ban_chat_member(chat_id, user_id)
+        return banned is not False
     except Exception:
         log.exception("moderation challenge ban failed | chat=%s user=%s", chat_id, user_id)
         return False
@@ -802,7 +923,7 @@ async def _begin_moderation_challenge_locked(
                 timeout_seconds=timeout_seconds,
             ),
             parse_mode="HTML",
-            reply_markup=build_group_prompt_keyboard(bot_username, group_id),
+            reply_markup=build_group_prompt_keyboard(user_id),
         )
         prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
     except Exception:
@@ -1026,7 +1147,7 @@ class JoinVerificationSweeper:
             expired = await list_expired_verifications(session, now=now)
             if not expired:
                 return 0
-            claimed: list[JoinVerification] = []
+            claimed: list[tuple[JoinVerification, _GroupBanState, bool]] = []
             for record in expired:
                 record_provider = normalize_verification_provider(record.provider)
                 if (
@@ -1054,32 +1175,123 @@ class JoinVerificationSweeper:
                 )
                 if not won:
                     continue
-                if record.kind == VERIFICATION_KIND_MODERATION:
-                    await add_global_ban(
+                protected_owner = bool(
+                    record.kind == VERIFICATION_KIND_MODERATION
+                    and self.settings is not None
+                    and is_super_admin_user_id(record.user_id, self.settings)
+                )
+                ban_state = None
+                if record.kind == VERIFICATION_KIND_MODERATION and not protected_owner:
+                    ban_state = await mark_group_banned(
                         session,
+                        record.group_id,
                         record.user_id,
-                        reason=f"消息审查质询超时: {record.reason or '疑似命中群规'}"[:500],
-                        source="moderation_challenge_timeout",
-                        created_by=0,
                     )
-                claimed.append(record)
-            # Persist the terminal claim (and moderation ban registry entry)
-            # before Telegram calls. Failed API calls are then safely enforced
-            # by the global-ban middleware on the user's next update.
+                claimed.append((record, ban_state, protected_owner))
+            # Persist the terminal claim before Telegram calls. A failed
+            # moderation ban is compensated below and the challenge is requeued.
             await session.commit()
 
-        for record in claimed:
+        for record, ban_state, protected_owner in claimed:
             log.info(
                 "verification timeout | kind=%s group=%s user=%s",
                 record.kind,
                 record.group_id,
                 record.user_id,
             )
+            if protected_owner:
+                restored = await restore_member_permissions(
+                    self.bot,
+                    record.group_id,
+                    record.user_id,
+                )
+                if not restored:
+                    async with self.session_factory() as session:
+                        await upsert_join_verification(
+                            session,
+                            group_id=record.group_id,
+                            user_id=record.user_id,
+                            deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                            kind=record.kind,
+                            provider=record.provider,
+                            reason=record.reason,
+                            display_name=record.display_name,
+                            prompt_message_id=record.prompt_message_id,
+                        )
+                        await session.commit()
+                    continue
+                await self._finalize_prompt(
+                    record,
+                    "✅ 最高管理员无需消息审查验证，发言权限已恢复。",
+                )
+                continue
             if record.kind == VERIFICATION_KIND_MODERATION:
-                await ban_member(self.bot, record.group_id, record.user_id)
+                enforced = await ban_member(self.bot, record.group_id, record.user_id)
+                if not enforced:
+                    async with self.session_factory() as session:
+                        rolled_back = await rollback_group_ban(
+                            session,
+                            record.group_id,
+                            record.user_id,
+                            ban_state,
+                        )
+                        if rolled_back and not (ban_state and ban_state[1]):
+                            timeout_seconds = (
+                                self.settings.moderation.challenge_timeout_seconds
+                                if self.settings is not None
+                                else 300
+                            )
+                            await upsert_join_verification(
+                                session,
+                                group_id=record.group_id,
+                                user_id=record.user_id,
+                                deadline_at=now_shanghai_naive()
+                                + timedelta(seconds=max(60, int(timeout_seconds))),
+                                kind=record.kind,
+                                provider=record.provider,
+                                reason=record.reason,
+                                display_name=record.display_name,
+                                prompt_message_id=record.prompt_message_id,
+                            )
+                        await session.commit()
+                    log.warning(
+                        "moderation verification timeout ban failed | group=%s user=%s "
+                        "state_restored=%s",
+                        record.group_id,
+                        record.user_id,
+                        rolled_back,
+                    )
+                    continue
                 text = "⏰ 消息审查验证超时，已封禁。请联系管理员处理。"
             else:
-                await kick_member(self.bot, record.group_id, record.user_id)
+                enforced = await kick_member(self.bot, record.group_id, record.user_id)
+                if not enforced:
+                    async with self.session_factory() as session:
+                        timeout_seconds = (
+                            self.settings.join_verification_timeout_seconds
+                            if self.settings is not None
+                            else 300
+                        )
+                        await upsert_join_verification(
+                            session,
+                            group_id=record.group_id,
+                            user_id=record.user_id,
+                            deadline_at=now_shanghai_naive()
+                            + timedelta(seconds=max(60, int(timeout_seconds))),
+                            kind=record.kind,
+                            provider=record.provider,
+                            reason=record.reason,
+                            display_name=record.display_name,
+                            prompt_message_id=record.prompt_message_id,
+                        )
+                        await session.commit()
+                    log.warning(
+                        "join verification timeout kick failed; requeued | "
+                        "group=%s user=%s",
+                        record.group_id,
+                        record.user_id,
+                    )
+                    continue
                 text = "⏰ 验证超时，已移出群聊。可重新加入再次验证。"
             await self._finalize_prompt(record, text)
         return len(claimed)
