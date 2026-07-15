@@ -47,6 +47,7 @@ from bot.services.join_verification import (
     rollback_group_ban,
     restrict_new_member,
     upsert_join_verification,
+    verification_deadline_passed,
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
@@ -186,7 +187,7 @@ async def _enforce_pending_moderation_challenge(
         return
 
     now = now_shanghai_naive()
-    if record.deadline_at <= now:
+    if verification_deadline_passed(record.deadline_at, now=now):
         claimed = await claim_join_verification(
             session,
             verification_id=record.id,
@@ -312,7 +313,7 @@ async def _verification_callback_record(
     if (
         record is None
         or int(record.prompt_message_id or 0) != message_id
-        or record.deadline_at <= now_shanghai_naive()
+        or verification_deadline_passed(record.deadline_at)
     ):
         await callback.answer("验证已失效、过期或已处理", show_alert=True)
         return None

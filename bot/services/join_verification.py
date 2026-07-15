@@ -66,6 +66,12 @@ _BLOCKED_VERIFICATION_CONFIGS: dict[
 # (web_app) buttons are only allowed in private chats, so the callback redirects
 # the affected user there before the actual challenge button is shown.
 START_VERIFY_PAYLOAD = "verify"
+# Interactive challenges (hCaptcha image rounds, slow proxies) legitimately
+# finish shortly after deadline_at. Submissions and admin actions stay valid
+# for this long past the deadline, and the sweeper only enforces timeouts once
+# the grace has also elapsed, so a member who solved in time is never rejected
+# by a race with enforcement.
+CHALLENGE_SUBMIT_GRACE = timedelta(seconds=60)
 VERIFICATION_KIND_JOIN = "join"
 VERIFICATION_KIND_MODERATION = "moderation"
 VERIFICATION_PROVIDERS = frozenset({"turnstile", "hcaptcha"})
@@ -90,6 +96,16 @@ def normalize_verification_provider(value: object, *, default: str = "turnstile"
         return provider
     fallback = str(default or "turnstile").strip().lower()
     return fallback if fallback in VERIFICATION_PROVIDERS else "turnstile"
+
+
+def verification_deadline_passed(
+    deadline_at: datetime,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True once the deadline plus CHALLENGE_SUBMIT_GRACE has elapsed."""
+    current = now if now is not None else now_shanghai_naive()
+    return deadline_at <= current - CHALLENGE_SUBMIT_GRACE
 
 
 async def mark_group_banned(
@@ -574,6 +590,27 @@ async def get_pending_verification_for_user(
     return result.scalar_one_or_none()
 
 
+async def get_sole_pending_verification_for_user(
+    session: AsyncSession, user_id: int
+) -> JoinVerification | None:
+    """The user's pending record, but only when it is unambiguous.
+
+    Used to recover a submission whose page pinned a stale verification id:
+    with records pending in several groups there is no way to tell which one
+    the page belonged to, so recovery must not guess.
+    """
+    stmt = (
+        select(JoinVerification)
+        .where(JoinVerification.user_id == user_id)
+        .limit(2)
+        .execution_options(populate_existing=True)
+    )
+    with session.no_autoflush:
+        result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    return rows[0] if len(rows) == 1 else None
+
+
 async def get_pending_verification_by_id_for_user(
     session: AsyncSession,
     verification_id: int,
@@ -691,12 +728,17 @@ async def claim_join_verification(
     Both the web callback and deadline sweeper use this compare-and-delete so
     only one side may restore, kick, or ban a member. Matching the deadline and
     kind also prevents a stale worker from consuming a freshly replaced row.
+
+    The deadline is enforced with CHALLENGE_SUBMIT_GRACE: a pass may still be
+    claimed until deadline+grace, and a timeout only after it. The two
+    conditions stay complementary, so exactly one side can win at any instant.
     """
     await session.flush()
+    cutoff = now - CHALLENGE_SUBMIT_GRACE
     deadline_condition = (
-        JoinVerification.deadline_at <= now
+        JoinVerification.deadline_at <= cutoff
         if expired
-        else JoinVerification.deadline_at > now
+        else JoinVerification.deadline_at > cutoff
     )
     result = await session.execute(
         delete(JoinVerification).where(
@@ -714,7 +756,7 @@ async def list_expired_verifications(
 ) -> list[JoinVerification]:
     stmt = (
         select(JoinVerification)
-        .where(JoinVerification.deadline_at <= now)
+        .where(JoinVerification.deadline_at <= now - CHALLENGE_SUBMIT_GRACE)
         .order_by(JoinVerification.deadline_at)
         .limit(max(1, limit))
     )
@@ -1051,16 +1093,49 @@ async def maybe_send_private_verification(
     )
     if record is None:
         return False
-    if record.deadline_at <= now_shanghai_naive():
+    if verification_deadline_passed(record.deadline_at):
         # The sweeper will kick shortly; a fresh button would be useless.
         return False
     provider = normalize_verification_provider(record.provider)
     if not verification_service_ready(settings, provider):
         return False
 
+    # Reaching the private chat is when the interactive solve actually starts;
+    # the original deadline started at join/challenge time and may already be
+    # mostly consumed by the group-prompt hop. Restart the window here so an
+    # hCaptcha image challenge cannot be raced by the sweeper mid-solve.
+    # Capped at 3x the timeout since issuance: repeated /start must not defer
+    # the kick/ban forever.
+    timeout_seconds = max(
+        60,
+        int(
+            settings.moderation.challenge_timeout_seconds
+            if record.kind == VERIFICATION_KIND_MODERATION
+            else settings.join_verification_timeout_seconds
+        ),
+    )
+    now = now_shanghai_naive()
+    lifetime_cap = (record.created_at or now) + timedelta(seconds=3 * timeout_seconds)
+    fresh_deadline = min(now + timedelta(seconds=timeout_seconds), lifetime_cap)
+    shown_deadline = record.deadline_at
+    if fresh_deadline > record.deadline_at:
+        # Targeted UPDATE instead of mutating the ORM row: a concurrent pass
+        # may have consumed the record, and 0 matched rows must not raise.
+        result = await session.execute(
+            update(JoinVerification)
+            .where(
+                JoinVerification.id == record.id,
+                JoinVerification.deadline_at < fresh_deadline,
+            )
+            .values(deadline_at=fresh_deadline)
+        )
+        await session.commit()
+        if result.rowcount:
+            shown_deadline = fresh_deadline
+
     await message.answer(
         build_private_challenge_text(
-            deadline_at=record.deadline_at,
+            deadline_at=shown_deadline,
             kind=record.kind,
             reason=record.reason,
         ),

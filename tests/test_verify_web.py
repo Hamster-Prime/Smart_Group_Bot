@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from bot.db.engine import init_db
 from bot.services.join_screening import add_global_ban
 from bot.services.join_verification import (
+    CHALLENGE_SUBMIT_GRACE,
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
     delete_join_verification,
@@ -480,13 +481,121 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         verify_mock.assert_not_awaited()
 
     async def test_expired_record_gets_404(self) -> None:
-        await self._seed(user_id=106, minutes=-1)
+        await self._seed(user_id=106, minutes=-2)
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
             new=AsyncMock(return_value=(True, [])),
         ):
             resp = await self._submit(106)
         self.assertEqual(resp.status, 404)
+
+    async def test_submit_within_grace_after_deadline_passes(self) -> None:
+        # An interactive hCaptcha solve legitimately lands shortly after
+        # deadline_at; while the record still exists the pass must count.
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        verification_id = await self._seed(user_id=140, provider="hcaptcha")
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 140)
+            record.deadline_at = now_shanghai_naive() - timedelta(seconds=5)
+            await session.commit()
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as verify_mock:
+            resp = await self._submit_hcaptcha(140, verification_id=verification_id)
+
+        self.assertEqual(resp.status, 200)
+        verify_mock.assert_awaited_once()
+        self.bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 140))
+
+    async def test_submit_after_grace_is_rejected(self) -> None:
+        verification_id = await self._seed(user_id=141)
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 141)
+            record.deadline_at = (
+                now_shanghai_naive() - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1)
+            )
+            await session.commit()
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as verify_mock:
+            resp = await self._submit(141, verification_id=verification_id)
+
+        self.assertEqual(resp.status, 404)
+        verify_mock.assert_not_awaited()
+
+    async def test_stale_verification_id_falls_back_to_current_record(self) -> None:
+        # Kick+rejoin (or a requeue) replaces the row with a new id while the
+        # already-open Mini App page still pins the old id. The solve must be
+        # applied to the member's current pending record, not discarded.
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        old_id = await self._seed(user_id=142, provider="hcaptcha")
+        async with self.session_factory() as session:
+            self.assertTrue(await delete_join_verification(session, -100, 142))
+            await session.commit()
+        new_id = await self._seed(user_id=142, provider="hcaptcha")
+        self.assertNotEqual(new_id, old_id)
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(True, [])),
+        ) as verify_mock:
+            resp = await self._submit_hcaptcha(142, verification_id=old_id)
+
+        self.assertEqual(resp.status, 200)
+        verify_mock.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 142))
+
+    async def test_stale_id_fallback_refuses_ambiguous_multi_group_records(self) -> None:
+        # With pending records in several groups, a stale page id cannot be
+        # mapped to "the" current record — the solve must not be redirected
+        # to a group the page never belonged to.
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        old_id = await self._seed(user_id=144, group_id=-100, provider="hcaptcha")
+        async with self.session_factory() as session:
+            self.assertTrue(await delete_join_verification(session, -100, 144))
+            await session.commit()
+        await self._seed(user_id=144, group_id=-100, provider="hcaptcha")
+        await self._seed(user_id=144, group_id=-200, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            resp = await self._submit_hcaptcha(144, verification_id=old_id)
+
+        self.assertEqual(resp.status, 404)
+        verify_mock.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 144))
+            self.assertIsNotNone(await get_join_verification(session, -200, 144))
+
+    async def test_expired_challenge_token_gets_retry_message(self) -> None:
+        # expired-input-response / already-seen-response mean the human solved
+        # the challenge but the one-time token aged out before siteverify.
+        self.settings.join_verification_hcaptcha_site_key = "h-site"
+        self.settings.join_verification_hcaptcha_secret_key = "h-secret"
+        verification_id = await self._seed(user_id=143, provider="hcaptcha")
+
+        with patch(
+            "bot.services.verify_web.verify_hcaptcha_token",
+            new=AsyncMock(return_value=(False, ["expired-input-response"])),
+        ):
+            resp = await self._submit_hcaptcha(143, verification_id=verification_id)
+
+        self.assertEqual(resp.status, 403)
+        self.assertIn("重新完成", (await resp.json())["error"])
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 143))
 
     async def test_record_expiring_during_turnstile_is_rejected(self) -> None:
         await self._seed(

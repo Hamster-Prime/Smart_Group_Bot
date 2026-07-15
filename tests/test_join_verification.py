@@ -15,6 +15,7 @@ from bot.services.join_screening import add_global_ban, get_global_ban
 from bot.services.join_verification import (
     JoinVerificationSweeper,
     VERIFICATION_CALLBACK_APPROVE,
+    CHALLENGE_SUBMIT_GRACE,
     VERIFICATION_CALLBACK_REJECT,
     VERIFICATION_CALLBACK_START,
     VERIFICATION_KIND_JOIN,
@@ -334,7 +335,7 @@ class VerificationStoreTests(_DbTestCase):
         now = now_shanghai_naive()
         async with self.session_factory() as session:
             await upsert_join_verification(
-                session, group_id=-100, user_id=4, deadline_at=now - timedelta(seconds=1)
+                session, group_id=-100, user_id=4, deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1)
             )
             await upsert_join_verification(
                 session, group_id=-100, user_id=5, deadline_at=now + timedelta(minutes=5)
@@ -357,7 +358,7 @@ class VerificationStoreTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=8,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
             )
             await session.commit()
@@ -744,7 +745,7 @@ class ModerationChallengeTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=919,
-                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                deadline_at=now_shanghai_naive() - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似广告",
                 display_name="可疑用户",
@@ -791,7 +792,7 @@ class ModerationChallengeTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=1,
-                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                deadline_at=now_shanghai_naive() - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
             )
             await session.commit()
@@ -1379,7 +1380,7 @@ class PrivateStartTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=922,
-                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                deadline_at=now_shanghai_naive() - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
             )
             await session.commit()
 
@@ -1408,6 +1409,76 @@ class PrivateStartTests(_DbTestCase):
             self.assertFalse(handled)
             message.answer.assert_not_awaited()
 
+    async def test_private_start_restarts_the_solve_window(self) -> None:
+        # The interactive solve begins when the member reaches the private
+        # chat; the remaining join-time window may be nearly consumed, so the
+        # deadline is re-armed to a full timeout from now.
+        settings = _settings(join_verification_timeout_seconds=120)
+        async with self.session_factory() as session:
+            nearly_expired = now_shanghai_naive() + timedelta(seconds=10)
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=927,
+                deadline_at=nearly_expired,
+            )
+            await session.commit()
+
+            message = self._private_message(927)
+            handled = await maybe_send_private_verification(message, session, settings)
+
+            self.assertTrue(handled)
+            record = await get_join_verification(session, -100, 927)
+            self.assertGreater(
+                record.deadline_at,
+                now_shanghai_naive() + timedelta(seconds=100),
+            )
+
+    async def test_private_start_never_shortens_a_longer_deadline(self) -> None:
+        settings = _settings(join_verification_timeout_seconds=120)
+        async with self.session_factory() as session:
+            far_deadline = now_shanghai_naive() + timedelta(hours=1)
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=928,
+                deadline_at=far_deadline,
+            )
+            await session.commit()
+
+            message = self._private_message(928)
+            handled = await maybe_send_private_verification(message, session, settings)
+
+            self.assertTrue(handled)
+            record = await get_join_verification(session, -100, 928)
+            self.assertEqual(record.deadline_at, far_deadline)
+
+    async def test_private_start_rearm_is_capped_to_record_lifetime(self) -> None:
+        # Repeated /start must not defer the kick forever: the deadline never
+        # exceeds created_at + 3x timeout.
+        settings = _settings(join_verification_timeout_seconds=120)
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=929,
+                deadline_at=now_shanghai_naive() + timedelta(seconds=5),
+            )
+            await session.commit()
+            record = await get_join_verification(session, -100, 929)
+            # Simulate a record issued long ago whose lifetime is nearly spent:
+            # the cap (created_at + 3x timeout) is closer than now + timeout.
+            record.created_at = now_shanghai_naive() - timedelta(seconds=350)
+            capped = record.created_at + timedelta(seconds=360)
+            await session.commit()
+
+            message = self._private_message(929)
+            handled = await maybe_send_private_verification(message, session, settings)
+
+            self.assertTrue(handled)
+            record = await get_join_verification(session, -100, 929)
+            self.assertLessEqual(record.deadline_at, capped)
+
 
 class SweeperTests(_DbTestCase):
     async def test_expired_super_admin_challenge_restores_instead_of_banning(self) -> None:
@@ -1416,7 +1487,7 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=1,
-                deadline_at=now_shanghai_naive() - timedelta(seconds=1),
+                deadline_at=now_shanghai_naive() - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 prompt_message_id=776,
             )
@@ -1456,14 +1527,14 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=930,
-                deadline_at=now - timedelta(seconds=2),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
                 prompt_message_id=777,
             )
             await upsert_join_verification(
                 session,
                 group_id=-100,
                 user_id=932,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似诈骗链接",
                 prompt_message_id=778,
@@ -1519,7 +1590,7 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=936,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似诈骗链接",
                 prompt_message_id=779,
@@ -1555,7 +1626,7 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=937,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 prompt_message_id=780,
             )
             await session.commit()
@@ -1593,7 +1664,7 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=933,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="待质询",
             )
@@ -1629,14 +1700,14 @@ class SweeperTests(_DbTestCase):
                 session,
                 group_id=-100,
                 user_id=934,
-                deadline_at=now - timedelta(seconds=2),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
                 provider="turnstile",
             )
             await upsert_join_verification(
                 session,
                 group_id=-100,
                 user_id=935,
-                deadline_at=now - timedelta(seconds=1),
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 provider="hcaptcha",
             )
             await session.commit()

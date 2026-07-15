@@ -48,11 +48,13 @@ from bot.services.join_verification import (
     get_join_verification,
     get_pending_verification_by_id_for_user,
     get_pending_verification_for_user,
+    get_sole_pending_verification_for_user,
     mark_turnstile_configuration_unavailable,
     normalize_verification_provider,
     restore_member_permissions,
     turnstile_verification_configured,
     upsert_join_verification,
+    verification_deadline_passed,
     verification_keys_for_provider,
     verification_provider,
 )
@@ -77,10 +79,23 @@ _HCAPTCHA_CONFIGURATION_ERRORS = {
     "invalid-input-secret",
     "sitekey-secret-mismatch",
     "not-using-dummy-passcode",
+    # "not-using-dummy-secret" (test site key + production secret) is left out
+    # on purpose: it is triggered by the user-supplied token, so mapping it to
+    # the sticky configuration block would let any member disable the provider
+    # by submitting hCaptcha's well-known dummy passcode.
 }
 _HCAPTCHA_REPLAY_ERRORS = {
     "already-seen-response",
     "invalid-or-already-seen-response",
+}
+# The widget token is single-use and short-lived (hCaptcha: 120s). These codes
+# mean the human solved the challenge but the token can no longer be redeemed,
+# so the member must re-solve — not "you failed the challenge".
+_CHALLENGE_TOKEN_RETRY_ERRORS = {
+    "expired-input-response",
+    "already-seen-response",
+    "invalid-or-already-seen-response",
+    "timeout-or-duplicate",
 }
 _TURNSTILE_SERVICE_ERRORS = {
     TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE,
@@ -899,19 +914,25 @@ class VerifyWebServer:
         user_id = int(web_user.id)
 
         async with self.session_factory() as session:
-            newer_record = None
+            record = None
             if verification_id:
                 record = await get_pending_verification_by_id_for_user(
                     session,
                     verification_id,
                     user_id,
                 )
-                if record is None:
-                    newer_record = await get_pending_verification_for_user(
-                        session,
-                        user_id,
-                    )
-            else:
+            if record is None and verification_id:
+                # A kick/rejoin or requeue replaces the row (new id) while an
+                # already-open page still pins the old id. Identity comes from
+                # the signed initData, so fall back to the member's current
+                # pending record instead of discarding a genuine solve — but
+                # only when it is unambiguous: the page carries no group id, so
+                # with records pending in several groups the solve must not be
+                # redirected to a group the page never belonged to.
+                record = await get_sole_pending_verification_for_user(
+                    session, user_id
+                )
+            elif record is None:
                 record = await get_pending_verification_for_user(session, user_id)
             locally_banned = bool(
                 record
@@ -924,14 +945,6 @@ class VerifyWebServer:
                 )
             )
         if record is None:
-            if newer_record is not None:
-                return web.json_response(
-                    {
-                        "ok": False,
-                        "error": "验证入口已更新，请关闭页面后从最新消息重新打开",
-                    },
-                    status=409,
-                )
             completed_fingerprint = self._completed_verification_fingerprint(
                 verification_id,
                 user_id,
@@ -957,7 +970,7 @@ class VerifyWebServer:
                 {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
                 status=404,
             )
-        if record.deadline_at <= now_shanghai_naive():
+        if verification_deadline_passed(record.deadline_at):
             return web.json_response(
                 {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
                 status=404,
@@ -1089,6 +1102,18 @@ class VerifyWebServer:
                     status=503,
                 )
             release_active()
+            if _CHALLENGE_TOKEN_RETRY_ERRORS.intersection(verification_errors):
+                # The human did solve the challenge; only the one-time token
+                # was too old or already redeemed by the time it reached
+                # siteverify. Distinguish this from a failed challenge so the
+                # member knows a fresh attempt will work.
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": "验证凭证已过期，请重新完成一次验证",
+                    },
+                    status=403,
+                )
             return web.json_response(
                 {"ok": False, "error": "人机验证未通过，请重试"},
                 status=403,
@@ -1105,12 +1130,14 @@ class VerifyWebServer:
                 user_id,
             )
             now = now_shanghai_naive()
+            # A deadline moved backwards means the row was replaced by a new
+            # issuance; moved forward is a benign /start re-arm mid-solve.
             if (
                 current is None
                 or current.id != record.id
                 or normalize_verification_provider(current.provider) != provider
-                or current.deadline_at != record.deadline_at
-                or current.deadline_at <= now
+                or current.deadline_at < record.deadline_at
+                or verification_deadline_passed(current.deadline_at, now=now)
             ):
                 release_active()
                 if await self._wait_for_completed_verification(active):
