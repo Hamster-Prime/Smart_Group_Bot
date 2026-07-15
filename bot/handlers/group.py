@@ -59,6 +59,11 @@ from bot.services.join_verification import (
     restore_member_permissions,
 )
 from bot.services.join_screening import is_globally_banned
+from bot.services.bot_screening import (
+    is_bot_whitelisted,
+    record_bot_screening_pass,
+    reset_bot_screening,
+)
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
@@ -297,6 +302,191 @@ def _build_moderation_notice(
         ]
     )
     return "\n".join(lines)
+
+
+async def _screen_bot_sender_message(
+    *,
+    moderation: ModerationService,
+    session: AsyncSession,
+    settings: Settings,
+    message: Message,
+    group_id: int,
+    bot_id: int,
+    input_text: str,
+    warn_target: str,
+    flow_started: float,
+) -> None:
+    """Moderate a message from another bot until it earns the whitelist.
+
+    Bots cannot complete the human verification challenge, so any conclusive
+    violation deletes the message and resets the clean-message counter; a
+    high-confidence hit on a ban rule also bans the bot. Clean conclusive
+    messages count toward the per-group whitelist threshold.
+    """
+    if await moderation.is_user_exempt(session, group_id, bot_id):
+        log.info("[%s] bot screening skipped | reason=manual_exempt bot=%s", group_id, bot_id)
+        return
+
+    # Admin bots (e.g. other management bots) get the same auto-exemption as
+    # human admins. Not cached as a whitelist so a demotion re-screens them.
+    if await _is_user_admin_cached(message):
+        log.info("[%s] bot screening skipped | reason=tg_admin_bot bot=%s", group_id, bot_id)
+        return
+
+    # With no enabled rules every message would trivially "pass" and grant a
+    # permanent whitelist before any real screening happened. Keep the counter
+    # frozen until the group actually has rules.
+    rules_stmt = select(ModerationRule.id).where(
+        ModerationRule.group_id == group_id,
+        ModerationRule.enabled == True,  # noqa: E712
+    ).limit(1)
+    with session.no_autoflush:
+        rules_result = await session.execute(rules_stmt)
+    if rules_result.scalar_one_or_none() is None:
+        log.info("[%s] bot screening skipped | reason=no_enabled_rules bot=%s", group_id, bot_id)
+        return
+
+    threshold = max(1, int(settings.moderation.bot_screening_message_count))
+    moderation_started = time.perf_counter()
+    verdict = await moderation.evaluate(session, group_id, input_text)
+    log.info(
+        "[%s]【流程】bot审核 | 完成 | bot=%s | 违规=%s | 置信度=%.2f | 原因=%s | 耗时=%dms",
+        group_id,
+        bot_id,
+        verdict.violated,
+        verdict.confidence,
+        verdict.reason,
+        int((time.perf_counter() - moderation_started) * 1000),
+    )
+
+    if not verdict.violated:
+        if not verdict.conclusive:
+            # Unparseable moderation output: neither punish nor credit a pass.
+            return
+        count, whitelisted = await record_bot_screening_pass(
+            session, group_id, bot_id, threshold
+        )
+        await session.commit()
+        log.info(
+            "[%s] bot screening pass | bot=%s count=%d/%d whitelisted=%s",
+            group_id,
+            bot_id,
+            count,
+            threshold,
+            whitelisted,
+        )
+        return
+
+    if not verdict.conclusive:
+        log.warning(
+            "[%s] inconclusive bot moderation confidence; no direct action | bot=%s",
+            group_id,
+            bot_id,
+        )
+        return
+
+    rule = verdict.rule
+    rule_action = str(rule.action if rule else "delete").strip().lower()
+    ban_now = rule_action == "ban" and moderation.is_high_confidence(verdict)
+
+    await reset_bot_screening(session, group_id, bot_id)
+    if not ban_now:
+        # Release the SQLite write lock before waiting on the per-user
+        # moderation lock inside the counted-ban path; holding both in
+        # opposite order deadlocks against a concurrent message from the
+        # same bot.
+        await session.commit()
+
+    if ban_now:
+        # Release the write lock held by the counter reset before the
+        # Telegram calls below.
+        await session.commit()
+        try:
+            await message.delete()
+        except Exception:
+            log.warning("[%s] bot message delete failed | bot=%s", group_id, bot_id)
+        ban_enforced = False
+        try:
+            banned = await message.chat.ban(bot_id)
+            if banned is False:
+                raise RuntimeError("Telegram returned false")
+            ban_enforced = True
+        except Exception:
+            log.exception("[%s] bot ban failed | bot=%s", group_id, bot_id)
+        # Record what actually happened so a failed ban is not logged as one.
+        await moderation.record_violation(
+            session,
+            group_id,
+            bot_id,
+            input_text,
+            "bot_ban" if ban_enforced else "bot_delete",
+            rule,
+        )
+        await session.commit()
+        notice = _build_moderation_notice(
+            warn_target=warn_target,
+            reason=verdict.reason,
+            rule=rule,
+            hit_action="ban" if ban_enforced else "delete",
+            should_ban=ban_enforced,
+        )
+        if not ban_enforced:
+            notice += "\n⚠️ Telegram 封禁该 bot 失败，请管理员手动处理。"
+        await answer_with_auto_delete(
+            message,
+            notice,
+            auto_delete_seconds=configured_auto_delete_seconds(settings, "moderation"),
+        )
+        log.info(
+            "[%s]【结束】bot审核拦截 | bot=%s | 动作=ban | 封禁=%s | 总耗时=%dms",
+            group_id,
+            bot_id,
+            ban_enforced,
+            int((time.perf_counter() - flow_started) * 1000),
+        )
+        return
+
+    # Non-immediate violations go through the counted warning path, so a
+    # flooding ad bot is auto-banned after warn_threshold hits instead of
+    # producing an unbounded delete/notice loop.
+    warn_threshold = max(1, int(settings.moderation.warn_threshold))
+    count, violation_id, ban_enforced, ban_failure_note = (
+        await _apply_counted_moderation_ban(
+            moderation=moderation,
+            session=session,
+            message=message,
+            group_id=group_id,
+            user_id=bot_id,
+            input_text=input_text,
+            rule=rule,
+            message_deleted=False,
+        )
+    )
+    notice = _build_moderation_notice(
+        warn_target=warn_target,
+        reason=verdict.reason,
+        rule=rule,
+        hit_action="ban",
+        count=count,
+        threshold=warn_threshold,
+        should_ban=ban_enforced,
+    ) + ban_failure_note
+    await answer_with_auto_delete(
+        message,
+        notice,
+        auto_delete_seconds=configured_auto_delete_seconds(settings, "moderation"),
+        reply_markup=_build_moderation_action_keyboard(violation_id),
+    )
+    log.info(
+        "[%s]【结束】bot审核拦截 | bot=%s | 动作=%s | 封禁=%s | 警告=%s/%s | 总耗时=%dms",
+        group_id,
+        bot_id,
+        rule_action,
+        ban_enforced,
+        count,
+        warn_threshold,
+        int((time.perf_counter() - flow_started) * 1000),
+    )
 
 
 def _build_moderation_action_keyboard(violation_id: int) -> InlineKeyboardMarkup:
@@ -2282,18 +2472,10 @@ async def on_group_message(
     text, msg_type = extract_message_text(message)
     if not text:
         return
-    if msg_type in {"video", "video_caption", "video_note"}:
-        log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
-        return
     input_text = text
     flow_started = time.perf_counter()
     group_settings = group_row.settings or {}
     bot_me = await message.bot.me()
-
-    # Other bots' messages never enter the moderation/reply pipeline.
-    raw_bot_sender = bool(message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message))
-    if raw_bot_sender:
-        return
 
     warn_target = _build_warn_target(
         user=user,
@@ -2302,6 +2484,74 @@ async def on_group_message(
         sender_username=sender_identity.username,
         sender_is_chat=sender_identity.is_chat,
     )
+
+    # Other bots' messages never enter the reply pipeline. Guest-mode ad bots
+    # abuse this blind spot, so when bot screening is enabled their messages
+    # are moderated until the bot earns the per-group whitelist.
+    raw_bot_sender = bool(message.from_user and message.from_user.is_bot and not _uses_sender_chat_identity(message))
+    if raw_bot_sender:
+        bot_sender_id = int(message.from_user.id)
+        if (
+            not getattr(settings.moderation, "enabled", False)
+            or not getattr(settings.moderation, "bot_screening_enabled", False)
+            or bot_sender_id == int(getattr(bot_me, "id", 0) or 0)
+        ):
+            return
+        if await is_bot_whitelisted(session, group_id, bot_sender_id):
+            log.info(
+                "[%s] bot screening skipped | reason=whitelisted bot=%s",
+                group_id,
+                bot_sender_id,
+            )
+            return
+        llm = LLMService(
+            settings.bot.main_model,
+            settings.bot.decision_model,
+            settings.bot.compress_model,
+            moderation=settings.bot.moderation_model,
+            vision=settings.bot.vision_model,
+            embed=settings.bot.embed_model,
+            max_context_tokens=settings.bot.max_context_tokens,
+        )
+        input_text, bot_vision_text = await _append_image_context(
+            message, llm, input_text, msg_type
+        )
+        # Placeholder-only media ("[voice]", "[video]", failed-vision images)
+        # carry nothing to judge; a trivially-clean verdict must not credit a
+        # pass toward the permanent whitelist, so skip them entirely.
+        has_screenable_content = (
+            msg_type == "text"
+            or "caption" in msg_type
+            or msg_type in {"contact", "document"}
+            or bool(bot_vision_text)
+        )
+        if not has_screenable_content:
+            log.info(
+                "[%s] bot screening skipped | reason=no_screenable_content bot=%s type=%s",
+                group_id,
+                bot_sender_id,
+                msg_type,
+            )
+            return
+        await _screen_bot_sender_message(
+            moderation=ModerationService(settings.moderation, llm),
+            session=session,
+            settings=settings,
+            message=message,
+            group_id=group_id,
+            bot_id=bot_sender_id,
+            input_text=input_text,
+            warn_target=warn_target,
+            flow_started=flow_started,
+        )
+        return
+
+    # The media bypass stays below bot screening: a bot shipping its ad as a
+    # video caption must still be screened, while human videos skip the
+    # pipeline as before.
+    if msg_type in {"video", "video_caption", "video_note"}:
+        log.info("[%s]【流程】媒体旁路 | 类型=%s", group_id, msg_type)
+        return
 
     mute_all_replies = bool(group_settings.get("mute_all_replies", False))
 

@@ -626,6 +626,8 @@
             ${field("moderation.warn_threshold", "警告阈值", { type: "number", min: 1, max: 100, step: 1, required: true })}
             ${field("moderation.high_confidence_threshold", "高置信度阈值", { type: "number", min: 0, max: 1, step: 0.01, required: true })}
             ${field("moderation.challenge_timeout_seconds", "质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
+            ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
+            ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
           </div>
         </section>
         <section class="settings-section">

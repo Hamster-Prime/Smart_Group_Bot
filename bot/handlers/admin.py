@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings
 from bot.db.models import Group, ModerationExemption, ModerationRule, ReplyMute, UserWarning
 from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabled
+from bot.services.bot_screening import remove_bot_whitelist
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
@@ -1683,13 +1684,10 @@ async def cmd_aiexempt(message: Message, session: AsyncSession, settings: Settin
     reply = message.reply_to_message
     target = reply.from_user if reply else None
     if not target:
-        await _answer(message, settings, 
+        await _answer(message, settings,
             "<b>命令用法</b>\n"
             "请先回复目标用户的一条消息，再执行 /aiexempt"
         )
-        return
-    if target.is_bot:
-        await _answer(message, settings, "<b>AI 审查豁免</b>\n机器人账号无需设置豁免。")
         return
 
     stmt = select(ModerationExemption).where(
@@ -1729,33 +1727,63 @@ async def cmd_unaiexempt(message: Message, session: AsyncSession, settings: Sett
 
     reply = message.reply_to_message
     target = reply.from_user if reply else None
-    if not target:
-        await _answer(message, settings, 
+    target_id: int | None = target.id if target else None
+    target_name = target.full_name if target else None
+    # ID form covers the spam-incident flow where the bot's messages were
+    # already deleted and there is nothing left to reply to.
+    target_is_bot = bool(target and target.is_bot)
+    if target_id is None:
+        args = (message.text or "").partition(" ")[2].strip()
+        first = args.split()[0] if args else ""
+        try:
+            target_id = int(first)
+        except ValueError:
+            target_id = None
+        target_is_bot = True  # ID form cannot verify; try both tables.
+    if target_id is None:
+        await _answer(message, settings,
             "<b>命令用法</b>\n"
-            "请先回复目标用户的一条消息，再执行 /unaiexempt"
+            "回复目标用户的一条消息，或使用 /unaiexempt &lt;用户ID&gt;"
         )
         return
-    if target.is_bot:
-        await _answer(message, settings, "<b>AI 审查豁免</b>\n机器人账号不在豁免名单中。")
-        return
+
+    # For bot senders this also revokes an earned screening whitelist, so the
+    # bot's next messages go back through moderation.
+    whitelist_revoked = False
+    if target_is_bot:
+        whitelist_revoked = await remove_bot_whitelist(
+            session, message.chat.id, target_id
+        )
 
     stmt = select(ModerationExemption).where(
         ModerationExemption.group_id == message.chat.id,
-        ModerationExemption.user_id == target.id,
+        ModerationExemption.user_id == target_id,
     )
     result = await session.execute(stmt)
     existing = result.scalar_one_or_none()
-    if not existing:
-        await _answer(message, settings, 
+    if not existing and not whitelist_revoked:
+        # A zero-row whitelist UPDATE still acquired the SQLite write lock.
+        await session.commit()
+        await _answer(message, settings,
             "<b>AI 审查豁免</b>\n"
-            f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
+            f"<b>用户</b>: {_safe_user_label(target_id, target_name)}\n"
             "<b>状态</b>: 当前不在豁免名单"
         )
         return
 
-    await session.delete(existing)
-    await _answer(message, settings, 
+    if existing:
+        await session.delete(existing)
+    # The whitelist UPDATE holds the process-wide SQLite write lock until
+    # commit; release it before the Telegram reply instead of stalling every
+    # concurrent write for the duration of the network call.
+    await session.commit()
+    status_lines = []
+    if existing:
+        status_lines.append("已取消豁免")
+    if whitelist_revoked:
+        status_lines.append("已撤销 bot 审核白名单，恢复审核")
+    await _answer(message, settings,
         "<b>AI 审查豁免</b>\n"
-        f"<b>用户</b>: {_safe_user_label(target.id, target.full_name)}\n"
-        "<b>状态</b>: 已取消豁免"
+        f"<b>用户</b>: {_safe_user_label(target_id, target_name)}\n"
+        f"<b>状态</b>: {'；'.join(status_lines)}"
     )

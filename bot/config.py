@@ -132,6 +132,10 @@ class ModerationConfig(BaseModel):
     high_confidence_threshold: float = Field(default=0.9, allow_inf_nan=False)
     # 低置信度质询限时（秒），超时自动封禁。
     challenge_timeout_seconds: int = 600
+    # 其他 bot（如 guest 模式广告机）发送的消息也进入内容审核；
+    # 连续 bot_screening_message_count 条干净后加入白名单不再审核。
+    bot_screening_enabled: bool = True
+    bot_screening_message_count: int = 5
 
 
 class Settings(BaseSettings):
@@ -650,6 +654,9 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     )
     settings.moderation.challenge_timeout_seconds = max(
         60, int(settings.moderation.challenge_timeout_seconds)
+    )
+    settings.moderation.bot_screening_message_count = min(
+        100, max(1, int(settings.moderation.bot_screening_message_count))
     )
 
     settings.bot.token = settings.bot_token

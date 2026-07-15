@@ -58,13 +58,21 @@ def contains_prompt_injection(text: str) -> bool:
     return bool(_INJECTION_RE.search(text or ""))
 
 
+_UNTRUSTED_TAG_BREAKOUT_RE = re.compile(r"</?\s*untrusted\b", re.IGNORECASE)
+
+
+def _neutralize_untrusted_tags(content: str) -> str:
+    """Stop message text from closing the wrapper tag and injecting directives."""
+    return _UNTRUSTED_TAG_BREAKOUT_RE.sub("[untrusted-tag]", content)
+
+
 def wrap_untrusted(label: str, text: str, max_len: int = 4000) -> str:
-    content = clean_text(text, max_len=max_len)
+    content = _neutralize_untrusted_tags(clean_text(text, max_len=max_len))
     return f"<untrusted:{label}>\n{content}\n</untrusted:{label}>"
 
 
 def wrap_untrusted_multiline(label: str, text: str, max_len: int = 4000) -> str:
-    content = clean_multiline_text(text, max_len=max_len)
+    content = _neutralize_untrusted_tags(clean_multiline_text(text, max_len=max_len))
     return f"<untrusted:{label}>\n{content}\n</untrusted:{label}>"
 
 

@@ -24,3 +24,5 @@ enabled = true
 warn_threshold = 3
 high_confidence_threshold = 0.9
 challenge_timeout_seconds = 600
+bot_screening_enabled = true
+bot_screening_message_count = 5

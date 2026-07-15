@@ -217,6 +217,8 @@ class ModerationSettingsConfig(StrictModel):
     warn_threshold: int = Field(default=3, ge=1, le=100)
     high_confidence_threshold: float = Field(default=0.9, ge=0.0, le=1.0, allow_inf_nan=False)
     challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
+    bot_screening_enabled: bool = True
+    bot_screening_message_count: int = Field(default=5, ge=1, le=100)
 
 
 class VerificationSettingsConfig(StrictModel):

@@ -107,6 +107,26 @@ class UserWarning(Base):
     __table_args__ = (Index("ix_warn_group_user", "group_id", "user_id", unique=True),)
 
 
+class BotScreening(Base):
+    """Per-group screening progress for bot senders.
+
+    A bot's messages are moderated until it accumulates the configured number
+    of clean messages, then it is whitelisted and skipped permanently.
+    Violations reset the counter.
+    """
+
+    __tablename__ = "bot_screenings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    bot_id: Mapped[int] = mapped_column(BigInteger)
+    passed_count: Mapped[int] = mapped_column(Integer, default=0)
+    whitelisted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (Index("ix_bot_screening_group_bot", "group_id", "bot_id", unique=True),)
+
+
 class ModerationExemption(Base):
     __tablename__ = "moderation_exemptions"
 
