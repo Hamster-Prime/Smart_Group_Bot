@@ -201,7 +201,7 @@ pip install -e .
 # 配置
 cp .env.example .env
 # 编辑 .env，只填写启动所需的 BOT_TOKEN、SUPER_ADMIN_ID、
-# CONFIG_MASTER_KEY、DATABASE_URL 和 MINIAPP_* 地址
+# CONFIG_MASTER_KEY、DATABASE_URL、MINIAPP_*，以及可选的 WEBHOOK_* 配置
 
 # 启动
 python start.py
@@ -238,9 +238,13 @@ DATABASE_URL=sqlite+aiosqlite:///./data/bot.db
 MINIAPP_PUBLIC_BASE_URL=https://bot.example.com
 MINIAPP_LISTEN_HOST=0.0.0.0
 MINIAPP_LISTEN_PORT=8480
+WEBHOOK_URL=https://bot.example.com/telegram/webhook
+WEBHOOK_SECRET=replace_with_at_least_32_random_characters
 ```
 
 `CONFIG_MASTER_KEY` 可用 `openssl rand -hex 32` 生成，并需随数据库备份一起妥善保管。
+
+配置 `WEBHOOK_URL` 和 `WEBHOOK_SECRET` 后，Telegram 更新会通过现有 Mini App HTTP 监听器接收。反向代理需要把 `WEBHOOK_URL` 的完整路径转发到 `MINIAPP_LISTEN_HOST:MINIAPP_LISTEN_PORT`；密钥需为 32-256 位字母、数字、下划线或连字符，可用 `openssl rand -hex 32` 生成。启动时会从 bot 所在主机探测该公网地址，运行中也会监控 Telegram 投递错误。Webhook 未配置、自检失败、URL/密钥格式错误、Telegram 注册失败或投递异常时，bot 会在日志中写明原因，清理远端 webhook，并自动降级为长轮询；运行中降级会保留已经积压的更新。
 
 升级旧版本时，如果数据库尚无运行时配置，现有 `.env` 和 `config.toml` 业务项会导入一次；创建数据库配置记录后，后续启动不再用文件覆盖 Mini App 设置。确认设置中心内容无误后，可清理旧文件中的模型、功能和第三方密钥值；Docker 部署保留空的 `config.toml` 占位即可。
 

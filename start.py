@@ -1,4 +1,4 @@
-"""Local launcher for Telegram bot polling mode."""
+"""Local launcher with webhook support and polling fallback."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ if __name__ == "__main__":
         print("=" * 50)
         print("  Smart Group Bot - Local Run")
         print("=" * 50)
-        print("  Mode: Telegram polling")
+        print("  Mode: Telegram webhook / polling fallback")
         print("  Press Ctrl+C to stop")
         print("=" * 50)
         print()

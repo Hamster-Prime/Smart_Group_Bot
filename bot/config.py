@@ -143,6 +143,8 @@ class Settings(BaseSettings):
     miniapp_public_base_url: str = ""
     miniapp_listen_host: str = ""
     miniapp_listen_port: int = 0
+    webhook_url: str = ""
+    webhook_secret: str = ""
 
     @field_validator("super_admin_id", mode="before")
     @classmethod

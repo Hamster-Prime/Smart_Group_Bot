@@ -26,6 +26,7 @@ from bot.services.runtime_config import (
     hcaptcha_key_configuration_issue,
     turnstile_key_configuration_issue,
 )
+from bot.services.update_delivery import resolve_webhook_config, run_update_delivery
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
 
@@ -152,11 +153,15 @@ async def main() -> None:
 
     from bot.services.verify_web import VerifyWebServer
 
+    webhook, webhook_fallback_reason = resolve_webhook_config(settings)
     verify_web = VerifyWebServer(
         bot=bot,
         settings=settings,
         session_factory=session_factory,
         runtime_config=runtime_config,
+        webhook_dispatcher=dp if webhook is not None else None,
+        webhook_path=webhook.path if webhook is not None else "",
+        webhook_secret=webhook.secret if webhook is not None else "",
     )
     try:
         await verify_web.start()
@@ -174,6 +179,9 @@ async def main() -> None:
             log.exception("Bot HTTP session cleanup failed after Mini App startup error")
         await engine.dispose()
         raise
+    if verify_web.webhook_route_error is not None:
+        webhook_fallback_reason = verify_web.webhook_route_error
+        webhook = None
     verification_issues = {
         "turnstile": turnstile_key_configuration_issue(
             settings.join_verification_turnstile_site_key,
@@ -203,20 +211,15 @@ async def main() -> None:
         )
     log.info("Bot starting...")
 
-    if settings.bot.drop_pending_updates:
-        # aiogram 3.x start_polling has no drop_pending_updates parameter;
-        # discarding the backlog is done via delete_webhook before polling.
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            log.warning("failed to drop pending updates", exc_info=True)
-
     try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-            handle_as_tasks=True,
-            tasks_concurrency_limit=8,
+        await run_update_delivery(
+            bot=bot,
+            dispatcher=dp,
+            settings=settings,
+            webhook=webhook,
+            fallback_reason=webhook_fallback_reason,
+            enable_webhook_route=verify_web.enable_webhook_route,
+            disable_webhook_route=verify_web.disable_webhook_route,
         )
     finally:
         proactive_runner.cancel()
@@ -231,6 +234,10 @@ async def main() -> None:
             await group.flush_pending_inbound_batches()
         except Exception:
             log.exception("pending inbound batch flush failed")
+        try:
+            await bot.session.close()
+        except Exception:
+            log.exception("Bot HTTP session shutdown failed")
         await engine.dispose()
 
 

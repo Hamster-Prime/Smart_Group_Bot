@@ -7,6 +7,6 @@ services:
       # Legacy one-time import only; ignored after runtime_config is created.
       - ./config.toml:/app/config.toml:ro
     ports:
-      # Telegram settings and verification Mini App.
+      # Telegram webhook, settings and verification Mini App.
       - "8480:8480"
     restart: unless-stopped

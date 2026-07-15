@@ -26,10 +26,12 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
+from aiogram.methods import TelegramMethod
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -55,6 +57,7 @@ from bot.services.join_verification import (
     verification_provider,
 )
 from bot.services.runtime_config import RuntimeConfigManager
+from bot.services.update_delivery import WEBHOOK_MAX_CONCURRENT_UPDATES
 from bot.utils.timezone import now_shanghai_naive
 from bot.web.settings_api import register_settings_routes
 
@@ -363,6 +366,93 @@ async def verify_hcaptcha_token(
     return success, errors
 
 
+class _WebhookUpdateQueue:
+    def __init__(
+        self,
+        *,
+        dispatcher: Dispatcher,
+        bot: Bot,
+        secret_token: str,
+        worker_count: int,
+    ) -> None:
+        self.dispatcher = dispatcher
+        self.bot = bot
+        self.secret_token = secret_token
+        self.worker_count = max(1, int(worker_count))
+        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=self.worker_count * 4
+        )
+        self._workers: list[asyncio.Task[None]] = []
+        self._start_lock = asyncio.Lock()
+        self._stopped = False
+
+    def verify_secret(self, request: web.Request) -> bool:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        return secrets.compare_digest(supplied, self.secret_token)
+
+    async def handle_verified(self, request: web.Request) -> web.Response:
+        try:
+            update = await request.json(loads=self.bot.session.json_loads)
+        except Exception:
+            return web.Response(text="Invalid update", status=400)
+        if not isinstance(update, dict):
+            return web.Response(text="Invalid update", status=400)
+
+        await self._ensure_workers()
+        if self._stopped:
+            return web.Response(text="Webhook disabled", status=503)
+        try:
+            self.queue.put_nowait(update)
+        except asyncio.QueueFull:
+            return web.Response(text="Webhook busy", status=503)
+        return web.json_response({}, dumps=self.bot.session.json_dumps)
+
+    async def _ensure_workers(self) -> None:
+        if self._workers or self._stopped:
+            return
+        async with self._start_lock:
+            if self._workers or self._stopped:
+                return
+            self._workers = [
+                asyncio.create_task(
+                    self._worker(),
+                    name=f"telegram-webhook-worker-{index + 1}",
+                )
+                for index in range(self.worker_count)
+            ]
+
+    async def _worker(self) -> None:
+        while True:
+            update = await self.queue.get()
+            try:
+                result = await self.dispatcher.feed_raw_update(
+                    bot=self.bot,
+                    update=update,
+                )
+                if isinstance(result, TelegramMethod):
+                    await self.dispatcher.silent_call_request(
+                        bot=self.bot,
+                        result=result,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Telegram webhook update processing failed")
+            finally:
+                self.queue.task_done()
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._workers:
+            await self.queue.join()
+            for worker in self._workers:
+                worker.cancel()
+            await asyncio.gather(*self._workers, return_exceptions=True)
+            self._workers.clear()
+
+
 class VerifyWebServer:
     """aiohttp server hosting the settings and human-verification Mini Apps."""
 
@@ -373,11 +463,21 @@ class VerifyWebServer:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         runtime_config: RuntimeConfigManager | None = None,
+        webhook_dispatcher: Dispatcher | None = None,
+        webhook_path: str = "",
+        webhook_secret: str = "",
     ) -> None:
         self.bot = bot
         self.settings = settings
         self.session_factory = session_factory
         self.runtime_config = runtime_config
+        self.webhook_dispatcher = webhook_dispatcher
+        self.webhook_path = webhook_path
+        self.webhook_secret = webhook_secret
+        self.webhook_route_error: str | None = None
+        self._webhook_accepting_updates = False
+        self._webhook_processor: _WebhookUpdateQueue | None = None
+        self._webhook_request_tasks: set[asyncio.Task[Any]] = set()
         self._runner: web.AppRunner | None = None
         self._completed_verifications: dict[
             tuple[int, int], tuple[float, _VerificationFingerprint]
@@ -599,7 +699,60 @@ class VerifyWebServer:
                 manager=self.runtime_config,
                 session_factory=self.session_factory,
             )
+        self.webhook_route_error = None
+        if self.webhook_dispatcher is not None and self.webhook_path:
+            try:
+                processor = _WebhookUpdateQueue(
+                    dispatcher=self.webhook_dispatcher,
+                    bot=self.bot,
+                    secret_token=self.webhook_secret,
+                    worker_count=WEBHOOK_MAX_CONCURRENT_UPDATES,
+                )
+
+                async def handle_webhook(request: web.Request) -> web.Response:
+                    if not processor.verify_secret(request):
+                        return web.Response(text="Unauthorized", status=401)
+                    if not self._webhook_accepting_updates:
+                        return web.Response(text="Webhook disabled", status=503)
+                    task = asyncio.current_task()
+                    if task is not None:
+                        self._webhook_request_tasks.add(task)
+                    try:
+                        return await processor.handle_verified(request)
+                    finally:
+                        if task is not None:
+                            self._webhook_request_tasks.discard(task)
+
+                async def close_webhook_handler(_app: web.Application) -> None:
+                    await self.disable_webhook_route()
+                    await self.bot.session.close()
+
+                app.router.add_post(self.webhook_path, handle_webhook)
+                app.on_shutdown.append(close_webhook_handler)
+                self._webhook_processor = processor
+            except Exception as exc:
+                self.webhook_route_error = f"Webhook HTTP 路由注册失败：{exc}"
+                log.error(
+                    "%s；该路由已禁用，将自动降级为轮询。",
+                    self.webhook_route_error,
+                    exc_info=True,
+                )
         return app
+
+    def enable_webhook_route(self) -> None:
+        self._webhook_accepting_updates = True
+
+    async def disable_webhook_route(self) -> None:
+        self._webhook_accepting_updates = False
+        request_tasks = [
+            task
+            for task in self._webhook_request_tasks
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        if request_tasks:
+            await asyncio.gather(*request_tasks, return_exceptions=True)
+        if self._webhook_processor is not None:
+            await self._webhook_processor.stop()
 
     async def start(self) -> None:
         app = self.build_app()
