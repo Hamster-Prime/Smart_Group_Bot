@@ -13,6 +13,7 @@ from bot.db.engine import init_db
 from bot.db.models import Group, UserWarning
 from bot.services.join_screening import add_global_ban, get_global_ban
 from bot.services.join_verification import (
+    COMBINED_VERIFICATION_PROVIDER,
     JoinVerificationSweeper,
     VERIFICATION_CALLBACK_APPROVE,
     CHALLENGE_SUBMIT_GRACE,
@@ -44,6 +45,7 @@ from bot.services.join_verification import (
     upsert_join_verification,
     verification_keys_for_provider,
     verification_service_ready,
+    verification_subproviders,
 )
 from bot.utils.timezone import now_shanghai_naive
 
@@ -130,6 +132,50 @@ class HelperTests(unittest.TestCase):
                 settings,
                 {"join_verification_enabled": False},
             )
+        )
+
+    def test_combined_provider_expands_to_both_base_services(self) -> None:
+        self.assertEqual(
+            verification_subproviders(COMBINED_VERIFICATION_PROVIDER),
+            ("turnstile", "hcaptcha"),
+        )
+        self.assertEqual(verification_subproviders("turnstile"), ("turnstile",))
+        self.assertEqual(verification_subproviders("hcaptcha"), ("hcaptcha",))
+
+    def test_combined_provider_requires_both_key_pairs(self) -> None:
+        settings = _settings(
+            join_verification_provider=COMBINED_VERIFICATION_PROVIDER
+        )
+        # Only Turnstile keys are present: combined mode is not configured.
+        self.assertFalse(verification_service_ready(settings))
+        settings.join_verification_hcaptcha_site_key = "h-site"
+        settings.join_verification_hcaptcha_secret_key = "h-secret"
+        self.assertTrue(verification_service_ready(settings))
+        self.assertTrue(join_verification_ready(settings))
+        # A duplicate hCaptcha pair breaks the combined mode again.
+        settings.join_verification_hcaptcha_secret_key = "h-site"
+        self.assertFalse(verification_service_ready(settings))
+
+    def test_combined_provider_blocked_when_base_service_is_blocked(self) -> None:
+        settings = _settings(
+            join_verification_provider=COMBINED_VERIFICATION_PROVIDER,
+            join_verification_hcaptcha_site_key="h-site",
+            join_verification_hcaptcha_secret_key="h-secret",
+        )
+        mark_turnstile_configuration_unavailable(
+            settings,
+            provider="hcaptcha",
+            reason="invalid hCaptcha secret",
+        )
+        try:
+            self.assertTrue(verification_service_ready(settings, "turnstile"))
+            self.assertFalse(
+                verification_service_ready(settings, COMBINED_VERIFICATION_PROVIDER)
+            )
+        finally:
+            clear_turnstile_configuration_unavailable(settings, provider="hcaptcha")
+        self.assertTrue(
+            verification_service_ready(settings, COMBINED_VERIFICATION_PROVIDER)
         )
 
     def test_provider_runtime_blocks_are_isolated(self) -> None:
@@ -1733,6 +1779,41 @@ class SweeperTests(_DbTestCase):
             hcaptcha_record = await get_join_verification(session, -100, 935)
             self.assertIsNotNone(hcaptcha_record)
             self.assertGreater(hcaptcha_record.deadline_at, now)
+
+    async def test_sweep_pauses_combined_records_when_base_service_is_down(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=936,
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
+                provider=COMBINED_VERIFICATION_PROVIDER,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        # hCaptcha is misconfigured, so the combined challenge cannot be
+        # solved; the record must be paused instead of the member kicked.
+        settings = _settings()
+        settings.join_verification_hcaptcha_site_key = "same-key"
+        settings.join_verification_hcaptcha_secret_key = "same-key"
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=settings,
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 0)
+        bot.ban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 936)
+            self.assertIsNotNone(record)
+            self.assertGreater(record.deadline_at, now)
 
 
 class MemberLeaveCleanupTests(_DbTestCase):

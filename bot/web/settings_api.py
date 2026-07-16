@@ -94,7 +94,9 @@ class _GroupSettingsUpdate(BaseModel):
     tts_mode: Literal["off", "on", "always"] | None = None
     # None clears the group override and inherits the global default.
     join_verification_enabled: StrictBool | None = None
-    join_verification_provider: Literal["turnstile", "hcaptcha"] | None = None
+    join_verification_provider: (
+        Literal["turnstile", "hcaptcha", "turnstile_hcaptcha"] | None
+    ) = None
     patrol_enabled: StrictBool | None = None
     proactive_enabled: StrictBool | None = None
     proactive_task_brief: str | None = Field(default=None, max_length=240)
@@ -226,7 +228,7 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         "join_verification_provider": (
             str(settings_data["join_verification_provider"]).strip().lower()
             if str(settings_data.get("join_verification_provider") or "").strip().lower()
-            in {"turnstile", "hcaptcha"}
+            in {"turnstile", "hcaptcha", "turnstile_hcaptcha"}
             else None
         ),
         "patrol_enabled": (

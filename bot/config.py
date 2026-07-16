@@ -262,7 +262,9 @@ class Settings(BaseSettings):
     join_verification_enabled: bool = False
     join_verification_timeout_seconds: int = 600
     join_verification_check_interval_seconds: float = 30.0
-    join_verification_provider: Literal["turnstile", "hcaptcha"] = "turnstile"
+    join_verification_provider: Literal[
+        "turnstile", "hcaptcha", "turnstile_hcaptcha"
+    ] = "turnstile"
     join_verification_turnstile_site_key: str = ""
     join_verification_turnstile_secret_key: str = ""
     join_verification_hcaptcha_site_key: str = ""
@@ -699,27 +701,47 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.join_verification_check_interval_seconds = max(
         5.0, float(settings.join_verification_check_interval_seconds)
     )
-    if settings.join_verification_provider not in {"turnstile", "hcaptcha"}:
+    if settings.join_verification_provider not in {
+        "turnstile",
+        "hcaptcha",
+        "turnstile_hcaptcha",
+    }:
         settings.join_verification_provider = "turnstile"
     settings.join_verification_listen_port = min(
         65535, max(1, int(settings.join_verification_listen_port))
     )
     if settings.join_verification_enabled:
-        if settings.join_verification_provider == "hcaptcha":
-            challenge_site_key = settings.join_verification_hcaptcha_site_key
-            challenge_secret_key = settings.join_verification_hcaptcha_secret_key
-            challenge_site_name = "JOIN_VERIFICATION_HCAPTCHA_SITE_KEY"
-            challenge_secret_name = "JOIN_VERIFICATION_HCAPTCHA_SECRET_KEY"
-        else:
-            challenge_site_key = settings.join_verification_turnstile_site_key
-            challenge_secret_key = settings.join_verification_turnstile_secret_key
-            challenge_site_name = "JOIN_VERIFICATION_TURNSTILE_SITE_KEY"
-            challenge_secret_name = "JOIN_VERIFICATION_TURNSTILE_SECRET_KEY"
+        challenge_keys: list[tuple[str, str]] = []
+        if settings.join_verification_provider in {"hcaptcha", "turnstile_hcaptcha"}:
+            challenge_keys.extend(
+                (
+                    (
+                        "JOIN_VERIFICATION_HCAPTCHA_SITE_KEY",
+                        settings.join_verification_hcaptcha_site_key,
+                    ),
+                    (
+                        "JOIN_VERIFICATION_HCAPTCHA_SECRET_KEY",
+                        settings.join_verification_hcaptcha_secret_key,
+                    ),
+                )
+            )
+        if settings.join_verification_provider in {"turnstile", "turnstile_hcaptcha"}:
+            challenge_keys.extend(
+                (
+                    (
+                        "JOIN_VERIFICATION_TURNSTILE_SITE_KEY",
+                        settings.join_verification_turnstile_site_key,
+                    ),
+                    (
+                        "JOIN_VERIFICATION_TURNSTILE_SECRET_KEY",
+                        settings.join_verification_turnstile_secret_key,
+                    ),
+                )
+            )
         missing = [
             name
             for name, value in (
-                (challenge_site_name, challenge_site_key),
-                (challenge_secret_name, challenge_secret_key),
+                *challenge_keys,
                 ("JOIN_VERIFICATION_PUBLIC_BASE_URL", settings.join_verification_public_base_url),
             )
             if not value.strip()

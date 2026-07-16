@@ -40,8 +40,10 @@ from bot.config import Settings
 from bot.db.models import JoinVerification, UserWarning
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
+    COMBINED_VERIFICATION_PROVIDER,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_PATROL,
+    VERIFICATION_PROVIDERS,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
@@ -58,6 +60,7 @@ from bot.services.join_verification import (
     verification_deadline_passed,
     verification_keys_for_provider,
     verification_provider,
+    verification_subproviders,
     verification_timeout_seconds_for_kind,
 )
 from bot.services.runtime_config import RuntimeConfigManager
@@ -146,15 +149,11 @@ def _verification_config_tag(
     provider: str,
 ) -> str:
     """Opaque public tag that detects key rotation between GET and POST."""
-    site_key, secret_key = verification_keys_for_provider(settings, provider)
-    payload = "\x00".join(
-        (
-            normalize_verification_provider(provider),
-            site_key,
-            secret_key,
-            settings.join_verification_public_base_url.strip().rstrip("/"),
-        )
-    )
+    parts = [normalize_verification_provider(provider)]
+    for subprovider in verification_subproviders(provider):
+        parts.extend(verification_keys_for_provider(settings, subprovider))
+    parts.append(settings.join_verification_public_base_url.strip().rstrip("/"))
+    payload = "\x00".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -185,7 +184,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>真人验证</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script src="{script_url}" async defer></script>
+{script_tags}
 <style>
   body {{
     box-sizing: border-box;
@@ -206,6 +205,13 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   #status {{ margin-top: 16px; font-size: 14px; min-height: 20px; }}
   .challenge-widget {{ display: flex; max-width: 100%; justify-content: center; overflow: visible; }}
   .challenge-widget > * {{ max-width: 100%; }}
+  .challenge-steps {{ display: flex; flex-direction: column; width: 100%; }}
+  .challenge-step {{ margin-top: 16px; transition: opacity .2s ease; }}
+  .challenge-step:first-child {{ margin-top: 0; }}
+  .challenge-step.locked {{ opacity: .4; pointer-events: none; }}
+  .challenge-step-title {{ font-size: 13px; font-weight: 600; margin: 0 0 8px; text-align: left; }}
+  .challenge-step-widget {{ display: flex; max-width: 100%; justify-content: center; overflow: visible; }}
+  .challenge-step-widget > * {{ max-width: 100%; }}
   .ok {{ color: #1a7f37; }}
   .err {{ color: #cf222e; }}
   @media (max-width: 360px) {{
@@ -217,7 +223,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="card">
   <h1>真人验证</h1>
-  <p>完成下方人机验证后即可在群内发言。</p>
+  <p>{intro_text}</p>
   <div class="challenge-widget">{widget_html}</div>
   <div id="status"></div>
 </div>
@@ -226,70 +232,116 @@ const tg = window.Telegram ? window.Telegram.WebApp : null;
 if (tg) {{ tg.ready(); tg.expand(); }}
 
 const provider = "{provider}";
+const combined = provider === "turnstile_hcaptcha";
 const configTag = "{config_tag}";
 let verificationId = {verification_id};
 let challengeSubmitting = false;
+let turnstileToken = "";
+let hcaptchaToken = "";
+
+function setStatus(text, cls) {{
+  const status = document.getElementById("status");
+  status.textContent = text;
+  status.className = cls || "";
+}}
+
+function setHcaptchaStepLocked(locked) {{
+  const step = document.getElementById("step-hcaptcha");
+  if (step) step.classList.toggle("locked", locked);
+}}
 
 function resetChallenge() {{
-  if (provider === "hcaptcha" && window.hcaptcha) window.hcaptcha.reset();
-  if (provider === "turnstile" && window.turnstile) window.turnstile.reset();
+  turnstileToken = "";
+  hcaptchaToken = "";
+  if (combined) setHcaptchaStepLocked(true);
+  if ((combined || provider === "hcaptcha") && window.hcaptcha) window.hcaptcha.reset();
+  if ((combined || provider === "turnstile") && window.turnstile) window.turnstile.reset();
 }}
 
 function onChallengeError() {{
   if (challengeSubmitting) return;
-  const status = document.getElementById("status");
-  status.textContent = "❌ 验证组件暂时不可用，请稍后重试。";
-  status.className = "err";
+  setStatus("❌ 验证组件暂时不可用，请稍后重试。", "err");
   setTimeout(resetChallenge, 1000);
 }}
 
 function onChallengeExpired() {{
   if (challengeSubmitting) return;
-  const status = document.getElementById("status");
-  status.textContent = "验证已过期，请重新完成验证。";
-  status.className = "err";
+  setStatus("验证已过期，请重新完成验证。", "err");
   resetChallenge();
 }}
 
-async function onChallengeSuccess(token) {{
+async function submitVerification(tokens) {{
   if (challengeSubmitting) return;
   challengeSubmitting = true;
-  const status = document.getElementById("status");
   if (!tg || !tg.initData) {{
     challengeSubmitting = false;
-    status.textContent = "❌ 请在 Telegram 内打开本页面。";
-    status.className = "err";
+    setStatus("❌ 请在 Telegram 内打开本页面。", "err");
     return;
   }}
-  status.textContent = "验证中…";
-  status.className = "";
+  setStatus("验证中…", "");
   try {{
     const resp = await fetch("/verify", {{
       method: "POST",
       headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{challenge_token: token, provider, config_tag: configTag, verification_id: verificationId, init_data: tg.initData}}),
+      body: JSON.stringify(Object.assign({{provider, config_tag: configTag, verification_id: verificationId, init_data: tg.initData}}, tokens)),
     }});
     const data = await resp.json();
     if (resp.ok && data.ok) {{
-      status.textContent = "✅ 验证通过，群内权限已恢复。";
-      status.className = "ok";
+      setStatus("✅ 验证通过，群内权限已恢复。", "ok");
       setTimeout(() => tg.close(), 1500);
     }} else {{
       challengeSubmitting = false;
       if (Number.isInteger(data.verification_id) && data.verification_id > 0) {{
         verificationId = data.verification_id;
       }}
-      status.textContent = "❌ " + (data.error || "验证失败，请重试。");
-      status.className = "err";
+      let message = "❌ " + (data.error || "验证失败，请重试。");
+      if (combined) message += " 请从第 1 步重新开始。";
+      setStatus(message, "err");
       resetChallenge();
     }}
   }} catch (e) {{
     challengeSubmitting = false;
-    status.textContent = "❌ 网络错误，请稍后重试。";
-    status.className = "err";
+    setStatus("❌ 网络错误，请稍后重试。", "err");
     resetChallenge();
   }}
 }}
+
+function onChallengeSuccess(token) {{
+  submitVerification({{challenge_token: token}});
+}}
+
+function maybeSubmitCombined() {{
+  if (turnstileToken && hcaptchaToken) {{
+    submitVerification({{turnstile_token: turnstileToken, hcaptcha_token: hcaptchaToken}});
+  }}
+}}
+
+function onTurnstileSuccess(token) {{
+  turnstileToken = token;
+  setHcaptchaStepLocked(false);
+  if (hcaptchaToken) {{ maybeSubmitCombined(); return; }}
+  setStatus("✅ 第 1 步已完成，请继续完成第 2 步 hCaptcha 验证。", "ok");
+}}
+
+function onTurnstileExpired() {{
+  turnstileToken = "";
+  if (challengeSubmitting) return;
+  setStatus("第 1 步 Turnstile 验证已过期，请重新完成。", "err");
+}}
+
+function onHcaptchaSuccess(token) {{
+  hcaptchaToken = token;
+  if (turnstileToken) {{ maybeSubmitCombined(); return; }}
+  setStatus("请先完成第 1 步 Turnstile 验证。", "err");
+}}
+
+function onHcaptchaExpired() {{
+  hcaptchaToken = "";
+  if (challengeSubmitting) return;
+  setStatus("第 2 步 hCaptcha 验证已过期，请重新完成。", "err");
+}}
+
+if (combined) setStatus("请先完成第 1 步 Turnstile 验证。", "");
 </script>
 </body>
 </html>"""
@@ -835,7 +887,7 @@ class VerifyWebServer:
         # The page is static: user identity arrives with the POSTed initData,
         # so an unauthenticated GET reveals nothing but the public site key.
         raw_provider = request.query.get("provider")
-        if raw_provider and raw_provider.strip().lower() not in {"turnstile", "hcaptcha"}:
+        if raw_provider and raw_provider.strip().lower() not in VERIFICATION_PROVIDERS:
             return web.json_response(
                 {"ok": False, "error": "不支持的验证服务"}, status=400
             )
@@ -854,20 +906,64 @@ class VerifyWebServer:
             return web.json_response(
                 {"ok": False, "error": "验证记录参数无效"}, status=400
             )
-        site_key, _secret_key = verification_keys_for_provider(self.settings, provider)
         if not turnstile_verification_configured(self.settings, provider):
             return web.json_response(
                 {"ok": False, "error": "验证服务暂时不可用，请联系管理员"}, status=503
             )
-        if provider == "hcaptcha":
-            script_url = "https://js.hcaptcha.com/1/api.js"
+        turnstile_script = (
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" '
+            "async defer></script>"
+        )
+        hcaptcha_script = (
+            '<script src="https://js.hcaptcha.com/1/api.js" async defer></script>'
+        )
+        intro_text = "完成下方人机验证后即可在群内发言。"
+        if provider == COMBINED_VERIFICATION_PROVIDER:
+            turnstile_key, _ = verification_keys_for_provider(
+                self.settings, "turnstile"
+            )
+            hcaptcha_key, _ = verification_keys_for_provider(self.settings, "hcaptcha")
+            script_tags = turnstile_script + "\n" + hcaptcha_script
+            intro_text = (
+                "本群需要依次完成两项人机验证：请先完成第 1 步 Turnstile，"
+                "再完成第 2 步 hCaptcha，两项都通过后即可在群内发言。"
+            )
+            widget_html = (
+                '<div class="challenge-steps">'
+                '<div class="challenge-step" id="step-turnstile">'
+                '<p class="challenge-step-title">第 1 步 · Cloudflare Turnstile</p>'
+                '<div class="challenge-step-widget">'
+                '<div class="cf-turnstile" data-size="flexible" data-sitekey="{turnstile_key}" '
+                'data-callback="onTurnstileSuccess" data-error-callback="onChallengeError" '
+                'data-expired-callback="onTurnstileExpired"></div>'
+                "</div></div>"
+                '<div class="challenge-step locked" id="step-hcaptcha">'
+                '<p class="challenge-step-title">第 2 步 · hCaptcha</p>'
+                '<div class="challenge-step-widget">'
+                '<div class="h-captcha" data-size="compact" data-sitekey="{hcaptcha_key}" '
+                'data-callback="onHcaptchaSuccess" data-error-callback="onChallengeError" '
+                'data-expired-callback="onHcaptchaExpired"></div>'
+                "</div></div>"
+                "</div>"
+            ).format(
+                turnstile_key=html.escape(turnstile_key),
+                hcaptcha_key=html.escape(hcaptcha_key),
+            )
+        elif provider == "hcaptcha":
+            site_key, _secret_key = verification_keys_for_provider(
+                self.settings, provider
+            )
+            script_tags = hcaptcha_script
             widget_html = (
                 '<div class="h-captcha" data-size="compact" data-sitekey="{site_key}" '
                 'data-callback="onChallengeSuccess" data-error-callback="onChallengeError" '
                 'data-expired-callback="onChallengeExpired"></div>'
             ).format(site_key=html.escape(site_key))
         else:
-            script_url = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+            site_key, _secret_key = verification_keys_for_provider(
+                self.settings, provider
+            )
+            script_tags = turnstile_script
             widget_html = (
                 '<div class="cf-turnstile" data-size="flexible" data-sitekey="{site_key}" '
                 'data-callback="onChallengeSuccess" data-error-callback="onChallengeError" '
@@ -877,7 +973,8 @@ class VerifyWebServer:
             provider=provider,
             config_tag=_verification_config_tag(self.settings, provider),
             verification_id=verification_id,
-            script_url=script_url,
+            script_tags=script_tags,
+            intro_text=intro_text,
             widget_html=widget_html,
             nonce=(nonce := secrets.token_urlsafe(18)),
         )
@@ -901,17 +998,35 @@ class VerifyWebServer:
             body = {}
         if not isinstance(body, dict):
             body = {}
-        challenge_token = str(
-            body.get("challenge_token") or body.get("turnstile_token") or ""
-        )
         page_provider = str(body.get("provider") or "turnstile").strip().lower()
+        # The combined provider submits one token per solved challenge; base
+        # providers keep the single challenge_token field (with the legacy
+        # turnstile_token alias).
+        if page_provider == COMBINED_VERIFICATION_PROVIDER:
+            subprovider_tokens = {
+                "turnstile": str(body.get("turnstile_token") or ""),
+                "hcaptcha": str(body.get("hcaptcha_token") or ""),
+            }
+        else:
+            challenge_token = str(
+                body.get("challenge_token") or body.get("turnstile_token") or ""
+            )
+            subprovider_tokens = {
+                "hcaptcha"
+                if page_provider == "hcaptcha"
+                else "turnstile": challenge_token
+            }
         page_config_tag = str(body.get("config_tag") or "").strip()
         try:
             verification_id = int(body.get("verification_id") or 0)
         except (TypeError, ValueError):
             verification_id = -1
         init_data = str(body.get("init_data") or "")
-        if not challenge_token or not init_data or verification_id < 0:
+        if (
+            not all(subprovider_tokens.values())
+            or not init_data
+            or verification_id < 0
+        ):
             return web.json_response({"ok": False, "error": "缺少验证参数"}, status=400)
 
         # Telegram signs initData with HMAC(bot_token); a valid signature
@@ -1019,7 +1134,9 @@ class VerifyWebServer:
             return web.json_response(
                 {"ok": False, "error": "验证服务暂时不可用，请联系管理员"}, status=503
             )
-        site_key, secret_key = verification_keys_for_provider(self.settings, provider)
+        required_subproviders = verification_subproviders(provider)
+        if set(subprovider_tokens) != set(required_subproviders):
+            return web.json_response({"ok": False, "error": "缺少验证参数"}, status=400)
         active, joined_existing_active = self._enter_verification_active(
             verification_id,
             user_id,
@@ -1043,19 +1160,31 @@ class VerifyWebServer:
             request_task.add_done_callback(lambda _task: release_active())
 
         remote_ip = _client_public_ip(request)
-        if provider == "hcaptcha":
-            passed, verification_errors = await verify_hcaptcha_token(
-                secret_key=secret_key,
-                hcaptcha_token=challenge_token,
-                remote_ip=remote_ip,
-                site_key=site_key,
+        # Combined verification checks each service in guided order and stops
+        # at the first failure; the member must pass every one of them.
+        passed = True
+        verification_errors: list[str] = []
+        failed_subprovider = required_subproviders[0]
+        for subprovider in required_subproviders:
+            site_key, secret_key = verification_keys_for_provider(
+                self.settings, subprovider
             )
-        else:
-            passed, verification_errors = await verify_turnstile_token(
-                secret_key=secret_key,
-                turnstile_token=challenge_token,
-                remote_ip=remote_ip,
-            )
+            if subprovider == "hcaptcha":
+                passed, verification_errors = await verify_hcaptcha_token(
+                    secret_key=secret_key,
+                    hcaptcha_token=subprovider_tokens[subprovider],
+                    remote_ip=remote_ip,
+                    site_key=site_key,
+                )
+            else:
+                passed, verification_errors = await verify_turnstile_token(
+                    secret_key=secret_key,
+                    turnstile_token=subprovider_tokens[subprovider],
+                    remote_ip=remote_ip,
+                )
+            if not passed:
+                failed_subprovider = subprovider
+                break
         if _verification_config_tag(self.settings, provider) != current_config_tag:
             release_active()
             return web.json_response(
@@ -1063,7 +1192,7 @@ class VerifyWebServer:
                 status=409,
             )
         if not passed:
-            replay_error = provider == "hcaptcha" and bool(
+            replay_error = failed_subprovider == "hcaptcha" and bool(
                 _HCAPTCHA_REPLAY_ERRORS.intersection(verification_errors)
             )
             if replay_error and joined_existing_active:
@@ -1085,7 +1214,7 @@ class VerifyWebServer:
                     return web.json_response({"ok": True})
             configuration_error_codes = (
                 _HCAPTCHA_CONFIGURATION_ERRORS
-                if provider == "hcaptcha"
+                if failed_subprovider == "hcaptcha"
                 else _TURNSTILE_CONFIGURATION_ERRORS
             )
             configuration_errors = configuration_error_codes.intersection(
@@ -1093,16 +1222,18 @@ class VerifyWebServer:
             )
             if configuration_errors:
                 release_active()
+                # Block only the base service whose secret failed; extending
+                # by that service also covers combined records that need it.
                 mark_turnstile_configuration_unavailable(
                     self.settings,
-                    reason=f"{provider} Secret Key 无效",
-                    provider=provider,
+                    reason=f"{failed_subprovider} Secret Key 无效",
+                    provider=failed_subprovider,
                 )
                 async with self.session_factory() as session:
                     await extend_pending_verification_deadlines(
                         session,
                         settings=self.settings,
-                        provider=provider,
+                        provider=failed_subprovider,
                     )
                     await session.commit()
                 return web.json_response(

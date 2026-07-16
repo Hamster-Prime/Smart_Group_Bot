@@ -640,13 +640,14 @@
             ${field("verification.provider", "默认验证服务", { type: "select", options: [
               { value: "turnstile", label: "Cloudflare Turnstile" },
               { value: "hcaptcha", label: "hCaptcha" },
+              { value: "turnstile_hcaptcha", label: "Turnstile + hCaptcha（双重验证）" },
             ] })}
             ${field("verification.turnstile_site_key", "Turnstile Site Key", { maxlength: 255 })}
             ${secretField("verification.turnstile_secret_key", "Turnstile Secret Key", "必须填写 Cloudflare 控制台中的 Secret Key，不能重复 Site Key；空白不会覆盖已保存值")}
             ${field("verification.hcaptcha_site_key", "hCaptcha Site Key", { maxlength: 255 })}
             ${secretField("verification.hcaptcha_secret_key", "hCaptcha Secret Key", "空白不会覆盖已保存值")}
           </div>
-          <div class="notice info">${icon("refresh-cw")}<span>默认使用 ${provider === "hcaptcha" ? "hCaptcha" : "Cloudflare Turnstile"}；两套密钥可同时保留并随时切换，群组可单独选择服务。</span></div>
+          <div class="notice info">${icon("refresh-cw")}<span>默认使用 ${provider === "turnstile_hcaptcha" ? "Turnstile + hCaptcha 双重验证（需依次通过两项，且两套密钥都必须配置）" : provider === "hcaptcha" ? "hCaptcha" : "Cloudflare Turnstile"}；两套密钥可同时保留并随时切换，群组可单独选择服务。</span></div>
         </section>
         <section class="settings-section">
           ${sectionHead("自动巡检", "按时批量复查已知成员的名字和简介是否违反群规；违规者禁言并发起真人质询，通过恢复权限，超时移出群聊（不封禁）。群组页可逐群覆盖开关和手动触发。")}
@@ -797,7 +798,7 @@
       mute_all_replies: settings.mute_all_replies ?? false,
       at_reply_mode: settings.at_reply_mode ?? false,
       join_verification_enabled: settings.join_verification_enabled == null ? null : Boolean(settings.join_verification_enabled),
-      join_verification_provider: ["turnstile", "hcaptcha"].includes(settings.join_verification_provider)
+      join_verification_provider: ["turnstile", "hcaptcha", "turnstile_hcaptcha"].includes(settings.join_verification_provider)
         ? settings.join_verification_provider
         : null,
       patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
@@ -863,6 +864,7 @@
                 <option value=""${group.settings.join_verification_provider == null ? " selected" : ""}>继承全局默认</option>
                 <option value="turnstile"${group.settings.join_verification_provider === "turnstile" ? " selected" : ""}>Cloudflare Turnstile</option>
                 <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
+                <option value="turnstile_hcaptcha"${group.settings.join_verification_provider === "turnstile_hcaptcha" ? " selected" : ""}>Turnstile + hCaptcha（双重验证）</option>
               </select>
             </div>
             <div class="field">

@@ -85,7 +85,9 @@
 
 ### 入群验证（Turnstile / hCaptcha 真人质询）
 
-入群验证按群配置：每个群都能单独关闭、开启或继承全局默认，并可分别选择 Cloudflare Turnstile 或 hCaptcha。新成员入群后会先被禁言，需点击群内按钮跳转 bot 私聊，在 Telegram Mini App 内完成该群所选验证码后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
+入群验证按群配置：每个群都能单独关闭、开启或继承全局默认，并可选择 Cloudflare Turnstile、hCaptcha，或「Turnstile + hCaptcha」双重验证。新成员入群后会先被禁言，需点击群内按钮跳转 bot 私聊，在 Telegram Mini App 内完成该群所选验证码后恢复权限；超时被移出群聊（可重进重试）。身份由 Telegram initData 签名（HMAC bot token）保证。需要 bot 是带「封禁用户」权限的群管理员（启动时自检并警告）。
+
+双重验证模式下，Mini App 页面同时展示两个验证组件并引导按顺序完成：先完成第 1 步 Turnstile（完成前 hCaptcha 步骤置灰锁定），再完成第 2 步 hCaptcha，两个 token 一并提交，服务端依次经两家 siteverify 校验，全部通过才放行。该模式要求 Turnstile 和 hCaptcha 两套 Site/Secret Key 均已配置。
 
 ### 资料筛查与全局封禁
 

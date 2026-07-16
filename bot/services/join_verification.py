@@ -59,7 +59,7 @@ _MODERATION_CHALLENGE_LOCKS: weakref.WeakValueDictionary[
     tuple[int, int], asyncio.Lock
 ] = weakref.WeakValueDictionary()
 _BLOCKED_VERIFICATION_CONFIGS: dict[
-    tuple[int, str], tuple[Settings, tuple[str, str, str, str], str]
+    tuple[int, str], tuple[Settings, tuple[str, ...], str]
 ] = {}
 
 # Constant /start payload used after the target-locked group callback. Mini App
@@ -82,7 +82,12 @@ VERIFICATION_KINDS = frozenset(
         VERIFICATION_KIND_PATROL,
     }
 )
-VERIFICATION_PROVIDERS = frozenset({"turnstile", "hcaptcha"})
+# The combined provider requires solving both base challenges in one session.
+COMBINED_VERIFICATION_PROVIDER = "turnstile_hcaptcha"
+_BASE_VERIFICATION_PROVIDERS = ("turnstile", "hcaptcha")
+VERIFICATION_PROVIDERS = frozenset(
+    {*_BASE_VERIFICATION_PROVIDERS, COMBINED_VERIFICATION_PROVIDER}
+)
 VERIFICATION_CALLBACK_PREFIX = "jv"
 VERIFICATION_CALLBACK_START = "v"
 VERIFICATION_CALLBACK_APPROVE = "a"
@@ -107,6 +112,22 @@ def normalize_verification_provider(value: object, *, default: str = "turnstile"
         return provider
     fallback = str(default or "turnstile").strip().lower()
     return fallback if fallback in VERIFICATION_PROVIDERS else "turnstile"
+
+
+def verification_subproviders(
+    provider: object,
+    *,
+    default: str = "turnstile",
+) -> tuple[str, ...]:
+    """Base challenge services the member must solve for a selected provider.
+
+    Base providers map to themselves; the combined provider expands to both
+    base services in the order the member is guided through them.
+    """
+    normalized = normalize_verification_provider(provider, default=default)
+    if normalized == COMBINED_VERIFICATION_PROVIDER:
+        return _BASE_VERIFICATION_PROVIDERS
+    return (normalized,)
 
 
 def verification_deadline_passed(
@@ -212,6 +233,12 @@ def verification_keys_for_provider(
     settings: Settings,
     provider: str,
 ) -> tuple[str, str]:
+    """Site/secret pair for one base challenge service.
+
+    The combined provider has no single key pair; callers handling it must
+    iterate verification_subproviders() instead. An unknown value falls back
+    to Turnstile, matching normalize_verification_provider.
+    """
     if normalize_verification_provider(provider) == "hcaptcha":
         return (
             settings.join_verification_hcaptcha_site_key.strip(),
@@ -248,18 +275,16 @@ def join_verification_policy(
 def _verification_config_fingerprint(
     settings: Settings,
     provider: str | None = None,
-) -> tuple[str, str, str, str]:
+) -> tuple[str, ...]:
     selected_provider = normalize_verification_provider(
         provider,
         default=verification_provider(settings),
     )
-    site_key, secret_key = verification_keys_for_provider(settings, selected_provider)
-    return (
-        selected_provider,
-        site_key,
-        secret_key,
-        settings.join_verification_public_base_url.strip().rstrip("/"),
-    )
+    parts: list[str] = [selected_provider]
+    for subprovider in verification_subproviders(selected_provider):
+        parts.extend(verification_keys_for_provider(settings, subprovider))
+    parts.append(settings.join_verification_public_base_url.strip().rstrip("/"))
+    return tuple(parts)
 
 
 def mark_turnstile_configuration_unavailable(
@@ -268,14 +293,22 @@ def mark_turnstile_configuration_unavailable(
     reason: str,
     provider: str | None = None,
 ) -> None:
-    """Block one provider configuration until its credentials change."""
-    fingerprint = _verification_config_fingerprint(settings, provider)
-    selected_provider = fingerprint[0]
-    _BLOCKED_VERIFICATION_CONFIGS[(id(settings), selected_provider)] = (
-        settings,
-        fingerprint,
-        (reason or f"{selected_provider} 配置不可用").strip(),
+    """Block one provider configuration until its credentials change.
+
+    Blocks are stored per base service; a combined provider blocks each base
+    service it expands to (callers that know which one failed should pass it).
+    """
+    selected_provider = normalize_verification_provider(
+        provider,
+        default=verification_provider(settings),
     )
+    for subprovider in verification_subproviders(selected_provider):
+        fingerprint = _verification_config_fingerprint(settings, subprovider)
+        _BLOCKED_VERIFICATION_CONFIGS[(id(settings), subprovider)] = (
+            settings,
+            fingerprint,
+            (reason or f"{subprovider} 配置不可用").strip(),
+        )
 
 
 def clear_turnstile_configuration_unavailable(
@@ -284,29 +317,41 @@ def clear_turnstile_configuration_unavailable(
     provider: str | None = None,
 ) -> None:
     """Clear a provider block after the same configuration verifies successfully."""
-    fingerprint = _verification_config_fingerprint(settings, provider)
-    selected_provider = fingerprint[0]
-    key = (id(settings), selected_provider)
-    blocked = _BLOCKED_VERIFICATION_CONFIGS.get(key)
-    if blocked is not None and blocked[0] is settings and blocked[1] == fingerprint:
-        _BLOCKED_VERIFICATION_CONFIGS.pop(key, None)
+    selected_provider = normalize_verification_provider(
+        provider,
+        default=verification_provider(settings),
+    )
+    for subprovider in verification_subproviders(selected_provider):
+        fingerprint = _verification_config_fingerprint(settings, subprovider)
+        key = (id(settings), subprovider)
+        blocked = _BLOCKED_VERIFICATION_CONFIGS.get(key)
+        if blocked is not None and blocked[0] is settings and blocked[1] == fingerprint:
+            _BLOCKED_VERIFICATION_CONFIGS.pop(key, None)
 
 
 def turnstile_runtime_configuration_issue(
     settings: Settings,
     provider: str | None = None,
 ) -> str:
-    """Return a provider's runtime block, clearing it after config edits."""
-    fingerprint = _verification_config_fingerprint(settings, provider)
-    selected_provider = fingerprint[0]
-    key = (id(settings), selected_provider)
-    blocked = _BLOCKED_VERIFICATION_CONFIGS.get(key)
-    if blocked is None or blocked[0] is not settings:
-        return ""
-    if blocked[1] != fingerprint:
-        _BLOCKED_VERIFICATION_CONFIGS.pop(key, None)
-        return ""
-    return blocked[2]
+    """Return a provider's runtime block, clearing it after config edits.
+
+    A combined provider reports the first blocked base service it expands to.
+    """
+    selected_provider = normalize_verification_provider(
+        provider,
+        default=verification_provider(settings),
+    )
+    for subprovider in verification_subproviders(selected_provider):
+        fingerprint = _verification_config_fingerprint(settings, subprovider)
+        key = (id(settings), subprovider)
+        blocked = _BLOCKED_VERIFICATION_CONFIGS.get(key)
+        if blocked is None or blocked[0] is not settings:
+            continue
+        if blocked[1] != fingerprint:
+            _BLOCKED_VERIFICATION_CONFIGS.pop(key, None)
+            continue
+        return blocked[2]
+    return ""
 
 _FULL_RESTRICT = ChatPermissions(
     can_send_messages=False,
@@ -352,19 +397,27 @@ def turnstile_verification_configured(
     settings: Settings,
     provider: str | None = None,
 ) -> bool:
-    """Return whether the selected challenge provider has complete config."""
+    """Return whether the selected challenge provider has complete config.
+
+    The combined provider is only configured when every base service it
+    expands to is configured and unblocked.
+    """
     selected_provider = normalize_verification_provider(
         provider,
         default=verification_provider(settings),
     )
-    site_key, secret_key = verification_keys_for_provider(settings, selected_provider)
-    return bool(
-        site_key
-        and secret_key
-        and site_key != secret_key
-        and settings.join_verification_public_base_url.strip()
-        and not turnstile_runtime_configuration_issue(settings, selected_provider)
-    )
+    if not settings.join_verification_public_base_url.strip():
+        return False
+    for subprovider in verification_subproviders(selected_provider):
+        site_key, secret_key = verification_keys_for_provider(settings, subprovider)
+        if (
+            not site_key
+            or not secret_key
+            or site_key == secret_key
+            or turnstile_runtime_configuration_issue(settings, subprovider)
+        ):
+            return False
+    return True
 
 
 def join_verification_ready(
@@ -809,9 +862,16 @@ async def extend_pending_verification_deadlines(
     current = now or now_shanghai_naive()
     stmt = select(JoinVerification)
     if provider is not None:
-        stmt = stmt.where(
-            JoinVerification.provider == normalize_verification_provider(provider)
+        normalized = normalize_verification_provider(provider)
+        # An unavailable base service also stalls combined records that
+        # include it, so those must receive the same deadline extension.
+        affected = sorted(
+            candidate
+            for candidate in VERIFICATION_PROVIDERS
+            if candidate == normalized
+            or normalized in verification_subproviders(candidate)
         )
+        stmt = stmt.where(JoinVerification.provider.in_(affected))
     result = await session.execute(stmt)
     extended = 0
     for record in result.scalars().all():

@@ -251,7 +251,7 @@ class VerificationSettingsConfig(StrictModel):
     enabled: bool = False
     timeout_seconds: int = Field(default=600, ge=60, le=86400)
     check_interval_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
-    provider: Literal["turnstile", "hcaptcha"] = "turnstile"
+    provider: Literal["turnstile", "hcaptcha", "turnstile_hcaptcha"] = "turnstile"
     turnstile_site_key: str = Field(default="", max_length=255)
     turnstile_secret_key: str = Field(default="", max_length=1024)
     hcaptcha_site_key: str = Field(default="", max_length=255)
@@ -502,20 +502,26 @@ class RuntimeConfig(StrictModel):
         apply_prompts: bool = True,
     ) -> None:
         verification = self.verification
-        if verification.provider == "hcaptcha":
-            challenge_label = "hCaptcha"
-            challenge_site_key = verification.hcaptcha_site_key
-            challenge_secret_key = verification.hcaptcha_secret_key
-        else:
-            challenge_label = "Turnstile"
-            challenge_site_key = verification.turnstile_site_key
-            challenge_secret_key = verification.turnstile_secret_key
+        challenge_keys: list[tuple[str, str]] = []
+        if verification.provider in {"turnstile", "turnstile_hcaptcha"}:
+            challenge_keys.extend(
+                (
+                    ("Turnstile Site Key", verification.turnstile_site_key),
+                    ("Turnstile Secret Key", verification.turnstile_secret_key),
+                )
+            )
+        if verification.provider in {"hcaptcha", "turnstile_hcaptcha"}:
+            challenge_keys.extend(
+                (
+                    ("hCaptcha Site Key", verification.hcaptcha_site_key),
+                    ("hCaptcha Secret Key", verification.hcaptcha_secret_key),
+                )
+            )
         if verification.enabled:
             missing = [
                 label
                 for label, value in (
-                    (f"{challenge_label} Site Key", challenge_site_key),
-                    (f"{challenge_label} Secret Key", challenge_secret_key),
+                    *challenge_keys,
                     ("MINIAPP_PUBLIC_BASE_URL", settings.miniapp_public_base_url),
                 )
                 if not str(value or "").strip()
