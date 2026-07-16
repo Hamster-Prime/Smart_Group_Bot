@@ -375,25 +375,28 @@ async def verify_hcaptcha_token(
     if not success:
         token = (hcaptcha_token or "").strip()
         log.info(
-            "hcaptcha siteverify rejected | errors=%s token_len=%s token_shape=%s",
+            "hcaptcha siteverify rejected | errors=%s hostname=%s token_len=%s "
+            "token_shape=%s",
             errors or ["unknown"],
+            data.get("hostname") or "-",
             len(token),
             "p1" if token.startswith("P1_") else "other",
         )
         if token.startswith("P1_") and len(token) > 200 and "invalid-input-response" in errors:
-            # siteverify never validates the secret itself: a token from a
-            # sitekey the secret's account does not own is simply "not found"
-            # and reported as invalid-input-response. A well-formed P1_ solve
-            # token rejected this way therefore usually means the Site Key and
-            # Secret Key come from different hCaptcha accounts (or the secret
-            # was rotated), not that the member failed the challenge.
+            # siteverify reports invalid-input-response for every token it
+            # cannot redeem, with no distinguishing code: a sitekey Domain
+            # allowlist rejecting the embedding host, a secret from a
+            # different account than the sitekey, or a rotated secret all
+            # look identical. A well-formed P1_ solve token rejected this way
+            # means one of those sitekey/secret settings, not a failed
+            # challenge.
             log.warning(
                 "hcaptcha rejected a well-formed solve token as "
                 "invalid-input-response; if real users hit this repeatedly, "
-                "the hCaptcha Secret Key likely belongs to a different "
-                "account than the Site Key (or was rotated) — re-copy the "
-                "account secret (ES_...) from the dashboard that owns the "
-                "site key"
+                "check the sitekey settings in the hCaptcha dashboard: "
+                "Domain allowlisting must include this Mini App's public "
+                "host (or be disabled), and the Secret Key (ES_...) must "
+                "come from the account that owns the Site Key"
             )
     return success, errors
 
