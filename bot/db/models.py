@@ -231,6 +231,8 @@ class JoinVerification(Base):
     kind="join": issued on member join; missing the deadline kicks (the user
     may rejoin and retry). kind="moderation": issued when a message is judged
     violating with low confidence; missing the deadline bans permanently.
+    kind="patrol": issued when the profile patrol flags a member; missing the
+    deadline kicks without banning (the user may rejoin).
 
     No secret token: the Mini App submits Telegram-signed initData, so the
     verified user identity comes from the signature, keyed by user_id here.
@@ -265,6 +267,39 @@ class JoinVerification(Base):
     )
 
 
+class GroupMember(Base):
+    """Known members per group, maintained from joins/leaves and messages.
+
+    The Bot API cannot enumerate chat members, so the patrol scanner walks
+    this roster instead. Rows are upserted on join and on every message
+    (cheap: only when the visible profile changed) and marked left on leave;
+    a stale row is harmless — the scanner skips users who are no longer in
+    the group when Telegram rejects the restriction call.
+    """
+
+    __tablename__ = "group_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    full_name: Mapped[str] = mapped_column(String(255), default="")
+    username: Mapped[str] = mapped_column(String(255), default="")
+    is_bot: Mapped[bool] = mapped_column(Boolean, default=False)
+    left: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Last profile signature (incl. rules fingerprint) that passed the patrol
+    # in THIS group; per-group so multi-group patrols cannot thrash the cache.
+    patrol_hash: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_group_member_group_user", "group_id", "user_id", unique=True),
+    )
+
+
 class UserProfileScreen(Base):
     """Last screened profile signature per user, for on-message re-screening."""
 
@@ -277,6 +312,18 @@ class UserProfileScreen(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class PatrolRun(Base):
+    """Per-group patrol bookkeeping: last completed run and its summary."""
+
+    __tablename__ = "patrol_runs"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    last_violations: Mapped[int] = mapped_column(Integer, default=0)
+    running: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SpeechStyleSample(Base):

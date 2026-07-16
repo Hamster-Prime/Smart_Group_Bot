@@ -41,6 +41,7 @@ from bot.db.models import JoinVerification, UserWarning
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     VERIFICATION_KIND_MODERATION,
+    VERIFICATION_KIND_PATROL,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
@@ -57,6 +58,7 @@ from bot.services.join_verification import (
     verification_deadline_passed,
     verification_keys_for_provider,
     verification_provider,
+    verification_timeout_seconds_for_kind,
 )
 from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.update_delivery import WEBHOOK_MAX_CONCURRENT_UPDATES
@@ -1277,10 +1279,8 @@ class VerifyWebServer:
             restored,
         )
         if not restored:
-            timeout_seconds = (
-                self.settings.moderation.challenge_timeout_seconds
-                if kind == VERIFICATION_KIND_MODERATION
-                else self.settings.join_verification_timeout_seconds
+            timeout_seconds = verification_timeout_seconds_for_kind(
+                self.settings, kind
             )
             async with self.session_factory() as session:
                 await upsert_join_verification(
@@ -1328,6 +1328,27 @@ class VerifyWebServer:
             user_id,
             fingerprint,
         )
+        if kind == VERIFICATION_KIND_PATROL:
+            # Whitelist the passing profile so the next patrol run and the
+            # on-message screening do not immediately re-flag it.
+            from bot.services.patrol import acknowledge_patrol_pass
+
+            try:
+                await acknowledge_patrol_pass(
+                    self.bot,
+                    self.session_factory,
+                    group_id=group_id,
+                    user_id=user_id,
+                    fetch_bio=bool(
+                        getattr(self.settings, "patrol_fetch_bio", True)
+                    ),
+                )
+            except Exception:
+                log.exception(
+                    "patrol pass acknowledgement failed | group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
         await self._announce_pass(
             group_id=group_id,
             user_id=user_id,
@@ -1364,10 +1385,8 @@ class VerifyWebServer:
                 )
                 return
 
-            timeout_seconds = (
-                self.settings.moderation.challenge_timeout_seconds
-                if kind == VERIFICATION_KIND_MODERATION
-                else self.settings.join_verification_timeout_seconds
+            timeout_seconds = verification_timeout_seconds_for_kind(
+                self.settings, kind
             )
             async with self.session_factory() as session:
                 await upsert_join_verification(
@@ -1408,15 +1427,18 @@ class VerifyWebServer:
         restored: bool,
     ) -> None:
         shown = html.escape(display_name or str(user_id))
-        passed_text = (
-            f"✅ <b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
-            if kind == VERIFICATION_KIND_MODERATION
-            else f"✅ <b>{shown}</b> 已通过真人验证，欢迎加入！"
-        )
+        if kind == VERIFICATION_KIND_MODERATION:
+            passed_text = f"✅ <b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
+        elif kind == VERIFICATION_KIND_PATROL:
+            passed_text = f"✅ <b>{shown}</b> 已通过资料巡检质询，发言权限已恢复。"
+        else:
+            passed_text = f"✅ <b>{shown}</b> 已通过真人验证，欢迎加入！"
         text = passed_text + (
             "" if restored else "\n⚠️ 权限恢复失败，请管理员手动解除禁言。"
         )
-        if prompt_message_id:
+        # A patrol prompt is shared by several violators; editing it would
+        # remove the warning and its challenge button for the others.
+        if prompt_message_id and kind != VERIFICATION_KIND_PATROL:
             try:
                 await self.bot.edit_message_text(
                     chat_id=group_id,

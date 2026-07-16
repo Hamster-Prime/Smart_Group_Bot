@@ -61,6 +61,7 @@
     "at_reply_mode",
     "join_verification_enabled",
     "join_verification_provider",
+    "patrol_enabled",
     "tts_mode",
     "proactive_enabled",
     "proactive_task_brief",
@@ -647,6 +648,18 @@
           </div>
           <div class="notice info">${icon("refresh-cw")}<span>默认使用 ${provider === "hcaptcha" ? "hCaptcha" : "Cloudflare Turnstile"}；两套密钥可同时保留并随时切换，群组可单独选择服务。</span></div>
         </section>
+        <section class="settings-section">
+          ${sectionHead("自动巡检", "按时批量复查已知成员的名字和简介是否违反群规；违规者禁言并发起真人质询，通过恢复权限，超时移出群聊（不封禁）。群组页可逐群覆盖开关和手动触发。")}
+          <div class="field-grid three">
+            ${toggle("patrol.enabled", "默认启用自动巡检", "需要已配置真人验证服务；群组管理员可在群组页覆盖")}
+            ${field("patrol.schedule_time", "每日巡检时间", { maxlength: 5, required: true, placeholder: "04:30", hint: "24 小时制 HH:MM（Asia/Shanghai）" })}
+            ${field("patrol.batch_size", "分批大小", { type: "number", min: 10, max: 5000, step: 1, required: true, hint: "每批检查的成员数，默认 500" })}
+            ${field("patrol.batch_pause_seconds", "批间停顿（秒）", { type: "number", min: 0, max: 600, step: 0.5, required: true })}
+            ${field("patrol.challenge_timeout_seconds", "质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "超时未完成质询将被移出群聊（可重新加入）" })}
+            ${field("patrol.check_interval_seconds", "调度检查间隔（秒）", { type: "number", min: 15, max: 3600, step: 1, required: true })}
+            ${toggle("patrol.fetch_bio", "巡检时抓取简介", "逐个调用 getChat 获取简介，更全面但更慢")}
+          </div>
+        </section>
       </div>`;
   }
 
@@ -787,6 +800,7 @@
       join_verification_provider: ["turnstile", "hcaptcha"].includes(settings.join_verification_provider)
         ? settings.join_verification_provider
         : null,
+      patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
       tts_mode: ["off", "on", "always"].includes(settings.tts_mode) ? settings.tts_mode : "off",
       proactive_enabled: settings.proactive_enabled == null ? null : Boolean(settings.proactive_enabled),
       proactive_task_brief: String(settings.proactive_task_brief || ""),
@@ -850,6 +864,18 @@
                 <option value="turnstile"${group.settings.join_verification_provider === "turnstile" ? " selected" : ""}>Cloudflare Turnstile</option>
                 <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
               </select>
+            </div>
+            <div class="field">
+              <label class="field-label" for="group-${attr(group.id)}-patrol-enabled">自动巡检</label>
+              <select id="group-${attr(group.id)}-patrol-enabled" data-group-id="${attr(group.id)}" data-group-key="patrol_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                <option value=""${group.settings.patrol_enabled == null ? " selected" : ""}>继承全局默认</option>
+                <option value="true"${group.settings.patrol_enabled === true ? " selected" : ""}>开启</option>
+                <option value="false"${group.settings.patrol_enabled === false ? " selected" : ""}>关闭</option>
+              </select>
+              <button class="secondary-button patrol-trigger" type="button" data-action="trigger-patrol" data-group-id="${attr(group.id)}"${saving ? " disabled" : ""}>
+                ${icon("radar")}<span>立即巡检</span>
+              </button>
+              <span class="field-hint">巡检时间等参数在「审核验证」页配置</span>
             </div>
             <div class="field">
               <label class="field-label" for="group-${attr(group.id)}-proactive">主动发言</label>
@@ -1663,6 +1689,23 @@
       state.config.prompts[button.dataset.promptKey] = "";
       renderContent();
       updateChrome();
+      return;
+    }
+    if (action === "trigger-patrol") {
+      const groupId = button.dataset.groupId;
+      if (!await askConfirmation(
+        "手动触发巡检",
+        "将立即分批检查该群所有已知成员的名字和简介；违规者会被禁言并要求真人质询。确认开始？",
+      )) return;
+      button.disabled = true;
+      try {
+        await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/patrol`, { method: "POST" });
+        showToast("巡检已开始，将在后台分批执行");
+      } catch (error) {
+        showToast(error.message || "巡检启动失败", "error", 6000);
+      } finally {
+        button.disabled = false;
+      }
       return;
     }
     if (action === "save-group") {

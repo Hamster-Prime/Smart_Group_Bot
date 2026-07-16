@@ -10,6 +10,7 @@ from bot.loader import create_bot, dp
 from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.logging_mw import LoggingMiddleware
+from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.services import memory_holder
 from bot.services.join_verification import (
@@ -20,6 +21,7 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
+from bot.services.patrol import PatrolService, init_patrol_service
 from bot.services.proactive import ProactiveTopicService
 from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
 from bot.services.runtime_config import (
@@ -85,6 +87,8 @@ async def main() -> None:
     # Outer so it also covers matched commands (/help), videos, and empty-text
     # media that the group handler bypasses.
     dp.message.outer_middleware(ProfileScreenEnforcementMiddleware(session_factory))
+    # Roster tracking feeds the profile patrol; outer so every sender is seen.
+    dp.message.outer_middleware(MemberRosterMiddleware(session_factory))
     dp.message.middleware(LoggingMiddleware())
     # No throttle middleware: it silently drops rapid consecutive messages,
     # which breaks inbound batch merging and lets a fast second violating
@@ -131,6 +135,16 @@ async def main() -> None:
         sweeper.run_forever(),
         name="verification-sweeper",
     )
+    patrol = PatrolService(
+        bot=bot,
+        settings=settings,
+        session_factory=session_factory,
+    )
+    init_patrol_service(patrol)
+    patrol_runner = asyncio.create_task(
+        patrol.run_forever(),
+        name="profile-patrol-runner",
+    )
 
     async def apply_runtime_update(_config: RuntimeConfig) -> None:
         llm.reconfigure(
@@ -168,9 +182,11 @@ async def main() -> None:
     except Exception:
         proactive_runner.cancel()
         verification_runner.cancel()
+        patrol_runner.cancel()
         await asyncio.gather(
             proactive_runner,
             verification_runner,
+            patrol_runner,
             return_exceptions=True,
         )
         try:
@@ -226,6 +242,12 @@ async def main() -> None:
         await asyncio.gather(proactive_runner, return_exceptions=True)
         verification_runner.cancel()
         await asyncio.gather(verification_runner, return_exceptions=True)
+        patrol_runner.cancel()
+        await asyncio.gather(patrol_runner, return_exceptions=True)
+        try:
+            await patrol.shutdown()
+        except Exception:
+            log.exception("patrol manual-task shutdown failed")
         try:
             await verify_web.stop()
         except Exception:

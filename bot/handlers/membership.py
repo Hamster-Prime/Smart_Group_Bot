@@ -26,11 +26,13 @@ from bot.services.join_screening import (
     screen_member_profile_verbose,
 )
 from bot.services.join_verification import (
+    PATROL_VERIFY_CALLBACK_DATA,
     VERIFICATION_CALLBACK_APPROVE,
     VERIFICATION_CALLBACK_PREFIX,
     VERIFICATION_CALLBACK_REJECT,
     VERIFICATION_CALLBACK_START,
     VERIFICATION_KIND_MODERATION,
+    VERIFICATION_KIND_PATROL,
     ban_member,
     build_group_prompt_keyboard,
     build_group_prompt_text,
@@ -48,9 +50,11 @@ from bot.services.join_verification import (
     restrict_new_member,
     upsert_join_verification,
     verification_deadline_passed,
+    verification_timeout_seconds_for_kind,
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
+from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.utils.bot_identity import get_bot_identity
 from bot.utils.timezone import now_shanghai_naive
 
@@ -179,13 +183,18 @@ async def _enforce_pending_moderation_challenge(
     *,
     display_name: str,
 ) -> None:
-    """Keep an unresolved message challenge intact across leave/rejoin."""
+    """Keep an unresolved message/patrol challenge intact across leave/rejoin.
+
+    Moderation challenges ban on expiry; patrol challenges kick without
+    banning, matching the sweeper's consequences for each kind.
+    """
     if is_super_admin_user_id(record.user_id, settings):
         await delete_join_verification(session, record.group_id, record.user_id)
         await session.commit()
         await restore_member_permissions(event.bot, record.group_id, record.user_id)
         return
 
+    is_patrol = record.kind == VERIFICATION_KIND_PATROL
     now = now_shanghai_naive()
     if verification_deadline_passed(record.deadline_at, now=now):
         claimed = await claim_join_verification(
@@ -197,6 +206,24 @@ async def _enforce_pending_moderation_challenge(
             expired=True,
         )
         if not claimed:
+            return
+        if is_patrol:
+            await session.commit()
+            enforced = await kick_member(event.bot, record.group_id, record.user_id)
+            if not enforced:
+                await upsert_join_verification(
+                    session,
+                    group_id=record.group_id,
+                    user_id=record.user_id,
+                    deadline_at=_verification_retry_deadline(settings, record.kind),
+                    kind=record.kind,
+                    provider=record.provider,
+                    reason=record.reason,
+                    display_name=display_name or record.display_name,
+                    prompt_message_id=record.prompt_message_id,
+                )
+                await session.commit()
+                await restrict_new_member(event.bot, record.group_id, record.user_id)
             return
         ban_state = await mark_group_banned(
             session,
@@ -242,12 +269,13 @@ async def _enforce_pending_moderation_challenge(
     if not restricted:
         return
     current = await get_join_verification(session, record.group_id, record.user_id)
-    if current is None or current.kind != VERIFICATION_KIND_MODERATION:
+    if current is None or current.kind != record.kind:
         # Verification completed while the rejoin restriction was in flight.
         await restore_member_permissions(event.bot, record.group_id, record.user_id)
         return
     log.info(
-        "moderation challenge re-enforced after rejoin | group=%s user=%s",
+        "%s challenge re-enforced after rejoin | group=%s user=%s",
+        record.kind,
         record.group_id,
         record.user_id,
     )
@@ -269,12 +297,9 @@ def _verification_retry_deadline(
     settings: Settings,
     kind: str,
 ):
-    timeout_seconds = (
-        settings.moderation.challenge_timeout_seconds
-        if kind == VERIFICATION_KIND_MODERATION
-        else settings.join_verification_timeout_seconds
+    return now_shanghai_naive() + timedelta(
+        seconds=verification_timeout_seconds_for_kind(settings, kind)
     )
-    return now_shanghai_naive() + timedelta(seconds=max(60, int(timeout_seconds)))
 
 
 async def _requeue_verification(
@@ -537,6 +562,46 @@ async def on_verification_callback(
     )
 
 
+@router.callback_query(F.data == PATROL_VERIFY_CALLBACK_DATA)
+async def on_patrol_verify_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """The shared patrol-warning button: only mentioned violators may use it.
+
+    The callback data carries no user id (many violators share one message),
+    so authorization is the existence of the clicker's own pending patrol
+    record in this group.
+    """
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    if message is None or chat is None or chat.type not in ("group", "supergroup"):
+        await callback.answer("质询入口已失效", show_alert=True)
+        return
+    if operator is None:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return
+
+    record = await get_join_verification(session, int(chat.id), int(operator.id))
+    if (
+        record is None
+        or record.kind != VERIFICATION_KIND_PATROL
+        or verification_deadline_passed(record.deadline_at)
+    ):
+        await callback.answer("仅被点名的违规成员可点击", show_alert=True)
+        return
+
+    username = await _callback_bot_username(callback)
+    if not username:
+        await callback.answer("质询入口暂时不可用，请稍后重试", show_alert=True)
+        return
+    await callback.answer(
+        url=build_private_deep_link(username, int(record.group_id)),
+    )
+
+
 @router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def on_member_join(
     event: ChatMemberUpdated, session: AsyncSession, settings: Settings
@@ -552,9 +617,23 @@ async def on_member_join(
     user = event.new_chat_member.user
     if user.is_bot:
         return
-    if is_super_admin_user_id(user.id, settings):
-        return
     if not await is_group_authorized(session, event.chat.id):
+        return
+    try:
+        await track_group_member(
+            session,
+            event.chat.id,
+            user_id=user.id,
+            full_name=user.full_name or "",
+            username=user.username or "",
+            is_bot=False,
+        )
+        # Commit now: the rest of this handler awaits network calls (bio
+        # fetch, screening LLM) and must not hold the SQLite write lock.
+        await session.commit()
+    except Exception:
+        log.debug("join roster tracking failed | group=%s user=%s", event.chat.id, user.id, exc_info=True)
+    if is_super_admin_user_id(user.id, settings):
         return
 
     group_id = event.chat.id
@@ -572,7 +651,10 @@ async def on_member_join(
         return
 
     pending = await get_join_verification(session, group_id, user_id)
-    if pending is not None and pending.kind == VERIFICATION_KIND_MODERATION:
+    if pending is not None and pending.kind in (
+        VERIFICATION_KIND_MODERATION,
+        VERIFICATION_KIND_PATROL,
+    ):
         await _enforce_pending_moderation_challenge(
             event,
             session,
@@ -675,12 +757,17 @@ async def on_member_leave(
     user = getattr(getattr(event, "new_chat_member", None), "user", None)
     if user is None:
         return
+    try:
+        await mark_group_member_left(session, event.chat.id, user.id)
+    except Exception:
+        log.debug("leave roster tracking failed | group=%s user=%s", event.chat.id, user.id, exc_info=True)
     record = await get_join_verification(session, event.chat.id, user.id)
     if record is None:
         return
-    if record.kind == VERIFICATION_KIND_MODERATION:
+    if record.kind in (VERIFICATION_KIND_MODERATION, VERIFICATION_KIND_PATROL):
         log.info(
-            "moderation challenge retained | reason=left group=%s user=%s",
+            "%s challenge retained | reason=left group=%s user=%s",
+            record.kind,
             event.chat.id,
             user.id,
         )

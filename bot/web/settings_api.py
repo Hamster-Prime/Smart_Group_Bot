@@ -39,7 +39,10 @@ from bot.services.join_verification import (
     join_verification_policy,
     restore_member_permissions,
     turnstile_verification_configured,
+    verification_provider,
+    verification_service_ready,
 )
+from bot.services.patrol import get_patrol_service, patrol_policy
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
     RuntimeConfigEncryptionError,
@@ -62,6 +65,7 @@ _GROUP_SETTING_FIELDS = {
     "tts_mode",
     "join_verification_enabled",
     "join_verification_provider",
+    "patrol_enabled",
     "proactive_enabled",
     "proactive_task_brief",
     "mimic_target_user_id",
@@ -91,6 +95,7 @@ class _GroupSettingsUpdate(BaseModel):
     # None clears the group override and inherits the global default.
     join_verification_enabled: StrictBool | None = None
     join_verification_provider: Literal["turnstile", "hcaptcha"] | None = None
+    patrol_enabled: StrictBool | None = None
     proactive_enabled: StrictBool | None = None
     proactive_task_brief: str | None = Field(default=None, max_length=240)
     mimic_target_user_id: StrictInt | None = Field(default=None, ge=0)
@@ -224,6 +229,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
             in {"turnstile", "hcaptcha"}
             else None
         ),
+        "patrol_enabled": (
+            _setting_bool(settings_data, "patrol_enabled")
+            if settings_data.get("patrol_enabled") is not None
+            else None
+        ),
         # None means the group inherits the global default.
         "proactive_enabled": (
             bool(proactive_state.get("enabled"))
@@ -336,6 +346,7 @@ def _apply_group_settings(
             "proactive_enabled",
             "join_verification_enabled",
             "join_verification_provider",
+            "patrol_enabled",
         }
         and getattr(update, name) is None
     )
@@ -383,6 +394,19 @@ def _apply_group_settings(
                 "verification_provider_unavailable",
                 "该验证服务尚未由最高管理员完成配置，暂时不能为本群启用。",
             )
+    if "patrol_enabled" in fields:
+        if update.patrol_enabled is None:
+            updated.pop("patrol_enabled", None)
+        else:
+            if update.patrol_enabled and not verification_service_ready(
+                settings, verification_provider(settings)
+            ):
+                raise _APIError(
+                    400,
+                    "verification_provider_unavailable",
+                    "真人质询验证服务未配置，暂时不能启用巡检。",
+                )
+            updated["patrol_enabled"] = bool(update.patrol_enabled)
     if "proactive_enabled" in fields:
         inherited = update.proactive_enabled is None
         updated = set_cooldown_task_enabled(
@@ -1257,6 +1281,43 @@ def register_settings_routes(
     async def delete_reply_mute(request: web.Request, user: Any) -> web.Response:
         return await _delete_user_row(request, user, ReplyMute)
 
+    @any_admin
+    async def get_patrol_status(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        service = get_patrol_service()
+        if service is None:
+            raise _APIError(503, "patrol_unavailable", "巡检服务尚未启动。")
+        status = await service.status(group_id)
+        async with session_factory() as session:
+            group = await session.get(Group, group_id)
+            group_settings = dict(group.settings or {}) if group else {}
+        status["enabled"] = patrol_policy(settings, group_settings)
+        return _success_response({"patrol": status})
+
+    @any_admin
+    async def trigger_patrol(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        service = get_patrol_service()
+        if service is None:
+            raise _APIError(503, "patrol_unavailable", "巡检服务尚未启动。")
+        if not settings.moderation.enabled:
+            raise _APIError(400, "moderation_disabled", "内容审核已关闭，无法巡检。")
+        if not verification_service_ready(settings, verification_provider(settings)):
+            raise _APIError(
+                400,
+                "verification_provider_unavailable",
+                "真人质询验证服务未配置，暂时不能巡检。",
+            )
+        # Fire-and-forget: a full scan takes far longer than the Mini App's
+        # 10-minute initData window allows a request to wait.
+        result = service.start_manual_patrol(group_id)
+        if not result.get("started"):
+            raise _APIError(409, "patrol_already_running", "该群巡检正在进行中。")
+        log.info("manual patrol triggered | group=%s operator=%s", group_id, user.id)
+        return _success_response({"patrol": result})
+
     app.router.add_get("/api/v1/session", get_session)
     app.router.add_get("/api/v1/settings", get_settings)
     app.router.add_put("/api/v1/settings", put_settings)
@@ -1290,6 +1351,8 @@ def register_settings_routes(
     app.router.add_get("/api/v1/groups/{id}/reply-mutes", list_reply_mutes)
     app.router.add_post("/api/v1/groups/{id}/reply-mutes", create_reply_mute)
     app.router.add_delete("/api/v1/groups/{id}/reply-mutes/{user_id}", delete_reply_mute)
+    app.router.add_get("/api/v1/groups/{id}/patrol", get_patrol_status)
+    app.router.add_post("/api/v1/groups/{id}/patrol", trigger_patrol)
 
 
 __all__ = ["register_settings_routes"]

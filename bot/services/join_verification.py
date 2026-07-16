@@ -74,6 +74,14 @@ START_VERIFY_PAYLOAD = "verify"
 CHALLENGE_SUBMIT_GRACE = timedelta(seconds=60)
 VERIFICATION_KIND_JOIN = "join"
 VERIFICATION_KIND_MODERATION = "moderation"
+VERIFICATION_KIND_PATROL = "patrol"
+VERIFICATION_KINDS = frozenset(
+    {
+        VERIFICATION_KIND_JOIN,
+        VERIFICATION_KIND_MODERATION,
+        VERIFICATION_KIND_PATROL,
+    }
+)
 VERIFICATION_PROVIDERS = frozenset({"turnstile", "hcaptcha"})
 VERIFICATION_CALLBACK_PREFIX = "jv"
 VERIFICATION_CALLBACK_START = "v"
@@ -86,6 +94,9 @@ VERIFICATION_CALLBACK_ACTIONS = frozenset(
         VERIFICATION_CALLBACK_REJECT,
     }
 )
+# The patrol warning message is shared by many violators, so its button has no
+# embedded user id: the handler resolves the clicker's own pending record.
+PATROL_VERIFY_CALLBACK_DATA = "ptv"
 
 _GroupBanState = tuple[int, bool] | None
 
@@ -166,6 +177,20 @@ async def rollback_group_ban(
         .values(is_banned=False)
     )
     return int(result.rowcount or 0) == 1
+
+
+def verification_timeout_seconds_for_kind(settings: Settings, kind: str) -> int:
+    """Challenge window for a verification kind, min-clamped to 60 seconds."""
+    if kind == VERIFICATION_KIND_MODERATION:
+        raw = settings.moderation.challenge_timeout_seconds
+    elif kind == VERIFICATION_KIND_PATROL:
+        raw = (
+            getattr(settings, "patrol_challenge_timeout_seconds", 0)
+            or settings.join_verification_timeout_seconds
+        )
+    else:
+        raw = settings.join_verification_timeout_seconds
+    return max(60, int(raw))
 
 
 def verification_provider(
@@ -527,6 +552,14 @@ def build_private_challenge_text(
             "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
             f"请在今天 {deadline} 前完成，超时将被封禁。"
         )
+    if kind == VERIFICATION_KIND_PATROL:
+        safe_reason = html.escape((reason or "资料疑似命中群规").strip())
+        return (
+            "<b>资料巡检真人质询</b>\n"
+            f"待核验原因：{safe_reason}\n"
+            "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
+            f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。"
+        )
     return (
         "<b>入群真人验证</b>\n"
         "点击下方按钮，在弹出的窗口中完成人机验证，通过后即可在群内发言。\n\n"
@@ -646,7 +679,7 @@ async def upsert_join_verification(
     A rejoin while a stale record exists must issue a fresh deadline, so this
     always resets every mutable field.
     """
-    if kind not in {VERIFICATION_KIND_JOIN, VERIFICATION_KIND_MODERATION}:
+    if kind not in VERIFICATION_KINDS:
         raise ValueError(f"unsupported verification kind: {kind}")
     selected_provider = normalize_verification_provider(provider)
     await session.flush()
@@ -782,12 +815,8 @@ async def extend_pending_verification_deadlines(
     result = await session.execute(stmt)
     extended = 0
     for record in result.scalars().all():
-        timeout_seconds = (
-            settings.moderation.challenge_timeout_seconds
-            if record.kind == VERIFICATION_KIND_MODERATION
-            else settings.join_verification_timeout_seconds
-        )
-        target = current + timedelta(seconds=max(60, int(timeout_seconds)))
+        timeout_seconds = verification_timeout_seconds_for_kind(settings, record.kind)
+        target = current + timedelta(seconds=timeout_seconds)
         if record.deadline_at < target:
             record.deadline_at = target
             extended += 1
@@ -1106,14 +1135,7 @@ async def maybe_send_private_verification(
     # hCaptcha image challenge cannot be raced by the sweeper mid-solve.
     # Capped at 3x the timeout since issuance: repeated /start must not defer
     # the kick/ban forever.
-    timeout_seconds = max(
-        60,
-        int(
-            settings.moderation.challenge_timeout_seconds
-            if record.kind == VERIFICATION_KIND_MODERATION
-            else settings.join_verification_timeout_seconds
-        ),
-    )
+    timeout_seconds = verification_timeout_seconds_for_kind(settings, record.kind)
     now = now_shanghai_naive()
     lifetime_cap = (record.created_at or now) + timedelta(seconds=3 * timeout_seconds)
     fresh_deadline = min(now + timedelta(seconds=timeout_seconds), lifetime_cap)
@@ -1231,14 +1253,10 @@ class JoinVerificationSweeper:
                     and not verification_service_ready(self.settings, record_provider)
                 ):
                     if self.settings is not None:
-                        timeout_seconds = (
-                            self.settings.moderation.challenge_timeout_seconds
-                            if record.kind == VERIFICATION_KIND_MODERATION
-                            else self.settings.join_verification_timeout_seconds
+                        timeout_seconds = verification_timeout_seconds_for_kind(
+                            self.settings, record.kind
                         )
-                        record.deadline_at = now + timedelta(
-                            seconds=max(60, int(timeout_seconds))
-                        )
+                        record.deadline_at = now + timedelta(seconds=timeout_seconds)
                     continue
                 won = await claim_join_verification(
                     session,
@@ -1312,7 +1330,9 @@ class JoinVerificationSweeper:
                         )
                         if rolled_back and not (ban_state and ban_state[1]):
                             timeout_seconds = (
-                                self.settings.moderation.challenge_timeout_seconds
+                                verification_timeout_seconds_for_kind(
+                                    self.settings, record.kind
+                                )
                                 if self.settings is not None
                                 else 300
                             )
@@ -1343,7 +1363,9 @@ class JoinVerificationSweeper:
                 if not enforced:
                     async with self.session_factory() as session:
                         timeout_seconds = (
-                            self.settings.join_verification_timeout_seconds
+                            verification_timeout_seconds_for_kind(
+                                self.settings, record.kind
+                            )
                             if self.settings is not None
                             else 300
                         )
@@ -1367,11 +1389,34 @@ class JoinVerificationSweeper:
                         record.user_id,
                     )
                     continue
-                text = "⏰ 验证超时，已移出群聊。可重新加入再次验证。"
+                if record.kind == VERIFICATION_KIND_PATROL:
+                    text = "⏰ 资料巡检质询超时，已移出群聊（未封禁，可重新加入）。"
+                else:
+                    text = "⏰ 验证超时，已移出群聊。可重新加入再次验证。"
             await self._finalize_prompt(record, text)
         return len(claimed)
 
     async def _finalize_prompt(self, record: JoinVerification, text: str) -> None:
+        # A patrol prompt is shared by several violators; editing it would
+        # remove the warning and its challenge button for the others, so post
+        # the outcome as a separate message instead.
+        if record.kind == VERIFICATION_KIND_PATROL:
+            shown = html.escape(
+                (record.display_name or "").strip() or str(record.user_id)
+            )
+            try:
+                await self.bot.send_message(
+                    record.group_id,
+                    f"<b>{shown}</b>：{text}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                log.debug(
+                    "patrol timeout notice failed | group=%s user=%s",
+                    record.group_id,
+                    record.user_id,
+                )
+            return
         message_id = int(record.prompt_message_id or 0)
         if not message_id:
             return

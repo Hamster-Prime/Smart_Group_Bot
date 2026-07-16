@@ -272,6 +272,15 @@ class Settings(BaseSettings):
     join_verification_listen_host: str = "0.0.0.0"
     join_verification_listen_port: int = 8480
 
+    # 资料自动巡检：按名单批量复查所有已知成员的名字/简介。
+    patrol_enabled: bool = False
+    patrol_schedule_time: str = "04:30"
+    patrol_batch_size: int = 500
+    patrol_batch_pause_seconds: float = 5.0
+    patrol_fetch_bio: bool = True
+    patrol_challenge_timeout_seconds: int = 600
+    patrol_check_interval_seconds: float = 60.0
+
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
 

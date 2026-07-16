@@ -1145,6 +1145,11 @@ button:disabled {
   min-height: 74px;
 }
 
+.group-settings-grid .patrol-trigger {
+  margin-top: 6px;
+  align-self: flex-start;
+}
+
 .group-save-state {
   color: var(--warning);
   font-size: 11px;

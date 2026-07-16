@@ -221,6 +221,32 @@ class ModerationSettingsConfig(StrictModel):
     bot_screening_message_count: int = Field(default=5, ge=1, le=100)
 
 
+class PatrolSettingsConfig(StrictModel):
+    """Daily profile patrol over the known-member roster."""
+
+    enabled: bool = False
+    schedule_time: str = Field(default="04:30", max_length=5)
+    batch_size: int = Field(default=500, ge=10, le=5000)
+    batch_pause_seconds: float = Field(default=5.0, ge=0.0, le=600.0, allow_inf_nan=False)
+    fetch_bio: bool = True
+    challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
+    check_interval_seconds: float = Field(default=60.0, ge=15.0, le=3600.0, allow_inf_nan=False)
+
+    @field_validator("schedule_time", mode="before")
+    @classmethod
+    def _validate_schedule_time(cls, value: object) -> str:
+        text = str(value or "").strip()
+        parts = text.split(":")
+        if len(parts) == 2:
+            try:
+                hour, minute = int(parts[0]), int(parts[1])
+            except ValueError:
+                hour = minute = -1
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return f"{hour:02d}:{minute:02d}"
+        raise ValueError("巡检时间必须是 HH:MM 格式（例如 04:30）")
+
+
 class VerificationSettingsConfig(StrictModel):
     enabled: bool = False
     timeout_seconds: int = Field(default=600, ge=60, le=86400)
@@ -362,6 +388,7 @@ class RuntimeConfig(StrictModel):
     models: ModelSettingsConfig = Field(default_factory=ModelSettingsConfig)
     bot: BotBehaviorConfig = Field(default_factory=BotBehaviorConfig)
     moderation: ModerationSettingsConfig = Field(default_factory=ModerationSettingsConfig)
+    patrol: PatrolSettingsConfig = Field(default_factory=PatrolSettingsConfig)
     verification: VerificationSettingsConfig = Field(default_factory=VerificationSettingsConfig)
     tts: TTSSettingsConfig = Field(default_factory=TTSSettingsConfig)
     music: MusicSettingsConfig = Field(default_factory=MusicSettingsConfig)
@@ -608,6 +635,13 @@ class RuntimeConfig(StrictModel):
         settings.max_output_tokens = bot.max_output_tokens
 
         settings.moderation = ModerationConfig(**self.moderation.model_dump())
+        settings.patrol_enabled = self.patrol.enabled
+        settings.patrol_schedule_time = self.patrol.schedule_time
+        settings.patrol_batch_size = self.patrol.batch_size
+        settings.patrol_batch_pause_seconds = self.patrol.batch_pause_seconds
+        settings.patrol_fetch_bio = self.patrol.fetch_bio
+        settings.patrol_challenge_timeout_seconds = self.patrol.challenge_timeout_seconds
+        settings.patrol_check_interval_seconds = self.patrol.check_interval_seconds
         settings.join_verification_enabled = self.verification.enabled
         settings.join_verification_timeout_seconds = self.verification.timeout_seconds
         settings.join_verification_check_interval_seconds = self.verification.check_interval_seconds
@@ -1175,6 +1209,15 @@ def build_legacy_runtime_config(
             proactive_retry_minutes=settings.bot_proactive_retry_minutes,
         ),
         moderation=ModerationSettingsConfig(**settings.moderation.model_dump()),
+        patrol=PatrolSettingsConfig(
+            enabled=settings.patrol_enabled,
+            schedule_time=settings.patrol_schedule_time,
+            batch_size=settings.patrol_batch_size,
+            batch_pause_seconds=settings.patrol_batch_pause_seconds,
+            fetch_bio=settings.patrol_fetch_bio,
+            challenge_timeout_seconds=settings.patrol_challenge_timeout_seconds,
+            check_interval_seconds=settings.patrol_check_interval_seconds,
+        ),
         verification=VerificationSettingsConfig(
             enabled=settings.join_verification_enabled,
             timeout_seconds=settings.join_verification_timeout_seconds,

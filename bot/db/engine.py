@@ -264,6 +264,12 @@ async def init_db(
                 "reason TEXT NOT NULL DEFAULT ''",
             )
             await _sqlite_migrate_join_verification_autoincrement(conn)
+            await _sqlite_ensure_column(
+                conn,
+                "group_members",
+                "patrol_hash",
+                "patrol_hash VARCHAR(64) NOT NULL DEFAULT ''",
+            )
 
     session_factory = async_sessionmaker(
         engine,
