@@ -22,6 +22,7 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
+from bot.services.raid_guard import RaidGuardService, init_raid_guard_service
 from bot.services.proactive import ProactiveTopicService
 from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
 from bot.services.runtime_config import (
@@ -144,6 +145,15 @@ async def main() -> None:
     patrol_runner = asyncio.create_task(
         patrol.run_forever(),
         name="profile-patrol-runner",
+    )
+    # Event-driven (no background loop): joins feed the detector from the
+    # membership handler; challenge deadlines ride the shared sweeper.
+    init_raid_guard_service(
+        RaidGuardService(
+            bot=bot,
+            settings=settings,
+            session_factory=session_factory,
+        )
     )
 
     async def apply_runtime_update(_config: RuntimeConfig) -> None:

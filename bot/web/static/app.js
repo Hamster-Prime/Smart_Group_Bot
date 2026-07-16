@@ -62,6 +62,12 @@
     "join_verification_enabled",
     "join_verification_provider",
     "patrol_enabled",
+    "raid_guard_enabled",
+    "raid_guard_join_threshold",
+    "raid_guard_window_seconds",
+    "raid_guard_lockdown_seconds",
+    "raid_guard_lookback_seconds",
+    "raid_guard_challenge_timeout_seconds",
     "tts_mode",
     "proactive_enabled",
     "proactive_task_brief",
@@ -69,6 +75,14 @@
     "mimic_target_user_name",
     "mimic_profile_text",
   ]);
+
+  const RAID_GUARD_GROUP_INT_FIELDS = [
+    { key: "raid_guard_join_threshold", label: "触发阈值（人数）", min: 2, max: 1000 },
+    { key: "raid_guard_window_seconds", label: "检测窗口（秒）", min: 5, max: 3600 },
+    { key: "raid_guard_lockdown_seconds", label: "锁定时长（秒）", min: 60, max: 86400 },
+    { key: "raid_guard_lookback_seconds", label: "追溯窗口（秒）", min: 0, max: 86400 },
+    { key: "raid_guard_challenge_timeout_seconds", label: "质询超时（秒）", min: 60, max: 86400 },
+  ];
 
   const state = {
     session: null,
@@ -661,6 +675,17 @@
             ${toggle("patrol.fetch_bio", "巡检时抓取简介", "逐个调用 getChat 获取简介，更全面但更慢")}
           </div>
         </section>
+        <section class="settings-section">
+          ${sectionHead("爆破防护", "短时间内大量成员加入时自动锁群：锁定期内任何新加入的成员都被移出（不封禁），并只发送一条防护提示；同时追溯锁定前进群的成员，统一 @ 要求真人质询，超时未通过将被移出（可重新加入）。群组页可逐群覆盖开关和各项阈值。")}
+          <div class="field-grid three">
+            ${toggle("raid_guard.enabled", "默认启用爆破防护", "需要已配置真人验证服务用于追溯质询；群组管理员可在群组页覆盖")}
+            ${field("raid_guard.join_threshold", "触发阈值（人数）", { type: "number", min: 2, max: 1000, step: 1, required: true, hint: "检测窗口内加入人数达到该值即触发锁定" })}
+            ${field("raid_guard.window_seconds", "检测窗口（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true })}
+            ${field("raid_guard.lockdown_seconds", "锁定时长（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "锁定期内的新加入会刷新锁定时间" })}
+            ${field("raid_guard.lookback_seconds", "追溯窗口（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "触发前该时间段内进群的成员将被要求真人质询" })}
+            ${field("raid_guard.challenge_timeout_seconds", "质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "超时未完成质询将被移出群聊（可重新加入）" })}
+          </div>
+        </section>
       </div>`;
   }
 
@@ -802,6 +827,11 @@
         ? settings.join_verification_provider
         : null,
       patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
+      raid_guard_enabled: settings.raid_guard_enabled == null ? null : Boolean(settings.raid_guard_enabled),
+      ...Object.fromEntries(RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => [
+        key,
+        settings[key] == null ? null : Number(settings[key]),
+      ])),
       tts_mode: ["off", "on", "always"].includes(settings.tts_mode) ? settings.tts_mode : "off",
       proactive_enabled: settings.proactive_enabled == null ? null : Boolean(settings.proactive_enabled),
       proactive_task_brief: String(settings.proactive_task_brief || ""),
@@ -879,6 +909,20 @@
               </button>
               <span class="field-hint">巡检时间等参数在「审核验证」页配置</span>
             </div>
+            <div class="field">
+              <label class="field-label" for="group-${attr(group.id)}-raid-guard-enabled">爆破防护</label>
+              <select id="group-${attr(group.id)}-raid-guard-enabled" data-group-id="${attr(group.id)}" data-group-key="raid_guard_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                <option value=""${group.settings.raid_guard_enabled == null ? " selected" : ""}>继承全局默认</option>
+                <option value="true"${group.settings.raid_guard_enabled === true ? " selected" : ""}>开启</option>
+                <option value="false"${group.settings.raid_guard_enabled === false ? " selected" : ""}>关闭</option>
+              </select>
+              <span class="field-hint">锁群阈值与超时可在下方逐群覆盖</span>
+            </div>
+            ${RAID_GUARD_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
+            <div class="field">
+              <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">爆破防护 · ${escapeHtml(label)}</label>
+              <input id="group-${attr(group.id)}-${key.replaceAll("_", "-")}" type="number" min="${min}" max="${max}" step="1" data-group-id="${attr(group.id)}" data-group-key="${key}" data-kind="nullable-int" value="${attr(group.settings[key] == null ? "" : group.settings[key])}" placeholder="继承全局默认"${saving ? " disabled" : ""}>
+            </div>`).join("")}
             <div class="field">
               <label class="field-label" for="group-${attr(group.id)}-proactive">主动发言</label>
               <select id="group-${attr(group.id)}-proactive" data-group-id="${attr(group.id)}" data-group-key="proactive_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
@@ -1500,6 +1544,7 @@
       return target.value === "true";
     }
     if (kind === "nullable-string") return target.value === "" ? null : target.value;
+    if (kind === "nullable-int") return target.value === "" ? null : Number(target.value);
     if (kind === "lower-string") return target.value.trim().toLowerCase();
     return target.value;
   }

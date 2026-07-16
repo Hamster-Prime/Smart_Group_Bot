@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import Settings
 from bot.db.models import JoinVerification, UserWarning
 from bot.services.authz import is_super_admin_user_id
+from bot.services.join_screening import is_globally_banned
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -75,12 +76,19 @@ CHALLENGE_SUBMIT_GRACE = timedelta(seconds=60)
 VERIFICATION_KIND_JOIN = "join"
 VERIFICATION_KIND_MODERATION = "moderation"
 VERIFICATION_KIND_PATROL = "patrol"
+VERIFICATION_KIND_RAID = "raid"
 VERIFICATION_KINDS = frozenset(
     {
         VERIFICATION_KIND_JOIN,
         VERIFICATION_KIND_MODERATION,
         VERIFICATION_KIND_PATROL,
+        VERIFICATION_KIND_RAID,
     }
+)
+# Kinds whose prompt message is shared by several members: the outcome of one
+# member must never edit the prompt away from the others.
+SHARED_PROMPT_VERIFICATION_KINDS = frozenset(
+    {VERIFICATION_KIND_PATROL, VERIFICATION_KIND_RAID}
 )
 # The combined provider requires solving both base challenges in one session.
 COMBINED_VERIFICATION_PROVIDER = "turnstile_hcaptcha"
@@ -102,6 +110,8 @@ VERIFICATION_CALLBACK_ACTIONS = frozenset(
 # The patrol warning message is shared by many violators, so its button has no
 # embedded user id: the handler resolves the clicker's own pending record.
 PATROL_VERIFY_CALLBACK_DATA = "ptv"
+# Same shared-button scheme for the raid-guard retro challenge message.
+RAID_VERIFY_CALLBACK_DATA = "rgv"
 
 _GroupBanState = tuple[int, bool] | None
 
@@ -200,13 +210,36 @@ async def rollback_group_ban(
     return int(result.rowcount or 0) == 1
 
 
-def verification_timeout_seconds_for_kind(settings: Settings, kind: str) -> int:
-    """Challenge window for a verification kind, min-clamped to 60 seconds."""
+def verification_timeout_seconds_for_kind(
+    settings: Settings,
+    kind: str,
+    group_settings: dict | None = None,
+) -> int:
+    """Challenge window for a verification kind, min-clamped to 60 seconds.
+
+    Raid challenges honor the per-group raid_guard_challenge_timeout_seconds
+    override when the caller can supply the group's settings dict; the other
+    kinds only have global timeouts.
+    """
     if kind == VERIFICATION_KIND_MODERATION:
         raw = settings.moderation.challenge_timeout_seconds
     elif kind == VERIFICATION_KIND_PATROL:
         raw = (
             getattr(settings, "patrol_challenge_timeout_seconds", 0)
+            or settings.join_verification_timeout_seconds
+        )
+    elif kind == VERIFICATION_KIND_RAID:
+        raw = 0
+        if isinstance(group_settings, dict):
+            override = group_settings.get("raid_guard_challenge_timeout_seconds")
+            if not isinstance(override, bool):
+                try:
+                    raw = max(0, int(override))
+                except (TypeError, ValueError):
+                    raw = 0
+        raw = (
+            raw
+            or getattr(settings, "raid_guard_challenge_timeout_seconds", 0)
             or settings.join_verification_timeout_seconds
         )
     else:
@@ -609,6 +642,14 @@ def build_private_challenge_text(
         safe_reason = html.escape((reason or "资料疑似命中群规").strip())
         return (
             "<b>资料巡检真人质询</b>\n"
+            f"待核验原因：{safe_reason}\n"
+            "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
+            f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。"
+        )
+    if kind == VERIFICATION_KIND_RAID:
+        safe_reason = html.escape((reason or "群组正遭遇批量加入").strip())
+        return (
+            "<b>爆破防护真人质询</b>\n"
             f"待核验原因：{safe_reason}\n"
             "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
             f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。"
@@ -1195,7 +1236,16 @@ async def maybe_send_private_verification(
     # hCaptcha image challenge cannot be raced by the sweeper mid-solve.
     # Capped at 3x the timeout since issuance: repeated /start must not defer
     # the kick/ban forever.
-    timeout_seconds = verification_timeout_seconds_for_kind(settings, record.kind)
+    record_group_settings: dict | None = None
+    if record.kind == VERIFICATION_KIND_RAID:
+        from bot.db.models import Group
+
+        group_row = await session.get(Group, int(record.group_id))
+        if group_row is not None and isinstance(group_row.settings, dict):
+            record_group_settings = group_row.settings
+    timeout_seconds = verification_timeout_seconds_for_kind(
+        settings, record.kind, record_group_settings
+    )
     now = now_shanghai_naive()
     lifetime_cap = (record.created_at or now) + timedelta(seconds=3 * timeout_seconds)
     fresh_deadline = min(now + timedelta(seconds=timeout_seconds), lifetime_cap)
@@ -1328,6 +1378,13 @@ class JoinVerificationSweeper:
                 )
                 if not won:
                     continue
+                if record.kind != VERIFICATION_KIND_MODERATION and (
+                    await is_globally_banned(session, record.user_id)
+                ):
+                    # Screening banned this member after the challenge was
+                    # issued; a kick (ban + unban) would lift that ban, so
+                    # consume the record without enforcement.
+                    continue
                 protected_owner = bool(
                     record.kind == VERIFICATION_KIND_MODERATION
                     and self.settings is not None
@@ -1451,16 +1508,18 @@ class JoinVerificationSweeper:
                     continue
                 if record.kind == VERIFICATION_KIND_PATROL:
                     text = "⏰ 资料巡检质询超时，已移出群聊（未封禁，可重新加入）。"
+                elif record.kind == VERIFICATION_KIND_RAID:
+                    text = "⏰ 爆破防护质询超时，已移出群聊（未封禁，可重新加入）。"
                 else:
                     text = "⏰ 验证超时，已移出群聊。可重新加入再次验证。"
             await self._finalize_prompt(record, text)
         return len(claimed)
 
     async def _finalize_prompt(self, record: JoinVerification, text: str) -> None:
-        # A patrol prompt is shared by several violators; editing it would
+        # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others, so post
         # the outcome as a separate message instead.
-        if record.kind == VERIFICATION_KIND_PATROL:
+        if record.kind in SHARED_PROMPT_VERIFICATION_KINDS:
             shown = html.escape(
                 (record.display_name or "").strip() or str(record.user_id)
             )

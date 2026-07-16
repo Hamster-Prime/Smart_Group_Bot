@@ -283,6 +283,14 @@ class Settings(BaseSettings):
     patrol_challenge_timeout_seconds: int = 600
     patrol_check_interval_seconds: float = 60.0
 
+    # 爆破防护：短窗口内大量入群自动锁群，并追溯质询爆破前入群的成员。
+    raid_guard_enabled: bool = False
+    raid_guard_join_threshold: int = 8
+    raid_guard_window_seconds: int = 60
+    raid_guard_lockdown_seconds: int = 600
+    raid_guard_lookback_seconds: int = 300
+    raid_guard_challenge_timeout_seconds: int = 600
+
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()
 

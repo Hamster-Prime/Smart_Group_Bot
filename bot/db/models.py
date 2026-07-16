@@ -232,7 +232,9 @@ class JoinVerification(Base):
     may rejoin and retry). kind="moderation": issued when a message is judged
     violating with low confidence; missing the deadline bans permanently.
     kind="patrol": issued when the profile patrol flags a member; missing the
-    deadline kicks without banning (the user may rejoin).
+    deadline kicks without banning (the user may rejoin). kind="raid": issued
+    by the raid guard's retroactive sweep after a join-flood lockdown; same
+    kick-without-ban timeout semantics as patrol.
 
     No secret token: the Mini App submits Telegram-signed initData, so the
     verified user identity comes from the signature, keyed by user_id here.

@@ -27,12 +27,15 @@ from bot.services.join_screening import (
 )
 from bot.services.join_verification import (
     PATROL_VERIFY_CALLBACK_DATA,
+    RAID_VERIFY_CALLBACK_DATA,
     VERIFICATION_CALLBACK_APPROVE,
     VERIFICATION_CALLBACK_PREFIX,
     VERIFICATION_CALLBACK_REJECT,
     VERIFICATION_CALLBACK_START,
+    VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_PATROL,
+    VERIFICATION_KIND_RAID,
     ban_member,
     build_group_prompt_keyboard,
     build_group_prompt_text,
@@ -55,6 +58,7 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
+from bot.services.raid_guard import get_raid_guard_service
 from bot.utils.bot_identity import get_bot_identity
 from bot.utils.timezone import now_shanghai_naive
 
@@ -137,6 +141,22 @@ async def _start_join_verification(
     had access to.
     """
     group_id = event.chat.id
+    # This handler awaited network calls (bio fetch, screening LLM) since its
+    # last record check; a raid retro sweep may have issued a challenge for
+    # this member meanwhile. Upserting kind="join" would clobber it and break
+    # its shared challenge button, so the existing record wins. Commit first:
+    # the raid record was written by another session and a stale SQLite
+    # snapshot from before those awaits would hide it.
+    await session.commit()
+    existing = await get_join_verification(session, group_id, user_id)
+    if existing is not None and existing.kind != VERIFICATION_KIND_JOIN:
+        log.info(
+            "join verification skipped | reason=pending_%s group=%s user=%s",
+            existing.kind,
+            group_id,
+            user_id,
+        )
+        return
     if not await restrict_new_member(event.bot, group_id, user_id):
         return
 
@@ -183,10 +203,10 @@ async def _enforce_pending_moderation_challenge(
     *,
     display_name: str,
 ) -> None:
-    """Keep an unresolved message/patrol challenge intact across leave/rejoin.
+    """Keep an unresolved message/patrol/raid challenge intact across leave/rejoin.
 
-    Moderation challenges ban on expiry; patrol challenges kick without
-    banning, matching the sweeper's consequences for each kind.
+    Moderation challenges ban on expiry; patrol and raid challenges kick
+    without banning, matching the sweeper's consequences for each kind.
     """
     if is_super_admin_user_id(record.user_id, settings):
         await delete_join_verification(session, record.group_id, record.user_id)
@@ -194,7 +214,7 @@ async def _enforce_pending_moderation_challenge(
         await restore_member_permissions(event.bot, record.group_id, record.user_id)
         return
 
-    is_patrol = record.kind == VERIFICATION_KIND_PATROL
+    is_patrol = record.kind in (VERIFICATION_KIND_PATROL, VERIFICATION_KIND_RAID)
     now = now_shanghai_naive()
     if verification_deadline_passed(record.deadline_at, now=now):
         claimed = await claim_join_verification(
@@ -562,17 +582,17 @@ async def on_verification_callback(
     )
 
 
-@router.callback_query(F.data == PATROL_VERIFY_CALLBACK_DATA)
-async def on_patrol_verify_callback(
+async def _handle_shared_challenge_callback(
     callback: CallbackQuery,
     session: AsyncSession,
-    settings: Settings,
+    *,
+    kind: str,
 ) -> None:
-    """The shared patrol-warning button: only mentioned violators may use it.
+    """Shared-button challenge prompts: only mentioned members may use them.
 
-    The callback data carries no user id (many violators share one message),
-    so authorization is the existence of the clicker's own pending patrol
-    record in this group.
+    The callback data carries no user id (many members share one message),
+    so authorization is the existence of the clicker's own pending record of
+    the matching kind in this group.
     """
     message = callback.message
     chat = getattr(message, "chat", None)
@@ -587,7 +607,7 @@ async def on_patrol_verify_callback(
     record = await get_join_verification(session, int(chat.id), int(operator.id))
     if (
         record is None
-        or record.kind != VERIFICATION_KIND_PATROL
+        or record.kind != kind
         or verification_deadline_passed(record.deadline_at)
     ):
         await callback.answer("仅被点名的违规成员可点击", show_alert=True)
@@ -599,6 +619,28 @@ async def on_patrol_verify_callback(
         return
     await callback.answer(
         url=build_private_deep_link(username, int(record.group_id)),
+    )
+
+
+@router.callback_query(F.data == PATROL_VERIFY_CALLBACK_DATA)
+async def on_patrol_verify_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    await _handle_shared_challenge_callback(
+        callback, session, kind=VERIFICATION_KIND_PATROL
+    )
+
+
+@router.callback_query(F.data == RAID_VERIFY_CALLBACK_DATA)
+async def on_raid_verify_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    await _handle_shared_challenge_callback(
+        callback, session, kind=VERIFICATION_KIND_RAID
     )
 
 
@@ -650,10 +692,28 @@ async def on_member_join(
         )
         return
 
+    raid_guard = get_raid_guard_service()
+    if raid_guard is not None:
+        group = await session.get(Group, group_id)
+        group_settings = dict(group.settings or {}) if group else None
+        # End the read transaction before the Telegram calls inside the
+        # raid-guard path so concurrent writers are not blocked.
+        await session.commit()
+        consumed = await raid_guard.handle_join(
+            group_id=group_id,
+            user_id=user_id,
+            full_name=user.full_name or "",
+            username=user.username or "",
+            group_settings=group_settings,
+        )
+        if consumed:
+            return
+
     pending = await get_join_verification(session, group_id, user_id)
     if pending is not None and pending.kind in (
         VERIFICATION_KIND_MODERATION,
         VERIFICATION_KIND_PATROL,
+        VERIFICATION_KIND_RAID,
     ):
         await _enforce_pending_moderation_challenge(
             event,
@@ -764,7 +824,11 @@ async def on_member_leave(
     record = await get_join_verification(session, event.chat.id, user.id)
     if record is None:
         return
-    if record.kind in (VERIFICATION_KIND_MODERATION, VERIFICATION_KIND_PATROL):
+    if record.kind in (
+        VERIFICATION_KIND_MODERATION,
+        VERIFICATION_KIND_PATROL,
+        VERIFICATION_KIND_RAID,
+    ):
         log.info(
             "%s challenge retained | reason=left group=%s user=%s",
             record.kind,

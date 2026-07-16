@@ -41,8 +41,10 @@ from bot.db.models import JoinVerification, UserWarning
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
+    SHARED_PROMPT_VERIFICATION_KINDS,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_PATROL,
+    VERIFICATION_KIND_RAID,
     VERIFICATION_PROVIDERS,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
@@ -1580,14 +1582,16 @@ class VerifyWebServer:
             passed_text = f"✅ <b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
         elif kind == VERIFICATION_KIND_PATROL:
             passed_text = f"✅ <b>{shown}</b> 已通过资料巡检质询，发言权限已恢复。"
+        elif kind == VERIFICATION_KIND_RAID:
+            passed_text = f"✅ <b>{shown}</b> 已通过爆破防护质询，发言权限已恢复。"
         else:
             passed_text = f"✅ <b>{shown}</b> 已通过真人验证，欢迎加入！"
         text = passed_text + (
             "" if restored else "\n⚠️ 权限恢复失败，请管理员手动解除禁言。"
         )
-        # A patrol prompt is shared by several violators; editing it would
+        # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others.
-        if prompt_message_id and kind != VERIFICATION_KIND_PATROL:
+        if prompt_message_id and kind not in SHARED_PROMPT_VERIFICATION_KINDS:
             try:
                 await self.bot.edit_message_text(
                     chat_id=group_id,

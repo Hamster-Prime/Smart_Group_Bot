@@ -247,6 +247,17 @@ class PatrolSettingsConfig(StrictModel):
         raise ValueError("巡检时间必须是 HH:MM 格式（例如 04:30）")
 
 
+class RaidGuardSettingsConfig(StrictModel):
+    """Join-flood lockdown with retroactive human challenges."""
+
+    enabled: bool = False
+    join_threshold: int = Field(default=8, ge=2, le=1000)
+    window_seconds: int = Field(default=60, ge=5, le=3600)
+    lockdown_seconds: int = Field(default=600, ge=60, le=86400)
+    lookback_seconds: int = Field(default=300, ge=0, le=86400)
+    challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
+
+
 class VerificationSettingsConfig(StrictModel):
     enabled: bool = False
     timeout_seconds: int = Field(default=600, ge=60, le=86400)
@@ -389,6 +400,7 @@ class RuntimeConfig(StrictModel):
     bot: BotBehaviorConfig = Field(default_factory=BotBehaviorConfig)
     moderation: ModerationSettingsConfig = Field(default_factory=ModerationSettingsConfig)
     patrol: PatrolSettingsConfig = Field(default_factory=PatrolSettingsConfig)
+    raid_guard: RaidGuardSettingsConfig = Field(default_factory=RaidGuardSettingsConfig)
     verification: VerificationSettingsConfig = Field(default_factory=VerificationSettingsConfig)
     tts: TTSSettingsConfig = Field(default_factory=TTSSettingsConfig)
     music: MusicSettingsConfig = Field(default_factory=MusicSettingsConfig)
@@ -648,6 +660,14 @@ class RuntimeConfig(StrictModel):
         settings.patrol_fetch_bio = self.patrol.fetch_bio
         settings.patrol_challenge_timeout_seconds = self.patrol.challenge_timeout_seconds
         settings.patrol_check_interval_seconds = self.patrol.check_interval_seconds
+        settings.raid_guard_enabled = self.raid_guard.enabled
+        settings.raid_guard_join_threshold = self.raid_guard.join_threshold
+        settings.raid_guard_window_seconds = self.raid_guard.window_seconds
+        settings.raid_guard_lockdown_seconds = self.raid_guard.lockdown_seconds
+        settings.raid_guard_lookback_seconds = self.raid_guard.lookback_seconds
+        settings.raid_guard_challenge_timeout_seconds = (
+            self.raid_guard.challenge_timeout_seconds
+        )
         settings.join_verification_enabled = self.verification.enabled
         settings.join_verification_timeout_seconds = self.verification.timeout_seconds
         settings.join_verification_check_interval_seconds = self.verification.check_interval_seconds
@@ -1223,6 +1243,14 @@ def build_legacy_runtime_config(
             fetch_bio=settings.patrol_fetch_bio,
             challenge_timeout_seconds=settings.patrol_challenge_timeout_seconds,
             check_interval_seconds=settings.patrol_check_interval_seconds,
+        ),
+        raid_guard=RaidGuardSettingsConfig(
+            enabled=settings.raid_guard_enabled,
+            join_threshold=settings.raid_guard_join_threshold,
+            window_seconds=settings.raid_guard_window_seconds,
+            lockdown_seconds=settings.raid_guard_lockdown_seconds,
+            lookback_seconds=settings.raid_guard_lookback_seconds,
+            challenge_timeout_seconds=settings.raid_guard_challenge_timeout_seconds,
         ),
         verification=VerificationSettingsConfig(
             enabled=settings.join_verification_enabled,

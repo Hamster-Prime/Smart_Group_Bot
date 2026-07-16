@@ -66,11 +66,25 @@ _GROUP_SETTING_FIELDS = {
     "join_verification_enabled",
     "join_verification_provider",
     "patrol_enabled",
+    "raid_guard_enabled",
+    "raid_guard_join_threshold",
+    "raid_guard_window_seconds",
+    "raid_guard_lockdown_seconds",
+    "raid_guard_lookback_seconds",
+    "raid_guard_challenge_timeout_seconds",
     "proactive_enabled",
     "proactive_task_brief",
     "mimic_target_user_id",
     "mimic_target_user_name",
     "mimic_profile_text",
+}
+# Per-group raid-guard numeric overrides: key -> (min, max); null = inherit.
+_RAID_GUARD_GROUP_INT_FIELDS = {
+    "raid_guard_join_threshold": (2, 1000),
+    "raid_guard_window_seconds": (5, 3600),
+    "raid_guard_lockdown_seconds": (60, 86400),
+    "raid_guard_lookback_seconds": (0, 86400),
+    "raid_guard_challenge_timeout_seconds": (60, 86400),
 }
 _SCHEDULED_TASKS_KEY = "scheduled_tasks"
 _COOLDOWN_TASK_KEY = "cooldown_topic"
@@ -98,6 +112,18 @@ class _GroupSettingsUpdate(BaseModel):
         Literal["turnstile", "hcaptcha", "turnstile_hcaptcha"] | None
     ) = None
     patrol_enabled: StrictBool | None = None
+    raid_guard_enabled: StrictBool | None = None
+    raid_guard_join_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
+    raid_guard_window_seconds: StrictInt | None = Field(default=None, ge=5, le=3600)
+    raid_guard_lockdown_seconds: StrictInt | None = Field(
+        default=None, ge=60, le=86400
+    )
+    raid_guard_lookback_seconds: StrictInt | None = Field(
+        default=None, ge=0, le=86400
+    )
+    raid_guard_challenge_timeout_seconds: StrictInt | None = Field(
+        default=None, ge=60, le=86400
+    )
     proactive_enabled: StrictBool | None = None
     proactive_task_brief: str | None = Field(default=None, max_length=240)
     mimic_target_user_id: StrictInt | None = Field(default=None, ge=0)
@@ -212,6 +238,16 @@ def _setting_bool(settings_data: dict[str, Any], key: str) -> bool:
     return bool(value)
 
 
+def _setting_int(settings_data: dict[str, Any], key: str) -> int | None:
+    value = settings_data.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
     proactive_state = get_cooldown_task_state(settings_data)
     style_state = get_style_state(settings_data)
@@ -236,6 +272,15 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
             if settings_data.get("patrol_enabled") is not None
             else None
         ),
+        "raid_guard_enabled": (
+            _setting_bool(settings_data, "raid_guard_enabled")
+            if settings_data.get("raid_guard_enabled") is not None
+            else None
+        ),
+        **{
+            key: _setting_int(settings_data, key)
+            for key in _RAID_GUARD_GROUP_INT_FIELDS
+        },
         # None means the group inherits the global default.
         "proactive_enabled": (
             bool(proactive_state.get("enabled"))
@@ -349,6 +394,8 @@ def _apply_group_settings(
             "join_verification_enabled",
             "join_verification_provider",
             "patrol_enabled",
+            "raid_guard_enabled",
+            *_RAID_GUARD_GROUP_INT_FIELDS,
         }
         and getattr(update, name) is None
     )
@@ -409,6 +456,27 @@ def _apply_group_settings(
                     "真人质询验证服务未配置，暂时不能启用巡检。",
                 )
             updated["patrol_enabled"] = bool(update.patrol_enabled)
+    if "raid_guard_enabled" in fields:
+        if update.raid_guard_enabled is None:
+            updated.pop("raid_guard_enabled", None)
+        else:
+            if update.raid_guard_enabled and not verification_service_ready(
+                settings, verification_provider(settings)
+            ):
+                raise _APIError(
+                    400,
+                    "verification_provider_unavailable",
+                    "真人质询验证服务未配置，暂时不能启用爆破防护。",
+                )
+            updated["raid_guard_enabled"] = bool(update.raid_guard_enabled)
+    for key in _RAID_GUARD_GROUP_INT_FIELDS:
+        if key not in fields:
+            continue
+        value = getattr(update, key)
+        if value is None:
+            updated.pop(key, None)
+        else:
+            updated[key] = int(value)
     if "proactive_enabled" in fields:
         inherited = update.proactive_enabled is None
         updated = set_cooldown_task_enabled(
