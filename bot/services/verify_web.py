@@ -380,6 +380,21 @@ async def verify_hcaptcha_token(
             len(token),
             "p1" if token.startswith("P1_") else "other",
         )
+        if token.startswith("P1_") and len(token) > 200 and "invalid-input-response" in errors:
+            # siteverify never validates the secret itself: a token from a
+            # sitekey the secret's account does not own is simply "not found"
+            # and reported as invalid-input-response. A well-formed P1_ solve
+            # token rejected this way therefore usually means the Site Key and
+            # Secret Key come from different hCaptcha accounts (or the secret
+            # was rotated), not that the member failed the challenge.
+            log.warning(
+                "hcaptcha rejected a well-formed solve token as "
+                "invalid-input-response; if real users hit this repeatedly, "
+                "the hCaptcha Secret Key likely belongs to a different "
+                "account than the Site Key (or was rotated) — re-copy the "
+                "account secret (ES_...) from the dashboard that owns the "
+                "site key"
+            )
     return success, errors
 
 
