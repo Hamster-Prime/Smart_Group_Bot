@@ -295,19 +295,57 @@ class Settings(BaseSettings):
     moderation: ModerationConfig = ModerationConfig()
 
 
-def _build_litellm_model(provider: str, model: str) -> str:
+# Common vendor names people type that map onto litellm's native provider ids.
+_PROVIDER_ALIASES = {
+    "google": "gemini",
+    "claude": "anthropic",
+    "minimaxi": "minimax",
+    "kimi": "moonshot",
+    "moonshotai": "moonshot",
+    "doubao": "volcengine",
+    "ark": "volcengine",
+    "qwen": "dashscope",
+    "alibaba": "dashscope",
+    "grok": "xai",
+}
+
+
+def _canonical_provider(provider: str) -> str:
+    normalized = (provider or "").strip().lower()
+    return _PROVIDER_ALIASES.get(normalized, normalized)
+
+
+def _litellm_supports_provider(provider: str) -> bool:
+    try:
+        import litellm
+
+        known = {str(getattr(item, "value", item)) for item in litellm.provider_list}
+    except Exception:
+        return True
+    return provider in known
+
+
+def _build_litellm_model(provider: str, model: str, *, api_base: str | None = None) -> str:
     """Build LiteLLM model string from provider + model name.
 
     Most native LiteLLM providers, including `anthropic`, use `<provider>/<model>`.
-    OpenAI-compatible gateways are normalized to the `openai/<model>` prefix.
+    OpenAI-compatible gateways — explicit (`openai_compatible`) or implied by a
+    provider name litellm has no native adapter for while a custom api_base is
+    configured — are normalized to the `openai/<model>` prefix.
     """
-    provider_norm = (provider or "").strip().lower()
+    provider_norm = _canonical_provider(provider)
     model_norm = (model or "").strip()
     if not model_norm:
         return model_norm
     if "/" in model_norm:
         return model_norm
     if provider_norm == "openai_compatible":
+        return f"openai/{model_norm}"
+    if (
+        provider_norm
+        and str(api_base or "").strip()
+        and not _litellm_supports_provider(provider_norm)
+    ):
         return f"openai/{model_norm}"
     if provider_norm:
         return f"{provider_norm}/{model_norm}"
@@ -406,7 +444,7 @@ def _infer_provider_profile_from_api_base(
     provider: str,
     raw_api_base: str | None,
 ) -> tuple[str, str | None, Literal["chat_completions", "responses"] | None, str | None]:
-    provider_norm = (provider or "").strip().lower()
+    provider_norm = _canonical_provider(provider)
     api_base = _normalize_api_base(raw_api_base)
     if not api_base:
         return provider_norm, None, None, None
@@ -548,7 +586,7 @@ def _build_chat_config(
     effort = _normalize_reasoning_effort(reasoning_effort)
     profile = _get_profile(profiles, provider_name)
     cfg = ModelConfig(
-        model=_build_litellm_model(profile.provider, model_name),
+        model=_build_litellm_model(profile.provider, model_name, api_base=profile.api_base),
         provider=profile.provider,
         api_key=profile.api_key,
         api_base=profile.api_base,
@@ -569,7 +607,11 @@ def _build_chat_config(
         fb_profile = _get_profile(profiles, fb_provider_name)
         cfg.fallbacks.append(
             ChatEndpointConfig(
-                model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
+                model=_build_litellm_model(
+                    fb_profile.provider,
+                    fb_model_name or model_name,
+                    api_base=fb_profile.api_base,
+                ),
                 provider=fb_profile.provider,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
@@ -606,7 +648,7 @@ def _build_embed_config(
 
     profile = _get_profile(profiles, provider_name)
     cfg = EmbedConfig(
-        model=_build_litellm_model(profile.provider, model_name),
+        model=_build_litellm_model(profile.provider, model_name, api_base=profile.api_base),
         provider=profile.provider,
         api_key=profile.api_key,
         api_base=profile.api_base,
@@ -622,7 +664,11 @@ def _build_embed_config(
         fb_profile = _get_profile(profiles, fb_provider_name)
         cfg.fallbacks.append(
             EmbedEndpointConfig(
-                model=_build_litellm_model(fb_profile.provider, fb_model_name or model_name),
+                model=_build_litellm_model(
+                    fb_profile.provider,
+                    fb_model_name or model_name,
+                    api_base=fb_profile.api_base,
+                ),
                 provider=fb_profile.provider,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,

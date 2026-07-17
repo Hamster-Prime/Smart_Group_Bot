@@ -581,6 +581,8 @@
       ${pageHead("模型路由", "管理 API 供应商、任务角色和失败回退顺序。")}
       <datalist id="provider-types">
         <option value="gemini"></option><option value="openai"></option><option value="anthropic"></option><option value="openrouter"></option>
+        <option value="openai_compatible"></option><option value="minimax"></option><option value="deepseek"></option><option value="moonshot"></option>
+        <option value="dashscope"></option><option value="volcengine"></option><option value="xai"></option><option value="mistral"></option><option value="groq"></option>
       </datalist>
       <div class="section-stack">
         <section class="settings-section">

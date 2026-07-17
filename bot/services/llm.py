@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
@@ -19,13 +20,40 @@ _PROVIDER_CREDENTIAL_ENV_KEYS = {
     "openai": ("OPENAI_API_KEY", "OPENAI_ADMIN_KEY"),
     "anthropic": ("ANTHROPIC_API_KEY",),
     "openrouter": ("OPENROUTER_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "moonshot": ("MOONSHOT_API_KEY",),
+    "dashscope": ("DASHSCOPE_API_KEY",),
+    "volcengine": ("VOLCENGINE_API_KEY", "ARK_API_KEY"),
+    "xai": ("XAI_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "groq": ("GROQ_API_KEY",),
 }
 _PROVIDER_OFFICIAL_HOSTS = {
     "gemini": {"generativelanguage.googleapis.com"},
     "openai": {"api.openai.com"},
     "anthropic": {"api.anthropic.com"},
     "openrouter": {"openrouter.ai"},
+    "minimax": {"api.minimaxi.com", "api.minimax.io", "api.minimaxi.chat"},
+    "deepseek": {"api.deepseek.com"},
+    "moonshot": {"api.moonshot.cn", "api.moonshot.ai"},
+    "dashscope": {"dashscope.aliyuncs.com"},
+    "volcengine": {"ark.cn-beijing.volces.com"},
+    "xai": {"api.x.ai"},
+    "mistral": {"api.mistral.ai"},
+    "groq": {"api.groq.com"},
 }
+
+# Reasoning models behind OpenAI-compatible gateways (MiniMax M3, GLM, ...)
+# often inline `<think>...</think>` into message content instead of returning
+# a separate reasoning_content field. Keep the tag set aligned with
+# bot/utils/telegram.py so both layers agree on what counts as internal markup.
+_REASONING_TAG = r"(?:think|analysis|reasoning|scratchpad)"
+_REASONING_BLOCK_RE = re.compile(
+    rf"(?is)<\s*{_REASONING_TAG}[\w:-]*[^>]*>[\s\S]*?</\s*{_REASONING_TAG}[\w:-]*\s*>"
+)
+_REASONING_OPEN_TAG_RE = re.compile(rf"(?is)<\s*{_REASONING_TAG}[\w:-]*[^>]*>")
+_REASONING_CLOSE_TAG_RE = re.compile(rf"(?is)</\s*{_REASONING_TAG}[\w:-]*\s*>")
 
 # Disable extra LiteLLM debug logs.
 litellm.suppress_debug_info = True
@@ -88,6 +116,20 @@ class LLMService:
             return None
 
         provider_norm = str(provider or "").strip().lower()
+        if not provider_norm:
+            provider_norm = str(model or "").partition("/")[0].strip().lower()
+
+        if provider_norm == "anthropic":
+            normalized_base = base.rstrip("/")
+            lower_base = normalized_base.lower()
+            if lower_base.endswith("/messages"):
+                return normalized_base
+            if lower_base.endswith("/v1"):
+                # litellm's anthropic handler appends /v1/messages itself;
+                # keeping /v1 here produces /v1/v1/messages.
+                return normalized_base[: -len("/v1")]
+            return normalized_base
+
         if provider_norm != "gemini":
             return base
 
@@ -112,6 +154,7 @@ class LLMService:
         cfg: ChatEndpointConfig,
         *,
         stream: bool | None = None,
+        exclude_params: frozenset[str] | set[str] = frozenset(),
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": cfg.model,
@@ -137,6 +180,8 @@ class LLMService:
         )
         if resolved_api_base:
             kwargs["api_base"] = resolved_api_base
+        for name in exclude_params:
+            kwargs.pop(name, None)
         return kwargs
 
     @classmethod
@@ -145,6 +190,7 @@ class LLMService:
         cfg: ChatEndpointConfig,
         *,
         stream: bool | None = None,
+        exclude_params: frozenset[str] | set[str] = frozenset(),
     ) -> dict[str, Any]:
         model = str(cfg.model or "").strip()
         provider = str(getattr(cfg, "provider", "") or "").strip().lower()
@@ -172,6 +218,14 @@ class LLMService:
         )
         if resolved_api_base:
             kwargs["api_base"] = resolved_api_base
+        responses_param_names = {
+            "temperature": "temperature",
+            "max_tokens": "max_output_tokens",
+            "reasoning_effort": "reasoning",
+            "top_p": "top_p",
+        }
+        for name in exclude_params:
+            kwargs.pop(responses_param_names.get(name, name), None)
         return kwargs
 
     @classmethod
@@ -258,10 +312,38 @@ class LLMService:
         return f"{provider} provider has no API key"
 
     @staticmethod
+    def _strip_inline_reasoning(text: str) -> str:
+        """Remove inline reasoning markup that some providers leave in content.
+
+        MiniMax M3/M2.7, GLM and other reasoning models served through
+        OpenAI-compatible gateways emit `<think>...</think>` (or an unclosed
+        `<think>` when max_tokens cuts the response) inside message content.
+        Downstream decision/moderation parsers expect clean text.
+        """
+        if not text or "<" not in text:
+            return text
+        cleaned = _REASONING_BLOCK_RE.sub("", text)
+        open_match = _REASONING_OPEN_TAG_RE.search(cleaned)
+        if open_match:
+            remainder = cleaned[open_match.end():]
+            close_match = _REASONING_CLOSE_TAG_RE.search(remainder)
+            if close_match:
+                cleaned = (
+                    cleaned[: open_match.start()]
+                    + remainder[close_match.end():]
+                )
+            else:
+                # Truncated reasoning with no closing tag: everything after the
+                # opening tag is internal monologue, not the answer.
+                cleaned = cleaned[: open_match.start()]
+        cleaned = _REASONING_CLOSE_TAG_RE.sub("", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
     def _normalize_content_text(content: Any) -> str:
         """Normalize text across providers that return different structures."""
         if isinstance(content, str):
-            return content
+            return LLMService._strip_inline_reasoning(content)
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
@@ -281,7 +363,7 @@ class LLMService:
                     if refusal:
                         parts.append(refusal)
                     continue
-            return "\n".join(parts)
+            return LLMService._strip_inline_reasoning("\n".join(parts))
         return str(content or "")
 
     @staticmethod
@@ -648,6 +730,28 @@ class LLMService:
     @staticmethod
     def _should_stream_upstream(label: str, cfg: ChatEndpointConfig) -> bool:
         return bool(getattr(cfg, "stream", False))
+
+    # Request params a provider may reject; matched against error text so the
+    # request can be retried without the offending param instead of failing
+    # the whole candidate (e.g. kimi-k3: "invalid temperature: only 1 is
+    # allowed for this model").
+    _DROPPABLE_PARAMS = ("temperature", "max_tokens", "reasoning_effort", "top_p")
+
+    @classmethod
+    def _unsupported_param_from_error(cls, exc: Exception) -> str:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None and int(status_code) != 400:
+            return ""
+        message = str(exc or "").lower()
+        if not any(
+            marker in message
+            for marker in ("invalid", "not support", "unsupported", "not allowed", "unknown parameter")
+        ):
+            return ""
+        for param in cls._DROPPABLE_PARAMS:
+            if param in message:
+                return param
+        return ""
 
     async def _consume_chat_stream(self, stream_resp: Any) -> Any:
         content_parts: dict[tuple[int, int], str] = {}
@@ -1223,6 +1327,38 @@ class LLMService:
 
         return items
 
+    @classmethod
+    def _tools_to_responses_format(cls, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flatten Chat-Completions tool definitions for the Responses API.
+
+        The Responses API expects name/description/parameters at the top level
+        of each function tool; the nested {"function": {...}} shape yields
+        "Missing required parameter: 'tools[0].name'".
+        """
+        converted: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                converted.append(tool)
+                continue
+            function = tool.get("function")
+            if str(tool.get("type", "") or "").strip().lower() == "function" and isinstance(function, dict):
+                flat: dict[str, Any] = {
+                    "type": "function",
+                    "name": str(function.get("name", "") or ""),
+                }
+                description = function.get("description")
+                if description:
+                    flat["description"] = description
+                parameters = function.get("parameters")
+                if parameters is not None:
+                    flat["parameters"] = parameters
+                if function.get("strict") is not None:
+                    flat["strict"] = function["strict"]
+                converted.append(flat)
+                continue
+            converted.append(tool)
+        return converted
+
     def _responses_sync_request(
         self,
         *,
@@ -1231,14 +1367,15 @@ class LLMService:
         stream: bool = False,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
+        exclude_params: frozenset[str] | set[str] = frozenset(),
     ) -> Any:
         responses_fn = getattr(litellm, "responses", None)
         if responses_fn is None:
             raise RuntimeError("installed litellm does not support responses(); please upgrade litellm")
 
-        kwargs = self._build_responses_kwargs(cfg, stream=stream)
+        kwargs = self._build_responses_kwargs(cfg, stream=stream, exclude_params=exclude_params)
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = self._tools_to_responses_format(tools)
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
 
@@ -1305,9 +1442,12 @@ class LLMService:
             )
             return None
 
-        for attempt in range(1, total_attempts + 1):
+        excluded_params: set[str] = set()
+        attempt = 0
+        while attempt < total_attempts:
+            attempt += 1
             stream = self._should_stream_upstream(label, cfg)
-            kwargs = self._build_chat_kwargs(cfg, stream=stream)
+            kwargs = self._build_chat_kwargs(cfg, stream=stream, exclude_params=excluded_params)
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
             prompt_usage = self.prompt_usage_text(
                 messages,
@@ -1338,6 +1478,7 @@ class LLMService:
                             stream=stream,
                             tools=tools,
                             tool_choice=tool_choice,
+                            exclude_params=set(excluded_params),
                         ),
                         timeout_sec=timeout_sec,
                     )
@@ -1432,6 +1573,17 @@ class LLMService:
                     timeout_sec,
                 )
             except Exception as exc:
+                dropped_param = self._unsupported_param_from_error(exc)
+                if dropped_param and dropped_param not in excluded_params:
+                    excluded_params.add(dropped_param)
+                    attempt -= 1
+                    log.warning(
+                        "LLM unsupported param | stage=%s | model=%s | param=%s | retrying_without_param",
+                        label_cn,
+                        cfg.model,
+                        dropped_param,
+                    )
+                    continue
                 if attempt < total_attempts:
                     log.warning(
                         "LLM failure | stage=%s | model=%s | attempt=%d/%d | error=%s | retrying_same_model",

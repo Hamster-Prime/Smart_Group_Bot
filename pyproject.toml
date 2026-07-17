@@ -15,6 +15,10 @@ dependencies = [
     "cryptography>=41.0",
     "ddgs>=9.0",
     "regex>=2024.4.16",
+    # litellm >=1.92 imports its proxy/responses stack (fastapi, orjson) even
+    # for plain SDK usage with tools or the Responses API.
+    "fastapi>=0.110",
+    "orjson>=3.9",
 ]
 
 [build-system]
