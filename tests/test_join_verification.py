@@ -1034,6 +1034,43 @@ class VerificationCallbackTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 944))
 
+    async def test_admin_approve_notice_honors_moderation_auto_delete(self) -> None:
+        from unittest.mock import patch
+
+        await self._add_record(user_id=945, message_id=845)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_APPROVE,
+            target_user_id=945,
+            operator_id=11,
+            message_id=845,
+        )
+        edited = SimpleNamespace(message_id=845)
+        callback.bot.edit_message_text = AsyncMock(return_value=edited)
+        settings = _settings()
+        settings.bot.auto_delete_seconds = 15
+        settings.bot.auto_delete_categories = ["moderation"]
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.restore_member_permissions",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.schedule_message_auto_delete"
+            ) as schedule_mock,
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback, session=session, settings=settings
+                )
+
+        callback.bot.edit_message_text.assert_awaited_once()
+        schedule_mock.assert_called_once_with(edited, 15)
+
     async def test_admin_approve_preserves_record_when_user_is_banned(self) -> None:
         await self._add_record(user_id=945, message_id=845)
         await self._add_record(user_id=946, message_id=846)
@@ -1628,6 +1665,47 @@ class SweeperTests(_DbTestCase):
             )
             self.assertIsNotNone(moderation_ban)
             self.assertTrue(moderation_ban.is_banned)
+
+    async def test_join_timeout_notice_shows_name_and_auto_deletes(self) -> None:
+        from unittest.mock import patch
+
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=940,
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
+                display_name="张三",
+                prompt_message_id=781,
+            )
+            await session.commit()
+
+        settings = _settings()
+        settings.bot.auto_delete_seconds = 30
+        settings.bot.auto_delete_categories = ["moderation"]
+        edited = SimpleNamespace(message_id=781)
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(return_value=edited),
+        )
+        sweeper = JoinVerificationSweeper(
+            bot=bot, session_factory=self.session_factory, settings=settings
+        )
+        with patch(
+            "bot.services.join_verification.schedule_message_auto_delete"
+        ) as schedule_mock:
+            self.assertEqual(await sweeper.sweep_once(), 1)
+
+        bot.edit_message_text.assert_awaited_once()
+        edit_kwargs = bot.edit_message_text.await_args.kwargs
+        self.assertEqual(edit_kwargs["message_id"], 781)
+        self.assertEqual(edit_kwargs["parse_mode"], "HTML")
+        # Name shown like the pass notice, and the outcome auto-deletes.
+        self.assertIn("<b>张三</b>", edit_kwargs["text"])
+        self.assertIn("验证超时", edit_kwargs["text"])
+        schedule_mock.assert_called_once_with(edited, 30)
 
     async def test_failed_moderation_timeout_ban_requeues_and_restores_state(self) -> None:
         now = now_shanghai_naive()

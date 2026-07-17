@@ -1413,6 +1413,9 @@ class JoinVerificationSweeper:
                 record.group_id,
                 record.user_id,
             )
+            shown = html.escape(
+                (record.display_name or "").strip() or str(record.user_id)
+            )
             if protected_owner:
                 restored = await restore_member_permissions(
                     self.bot,
@@ -1436,7 +1439,7 @@ class JoinVerificationSweeper:
                     continue
                 await self._finalize_prompt(
                     record,
-                    "✅ 最高管理员无需消息审查验证，发言权限已恢复。",
+                    f"✅ <b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
                 )
                 continue
             if record.kind == VERIFICATION_KIND_MODERATION:
@@ -1478,7 +1481,7 @@ class JoinVerificationSweeper:
                         rolled_back,
                     )
                     continue
-                text = "⏰ 消息审查验证超时，已封禁。请联系管理员处理。"
+                text = f"⏰ <b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
             else:
                 enforced = await kick_member(self.bot, record.group_id, record.user_id)
                 if not enforced:
@@ -1511,11 +1514,19 @@ class JoinVerificationSweeper:
                     )
                     continue
                 if record.kind == VERIFICATION_KIND_PATROL:
-                    text = "⏰ 资料巡检质询超时，已移出群聊（未封禁，可重新加入）。"
+                    text = (
+                        f"⏰ <b>{shown}</b> 资料巡检质询超时，"
+                        "已移出群聊（未封禁，可重新加入）。"
+                    )
                 elif record.kind == VERIFICATION_KIND_RAID:
-                    text = "⏰ 爆破防护质询超时，已移出群聊（未封禁，可重新加入）。"
+                    text = (
+                        f"⏰ <b>{shown}</b> 爆破防护质询超时，"
+                        "已移出群聊（未封禁，可重新加入）。"
+                    )
                 else:
-                    text = "⏰ 验证超时，已移出群聊。可重新加入再次验证。"
+                    text = (
+                        f"⏰ <b>{shown}</b> 验证超时，已移出群聊。可重新加入再次验证。"
+                    )
             await self._finalize_prompt(record, text)
         return len(claimed)
 
@@ -1526,26 +1537,23 @@ class JoinVerificationSweeper:
         return configured_auto_delete_seconds(self.settings, "moderation")
 
     async def _finalize_prompt(self, record: JoinVerification, text: str) -> None:
+        # The member's name is already embedded in `text` (built by the sweep
+        # loop), so each outcome is identifiable in both branches. The outcome
+        # is a moderation notice ("审核通知"): honor the group's auto-delete
+        # retention like the ban notice does.
+        seconds = self._moderation_auto_delete_seconds()
         # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others, so post
-        # the outcome as a separate message instead.
+        # the outcome as a separate message instead. The shared challenge
+        # prompt itself is a different message, deliberately left untouched.
         if record.kind in SHARED_PROMPT_VERIFICATION_KINDS:
-            shown = html.escape(
-                (record.display_name or "").strip() or str(record.user_id)
-            )
             try:
                 sent = await self.bot.send_message(
                     record.group_id,
-                    f"<b>{shown}</b>：{text}",
+                    text,
                     parse_mode="HTML",
                 )
-                # Standalone timeout outcome is a moderation notice; honor the
-                # group's auto-delete retention like the ban notice does. The
-                # shared challenge prompt itself is a different message and is
-                # deliberately left untouched above.
-                schedule_message_auto_delete(
-                    sent, self._moderation_auto_delete_seconds()
-                )
+                schedule_message_auto_delete(sent, seconds)
             except Exception:
                 log.debug(
                     "patrol timeout notice failed | group=%s user=%s",
@@ -1557,10 +1565,16 @@ class JoinVerificationSweeper:
         if not message_id:
             return
         try:
-            await self.bot.edit_message_text(
+            # Repurpose the challenge prompt into the outcome, then clean it up
+            # on the same moderation retention as the standalone notices.
+            edited = await self.bot.edit_message_text(
                 chat_id=record.group_id,
                 message_id=message_id,
                 text=text,
+                parse_mode="HTML",
+            )
+            schedule_message_auto_delete(
+                edited if not isinstance(edited, bool) else None, seconds
             )
         except Exception:
             log.debug(

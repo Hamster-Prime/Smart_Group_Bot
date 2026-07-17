@@ -450,6 +450,31 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 109))
 
+    async def test_join_pass_edit_notice_honors_moderation_auto_delete(self) -> None:
+        # JOIN pass edits the prompt in place; that repurposed message must
+        # also inherit the moderation retention.
+        self.settings.bot.auto_delete_seconds = 20
+        self.settings.bot.auto_delete_categories = ["moderation"]
+        edited = SimpleNamespace(message_id=777)
+        self.bot.edit_message_text = AsyncMock(return_value=edited)
+        await self._seed(user_id=111)
+        with (
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(True, [])),
+            ),
+            patch(
+                "bot.services.verify_web.schedule_message_auto_delete"
+            ) as schedule_mock,
+        ):
+            resp = await self._submit(111)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue((await resp.json())["ok"])
+        self.bot.edit_message_text.assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
+        schedule_mock.assert_called_once_with(edited, 20)
+
     async def test_shared_kind_pass_notice_honors_moderation_auto_delete(self) -> None:
         # Patrol/raid prompts are shared, so the pass outcome is a standalone
         # send (not an in-place edit) and must inherit the moderation retention.

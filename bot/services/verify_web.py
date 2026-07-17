@@ -1597,11 +1597,17 @@ class VerifyWebServer:
         # remove the warning and its challenge button for the others.
         if prompt_message_id and kind not in SHARED_PROMPT_VERIFICATION_KINDS:
             try:
-                await self.bot.edit_message_text(
+                edited = await self.bot.edit_message_text(
                     chat_id=group_id,
                     message_id=prompt_message_id,
                     text=text,
                     parse_mode="HTML",
+                )
+                # Repurposed challenge prompt is now a moderation outcome
+                # notice: honor the group's auto-delete retention.
+                schedule_message_auto_delete(
+                    edited if not isinstance(edited, bool) else None,
+                    configured_auto_delete_seconds(self.settings, "moderation"),
                 )
                 return
             except Exception:

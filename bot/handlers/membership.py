@@ -379,6 +379,7 @@ async def _verification_callback_record(
 
 async def _edit_verification_prompt(
     callback: CallbackQuery,
+    settings: Settings,
     *,
     text: str,
 ) -> None:
@@ -387,12 +388,18 @@ async def _edit_verification_prompt(
     if message is None or chat is None:
         return
     try:
-        await callback.bot.edit_message_text(
+        edited = await callback.bot.edit_message_text(
             chat_id=chat.id,
             message_id=message.message_id,
             text=text,
             parse_mode="HTML",
             reply_markup=None,
+        )
+        # The prompt is now a moderation outcome notice ("审核通知"): honor the
+        # group's auto-delete retention like the other verification outcomes.
+        schedule_message_auto_delete(
+            edited if not isinstance(edited, bool) else None,
+            configured_auto_delete_seconds(settings, "moderation"),
         )
     except Exception:
         log.debug(
@@ -518,7 +525,7 @@ async def _handle_verification_admin_callback(
             if kind == VERIFICATION_KIND_MODERATION
             else f"✅ <b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
         )
-        await _edit_verification_prompt(callback, text=approved_text)
+        await _edit_verification_prompt(callback, settings, text=approved_text)
         await callback.answer("已直接通过验证")
         return
 
@@ -567,7 +574,7 @@ async def _handle_verification_admin_callback(
         rejected_text = (
             f"❌ <b>{shown}</b> 的入群验证已被管理员拒绝，已移出群聊。"
         )
-    await _edit_verification_prompt(callback, text=rejected_text)
+    await _edit_verification_prompt(callback, settings, text=rejected_text)
     await callback.answer("已直接拒绝验证")
 
 
