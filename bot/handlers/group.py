@@ -83,7 +83,9 @@ from bot.utils.telegram import (
     is_group,
     is_reply_message,
     mentions_other_user,
+    sanitize_outgoing_mentions,
     sanitize_outgoing_text,
+    schedule_message_auto_delete,
     send_reply,
     typing_action,
 )
@@ -172,6 +174,20 @@ def _resolve_sender_identity(message: Message) -> _SenderIdentity:
     )
 
 
+def _build_user_mention(*, user_id: int, username: str, full_name: str) -> str:
+    """Render a user reference the way moderation notices show the target:
+    a plain @handle when available, otherwise a name/id profile link.
+
+    Shared by the "用户" line and the manual-intervention outcome so both use
+    identical display logic.
+    """
+    handle = (username or "").strip()
+    if handle:
+        return f"@{handle}"
+    label = (full_name or "").strip() or str(user_id)
+    return f'<a href="tg://user?id={user_id}">{html.escape(label)}</a>'
+
+
 def _build_warn_target(
     *,
     user: object | None,
@@ -187,11 +203,11 @@ def _build_warn_target(
             return f'<a href="https://t.me/{safe_username}">{safe_name}</a>'
         return safe_name
 
-    if user and getattr(user, "username", None):
-        return f"@{user.username}"
-
-    label = (getattr(user, "full_name", None) or str(actor_id)).strip() if user else str(actor_id)
-    return f'<a href="tg://user?id={actor_id}">{html.escape(label or str(actor_id))}</a>'
+    return _build_user_mention(
+        user_id=actor_id,
+        username=(getattr(user, "username", "") or "") if user else "",
+        full_name=(getattr(user, "full_name", "") or "") if user else "",
+    )
 
 
 def _normalize_owner_address(reply: str, sender_is_owner: bool) -> str:
@@ -303,6 +319,86 @@ def _build_moderation_notice(
         ]
     )
     return "\n".join(lines)
+
+
+_MODERATION_OUTCOME_LABELS = {
+    "ban": "手动封禁",
+    "undo": "确认误封",
+    "exempt": "永久豁免",
+}
+# Matches the "处理结果" line inside a rendered notice (message.html_text keeps
+# the <b> entity). "处理结果" is not always the last line — a failed-ban notice
+# appends a ⚠️ warning after it — so rewrite only that one line.
+_MODERATION_RESULT_LINE_RE = re.compile(r"(<b>处理结果</b>:)[^\n]*")
+
+
+async def _apply_moderation_outcome_notice(
+    callback: CallbackQuery,
+    settings: Settings,
+    *,
+    outcome: str,
+) -> None:
+    """Finalize the notice after a manual intervention: rewrite the "处理结果"
+    line to name the operator and action, and drop the action buttons.
+
+    Mirrors the join-verification admin outcome (``_edit_verification_prompt``):
+    edit the message in place, remove the keyboard, and re-apply the group's
+    "moderation" auto-delete retention. Best-effort — never raises.
+    """
+    verb = _MODERATION_OUTCOME_LABELS.get(outcome)
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    current = getattr(message, "html_text", None)
+    if (
+        verb is None
+        or message is None
+        or chat is None
+        or operator is None
+        or not isinstance(current, str)
+        or not current.strip()
+    ):
+        return
+
+    mention = _build_user_mention(
+        user_id=int(getattr(operator, "id", 0) or 0),
+        username=str(getattr(operator, "username", "") or ""),
+        full_name=str(getattr(operator, "full_name", "") or ""),
+    )
+    # Sanitize like the send path so the operator handle renders the same way
+    # as the "用户" line (monospace @handle / stripped profile link).
+    body = sanitize_outgoing_mentions(f"已被 {mention} {verb}")
+    new_text, replaced = _MODERATION_RESULT_LINE_RE.subn(
+        lambda m: f"{m.group(1)} {body}", current, count=1
+    )
+    if replaced == 0:
+        # Notice format changed unexpectedly: append the outcome instead of
+        # silently dropping it.
+        new_text = f"{current.rstrip()}\n" + sanitize_outgoing_mentions(
+            f"<b>处理结果</b>: 已被 {mention} {verb}"
+        )
+
+    try:
+        edited = await callback.bot.edit_message_text(
+            chat_id=chat.id,
+            message_id=message.message_id,
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        # The card is now a moderation outcome notice ("审核通知"): honor the
+        # group's auto-delete retention like the verification outcomes do.
+        schedule_message_auto_delete(
+            edited if not isinstance(edited, bool) else None,
+            configured_auto_delete_seconds(settings, "moderation"),
+        )
+    except Exception:
+        log.debug(
+            "moderation outcome notice edit failed | group=%s message=%s",
+            getattr(chat, "id", "?"),
+            getattr(message, "message_id", "?"),
+            exc_info=True,
+        )
 
 
 async def _screen_bot_sender_message(
@@ -666,7 +762,7 @@ async def _moderation_direct_ban(
     violation: Violation,
     current_state: str,
     markers: set[str],
-) -> None:
+) -> str | None:
     violation_id = int(violation.id)
     group_id = int(violation.group_id)
     target_id = int(violation.user_id)
@@ -816,6 +912,7 @@ async def _moderation_direct_ban(
         return
 
     await callback.answer("已在当前群直接封禁该用户", show_alert=True)
+    return "ban"
 
 
 async def _moderation_undo_false_positive(
@@ -827,10 +924,10 @@ async def _moderation_undo_false_positive(
     base_state: str,
     current_state: str,
     markers: set[str],
-) -> None:
+) -> str | None:
     if "reverted" in markers:
         await callback.answer("该事件已撤销，无需重复操作", show_alert=True)
-        return
+        return None
     violation_id = int(violation.id)
 
     if base_state == "warn":
@@ -843,10 +940,10 @@ async def _moderation_undo_false_positive(
         if claimed_state is None:
             await session.rollback()
             await callback.answer("事件状态已变化，请重新点击", show_alert=True)
-            return
+            return None
         await session.commit()
         await callback.answer("已撤销本次误判；该警告未产生封禁计数", show_alert=True)
-        return
+        return "undo"
 
     group_id = int(violation.group_id)
     target_id = int(violation.user_id)
@@ -872,7 +969,7 @@ async def _moderation_undo_false_positive(
         if int(warning_lock.rowcount or 0) != 1:
             await session.rollback()
             await callback.answer("警告状态已变化，请重新点击", show_alert=True)
-            return
+            return None
 
     states_result = await session.execute(
         select(Violation.id, Violation.action_taken)
@@ -906,14 +1003,14 @@ async def _moderation_undo_false_positive(
     if claimed_state is None:
         await session.rollback()
         await callback.answer("事件状态已变化，请重新点击", show_alert=True)
-        return
+        return None
     if not belongs_to_current_generation:
         await session.commit()
         await callback.answer(
             "该事件已不属于当前警告周期，未修改现有计数",
             show_alert=True,
         )
-        return
+        return "undo"
 
     new_count = max(0, previous_count - 1)
 
@@ -959,7 +1056,7 @@ async def _moderation_undo_false_positive(
     if int(warning_update.rowcount or 0) != 1:
         await session.rollback()
         await callback.answer("警告状态已变化，请重新点击", show_alert=True)
-        return
+        return None
 
     restored = False
     if should_restore:
@@ -988,7 +1085,7 @@ async def _moderation_undo_false_positive(
                 violation_id,
             )
             await callback.answer("解除自动封禁失败，本次计数未撤销", show_alert=True)
-            return
+            return None
     try:
         await session.commit()
     except Exception:
@@ -1014,9 +1111,9 @@ async def _moderation_undo_false_positive(
                 f"撤销状态保存失败，{compensation}",
                 show_alert=True,
             )
-            return
+            return None
         await callback.answer("撤销状态保存失败，请稍后重试", show_alert=True)
-        return
+        return None
     suffix = "，并已解除自动封禁" if restored else ""
     if (has_direct_ban_marker or globally_banned) and remaining_banned:
         suffix = "；现有封禁保持不变"
@@ -1024,13 +1121,14 @@ async def _moderation_undo_false_positive(
         f"已撤销本次封禁计数，当前为 {new_count} 次{suffix}",
         show_alert=True,
     )
+    return "undo"
 
 
 async def _moderation_add_permanent_exemption(
     callback: CallbackQuery,
     session: AsyncSession,
     violation: Violation,
-) -> None:
+) -> str | None:
     operator_id = int(callback.from_user.id)
     result = await session.execute(
         select(ModerationExemption).where(
@@ -1040,7 +1138,7 @@ async def _moderation_add_permanent_exemption(
     )
     if result.scalar_one_or_none() is not None:
         await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
-        return
+        return None
 
     session.add(
         ModerationExemption(
@@ -1054,8 +1152,9 @@ async def _moderation_add_permanent_exemption(
     except IntegrityError:
         await session.rollback()
         await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
-        return
+        return None
     await callback.answer("已永久豁免该用户的当前群 AI 审核", show_alert=True)
+    return "exempt"
 
 
 @router.callback_query(F.data.startswith(f"{_MODERATION_ACTION_CALLBACK_PREFIX}:"))
@@ -1129,9 +1228,10 @@ async def on_moderation_action(
             return
 
         current_state = str(violation.action_taken or "")
+        outcome: str | None = None
         try:
             if action == "ban":
-                await _moderation_direct_ban(
+                outcome = await _moderation_direct_ban(
                     callback,
                     session,
                     settings,
@@ -1140,7 +1240,7 @@ async def on_moderation_action(
                     markers,
                 )
             elif action == "undo":
-                await _moderation_undo_false_positive(
+                outcome = await _moderation_undo_false_positive(
                     callback,
                     session,
                     settings,
@@ -1150,7 +1250,9 @@ async def on_moderation_action(
                     markers=markers,
                 )
             else:
-                await _moderation_add_permanent_exemption(callback, session, violation)
+                outcome = await _moderation_add_permanent_exemption(
+                    callback, session, violation
+                )
         except Exception:
             await session.rollback()
             log.exception(
@@ -1160,6 +1262,10 @@ async def on_moderation_action(
                 violation_id,
             )
             await callback.answer("审核操作失败，请稍后重试", show_alert=True)
+            outcome = None
+
+        if outcome:
+            await _apply_moderation_outcome_notice(callback, settings, outcome=outcome)
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:

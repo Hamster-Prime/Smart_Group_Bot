@@ -38,6 +38,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.settings = SimpleNamespace(
             super_admin_id=1,
             moderation=SimpleNamespace(warn_threshold=3),
+            bot=SimpleNamespace(auto_delete_categories=[], auto_delete_seconds=0),
         )
 
     async def asyncTearDown(self) -> None:
@@ -55,18 +56,35 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         *,
         bot: SimpleNamespace | None = None,
         operator_id: int = 9,
+        operator_username: str | None = None,
+        operator_name: str | None = None,
         group_id: int = -100,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             data=f"mact:{action}:{violation_id}",
             message=SimpleNamespace(
-                chat=SimpleNamespace(id=group_id, type="supergroup")
+                chat=SimpleNamespace(id=group_id, type="supergroup"),
+                message_id=555,
+                html_text=(
+                    "<b>AI审查警告</b>\n————————\n"
+                    "<b>用户</b>: <code>@aLnTpu</code>\n"
+                    "<b>警告次数</b>: 1/3\n"
+                    "<b>原因</b>: 发布上门按摩服务广告信息\n"
+                    "<b>依据规则</b>: #47（语义）\n"
+                    "<b>处理结果</b>: 已删除违规消息并发出警告"
+                ),
+                reply_markup=group._build_moderation_action_keyboard(violation_id),
             ),
-            from_user=SimpleNamespace(id=operator_id),
+            from_user=SimpleNamespace(
+                id=operator_id,
+                username=operator_username,
+                full_name=operator_name,
+            ),
             bot=bot
             or SimpleNamespace(
                 ban_chat_member=AsyncMock(),
                 unban_chat_member=AsyncMock(),
+                edit_message_text=AsyncMock(),
             ),
             answer=AsyncMock(),
         )
@@ -631,6 +649,93 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             violation = await session.get(Violation, violation_id)
             self.assertEqual(violation.action_taken, "warn")
         self.assertIn("全局封禁", callback.answer.await_args.args[0])
+
+    async def test_direct_ban_rewrites_notice_and_removes_buttons(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id, operator_username="mod_alice")
+
+        await self._invoke(callback)
+
+        callback.bot.edit_message_text.assert_awaited_once()
+        kwargs = callback.bot.edit_message_text.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], -100)
+        self.assertEqual(kwargs["message_id"], 555)
+        self.assertEqual(kwargs["parse_mode"], "HTML")
+        self.assertIsNone(kwargs["reply_markup"])
+        text = kwargs["text"]
+        self.assertIn("<b>处理结果</b>: 已被", text)
+        self.assertIn("mod_alice", text)
+        self.assertIn("手动封禁", text)
+        # The original automated outcome line must be gone, other lines kept.
+        self.assertNotIn("已删除违规消息并发出警告", text)
+        self.assertIn("<b>用户</b>: <code>@aLnTpu</code>", text)
+
+    async def test_false_positive_undo_rewrites_notice(self) -> None:
+        violation_id = await self._seed_violation("ban_warning", warning=(2, False))
+        callback = self._callback("undo", violation_id, operator_username="mod_bob")
+
+        await self._invoke(callback)
+
+        callback.bot.edit_message_text.assert_awaited_once()
+        text = callback.bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("<b>处理结果</b>: 已被", text)
+        self.assertIn("mod_bob", text)
+        self.assertIn("确认误封", text)
+
+    async def test_permanent_exemption_rewrites_notice(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("exempt", violation_id, operator_username="mod_eve")
+
+        await self._invoke(callback)
+
+        callback.bot.edit_message_text.assert_awaited_once()
+        text = callback.bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("mod_eve", text)
+        self.assertIn("永久豁免", text)
+
+    async def test_operator_without_username_uses_display_name(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id, operator_name="张三管理")
+
+        await self._invoke(callback)
+
+        callback.bot.edit_message_text.assert_awaited_once()
+        text = callback.bot.edit_message_text.await_args.kwargs["text"]
+        # Same display logic as the user line: profile link is stripped on send,
+        # leaving the plain display name.
+        self.assertIn("张三管理", text)
+        self.assertNotIn("tg://user", text)
+        self.assertIn("手动封禁", text)
+
+    async def test_failed_action_does_not_rewrite_notice(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id, operator_username="mod_alice")
+
+        await self._invoke(callback, allowed=False)
+
+        callback.bot.edit_message_text.assert_not_awaited()
+
+    async def test_idempotent_exemption_second_click_does_not_rewrite(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        first = self._callback("exempt", violation_id, operator_username="mod_a")
+        second = self._callback("exempt", violation_id, operator_username="mod_b")
+
+        await self._invoke(first)
+        await self._invoke(second)
+
+        first.bot.edit_message_text.assert_awaited_once()
+        second.bot.edit_message_text.assert_not_awaited()
+
+    async def test_missing_html_text_is_safe(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id, operator_username="mod_alice")
+        callback.message.html_text = None
+
+        await self._invoke(callback)
+
+        # Action still applied; the notice rewrite is simply skipped.
+        callback.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
+        callback.bot.edit_message_text.assert_not_awaited()
 
 
 if __name__ == "__main__":
