@@ -20,6 +20,7 @@ from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
+    VERIFICATION_KIND_RAID,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
     get_join_verification,
@@ -448,6 +449,31 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("欢迎加入", notice["text"])
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 109))
+
+    async def test_shared_kind_pass_notice_honors_moderation_auto_delete(self) -> None:
+        # Patrol/raid prompts are shared, so the pass outcome is a standalone
+        # send (not an in-place edit) and must inherit the moderation retention.
+        self.settings.bot.auto_delete_seconds = 25
+        self.settings.bot.auto_delete_categories = ["moderation"]
+        await self._seed(user_id=110, kind=VERIFICATION_KIND_RAID, reason="爆破防护")
+        with (
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(True, [])),
+            ),
+            patch(
+                "bot.services.verify_web.schedule_message_auto_delete"
+            ) as schedule_mock,
+        ):
+            resp = await self._submit(110)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue((await resp.json())["ok"])
+        self.bot.edit_message_text.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+        self.assertIn("已通过爆破防护质询", self.bot.send_message.await_args.args[1])
+        schedule_mock.assert_called_once()
+        self.assertEqual(schedule_mock.call_args.args[1], 25)
 
     async def test_forged_init_data_is_rejected(self) -> None:
         await self._seed(user_id=103)

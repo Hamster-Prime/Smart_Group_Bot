@@ -264,6 +264,29 @@ class DetectionTests(_DbTestCase):
                 self.assertEqual(record.kind, VERIFICATION_KIND_RAID)
                 self.assertEqual(record.prompt_message_id, 777)
 
+    async def test_lockdown_notice_honors_moderation_auto_delete(self) -> None:
+        from unittest.mock import patch
+
+        settings = _settings()
+        settings.bot.auto_delete_seconds = 30
+        settings.bot.auto_delete_categories = ["moderation"]
+        service, _bot = self._service(settings=settings)
+
+        with patch(
+            "bot.services.raid_guard.schedule_message_auto_delete"
+        ) as schedule_mock:
+            await self._join(service, 1, username="one")
+            await self._join(service, 2, username="two")
+            self.assertTrue(await self._join(service, 3, username="three"))
+
+        self.assertTrue(service.lockdown_active(-100))
+        # Only the lockdown alert is auto-deleted; the shared raid challenge
+        # prompt (a live, sweeper-tracked message) must be left intact.
+        schedule_mock.assert_called_once()
+        sent_arg, seconds_arg = schedule_mock.call_args.args
+        self.assertEqual(sent_arg.message_id, 777)
+        self.assertEqual(seconds_arg, 30)
+
     async def test_joins_outside_window_do_not_trigger(self) -> None:
         service, _bot = self._service()
         await self._join(service, 1)
@@ -624,6 +647,42 @@ class TimeoutTests(_DbTestCase):
         notice = bot.send_message.await_args.args[1]
         self.assertIn("爆破防护质询超时", notice)
         self.assertIn("已移出群聊", notice)
+
+    async def test_raid_timeout_notice_honors_moderation_auto_delete(self) -> None:
+        from unittest.mock import patch
+
+        bot = _bot_mock()
+        settings = _settings()
+        settings.bot.auto_delete_seconds = 45
+        settings.bot.auto_delete_categories = ["moderation"]
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=81,
+                deadline_at=now_shanghai_naive() - timedelta(minutes=10),
+                kind=VERIFICATION_KIND_RAID,
+                reason="爆破防护：短时间内批量加入",
+                display_name="超时者",
+                prompt_message_id=777,
+            )
+            await session.commit()
+
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=settings,
+        )
+        with patch(
+            "bot.services.join_verification.schedule_message_auto_delete"
+        ) as schedule_mock:
+            self.assertEqual(await sweeper.sweep_once(), 1)
+
+        bot.send_message.assert_awaited_once()
+        schedule_mock.assert_called_once()
+        sent_arg, seconds_arg = schedule_mock.call_args.args
+        self.assertEqual(sent_arg.message_id, 777)
+        self.assertEqual(seconds_arg, 45)
 
 
 class GroupSettingsAPITests(unittest.IsolatedAsyncioTestCase):

@@ -60,6 +60,10 @@ from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.services.raid_guard import get_raid_guard_service
 from bot.utils.bot_identity import get_bot_identity
+from bot.utils.telegram import (
+    configured_auto_delete_seconds,
+    schedule_message_auto_delete,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 router = Router()
@@ -90,6 +94,7 @@ def _build_llm(settings: Settings) -> LLMService:
 
 async def _ban_and_notify(
     event: ChatMemberUpdated,
+    settings: Settings,
     *,
     user_id: int,
     display_name: str,
@@ -105,11 +110,17 @@ async def _ban_and_notify(
     shown = html.escape(display_name or str(user_id))
     reason_text = html.escape(reason or "入群资料命中群规")
     try:
-        await event.bot.send_message(
+        sent = await event.bot.send_message(
             event.chat.id,
             f"🚫 已封禁新成员 <b>{shown}</b>（ID: <code>{user_id}</code>）\n原因：{reason_text}\n"
             "如需解封请管理员使用 /unban 命令。",
             parse_mode="HTML",
+        )
+        # This is a moderation outcome ("审核通知"): honor the group's
+        # auto-delete retention like the on-message ban notice in
+        # profile_screen.py does.
+        schedule_message_auto_delete(
+            sent, configured_auto_delete_seconds(settings, "moderation")
         )
     except Exception:
         log.exception("join screening notice failed | group=%s", event.chat.id)
@@ -253,6 +264,7 @@ async def _enforce_pending_moderation_challenge(
         await session.commit()
         enforced = await _ban_and_notify(
             event,
+            settings,
             user_id=record.user_id,
             display_name=display_name,
             reason="消息审查真人验证超时",
@@ -686,6 +698,7 @@ async def on_member_join(
         log.info("join blocked | reason=banned group=%s user=%s", group_id, user_id)
         await _ban_and_notify(
             event,
+            settings,
             user_id=user_id,
             display_name=user.full_name,
             reason="该用户在封禁名单中",
@@ -796,6 +809,7 @@ async def on_member_join(
     )
     await _ban_and_notify(
         event,
+        settings,
         user_id=user_id,
         display_name=user.full_name,
         reason=reason,

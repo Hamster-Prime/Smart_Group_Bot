@@ -67,6 +67,10 @@ from bot.services.join_verification import (
 )
 from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.update_delivery import WEBHOOK_MAX_CONCURRENT_UPDATES
+from bot.utils.telegram import (
+    configured_auto_delete_seconds,
+    schedule_message_auto_delete,
+)
 from bot.utils.timezone import now_shanghai_naive
 from bot.web.settings_api import register_settings_routes
 
@@ -1607,6 +1611,14 @@ class VerifyWebServer:
                     prompt_message_id,
                 )
         try:
-            await self.bot.send_message(group_id, text, parse_mode="HTML")
+            # Standalone pass notice (shared patrol/raid kinds, or edit
+            # fallback) is a moderation outcome notice: honor the group's
+            # auto-delete retention. The in-place edit above reuses the
+            # persisted challenge prompt and is left to persist like other
+            # finalizations.
+            sent = await self.bot.send_message(group_id, text, parse_mode="HTML")
+            schedule_message_auto_delete(
+                sent, configured_auto_delete_seconds(self.settings, "moderation")
+            )
         except Exception:
             log.debug("verification pass notice failed | group=%s", group_id)

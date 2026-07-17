@@ -52,6 +52,10 @@ from bot.services.join_verification import (
     verification_provider,
     verification_service_ready,
 )
+from bot.utils.telegram import (
+    configured_auto_delete_seconds,
+    schedule_message_auto_delete,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -413,7 +417,7 @@ class RaidGuardService:
         config: RaidGuardConfig,
     ) -> list[RaidSuspect]:
         try:
-            await self.bot.send_message(
+            sent = await self.bot.send_message(
                 group_id,
                 build_raid_lockdown_text(
                     joined_count=config.join_threshold,
@@ -421,6 +425,11 @@ class RaidGuardService:
                     lockdown_seconds=config.lockdown_seconds,
                 ),
                 parse_mode="HTML",
+            )
+            # The lockdown alert is a moderation notice ("审核通知"): honor the
+            # group's auto-delete retention like other moderation outcomes.
+            schedule_message_auto_delete(
+                sent, configured_auto_delete_seconds(self.settings, "moderation")
             )
         except Exception:
             # The lockdown itself still protects the group.

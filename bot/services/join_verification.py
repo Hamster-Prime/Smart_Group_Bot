@@ -52,6 +52,10 @@ from bot.config import Settings
 from bot.db.models import JoinVerification, UserWarning
 from bot.services.authz import is_super_admin_user_id
 from bot.services.join_screening import is_globally_banned
+from bot.utils.telegram import (
+    configured_auto_delete_seconds,
+    schedule_message_auto_delete,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -1515,6 +1519,12 @@ class JoinVerificationSweeper:
             await self._finalize_prompt(record, text)
         return len(claimed)
 
+    def _moderation_auto_delete_seconds(self) -> int:
+        """Group's retention for moderation outcome notices ("审核通知")."""
+        if self.settings is None:
+            return 0
+        return configured_auto_delete_seconds(self.settings, "moderation")
+
     async def _finalize_prompt(self, record: JoinVerification, text: str) -> None:
         # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others, so post
@@ -1524,10 +1534,17 @@ class JoinVerificationSweeper:
                 (record.display_name or "").strip() or str(record.user_id)
             )
             try:
-                await self.bot.send_message(
+                sent = await self.bot.send_message(
                     record.group_id,
                     f"<b>{shown}</b>：{text}",
                     parse_mode="HTML",
+                )
+                # Standalone timeout outcome is a moderation notice; honor the
+                # group's auto-delete retention like the ban notice does. The
+                # shared challenge prompt itself is a different message and is
+                # deliberately left untouched above.
+                schedule_message_auto_delete(
+                    sent, self._moderation_auto_delete_seconds()
                 )
             except Exception:
                 log.debug(

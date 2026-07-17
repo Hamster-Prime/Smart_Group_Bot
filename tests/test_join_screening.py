@@ -351,6 +351,36 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
             fake_moderation.check_rules.assert_not_awaited()
             event.bot.get_chat.assert_not_awaited()
 
+    async def test_ban_notice_honors_moderation_auto_delete(self) -> None:
+        from unittest.mock import patch
+
+        from bot.handlers import membership
+
+        event = _join_event(user_id=906)
+        sent = SimpleNamespace()
+        event.bot.send_message = AsyncMock(return_value=sent)
+        settings = self._settings()
+        settings.bot.auto_delete_seconds = 42
+        settings.bot.auto_delete_categories = ["moderation"]
+        async with self.session_factory() as session:
+            await add_global_ban(session, 906, reason="之前违规", created_by=1)
+            await session.commit()
+
+            fake_moderation = SimpleNamespace(check_rules=AsyncMock())
+            with (
+                patch("bot.handlers.membership.ModerationService", return_value=fake_moderation),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+                patch(
+                    "bot.handlers.membership.schedule_message_auto_delete"
+                ) as schedule_mock,
+            ):
+                await membership.on_member_join(event, session=session, settings=settings)
+
+            event.chat.ban.assert_awaited_once_with(906)
+            event.bot.send_message.assert_awaited_once()
+            # The ban notice ("审核通知") must inherit the moderation retention.
+            schedule_mock.assert_called_once_with(sent, 42)
+
     async def test_unbanned_user_rejoin_skips_profile_screening(self) -> None:
         from unittest.mock import patch
 
