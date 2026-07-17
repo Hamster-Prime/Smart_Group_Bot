@@ -100,6 +100,7 @@
     groupSaving: new Set(),
     groupResources: new Map(),
     access: null,
+    accessAdminGroup: null,
     promptKey: "decision",
     listPages: new Map(),
   };
@@ -1167,14 +1168,19 @@
       <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
     if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
     if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
-    const rows = (items, type, label, idKey = "user_id") => paginatedRows(items, `access:${type}`, item => {
+    const rows = (items, type, label, idKey = "user_id", emptyText) => paginatedRows(items, `access:${type}`, item => {
       const resourceId = type === "admins"
         ? `${item.group_id}:${item.user_id}`
         : item[idKey];
       return `
       <div class="resource-row"><span>${escapeHtml(label(item))}</span>
       <button class="mini-icon-button danger" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}" aria-label="删除" title="删除">${icon("trash-2")}</button></div>`;
-    });
+    }, emptyText);
+    const authGroups = access.authorized_groups || [];
+    const adminGroupId = authGroups.some(group => String(group.group_id) === String(state.accessAdminGroup))
+      ? String(state.accessAdminGroup)
+      : String(authGroups[0]?.group_id ?? "");
+    const groupAdmins = access.admins.filter(admin => String(admin.group_id) === adminGroupId);
     return `
       ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
       <div class="resource-grid access-grid">
@@ -1188,13 +1194,13 @@
           ${rows(access.authorized_groups, "authorized-groups", item => `${item.title || "未命名群组"} · ${item.group_id}`, "group_id")}
         </section>
         <section class="settings-section">
-          ${sectionHead("群管理员")}
+          ${sectionHead("群管理员", "先选择群组，下方仅显示并管理该群的管理员。")}
           <form class="inline-resource-form" data-access-form="admins">
-            <select name="group_id" required>${access.authorized_groups.map(item => `<option value="${attr(item.group_id)}">${escapeHtml(item.title || item.group_id)}</option>`).join("")}</select>
+            <select name="group_id" data-access-admin-filter required>${authGroups.map(item => `<option value="${attr(item.group_id)}"${String(item.group_id) === adminGroupId ? " selected" : ""}>${escapeHtml(item.title || item.group_id)}</option>`).join("")}</select>
             <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
             <button class="icon-button" type="submit" aria-label="授权管理员" title="授权管理员">${icon("plus")}</button>
           </form>
-          ${rows(access.admins, "admins", item => `${item.user_id} · ${item.group_id}`)}
+          ${rows(groupAdmins, "admins", item => `${item.user_id}`, "user_id", "该群暂无管理员")}
         </section>
         <section class="settings-section">
           ${sectionHead("全局封禁")}
@@ -1718,6 +1724,12 @@
 
   content.addEventListener("change", event => {
     const target = event.target;
+    if (target.matches("[data-access-admin-filter]")) {
+      state.accessAdminGroup = target.value;
+      state.listPages.set("access:admins", 1);
+      renderContent();
+      return;
+    }
     if (target.matches("[data-auto-delete-category]")) {
       const selected = [...content.querySelectorAll("[data-auto-delete-category]:checked")]
         .map(control => control.dataset.autoDeleteCategory);
