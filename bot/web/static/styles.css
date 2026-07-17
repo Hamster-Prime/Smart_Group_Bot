@@ -1182,6 +1182,42 @@ button:disabled {
   min-width: 0;
 }
 
+.resource-grid .resource-span {
+  grid-column: 1 / -1;
+}
+
+.list-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 0 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.entry-edit-form {
+  flex-wrap: wrap;
+}
+
+.entry-edit-form input[name="keyword"],
+.entry-edit-form input[name="schedule_time"] {
+  flex: 0 1 110px;
+}
+
+.entry-edit-form input[name="reply_text"],
+.entry-edit-form input[name="text"] {
+  flex: 1 1 180px;
+}
+
+.entry-edit-form input[name="interval_minutes"] {
+  flex: 0 1 84px;
+}
+
+.inline-resource-form .compact-check {
+  align-self: center;
+}
+
 .resource-grid h4 {
   margin: 0 0 9px;
   font-size: 12px;

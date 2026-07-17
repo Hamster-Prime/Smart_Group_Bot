@@ -189,7 +189,15 @@ class BotBehaviorConfig(StrictModel):
     stream_edit_interval_sec: float = Field(default=1.0, ge=0.3, le=30.0)
     auto_delete_seconds: int = Field(default=0, ge=0, le=604800)
     auto_delete_categories: list[
-        Literal["reply", "management", "moderation", "media", "proactive"]
+        Literal[
+            "reply",
+            "management",
+            "moderation",
+            "media",
+            "proactive",
+            "keyword",
+            "scheduled",
+        ]
     ] = Field(default_factory=lambda: ["management", "moderation"])
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)

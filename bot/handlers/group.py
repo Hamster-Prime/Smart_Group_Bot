@@ -64,6 +64,7 @@ from bot.services.bot_screening import (
     record_bot_screening_pass,
     reset_bot_screening,
 )
+from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
@@ -2851,6 +2852,20 @@ async def on_group_message(
         )
         return
 
+    # Keyword auto replies run after moderation and the mute gates, so a
+    # violating message never triggers a canned answer and muted scopes stay
+    # silent. Only real user text (incl. captions) is matched — synthesized
+    # placeholders like "[image]" must not trip contains-rules. A hit
+    # replaces the AI reply; memory indexing still happens.
+    keyword_rule = None
+    if msg_type == "text" or "caption" in msg_type:
+        keyword_subject = text if msg_type == "text" else message.caption or ""
+        try:
+            keyword_rule = await find_keyword_reply(session, group_id, keyword_subject)
+        except Exception:
+            await session.rollback()
+            log.exception("[%s] keyword reply lookup failed", group_id)
+
     memory = memory_holder.get()
 
     await _best_effort_commit(
@@ -2895,6 +2910,18 @@ async def on_group_message(
         except Exception:
             await session.rollback()
             log.exception("[%s] speech style collection failed", group_id)
+
+    if keyword_rule is not None:
+        sent_ok = await send_keyword_reply(message, keyword_rule, settings)
+        log.info(
+            "[%s]【结束】关键词回复 | 规则=%s 关键词=%s 已发送=%s | 总耗时=%dms",
+            group_id,
+            keyword_rule.id,
+            str(keyword_rule.keyword or "")[:40],
+            sent_ok,
+            int((time.perf_counter() - flow_started) * 1000),
+        )
+        return
 
     explicit_mention = has_explicit_bot_mention(message, bot_me.username or "", bot_me.id)
     mentioned = is_bot_mentioned(message, bot_me.username or "", bot_me.id)

@@ -19,7 +19,9 @@ from bot.db.models import (
     AuthorizedGroup,
     Group,
     GroupPermanentMemory,
+    KeywordReply,
     ModerationRule,
+    ScheduledMessage,
     SpeechStyleSample,
     UserWarning,
 )
@@ -223,6 +225,131 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertEqual((await session.get(ModerationRule, rule_id)).group_id, -501)
             self.assertEqual((await session.get(GroupPermanentMemory, memory_id)).group_id, -501)
+
+    async def test_group_admin_can_manage_keyword_replies(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-503, authorized_by=42))
+            session.add(Group(id=-503, title="Keyword Group", settings={}))
+            session.add(Admin(group_id=-503, user_id=99, role="admin"))
+            await session.commit()
+
+        created = await self.client.post(
+            "/api/v1/groups/-503/keyword-replies",
+            headers=self._headers(user_id=99),
+            json={
+                "keyword": "签到",
+                "match_type": "contains",
+                "reply_text": "欢迎签到！",
+                "pin_message": True,
+                "auto_delete": False,
+            },
+        )
+        self.assertEqual(created.status, 200)
+        document = (await created.json())["keyword_reply"]
+        self.assertTrue(document["pin_message"])
+        self.assertFalse(document["auto_delete"])
+        entry_id = document["id"]
+
+        async with self.session_factory() as session:
+            row = await session.get(KeywordReply, entry_id)
+            self.assertEqual(row.group_id, -503)
+            self.assertEqual(row.created_by, 99)
+
+        invalid_regex = await self.client.post(
+            "/api/v1/groups/-503/keyword-replies",
+            headers=self._headers(user_id=99),
+            json={"keyword": "([", "match_type": "regex", "reply_text": "x"},
+        )
+        self.assertEqual(invalid_regex.status, 400)
+        self.assertEqual(
+            (await invalid_regex.json())["error"]["code"], "invalid_keyword_regex"
+        )
+
+        updated = await self.client.patch(
+            f"/api/v1/groups/-503/keyword-replies/{entry_id}",
+            headers=self._headers(user_id=99),
+            json={"enabled": False, "reply_text": "改后的回复"},
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertFalse((await updated.json())["keyword_reply"]["enabled"])
+
+        other_admin = await self.client.delete(
+            f"/api/v1/groups/-503/keyword-replies/{entry_id}",
+            headers=self._headers(user_id=100),
+        )
+        self.assertEqual(other_admin.status, 403)
+
+        deleted = await self.client.delete(
+            f"/api/v1/groups/-503/keyword-replies/{entry_id}",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(deleted.status, 200)
+        listed = await self.client.get(
+            "/api/v1/groups/-503/keyword-replies",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual((await listed.json())["keyword_replies"], [])
+
+    async def test_group_admin_can_manage_scheduled_messages(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-504, authorized_by=42))
+            session.add(Group(id=-504, title="Schedule Group", settings={}))
+            session.add(Admin(group_id=-504, user_id=99, role="admin"))
+            await session.commit()
+
+        created = await self.client.post(
+            "/api/v1/groups/-504/scheduled-messages",
+            headers=self._headers(user_id=99),
+            json={
+                "text": "每日公告",
+                "schedule_type": "daily",
+                "schedule_time": "9:5",
+                "pin_message": True,
+                "unpin_previous": True,
+                "auto_delete": True,
+            },
+        )
+        self.assertEqual(created.status, 200)
+        document = (await created.json())["scheduled_message"]
+        self.assertEqual(document["schedule_time"], "09:05")
+        self.assertTrue(document["pin_message"])
+        entry_id = document["id"]
+
+        async with self.session_factory() as session:
+            row = await session.get(ScheduledMessage, entry_id)
+            self.assertEqual(row.group_id, -504)
+            self.assertTrue(row.unpin_previous)
+
+        bad_time = await self.client.post(
+            "/api/v1/groups/-504/scheduled-messages",
+            headers=self._headers(user_id=99),
+            json={"text": "x", "schedule_time": "25:99"},
+        )
+        self.assertEqual(bad_time.status, 400)
+        self.assertEqual(
+            (await bad_time.json())["error"]["code"], "invalid_schedule_time"
+        )
+
+        updated = await self.client.patch(
+            f"/api/v1/groups/-504/scheduled-messages/{entry_id}",
+            headers=self._headers(user_id=99),
+            json={"schedule_type": "interval", "interval_minutes": 120},
+        )
+        self.assertEqual(updated.status, 200)
+        self.assertEqual(
+            (await updated.json())["scheduled_message"]["interval_minutes"], 120
+        )
+
+        deleted = await self.client.delete(
+            f"/api/v1/groups/-504/scheduled-messages/{entry_id}",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(deleted.status, 200)
+        listed = await self.client.get(
+            "/api/v1/groups/-504/scheduled-messages",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual((await listed.json())["scheduled_messages"], [])
 
     async def test_group_admin_can_manage_group_bans_without_global_access(self) -> None:
         async with self.session_factory() as session:

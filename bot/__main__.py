@@ -29,6 +29,7 @@ from bot.services.runtime_config import (
     hcaptcha_key_configuration_issue,
     turnstile_key_configuration_issue,
 )
+from bot.services.scheduled_messages import ScheduledMessageService
 from bot.services.update_delivery import resolve_webhook_config, run_update_delivery
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
@@ -146,6 +147,15 @@ async def main() -> None:
         patrol.run_forever(),
         name="profile-patrol-runner",
     )
+    scheduled_messages = ScheduledMessageService(
+        bot=bot,
+        settings=settings,
+        session_factory=session_factory,
+    )
+    scheduled_message_runner = asyncio.create_task(
+        scheduled_messages.run_forever(),
+        name="scheduled-message-runner",
+    )
     # Event-driven (no background loop): joins feed the detector from the
     # membership handler; challenge deadlines ride the shared sweeper.
     init_raid_guard_service(
@@ -193,10 +203,12 @@ async def main() -> None:
         proactive_runner.cancel()
         verification_runner.cancel()
         patrol_runner.cancel()
+        scheduled_message_runner.cancel()
         await asyncio.gather(
             proactive_runner,
             verification_runner,
             patrol_runner,
+            scheduled_message_runner,
             return_exceptions=True,
         )
         try:
@@ -254,6 +266,8 @@ async def main() -> None:
         await asyncio.gather(verification_runner, return_exceptions=True)
         patrol_runner.cancel()
         await asyncio.gather(patrol_runner, return_exceptions=True)
+        scheduled_message_runner.cancel()
+        await asyncio.gather(scheduled_message_runner, return_exceptions=True)
         try:
             await patrol.shutdown()
         except Exception:

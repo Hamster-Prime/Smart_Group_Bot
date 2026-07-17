@@ -81,6 +81,65 @@ class ModerationRule(Base):
     group: Mapped[Group] = relationship(back_populates="moderation_rules")
 
 
+class KeywordReply(Base):
+    """Per-group keyword auto replies, managed from the Mini App.
+
+    match_type: "contains" (substring), "exact" (whole message), or "regex".
+    Replies are sent verbatim; pin_message optionally pins the sent reply and
+    auto_delete opts the reply into the global "keyword" retention category.
+    """
+
+    __tablename__ = "keyword_replies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    keyword: Mapped[str] = mapped_column(String(255), default="")
+    match_type: Mapped[str] = mapped_column(String(16), default="contains")
+    reply_text: Mapped[str] = mapped_column(Text, default="")
+    pin_message: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_delete: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+
+class ScheduledMessage(Base):
+    """Per-group timed announcements, managed from the Mini App.
+
+    schedule_type: "daily" fires once per day at HH:MM (Asia/Shanghai,
+    schedule_time); "interval" fires every interval_minutes. next_run_at /
+    last_run_at bookkeeping follows the patrol convention (compare against
+    the computed due instant so restarts never double-fire).
+    """
+
+    __tablename__ = "scheduled_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    schedule_type: Mapped[str] = mapped_column(String(16), default="daily")
+    schedule_time: Mapped[str] = mapped_column(String(5), default="09:00")
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    pin_message: Mapped[bool] = mapped_column(Boolean, default=False)
+    unpin_previous: Mapped[bool] = mapped_column(Boolean, default=False)
+    auto_delete: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Python-side default keeps created_at in Asia/Shanghai naive time; the
+    # due computation compares it against now_shanghai_naive().
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+
 class Violation(Base):
     __tablename__ = "violations"
 

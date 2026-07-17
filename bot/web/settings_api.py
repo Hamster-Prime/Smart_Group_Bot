@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from typing import Any, Literal
@@ -19,9 +20,11 @@ from bot.db.models import (
     AuthorizedGroup,
     Group,
     GroupPermanentMemory,
+    KeywordReply,
     ModerationExemption,
     ModerationRule,
     ReplyMute,
+    ScheduledMessage,
     SpeechStyleSample,
     UserWarning,
 )
@@ -42,7 +45,7 @@ from bot.services.join_verification import (
     verification_provider,
     verification_service_ready,
 )
-from bot.services.patrol import get_patrol_service, patrol_policy
+from bot.services.patrol import get_patrol_service, parse_schedule_time, patrol_policy
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
     RuntimeConfigEncryptionError,
@@ -54,6 +57,7 @@ from bot.services.speech_style import (
     set_style_target,
 )
 from bot.utils.security import clean_multiline_text, clean_text
+from bot.utils.timezone import now_shanghai_naive
 from bot.web.auth import require_authenticated_user, require_super_admin
 
 log = logging.getLogger(__name__)
@@ -137,6 +141,50 @@ class _RuleCreate(BaseModel):
     pattern: str = Field(min_length=1, max_length=1000)
     action: Literal["warn", "delete", "ban"] = "warn"
     enabled: StrictBool = True
+
+
+class _KeywordReplyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    keyword: str = Field(min_length=1, max_length=255)
+    match_type: Literal["contains", "exact", "regex"] = "contains"
+    reply_text: str = Field(min_length=1, max_length=4000)
+    pin_message: StrictBool = False
+    auto_delete: StrictBool = True
+    enabled: StrictBool = True
+
+
+class _KeywordReplyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    keyword: str | None = Field(default=None, min_length=1, max_length=255)
+    match_type: Literal["contains", "exact", "regex"] | None = None
+    reply_text: str | None = Field(default=None, min_length=1, max_length=4000)
+    pin_message: StrictBool | None = None
+    auto_delete: StrictBool | None = None
+    enabled: StrictBool | None = None
+
+
+class _ScheduledMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=4000)
+    schedule_type: Literal["daily", "interval"] = "daily"
+    schedule_time: str = Field(default="09:00", max_length=5)
+    interval_minutes: StrictInt = Field(default=60, ge=5, le=10080)
+    pin_message: StrictBool = False
+    unpin_previous: StrictBool = False
+    auto_delete: StrictBool = False
+    enabled: StrictBool = True
+
+
+class _ScheduledMessageUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str | None = Field(default=None, min_length=1, max_length=4000)
+    schedule_type: Literal["daily", "interval"] | None = None
+    schedule_time: str | None = Field(default=None, max_length=5)
+    interval_minutes: StrictInt | None = Field(default=None, ge=5, le=10080)
+    pin_message: StrictBool | None = None
+    unpin_previous: StrictBool | None = None
+    auto_delete: StrictBool | None = None
+    enabled: StrictBool | None = None
 
 
 class _RuleUpdate(BaseModel):
@@ -333,6 +381,56 @@ def _rule_document(rule: ModerationRule) -> dict[str, Any]:
         "action": str(rule.action or "warn"),
         "enabled": bool(rule.enabled),
     }
+
+
+def _keyword_reply_document(row: KeywordReply) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "keyword": str(row.keyword or ""),
+        "match_type": str(row.match_type or "contains"),
+        "reply_text": str(row.reply_text or ""),
+        "pin_message": bool(row.pin_message),
+        "auto_delete": bool(row.auto_delete),
+        "enabled": bool(row.enabled),
+    }
+
+
+def _scheduled_message_document(row: ScheduledMessage) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "text": str(row.text or ""),
+        "schedule_type": str(row.schedule_type or "daily"),
+        "schedule_time": str(row.schedule_time or "09:00"),
+        "interval_minutes": int(row.interval_minutes or 60),
+        "pin_message": bool(row.pin_message),
+        "unpin_previous": bool(row.unpin_previous),
+        "auto_delete": bool(row.auto_delete),
+        "enabled": bool(row.enabled),
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else "",
+    }
+
+
+def _validated_keyword(keyword: str, match_type: str) -> str:
+    cleaned = clean_text(keyword, max_len=255).strip()
+    if not cleaned:
+        raise _APIError(400, "empty_keyword", "关键词不能为空。")
+    if match_type == "regex":
+        try:
+            re.compile(cleaned)
+        except re.error as exc:
+            raise _APIError(400, "invalid_keyword_regex", f"正则表达式无效：{exc}") from exc
+    return cleaned
+
+
+def _validated_schedule_time(raw: str) -> str:
+    parsed = parse_schedule_time(raw)
+    if parsed is None:
+        raise _APIError(
+            400,
+            "invalid_schedule_time",
+            "发送时间必须是 HH:MM 格式（例如 09:00）。",
+        )
+    return f"{parsed[0]:02d}:{parsed[1]:02d}"
 
 
 def _memory_document(memory: GroupPermanentMemory) -> dict[str, Any]:
@@ -1053,6 +1151,201 @@ def register_settings_routes(
         return _success_response({"deleted": True})
 
     @any_admin
+    async def list_keyword_replies(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        async with session_factory() as session:
+            rows = (await session.scalars(
+                select(KeywordReply)
+                .where(KeywordReply.group_id == group_id)
+                .order_by(KeywordReply.id)
+            )).all()
+        return _success_response(
+            {"keyword_replies": [_keyword_reply_document(row) for row in rows]}
+        )
+
+    @any_admin
+    async def create_keyword_reply(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        body = _KeywordReplyCreate.model_validate(await _json_object(request))
+        reply_text = clean_multiline_text(body.reply_text, max_len=4000).strip()
+        if not reply_text:
+            raise _APIError(400, "empty_reply_text", "回复内容不能为空。")
+        row = KeywordReply(
+            group_id=group_id,
+            keyword=_validated_keyword(body.keyword, body.match_type),
+            match_type=body.match_type,
+            reply_text=reply_text,
+            pin_message=body.pin_message,
+            auto_delete=body.auto_delete,
+            enabled=body.enabled,
+            created_by=int(user.id),
+        )
+        async with session_factory() as session:
+            await _ensure_group_row(session, group_id)
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+        return _success_response({"keyword_reply": _keyword_reply_document(row)})
+
+    @any_admin
+    async def update_keyword_reply(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        entry_id = _path_int(
+            request, "entry_id", code="invalid_entry_id", message="记录 ID 无效。"
+        )
+        body = _KeywordReplyUpdate.model_validate(await _json_object(request))
+        if not body.model_fields_set:
+            raise _APIError(400, "empty_update", "至少需要修改一个字段。")
+        async with session_factory() as session:
+            row = await session.get(KeywordReply, entry_id)
+            if row is None or int(row.group_id) != group_id:
+                raise _APIError(404, "keyword_reply_not_found", "关键词回复不存在。")
+            if "match_type" in body.model_fields_set:
+                row.match_type = str(body.match_type)
+            if "keyword" in body.model_fields_set:
+                row.keyword = _validated_keyword(
+                    str(body.keyword or ""), str(row.match_type)
+                )
+            elif "match_type" in body.model_fields_set:
+                row.keyword = _validated_keyword(str(row.keyword), str(row.match_type))
+            if "reply_text" in body.model_fields_set:
+                row.reply_text = clean_multiline_text(
+                    str(body.reply_text or ""), max_len=4000
+                ).strip()
+                if not row.reply_text:
+                    raise _APIError(400, "empty_reply_text", "回复内容不能为空。")
+            if "pin_message" in body.model_fields_set:
+                row.pin_message = bool(body.pin_message)
+            if "auto_delete" in body.model_fields_set:
+                row.auto_delete = bool(body.auto_delete)
+            if "enabled" in body.model_fields_set:
+                row.enabled = bool(body.enabled)
+            await session.commit()
+            document = _keyword_reply_document(row)
+        return _success_response({"keyword_reply": document})
+
+    @any_admin
+    async def delete_keyword_reply(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        entry_id = _path_int(
+            request, "entry_id", code="invalid_entry_id", message="记录 ID 无效。"
+        )
+        async with session_factory() as session:
+            row = await session.get(KeywordReply, entry_id)
+            if row is None or int(row.group_id) != group_id:
+                raise _APIError(404, "keyword_reply_not_found", "关键词回复不存在。")
+            await session.delete(row)
+            await session.commit()
+        return _success_response({"deleted": True})
+
+    @any_admin
+    async def list_scheduled_messages(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        async with session_factory() as session:
+            rows = (await session.scalars(
+                select(ScheduledMessage)
+                .where(ScheduledMessage.group_id == group_id)
+                .order_by(ScheduledMessage.id)
+            )).all()
+        return _success_response(
+            {"scheduled_messages": [_scheduled_message_document(row) for row in rows]}
+        )
+
+    @any_admin
+    async def create_scheduled_message(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        body = _ScheduledMessageCreate.model_validate(await _json_object(request))
+        text = clean_multiline_text(body.text, max_len=4000).strip()
+        if not text:
+            raise _APIError(400, "empty_message_text", "消息内容不能为空。")
+        row = ScheduledMessage(
+            group_id=group_id,
+            text=text,
+            schedule_type=body.schedule_type,
+            schedule_time=_validated_schedule_time(body.schedule_time),
+            interval_minutes=int(body.interval_minutes),
+            pin_message=body.pin_message,
+            unpin_previous=body.unpin_previous,
+            auto_delete=body.auto_delete,
+            enabled=body.enabled,
+            # Anchor at creation so a daily entry created after today's HH:MM
+            # starts tomorrow instead of firing immediately.
+            last_run_at=now_shanghai_naive(),
+            created_by=int(user.id),
+        )
+        async with session_factory() as session:
+            await _ensure_group_row(session, group_id)
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+        return _success_response(
+            {"scheduled_message": _scheduled_message_document(row)}
+        )
+
+    @any_admin
+    async def update_scheduled_message(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        entry_id = _path_int(
+            request, "entry_id", code="invalid_entry_id", message="记录 ID 无效。"
+        )
+        body = _ScheduledMessageUpdate.model_validate(await _json_object(request))
+        if not body.model_fields_set:
+            raise _APIError(400, "empty_update", "至少需要修改一个字段。")
+        async with session_factory() as session:
+            row = await session.get(ScheduledMessage, entry_id)
+            if row is None or int(row.group_id) != group_id:
+                raise _APIError(404, "scheduled_message_not_found", "定时消息不存在。")
+            if "text" in body.model_fields_set:
+                row.text = clean_multiline_text(str(body.text or ""), max_len=4000).strip()
+                if not row.text:
+                    raise _APIError(400, "empty_message_text", "消息内容不能为空。")
+            if "schedule_type" in body.model_fields_set:
+                row.schedule_type = str(body.schedule_type)
+            if "schedule_time" in body.model_fields_set:
+                row.schedule_time = _validated_schedule_time(str(body.schedule_time or ""))
+            if "interval_minutes" in body.model_fields_set:
+                row.interval_minutes = int(body.interval_minutes or 60)
+            if "pin_message" in body.model_fields_set:
+                row.pin_message = bool(body.pin_message)
+            if "unpin_previous" in body.model_fields_set:
+                row.unpin_previous = bool(body.unpin_previous)
+            if "auto_delete" in body.model_fields_set:
+                row.auto_delete = bool(body.auto_delete)
+            if "enabled" in body.model_fields_set:
+                was_enabled = bool(row.enabled)
+                row.enabled = bool(body.enabled)
+                # Re-enabling anchors the next run to now instead of firing
+                # immediately off a stale last_run_at; an edit that keeps the
+                # entry enabled must not postpone the schedule.
+                if row.enabled and not was_enabled:
+                    row.last_run_at = now_shanghai_naive()
+            await session.commit()
+            document = _scheduled_message_document(row)
+        return _success_response({"scheduled_message": document})
+
+    @any_admin
+    async def delete_scheduled_message(request: web.Request, user: Any) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        entry_id = _path_int(
+            request, "entry_id", code="invalid_entry_id", message="记录 ID 无效。"
+        )
+        async with session_factory() as session:
+            row = await session.get(ScheduledMessage, entry_id)
+            if row is None or int(row.group_id) != group_id:
+                raise _APIError(404, "scheduled_message_not_found", "定时消息不存在。")
+            await session.delete(row)
+            await session.commit()
+        return _success_response({"deleted": True})
+
+    @any_admin
     async def list_memories(request: web.Request, user: Any) -> web.Response:
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
@@ -1406,6 +1699,26 @@ def register_settings_routes(
     app.router.add_post("/api/v1/groups/{id}/rules", create_rule)
     app.router.add_patch("/api/v1/groups/{id}/rules/{rule_id}", update_rule)
     app.router.add_delete("/api/v1/groups/{id}/rules/{rule_id}", delete_rule)
+    app.router.add_get("/api/v1/groups/{id}/keyword-replies", list_keyword_replies)
+    app.router.add_post("/api/v1/groups/{id}/keyword-replies", create_keyword_reply)
+    app.router.add_patch(
+        "/api/v1/groups/{id}/keyword-replies/{entry_id}", update_keyword_reply
+    )
+    app.router.add_delete(
+        "/api/v1/groups/{id}/keyword-replies/{entry_id}", delete_keyword_reply
+    )
+    app.router.add_get(
+        "/api/v1/groups/{id}/scheduled-messages", list_scheduled_messages
+    )
+    app.router.add_post(
+        "/api/v1/groups/{id}/scheduled-messages", create_scheduled_message
+    )
+    app.router.add_patch(
+        "/api/v1/groups/{id}/scheduled-messages/{entry_id}", update_scheduled_message
+    )
+    app.router.add_delete(
+        "/api/v1/groups/{id}/scheduled-messages/{entry_id}", delete_scheduled_message
+    )
     app.router.add_get("/api/v1/groups/{id}/memories", list_memories)
     app.router.add_post("/api/v1/groups/{id}/memories", create_memory)
     app.router.add_patch("/api/v1/groups/{id}/memories/{memory_id}", update_memory)

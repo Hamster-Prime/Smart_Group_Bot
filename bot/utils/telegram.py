@@ -115,7 +115,7 @@ def sanitize_outgoing_text(text: str) -> str:
 
 
 AUTO_DELETE_CATEGORIES = frozenset(
-    {"reply", "management", "moderation", "media", "proactive"}
+    {"reply", "management", "moderation", "media", "proactive", "keyword", "scheduled"}
 )
 
 

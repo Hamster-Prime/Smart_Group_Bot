@@ -29,7 +29,7 @@
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转" },
     { id: "prompts", label: "Prompts", icon: "file-code-2", subtitle: "模型系统提示词" },
     { id: "groups", label: "群组", icon: "users", subtitle: "逐群行为覆盖" },
-    { id: "access", label: "权限封禁", icon: "shield-user", subtitle: "群授权、管理员与全局封禁" },
+    { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局封禁" },
   ];
 
   const ROLE_META = {
@@ -101,7 +101,34 @@
     groupResources: new Map(),
     access: null,
     promptKey: "decision",
+    listPages: new Map(),
   };
+
+  const LIST_PAGE_SIZE = 8;
+
+  function paginate(items, key) {
+    const total = items.length;
+    const pages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
+    const current = Math.min(Math.max(1, state.listPages.get(key) || 1), pages);
+    const start = (current - 1) * LIST_PAGE_SIZE;
+    return { slice: items.slice(start, start + LIST_PAGE_SIZE), current, pages, total };
+  }
+
+  function pagerMarkup(key, current, pages, total) {
+    if (pages <= 1) return "";
+    return `
+      <div class="list-pager">
+        <button class="mini-icon-button" type="button" data-action="list-page" data-list-key="${attr(key)}" data-page="${current - 1}"${current <= 1 ? " disabled" : ""} aria-label="上一页" title="上一页">${icon("chevron-left")}</button>
+        <span>${current} / ${pages} 页 · 共 ${total} 条</span>
+        <button class="mini-icon-button" type="button" data-action="list-page" data-list-key="${attr(key)}" data-page="${current + 1}"${current >= pages ? " disabled" : ""} aria-label="下一页" title="下一页">${icon("chevron-right")}</button>
+      </div>`;
+  }
+
+  function paginatedRows(items, key, renderRow, emptyText = "暂无记录") {
+    if (!items.length) return `<p class="field-hint">${escapeHtml(emptyText)}</p>`;
+    const page = paginate(items, key);
+    return page.slice.map(renderRow).join("") + pagerMarkup(key, page.current, page.pages, page.total);
+  }
 
   function navItems() {
     return state.session?.can_manage_global
@@ -604,6 +631,8 @@
             ${categoryToggle("moderation", "审核通知")}
             ${categoryToggle("media", "语音、音乐与贴纸")}
             ${categoryToggle("proactive", "主动话题")}
+            ${categoryToggle("keyword", "关键词回复")}
+            ${categoryToggle("scheduled", "定时消息")}
           </div>
         </section>
         <section class="settings-section">
@@ -969,21 +998,86 @@
       </article>`;
   }
 
+  function renderKeywordReplyRow(group, item) {
+    return `
+      <form class="rule-resource-form entry-edit-form" data-entry-edit-form="keyword-replies" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+        <select name="match_type" aria-label="匹配方式">
+          <option value="contains"${item.match_type === "contains" ? " selected" : ""}>包含</option>
+          <option value="exact"${item.match_type === "exact" ? " selected" : ""}>完全匹配</option>
+          <option value="regex"${item.match_type === "regex" ? " selected" : ""}>正则</option>
+        </select>
+        <input name="keyword" maxlength="255" value="${attr(item.keyword)}" aria-label="关键词" required>
+        <input name="reply_text" maxlength="4000" value="${attr(item.reply_text)}" aria-label="回复内容" required>
+        <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
+        <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
+        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled ? " checked" : ""}><span>启用</span></label>
+        <button class="mini-icon-button" type="submit" aria-label="保存" title="保存">${icon("save")}</button>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="keyword-replies" data-resource-id="${attr(item.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
+      </form>`;
+  }
+
+  function renderScheduledMessageRow(group, item) {
+    return `
+      <form class="rule-resource-form entry-edit-form" data-entry-edit-form="scheduled-messages" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+        <input name="text" maxlength="4000" value="${attr(item.text)}" aria-label="消息内容" required>
+        <select name="schedule_type" aria-label="定时方式">
+          <option value="daily"${item.schedule_type === "daily" ? " selected" : ""}>每天定时</option>
+          <option value="interval"${item.schedule_type === "interval" ? " selected" : ""}>固定间隔</option>
+        </select>
+        <input name="schedule_time" type="time" value="${attr(item.schedule_time)}" aria-label="发送时间" title="每天定时的发送时间">
+        <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="${attr(item.interval_minutes)}" aria-label="间隔分钟" title="固定间隔的分钟数" required>
+        <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
+        <label class="compact-check"><input name="unpin_previous" type="checkbox"${item.unpin_previous ? " checked" : ""}><span>取消上次置顶</span></label>
+        <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
+        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled ? " checked" : ""}><span>启用</span></label>
+        <button class="mini-icon-button" type="submit" aria-label="保存" title="保存">${icon("save")}</button>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="scheduled-messages" data-resource-id="${attr(item.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
+      </form>`;
+  }
+
   function renderGroupResources(group) {
     const resource = state.groupResources.get(String(group.id));
-    if (!resource) return `<p class="field-hint">打开后可直接管理群规、永久记忆、警告记录、群内封禁、审核豁免和回复静默名单。</p>`;
+    if (!resource) return `<p class="field-hint">打开后可直接管理关键词回复、定时消息、群规、永久记忆、警告记录、群内封禁、审核豁免和回复静默名单。</p>`;
     if (resource.loading) return `<div class="loading-inline"><span class="spinner spinner-small"></span><span>正在加载</span></div>`;
     if (resource.error) return `<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(resource.error)}</span></div>`;
-    const itemRows = (items, type, text) => items.map(item => `
+    const listKey = type => `group:${group.id}:${type}`;
+    const itemRows = (items, type, text) => paginatedRows(items, listKey(type), item => `
       <div class="resource-row">
         <span>${escapeHtml(text(item))}</span>
         <span class="resource-row-actions">
           ${type === "memories" ? `<button class="mini-icon-button" type="button" data-action="edit-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id)}" aria-label="编辑" title="编辑">${icon("pencil")}</button>` : ""}
           ${(type !== "warnings" || !item.is_banned) ? `<button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id ?? item.user_id)}" aria-label="${type === "warnings" ? "清零警告" : "删除"}" title="${type === "warnings" ? "清零警告" : "删除"}">${icon("trash-2")}</button>` : ""}
         </span>
-      </div>`).join("") || `<p class="field-hint">暂无记录</p>`;
+      </div>`);
     return `
       <div class="resource-grid">
+        <section class="resource-span">
+          <h4>关键词回复</h4>
+          <form class="inline-resource-form" data-resource-form="keyword-replies" data-group-id="${attr(group.id)}">
+            <select name="match_type" aria-label="匹配方式"><option value="contains">包含</option><option value="exact">完全匹配</option><option value="regex">正则</option></select>
+            <input name="keyword" maxlength="255" placeholder="关键词" required>
+            <input name="reply_text" maxlength="4000" placeholder="回复内容" required>
+            <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
+            <label class="compact-check"><input name="auto_delete" type="checkbox" checked><span>自动删除</span></label>
+            <button class="icon-button" type="submit" aria-label="新增关键词回复" title="新增关键词回复">${icon("plus")}</button>
+          </form>
+          <p class="field-hint">命中后直接发送固定回复并跳过 AI 回复；「自动删除」按全局 Bot 设置中的「关键词回复」类别与秒数执行。</p>
+          ${paginatedRows(resource.keyword_replies, listKey("keyword-replies"), item => renderKeywordReplyRow(group, item))}
+        </section>
+        <section class="resource-span">
+          <h4>定时消息</h4>
+          <form class="inline-resource-form" data-resource-form="scheduled-messages" data-group-id="${attr(group.id)}">
+            <input name="text" maxlength="4000" placeholder="消息内容" required>
+            <select name="schedule_type" aria-label="定时方式"><option value="daily">每天定时</option><option value="interval">固定间隔</option></select>
+            <input name="schedule_time" type="time" value="09:00" aria-label="发送时间" title="每天定时的发送时间">
+            <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="60" aria-label="间隔分钟" title="固定间隔的分钟数" required>
+            <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
+            <label class="compact-check"><input name="auto_delete" type="checkbox"><span>自动删除</span></label>
+            <button class="icon-button" type="submit" aria-label="新增定时消息" title="新增定时消息">${icon("plus")}</button>
+          </form>
+          <p class="field-hint">「每天定时」按发送时间触发，「固定间隔」按分钟循环；勾选「置顶」即定时置顶，「取消上次置顶」会先取消上一条。「自动删除」按全局「定时消息」类别执行。</p>
+          ${paginatedRows(resource.scheduled_messages, listKey("scheduled-messages"), item => renderScheduledMessageRow(group, item))}
+        </section>
         <section>
           <h4>群规</h4>
           <form class="inline-resource-form" data-resource-form="rules" data-group-id="${attr(group.id)}">
@@ -992,7 +1086,7 @@
             <select name="action"><option value="warn">警告</option><option value="delete">删消息</option><option value="ban">封禁</option></select>
             <button class="icon-button" type="submit" aria-label="新增群规" title="新增群规">${icon("plus")}</button>
           </form>
-          ${resource.rules.map(rule => `
+          ${paginatedRows(resource.rules, listKey("rules"), rule => `
             <form class="rule-resource-form" data-rule-edit-form data-group-id="${attr(group.id)}" data-rule-id="${attr(rule.id)}">
               <select name="rule_type" aria-label="群规类型">
                 <option value="keyword"${rule.rule_type === "keyword" ? " selected" : ""}>关键词</option>
@@ -1008,7 +1102,7 @@
               <label class="compact-check"><input name="enabled" type="checkbox"${rule.enabled ? " checked" : ""}><span>启用</span></label>
               <button class="mini-icon-button" type="submit" aria-label="保存群规" title="保存群规">${icon("save")}</button>
               <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="rules" data-resource-id="${attr(rule.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
-            </form>`).join("") || `<p class="field-hint">暂无记录</p>`}
+            </form>`)}
         </section>
         <section>
           <h4>永久记忆</h4>
@@ -1071,14 +1165,14 @@
       <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
     if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
     if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
-    const rows = (items, type, label, idKey = "user_id") => items.map(item => {
+    const rows = (items, type, label, idKey = "user_id") => paginatedRows(items, `access:${type}`, item => {
       const resourceId = type === "admins"
         ? `${item.group_id}:${item.user_id}`
         : item[idKey];
       return `
       <div class="resource-row"><span>${escapeHtml(label(item))}</span>
       <button class="mini-icon-button danger" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}" aria-label="删除" title="删除">${icon("trash-2")}</button></div>`;
-    }).join("") || `<p class="field-hint">暂无记录</p>`;
+    });
     return `
       ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
       <div class="resource-grid access-grid">
@@ -1242,13 +1336,15 @@
     renderContent();
     try {
       const base = `/api/v1/groups/${encodeURIComponent(groupId)}`;
-      const [rules, memories, warnings, bans, exemptions, replyMutes] = await Promise.all([
+      const [rules, memories, warnings, bans, exemptions, replyMutes, keywordReplies, scheduledMessages] = await Promise.all([
         apiFetch(`${base}/rules`),
         apiFetch(`${base}/memories`),
         apiFetch(`${base}/warnings`),
         apiFetch(`${base}/bans`),
         apiFetch(`${base}/moderation-exemptions`),
         apiFetch(`${base}/reply-mutes`),
+        apiFetch(`${base}/keyword-replies`),
+        apiFetch(`${base}/scheduled-messages`),
       ]);
       state.groupResources.set(key, {
         rules: rules.rules || [],
@@ -1257,6 +1353,8 @@
         bans: bans.bans || [],
         exemptions: exemptions.exemptions || [],
         reply_mutes: replyMutes.reply_mutes || [],
+        keyword_replies: keywordReplies.keyword_replies || [],
+        scheduled_messages: scheduledMessages.scheduled_messages || [],
       });
     } catch (error) {
       state.groupResources.set(key, { error: error.message || "群管理数据加载失败" });
@@ -1652,6 +1750,11 @@
       loadAll();
       return;
     }
+    if (action === "list-page") {
+      state.listPages.set(button.dataset.listKey, Number(button.dataset.page) || 1);
+      renderContent();
+      return;
+    }
     if (action === "add-provider") {
       const existing = new Set(state.config.models.providers.map(item => item.name));
       let suffix = state.config.models.providers.length + 1;
@@ -1830,7 +1933,61 @@
     }
   });
 
+  const ENTRY_FORM_FIELDS = {
+    "keyword-replies": {
+      strings: ["keyword", "match_type", "reply_text"],
+      booleans: ["pin_message", "auto_delete", "enabled"],
+      numbers: [],
+    },
+    "scheduled-messages": {
+      strings: ["text", "schedule_type", "schedule_time"],
+      booleans: ["pin_message", "unpin_previous", "auto_delete", "enabled"],
+      numbers: ["interval_minutes"],
+    },
+  };
+
+  function readEntryFormValues(form, type, { includeEnabled }) {
+    const spec = ENTRY_FORM_FIELDS[type];
+    const values = {};
+    for (const name of spec.strings) {
+      const control = form.elements[name];
+      if (!control) continue;
+      // A cleared time input means "keep the stored HH:MM" (interval entries
+      // ignore it); sending "" would fail backend validation.
+      if (name === "schedule_time" && !control.value) continue;
+      values[name] = control.value;
+    }
+    for (const name of spec.numbers) {
+      const control = form.elements[name];
+      if (control) values[name] = Number(control.value);
+    }
+    for (const name of spec.booleans) {
+      if (name === "enabled" && !includeEnabled) continue;
+      const control = form.elements[name];
+      if (control) values[name] = control.checked;
+    }
+    return values;
+  }
+
   content.addEventListener("submit", async event => {
+    const entryEditForm = event.target.closest("[data-entry-edit-form]");
+    if (entryEditForm) {
+      event.preventDefault();
+      if (!entryEditForm.reportValidity()) return;
+      const type = entryEditForm.dataset.entryEditForm;
+      const values = readEntryFormValues(entryEditForm, type, { includeEnabled: true });
+      try {
+        await apiFetch(`/api/v1/groups/${encodeURIComponent(entryEditForm.dataset.groupId)}/${type}/${encodeURIComponent(entryEditForm.dataset.entryId)}`, {
+          method: "PATCH",
+          body: JSON.stringify(values),
+        });
+        await loadGroupResources(entryEditForm.dataset.groupId);
+        showToast("已更新");
+      } catch (error) {
+        showToast(error.message || "更新失败", "error");
+      }
+      return;
+    }
     const ruleEditForm = event.target.closest("[data-rule-edit-form]");
     if (ruleEditForm) {
       event.preventDefault();
@@ -1877,7 +2034,9 @@
     if (!form.reportValidity()) return;
     const groupId = form.dataset.groupId;
     const type = form.dataset.resourceForm;
-    const values = Object.fromEntries(new FormData(form).entries());
+    const values = ENTRY_FORM_FIELDS[type]
+      ? readEntryFormValues(form, type, { includeEnabled: false })
+      : Object.fromEntries(new FormData(form).entries());
     if (values.user_id != null) values.user_id = Number(values.user_id);
     try {
       await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}`, {
