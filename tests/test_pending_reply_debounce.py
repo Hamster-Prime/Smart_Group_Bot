@@ -199,6 +199,10 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             fake_skill.build_answer_prompt_payload.call_args.kwargs["sender_is_tg_admin"]
         )
         self.assertFalse(fake_skill.answer_with_skill.await_args.kwargs["sender_is_tg_admin"])
+        self.assertIs(
+            fake_skill.answer_with_skill.await_args.kwargs["session_factory"],
+            memory.session_factory,
+        )
 
     async def test_admin_revalidation_error_fails_closed(self) -> None:
         item = _item(

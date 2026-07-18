@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import GlobalBan, JoinScreeningExemption, ModerationRule, UserProfileScreen
+from bot.services.ban_audit import record_ban_event
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +82,17 @@ async def add_global_ban(
                     .where(GlobalBan.user_id == user_id)
                     .values(**values)
                 )
+        await record_ban_event(
+            session,
+            group_id=0,
+            target_user_id=user_id,
+            action="ban",
+            source=source,
+            outcome="policy_added" if created else "policy_updated",
+            reason=reason,
+            actor_user_id=created_by,
+            details={"registry_created": bool(created)},
+        )
         return created
 
     # Other dialects still avoid get-then-add. The savepoint keeps the outer
@@ -96,6 +108,17 @@ async def add_global_ban(
                 )
             )
             await session.flush()
+        await record_ban_event(
+            session,
+            group_id=0,
+            target_user_id=user_id,
+            action="ban",
+            source=source,
+            outcome="policy_added",
+            reason=reason,
+            actor_user_id=created_by,
+            details={"registry_created": True},
+        )
         return True
     except IntegrityError:
         values = {}
@@ -107,6 +130,17 @@ async def add_global_ban(
             await session.execute(
                 update(GlobalBan).where(GlobalBan.user_id == user_id).values(**values)
             )
+        await record_ban_event(
+            session,
+            group_id=0,
+            target_user_id=user_id,
+            action="ban",
+            source=source,
+            outcome="policy_updated",
+            reason=reason,
+            actor_user_id=created_by,
+            details={"registry_created": False},
+        )
         return False
 
 
@@ -131,6 +165,17 @@ async def remove_global_ban(
     exemption = await session.get(JoinScreeningExemption, user_id)
     if exemption is None:
         session.add(JoinScreeningExemption(user_id=user_id, created_by=operator_id))
+    await record_ban_event(
+        session,
+        group_id=0,
+        target_user_id=user_id,
+        action="unban",
+        source="manual",
+        outcome="policy_removed" if removed else "noop",
+        reason="管理员解除全局封禁",
+        actor_user_id=operator_id,
+        details={"registry_removed": bool(removed)},
+    )
     return removed
 
 

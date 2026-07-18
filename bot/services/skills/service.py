@@ -19,6 +19,7 @@ from bot.services.skills.sub2api_query import Sub2ApiQuerySkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.services.skills.weibo_search import WeiboSearchSkill
+from bot.services.skills.vote_ban import VoteBanSkill
 from bot.services.reply_output import REPLY_OUTPUT_AWARENESS, REPLY_OUTPUT_PROTOCOL
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
@@ -60,6 +61,7 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
     }
 )
 _PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
+_MANDATORY_REFUSAL_ERRORS = frozenset({"starter_quota_exhausted"})
 _NUMBERED_LIST_ITEM_RE = re.compile(r"^(\s*)(\d{1,2})([.)、]\s*)")
 _URL_RE = re.compile(r"https?://\S+")
 _RESULT_LIST_RE = re.compile(r"(?m)^\s*\d{1,2}[.)、]\s+")
@@ -93,6 +95,8 @@ class SkillService:
         self._register(WebFetchSkill())
         self._register(BilibiliSearchSkill())
         self._register(WeiboSearchSkill())
+        if settings is not None:
+            self._register(VoteBanSkill(settings))
         sub2api_skill = Sub2ApiQuerySkill(settings)
         if sub2api_skill.available:
             self._register(sub2api_skill)
@@ -838,6 +842,15 @@ class SkillService:
         recent_tool_results: list[dict[str, Any]],
         default_text: str,
     ) -> str:
+        for entry in reversed(recent_tool_results):
+            result = entry.get("result")
+            if (
+                isinstance(result, SkillRunResult)
+                and not result.ok
+                and result.error in _MANDATORY_REFUSAL_ERRORS
+                and result.summary
+            ):
+                return result.summary
         latest = cls._latest_successful_tool_result(
             recent_tool_results,
             allowed_skills=frozenset(
@@ -887,9 +900,12 @@ class SkillService:
         bot: Any | None = None,
         chat_id: int = 0,
         current_user_text: str = "",
+        session_factory: Any | None = None,
+        is_direct_request: bool = False,
     ) -> SkillRunResult:
         context = SkillContext(
             session=session,
+            session_factory=session_factory,
             message=message,
             bot=bot,
             chat_id=chat_id,
@@ -900,6 +916,7 @@ class SkillService:
             sender_is_owner=sender_is_owner,
             sender_is_tg_admin=sender_is_tg_admin,
             current_user_text=current_user_text,
+            is_direct_request=is_direct_request,
             default_sticker_file_ids=self.default_sticker_file_ids,
             auto_delete_media_seconds=(
                 configured_auto_delete_seconds(self.settings, "media")
@@ -920,6 +937,7 @@ class SkillService:
         sender_is_owner: bool = False,
         sender_is_tg_admin: bool = False,
         message: Any | None = None,
+        session_factory: Any | None = None,
         intent_type: str = "casual",
         allow_tts: bool = True,
         tts_mode: str = TTS_MODE_OFF,
@@ -928,6 +946,7 @@ class SkillService:
         reply_targets_context: str = "",
         is_mentioned: bool = False,
         is_reply_to_bot: bool = False,
+        is_direct_request: bool | None = None,
         style_profile_context: str = "",
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
@@ -955,6 +974,7 @@ class SkillService:
         tools = self._tool_definitions(selected_skills)
         context = SkillContext(
             session=session,
+            session_factory=session_factory,
             message=message,
             bot=getattr(message, "bot", None) if message is not None else None,
             chat_id=int(getattr(getattr(message, "chat", None), "id", 0) or 0) if message is not None else 0,
@@ -965,6 +985,11 @@ class SkillService:
             sender_is_owner=sender_is_owner,
             sender_is_tg_admin=sender_is_tg_admin,
             current_user_text=user_text,
+            is_direct_request=(
+                bool(is_mentioned or is_reply_to_bot)
+                if is_direct_request is None
+                else bool(is_direct_request)
+            ),
             default_sticker_file_ids=self.default_sticker_file_ids,
             auto_delete_media_seconds=(
                 configured_auto_delete_seconds(self.settings, "media")
@@ -973,8 +998,10 @@ class SkillService:
             ),
         )
         last_success_summary = ""
+        last_tool_summary = ""
         recent_tool_results: list[dict[str, Any]] = []
         followup_retry_used = False
+        mandatory_refusal_summary = ""
 
         def _build_answer_result(text: str = "") -> SkillAnswerResult:
             return SkillAnswerResult(
@@ -995,13 +1022,21 @@ class SkillService:
                 return _build_answer_result(
                     self._build_tool_fallback_text(
                         recent_tool_results=recent_tool_results,
-                        default_text=last_success_summary,
+                        default_text=last_tool_summary or last_success_summary,
                     )
                 )
 
             msg = resp.choices[0].message
             content = self._normalize_content_text(getattr(msg, "content", "")).strip()
             tool_calls = self._parse_tool_calls(msg)
+
+            # The model has now received the structured tool error and the
+            # mandatory-refusal system block.  Its prose is advisory only:
+            # return the trusted quota summary deterministically so it cannot
+            # claim success, omit the reason, or offer a bypass.
+            if mandatory_refusal_summary:
+                log.info("skill tool loop enforcing deterministic quota refusal")
+                return _build_answer_result(mandatory_refusal_summary)
 
             assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
@@ -1056,21 +1091,31 @@ class SkillService:
                 return _build_answer_result(
                     self._build_tool_fallback_text(
                         recent_tool_results=recent_tool_results,
-                        default_text=content or last_success_summary,
+                        default_text=content or last_tool_summary or last_success_summary,
                     )
                 )
 
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
             for tool_call in tool_calls:
                 args = self._parse_tool_arguments(tool_call["arguments"])
-                result = await self._run_tool(
-                    name=tool_call["name"],
-                    arguments=args,
-                    context=context,
-                    skills=selected_skills,
-                )
+                if mandatory_refusal_summary:
+                    result = SkillRunResult(
+                        ok=False,
+                        skill=tool_call["name"],
+                        summary=mandatory_refusal_summary,
+                        error="skipped_due_to_mandatory_refusal",
+                    )
+                else:
+                    result = await self._run_tool(
+                        name=tool_call["name"],
+                        arguments=args,
+                        context=context,
+                        skills=selected_skills,
+                    )
                 if result.ok and result.summary:
                     last_success_summary = result.summary
+                if result.summary:
+                    last_tool_summary = result.summary
                 recent_tool_results.append(
                     {
                         "name": tool_call["name"],
@@ -1088,7 +1133,28 @@ class SkillService:
                         "content": json.dumps(payload, ensure_ascii=False),
                     }
                 )
+                if result.error in _MANDATORY_REFUSAL_ERRORS:
+                    mandatory_refusal_summary = result.summary or (
+                        "本统计周期内的民主投票发起额度已用完，请稍后再试。"
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "[MANDATORY_TOOL_REFUSAL]\n"
+                                f"error: {result.error}\n"
+                                f"reason_to_user: {result.summary}\n"
+                                "You must refuse this action using reason_to_user. "
+                                "Do not retry the tool in this turn, do not suggest /voteban "
+                                "or another path to bypass the quota, and do not claim the vote started."
+                            ),
+                        }
+                    )
 
+            if mandatory_refusal_summary:
+                if step < self.max_tool_rounds:
+                    continue
+                return _build_answer_result(mandatory_refusal_summary)
             if _action_reply_completed():
                 log.info("skill tool loop finished: step=%d action_handled_without_followup", step)
                 return _build_answer_result()
@@ -1099,6 +1165,6 @@ class SkillService:
         return _build_answer_result(
             self._build_tool_fallback_text(
                 recent_tool_results=recent_tool_results,
-                default_text=last_success_summary,
+                default_text=last_tool_summary or last_success_summary,
             )
         )

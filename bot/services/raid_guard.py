@@ -11,6 +11,8 @@ lockdown:
   runs for a fixed duration: repelled joins do not extend it (a single
   bouncing account must not be able to lock the group forever), and a raid
   that outlasts it simply re-triggers on the next threshold of joins.
+  Trigger and recovery notices are persistent. A per-lockdown timer announces
+  recovery even when no later member joins to drive another event.
 - Members who joined within the lookback window before the trigger (the raid
   wave plus the accounts smuggled in just ahead of it) are fully muted and
   challenged: one message per chunk @-mentions them with a shared "真人质询"
@@ -19,11 +21,14 @@ lockdown:
   use it). Passing the private Mini App challenge restores permissions;
   missing the deadline kicks WITHOUT banning.
 
-Lockdown state is in-memory only: a restart drops an active lockdown, but the
-issued challenges live in join_verifications and stay enforced by the
-deadline sweeper. When the verification service is unavailable the lockdown
-still protects the group, but no challenges are issued (muting members with
-no challenge path would strand them).
+Automatically detected lockdowns are intentionally in-memory only. Manual
+lockdowns are persisted in ``Group.settings`` so both indefinite and timed
+administrator locks survive a restart; startup restores their timers and
+atomically claims expired records before announcing recovery. Issued
+challenges live in join_verifications and stay enforced by the deadline
+sweeper. When the verification service is unavailable the lockdown still
+protects the group, but no challenges are issued (muting members with no
+challenge path would strand them).
 """
 from __future__ import annotations
 
@@ -33,30 +38,36 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
+from bot.db.models import AuthorizedGroup, Group, JoinVerification
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
     VERIFICATION_KIND_RAID,
+    claim_join_verification,
     get_join_verification,
     kick_member,
     restore_member_permissions,
     restrict_new_member,
     upsert_join_verification,
+    verification_deadline_passed,
     verification_provider,
     verification_service_ready,
+    verification_timeout_seconds_for_kind,
 )
-from bot.utils.telegram import (
-    configured_auto_delete_seconds,
-    schedule_message_auto_delete,
+from bot.utils.timezone import (
+    now_shanghai_naive,
+    to_shanghai_datetime,
+    to_shanghai_naive,
 )
-from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +79,22 @@ _PER_MEMBER_CALL_PAUSE = 0.05
 # Upper bound on remembered joins per group; a raid larger than this still
 # triggers long before the cap is reached.
 _MAX_TRACKED_JOINS = 4096
+# Shared raid challenge callback used by administrators to remove every still
+# pending suspect mentioned by the clicked challenge message.
+RAID_REMOVE_CALLBACK_DATA = "rgr"
+# A command typo must not leave a group locked for an effectively unbounded
+# number of years. Indefinite manual lockdown is represented by no duration;
+# explicit minute values are capped at one week.
+MAX_MANUAL_LOCKDOWN_MINUTES = 7 * 24 * 60
+# Private service state. It is deliberately excluded from the Mini App's
+# editable group-settings schema, while sharing the same JSON document with
+# the group's other settings.
+MANUAL_LOCKDOWN_SETTINGS_KEY = "raid_guard_manual_lockdown"
+_MANUAL_LOCKDOWN_STATE_VERSION = 1
+_PERSISTENCE_RETRIES = 5
+_PERSISTENCE_ANY = object()
+_PERSISTENCE_DELETE = object()
+_INVALID_PERSISTED_STATE = object()
 
 _service: "RaidGuardService | None" = None
 
@@ -217,6 +244,87 @@ def build_raid_lockdown_text(
     )
 
 
+def build_manual_raid_lockdown_text(*, duration_minutes: int | None) -> str:
+    if duration_minutes is None:
+        duration_text = "关闭前将持续拒绝新成员加入"
+    else:
+        duration_text = (
+            f"将在 {_format_duration(duration_minutes * 60)} 内拒绝新成员加入"
+        )
+    return (
+        "🛡 <b>爆破防护已手动开启</b>\n"
+        f"{duration_text}；被拒绝的成员不会封禁，解除后可以重新加入。"
+    )
+
+
+def build_raid_unlock_text() -> str:
+    return (
+        "✅ <b>爆破防护已解除</b>\n"
+        "群组已恢复接收新成员；此前被临时移出的用户现在可以重新加入。"
+    )
+
+
+def normalize_manual_lockdown_minutes(value: object | None) -> int | None:
+    """Validate the optional ``/command <minutes>`` service argument.
+
+    ``None`` means an indefinite manual lockdown. A supplied value is always
+    interpreted as minutes, never seconds.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("爆破防护时长必须是分钟数字")
+    try:
+        minutes = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("爆破防护时长必须是分钟数字") from exc
+    if minutes < 1 or minutes > MAX_MANUAL_LOCKDOWN_MINUTES:
+        raise ValueError(
+            f"爆破防护时长必须在 1-{MAX_MANUAL_LOCKDOWN_MINUTES} 分钟之间"
+        )
+    return minutes
+
+
+def _manual_lockdown_state(until: datetime | None) -> dict[str, object]:
+    """Return the canonical JSON document stored for one manual lockdown."""
+    if until is None:
+        return {
+            "version": _MANUAL_LOCKDOWN_STATE_VERSION,
+            "indefinite": True,
+        }
+    return {
+        "version": _MANUAL_LOCKDOWN_STATE_VERSION,
+        # Include the UTC offset so the deadline remains unambiguous if the
+        # host timezone changes. Runtime comparisons still use the project's
+        # Asia/Shanghai-naive convention.
+        "until": to_shanghai_datetime(until).isoformat(),
+    }
+
+
+def _parse_manual_lockdown_state(value: object) -> datetime | None | object:
+    """Parse persisted state.
+
+    ``None`` is the valid indefinite value. ``_INVALID_PERSISTED_STATE`` is
+    returned for malformed documents so callers can distinguish them from an
+    indefinite lock without another sentinel type.
+    """
+    if not isinstance(value, Mapping):
+        return _INVALID_PERSISTED_STATE
+    if value.get("version") != _MANUAL_LOCKDOWN_STATE_VERSION:
+        return _INVALID_PERSISTED_STATE
+    indefinite = value.get("indefinite")
+    until_text = str(value.get("until") or "").strip()
+    if indefinite is True:
+        return None if not until_text else _INVALID_PERSISTED_STATE
+    if indefinite not in (None, False) or not until_text:
+        return _INVALID_PERSISTED_STATE
+    try:
+        parsed = datetime.fromisoformat(until_text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return _INVALID_PERSISTED_STATE
+    return to_shanghai_naive(parsed)
+
+
 def build_raid_challenge_text(
     suspects: Iterable[RaidSuspect],
     *,
@@ -245,8 +353,116 @@ def build_raid_challenge_keyboard() -> InlineKeyboardMarkup:
                     text="🙋 真人质询（仅被点名成员可用）",
                     callback_data=RAID_VERIFY_CALLBACK_DATA,
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚫 一键移除被追溯用户（仅管理员）",
+                    callback_data=RAID_REMOVE_CALLBACK_DATA,
+                )
+            ],
         ]
+    )
+
+
+@dataclass(slots=True)
+class RaidRemovalResult:
+    pending_count: int
+    removed_user_ids: tuple[int, ...]
+    failed_user_ids: tuple[int, ...]
+
+
+async def remove_raid_challenged_users(
+    *,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    group_id: int,
+    prompt_message_id: int,
+    group_settings: dict | None = None,
+) -> RaidRemovalResult:
+    """Atomically claim and kick pending raid suspects from one prompt.
+
+    The prompt message id scopes the bulk action to exactly the displayed
+    chunk. Each record is claimed with the same compare-and-delete primitive
+    used by Mini App passes and the timeout sweeper, preventing double actions.
+    Failed Telegram kicks are requeued with a fresh raid deadline so an
+    administrator can retry instead of silently losing enforcement state.
+    """
+    group_id = int(group_id)
+    prompt_message_id = int(prompt_message_id)
+    now = now_shanghai_naive()
+    result = await session.execute(
+        select(JoinVerification)
+        .where(
+            JoinVerification.group_id == group_id,
+            JoinVerification.kind == VERIFICATION_KIND_RAID,
+            JoinVerification.prompt_message_id == prompt_message_id,
+        )
+        .order_by(JoinVerification.id)
+    )
+    records = list(result.scalars().all())
+    claimed: list[tuple[dict[str, object], bool]] = []
+    for record in records:
+        globally_banned = await is_globally_banned(session, int(record.user_id))
+        won = await claim_join_verification(
+            session,
+            verification_id=int(record.id),
+            deadline_at=record.deadline_at,
+            kind=record.kind,
+            now=now,
+            expired=verification_deadline_passed(record.deadline_at, now=now),
+        )
+        if not won:
+            continue
+        claimed.append(
+            (
+                {
+                    "group_id": int(record.group_id),
+                    "user_id": int(record.user_id),
+                    "provider": str(record.provider),
+                    "reason": str(record.reason or ""),
+                    "display_name": str(record.display_name or ""),
+                    "prompt_message_id": int(record.prompt_message_id or 0),
+                },
+                globally_banned,
+            )
+        )
+    await session.commit()
+
+    removed: list[int] = []
+    failed: list[int] = []
+    retry_deadline = now_shanghai_naive() + timedelta(
+        seconds=verification_timeout_seconds_for_kind(
+            settings,
+            VERIFICATION_KIND_RAID,
+            group_settings,
+        )
+    )
+    for snapshot, globally_banned in claimed:
+        user_id = int(snapshot["user_id"])
+        # A global ban already keeps this account out. kick_member would ban
+        # and immediately unban it, accidentally lifting Telegram enforcement.
+        if globally_banned or await kick_member(bot, group_id, user_id):
+            removed.append(user_id)
+            continue
+        failed.append(user_id)
+        await upsert_join_verification(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            deadline_at=retry_deadline,
+            kind=VERIFICATION_KIND_RAID,
+            provider=str(snapshot["provider"]),
+            reason=str(snapshot["reason"]),
+            display_name=str(snapshot["display_name"]),
+            prompt_message_id=int(snapshot["prompt_message_id"]),
+        )
+    if failed:
+        await session.commit()
+    return RaidRemovalResult(
+        pending_count=len(records),
+        removed_user_ids=tuple(removed),
+        failed_user_ids=tuple(failed),
     )
 
 
@@ -266,9 +482,9 @@ class _JoinEvent:
 class RaidGuardService:
     """Event-driven join-flood detector with per-group lockdown state.
 
-    No background loop: lockdown expiry is passive (checked on the next
-    join), and challenge deadlines are enforced by the shared verification
-    sweeper.
+    No polling loop is needed: an asyncio timer sends the unlock notice at the
+    exact deadline, with the next join acting as a passive expiry fallback.
+    Challenge deadlines are enforced by the shared verification sweeper.
     """
 
     def __init__(
@@ -282,25 +498,526 @@ class RaidGuardService:
         self.settings = settings
         self.session_factory = session_factory
         self._recent_joins: dict[int, deque[_JoinEvent]] = {}
-        self._lockdown_until: dict[int, datetime] = {}
+        # None is an explicit indefinite manual lockdown; absence means idle.
+        self._lockdown_until: dict[int, datetime | None] = {}
+        self._lockdown_source: dict[int, str] = {}
+        self._lockdown_timers: dict[int, asyncio.TimerHandle] = {}
+        self._lockdown_expiry_tasks: dict[int, asyncio.Task[bool]] = {}
+        # Exact raw JSON values are retained so expiry/disable can use an
+        # optimistic compare-and-delete. Only the process that removes the
+        # matching record emits the recovery notice.
+        self._manual_persisted_state: dict[int, dict[str, object]] = {}
+        self._manual_state_locks: dict[int, asyncio.Lock] = {}
+
+    def _manual_state_lock(self, group_id: int) -> asyncio.Lock:
+        group_id = int(group_id)
+        lock = self._manual_state_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._manual_state_locks[group_id] = lock
+        return lock
+
+    def _cancel_lockdown_timer(self, group_id: int) -> None:
+        handle = self._lockdown_timers.pop(int(group_id), None)
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_lockdown(
+        self,
+        group_id: int,
+        *,
+        duration_seconds: int | None,
+        source: str,
+    ) -> datetime | None:
+        until = (
+            None
+            if duration_seconds is None
+            else now_shanghai_naive() + timedelta(seconds=max(1, int(duration_seconds)))
+        )
+        self._arm_lockdown_until(
+            int(group_id),
+            until=until,
+            source=source,
+        )
+        return until
+
+    def _arm_lockdown_until(
+        self,
+        group_id: int,
+        *,
+        until: datetime | None,
+        source: str,
+        persisted_state: Mapping[str, object] | None = None,
+        schedule_expiry: bool = True,
+    ) -> None:
+        """Install an exact deadline, used both at activation and restore."""
+        group_id = int(group_id)
+        self._cancel_lockdown_timer(group_id)
+        self._lockdown_until[group_id] = until
+        self._lockdown_source[group_id] = str(source or "automatic")
+        if source == "manual" and persisted_state is not None:
+            self._manual_persisted_state[group_id] = dict(persisted_state)
+        elif source != "manual":
+            self._manual_persisted_state.pop(group_id, None)
+        if until is not None and schedule_expiry:
+            try:
+                loop = asyncio.get_running_loop()
+                self._lockdown_timers[group_id] = loop.call_later(
+                    max(0.0, (until - now_shanghai_naive()).total_seconds()),
+                    self._schedule_lockdown_expiry,
+                    group_id,
+                    until,
+                )
+            except RuntimeError:
+                log.debug("[%s] raid unlock timer could not be scheduled", group_id)
+
+    def _schedule_lockdown_expiry(
+        self,
+        group_id: int,
+        expected_until: datetime,
+    ) -> None:
+        group_id = int(group_id)
+        self._lockdown_timers.pop(group_id, None)
+        existing = self._lockdown_expiry_tasks.get(group_id)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                self._expire_lockdown(group_id, expected_until),
+                name=f"raid-unlock:{group_id}",
+            )
+            self._lockdown_expiry_tasks[group_id] = task
+
+            def _finished(done: asyncio.Task[bool]) -> None:
+                if self._lockdown_expiry_tasks.get(group_id) is done:
+                    self._lockdown_expiry_tasks.pop(group_id, None)
+                if done.cancelled():
+                    return
+                try:
+                    done.result()
+                except Exception:
+                    log.exception(
+                        "[%s] raid unlock task failed",
+                        group_id,
+                    )
+
+            task.add_done_callback(_finished)
+        except RuntimeError:
+            log.debug("[%s] raid unlock notification could not be scheduled", group_id)
+
+    async def _update_persisted_manual_state(
+        self,
+        group_id: int,
+        *,
+        value: Mapping[str, object] | object,
+        expected: object = _PERSISTENCE_ANY,
+    ) -> bool | None:
+        """Optimistically set/delete the private manual-lockdown JSON key.
+
+        ``True`` means this call changed the stored document, ``False`` means
+        the requested value was already present or the expected prior state
+        no longer matched, and ``None`` means repeated concurrent writes kept
+        the update from committing. Comparing the full JSON snapshot mirrors
+        the established Group.settings update strategy used by the proactive
+        service and prevents us from replacing unrelated fields with a stale
+        copy.
+        """
+        group_id = int(group_id)
+        deleting = value is _PERSISTENCE_DELETE
+        if not deleting and not isinstance(value, Mapping):
+            raise TypeError("manual raid state must be a JSON object")
+        normalized_value = None if deleting else dict(value)
+        for _attempt in range(_PERSISTENCE_RETRIES):
+            async with self.session_factory() as session:
+                row = await session.get(Group, group_id)
+                if row is None:
+                    if deleting:
+                        return False
+                    settings_value = {
+                        MANUAL_LOCKDOWN_SETTINGS_KEY: normalized_value,
+                    }
+                    session.add(Group(id=group_id, title="", settings=settings_value))
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        # Another handler created the Group between SELECT and
+                        # INSERT; retry against its fresh JSON document.
+                        await session.rollback()
+                        continue
+                    return True
+
+                stored_settings = row.settings
+                updated_settings = dict(stored_settings or {})
+                current = updated_settings.get(
+                    MANUAL_LOCKDOWN_SETTINGS_KEY,
+                    _PERSISTENCE_ANY,
+                )
+                if expected is not _PERSISTENCE_ANY and current != expected:
+                    return False
+                if deleting:
+                    if current is _PERSISTENCE_ANY:
+                        return False
+                    updated_settings.pop(MANUAL_LOCKDOWN_SETTINGS_KEY, None)
+                else:
+                    if current == normalized_value:
+                        return False
+                    updated_settings[MANUAL_LOCKDOWN_SETTINGS_KEY] = normalized_value
+
+                stmt = (
+                    update(Group)
+                    .where(
+                        Group.id == group_id,
+                        Group.settings == stored_settings,
+                    )
+                    .values(settings=updated_settings)
+                    .execution_options(synchronize_session=False)
+                )
+                result = await session.execute(stmt)
+                if int(result.rowcount or 0) == 1:
+                    await session.commit()
+                    return True
+                await session.rollback()
+
+        log.warning(
+            "[%s] manual raid state update lost repeated concurrent races",
+            group_id,
+        )
+        return None
+
+    async def restore_manual_lockdowns(self) -> dict[str, int]:
+        """Restore persisted manual lockdowns for every authorized group.
+
+        Expired records are compare-and-deleted before an unlock notice is
+        sent. Calling this method repeatedly (or starting overlapping bot
+        processes) therefore cannot announce the same persisted expiry twice.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Group.id, Group.settings)
+                .join(AuthorizedGroup, AuthorizedGroup.group_id == Group.id)
+                .order_by(Group.id)
+            )
+            rows = list(result.all())
+
+        restored = 0
+        expired = 0
+        invalid = 0
+        now = now_shanghai_naive()
+        for raw_group_id, raw_settings in rows:
+            group_id = int(raw_group_id)
+            group_settings = dict(raw_settings or {})
+            if MANUAL_LOCKDOWN_SETTINGS_KEY not in group_settings:
+                continue
+            raw_state = group_settings[MANUAL_LOCKDOWN_SETTINGS_KEY]
+            parsed_until = _parse_manual_lockdown_state(raw_state)
+            if parsed_until is _INVALID_PERSISTED_STATE:
+                try:
+                    removed = await self._update_persisted_manual_state(
+                        group_id,
+                        value=_PERSISTENCE_DELETE,
+                        expected=raw_state,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    removed = None
+                    log.exception(
+                        "[%s] malformed manual raid state cleanup failed",
+                        group_id,
+                    )
+                if removed:
+                    invalid += 1
+                log.warning(
+                    "[%s] discarded malformed persisted manual raid state",
+                    group_id,
+                )
+                continue
+
+            if isinstance(parsed_until, datetime) and parsed_until <= now:
+                canonical = (
+                    dict(raw_state) if isinstance(raw_state, Mapping) else {}
+                )
+                self._arm_lockdown_until(
+                    group_id,
+                    until=parsed_until,
+                    source="manual",
+                    persisted_state=canonical,
+                    schedule_expiry=False,
+                )
+                if await self._expire_lockdown(group_id, parsed_until):
+                    expired += 1
+                continue
+
+            canonical = dict(raw_state) if isinstance(raw_state, Mapping) else {}
+            self._arm_lockdown_until(
+                group_id,
+                until=parsed_until if isinstance(parsed_until, datetime) else None,
+                source="manual",
+                persisted_state=canonical,
+            )
+            restored += 1
+
+        if restored or expired or invalid:
+            log.info(
+                "manual raid state restored | active=%d expired=%d invalid=%d",
+                restored,
+                expired,
+                invalid,
+            )
+        return {
+            "restored": restored,
+            "expired": expired,
+            "invalid": invalid,
+        }
+
+    def _clear_lockdown(self, group_id: int) -> str | None:
+        group_id = int(group_id)
+        if group_id not in self._lockdown_until:
+            return None
+        self._cancel_lockdown_timer(group_id)
+        self._lockdown_until.pop(group_id, None)
+        self._recent_joins.pop(group_id, None)
+        self._manual_persisted_state.pop(group_id, None)
+        return self._lockdown_source.pop(group_id, "automatic")
+
+    async def _send_unlock_notice(self, group_id: int, *, source: str) -> None:
+        try:
+            # Protection state notices are intentionally persistent and do
+            # not participate in any general moderation auto-delete policy.
+            await self.bot.send_message(
+                int(group_id),
+                build_raid_unlock_text(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception(
+                "[%s] raid unlock notice failed | source=%s", group_id, source
+            )
+
+    async def _expire_lockdown(
+        self,
+        group_id: int,
+        expected_until: datetime,
+    ) -> bool:
+        group_id = int(group_id)
+        current = self._lockdown_until.get(group_id)
+        if current != expected_until:
+            return False
+        now = now_shanghai_naive()
+        if now < expected_until:
+            # Wall-clock adjustments may make call_later fire early; re-arm
+            # for the remaining interval without changing the deadline.
+            self._cancel_lockdown_timer(group_id)
+            try:
+                loop = asyncio.get_running_loop()
+                self._lockdown_timers[group_id] = loop.call_later(
+                    max(0.0, (expected_until - now).total_seconds()),
+                    self._schedule_lockdown_expiry,
+                    group_id,
+                    expected_until,
+                )
+            except RuntimeError:
+                pass
+            return False
+        source = self._lockdown_source.get(group_id)
+        if source == "manual":
+            async with self._manual_state_lock(group_id):
+                # A concurrent /raidguard on/off may have replaced the state
+                # while this expiry task waited for the per-group lock.
+                if (
+                    self._lockdown_until.get(group_id) != expected_until
+                    or self._lockdown_source.get(group_id) != "manual"
+                ):
+                    return False
+                persisted = self._manual_persisted_state.get(
+                    group_id,
+                    _manual_lockdown_state(expected_until),
+                )
+                try:
+                    removed = await self._update_persisted_manual_state(
+                        group_id,
+                        value=_PERSISTENCE_DELETE,
+                        expected=persisted,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    removed = None
+                    log.exception(
+                        "[%s] manual raid expiry persistence failed; retrying",
+                        group_id,
+                    )
+                if removed is None:
+                    # Keep the expired in-memory marker and retry shortly. A
+                    # passive join/status check treats its deadline as expired,
+                    # so this retry does not unnecessarily repel new members.
+                    try:
+                        loop = asyncio.get_running_loop()
+                        self._lockdown_timers[group_id] = loop.call_later(
+                            5.0,
+                            self._schedule_lockdown_expiry,
+                            group_id,
+                            expected_until,
+                        )
+                    except RuntimeError:
+                        pass
+                    return False
+                self._clear_lockdown(group_id)
+                if not removed:
+                    # Another expiry/disable already changed this exact
+                    # persisted state and owns the recovery notification.
+                    return False
+            await self._send_unlock_notice(group_id, source="manual")
+            return True
+
+        source = self._clear_lockdown(group_id)
+        if source is None:
+            return False
+        await self._send_unlock_notice(group_id, source=source)
+        return True
 
     def lockdown_active(self, group_id: int, *, now: datetime | None = None) -> bool:
-        until = self._lockdown_until.get(int(group_id))
-        if until is None:
+        group_id = int(group_id)
+        if group_id not in self._lockdown_until:
             return False
+        until = self._lockdown_until[group_id]
+        if until is None:
+            return True
         current = now if now is not None else now_shanghai_naive()
         if current < until:
             return True
-        self._lockdown_until.pop(int(group_id), None)
+        if self._lockdown_source.get(group_id) == "manual":
+            # Persistence cleanup and the exactly-once recovery notice require
+            # async I/O. Treat the deadline as expired immediately, but let the
+            # compare-and-delete task own state removal and notification.
+            self._cancel_lockdown_timer(group_id)
+            self._schedule_lockdown_expiry(group_id, until)
+            return False
+        source = self._clear_lockdown(group_id)
+        if source is not None:
+            try:
+                asyncio.create_task(
+                    self._send_unlock_notice(group_id, source=source),
+                    name=f"raid-unlock:{group_id}",
+                )
+            except RuntimeError:
+                log.debug(
+                    "[%s] raid unlock notification could not be scheduled",
+                    group_id,
+                )
         return False
+
+    async def enable_manual_lockdown(
+        self,
+        group_id: int,
+        *,
+        duration_minutes: object | None = None,
+    ) -> datetime | None:
+        """Immediately reject joins until disabled or the minute duration ends."""
+        minutes = normalize_manual_lockdown_minutes(duration_minutes)
+        group_id = int(group_id)
+        until = (
+            None
+            if minutes is None
+            else now_shanghai_naive() + timedelta(minutes=minutes)
+        )
+        persisted = _manual_lockdown_state(until)
+        async with self._manual_state_lock(group_id):
+            saved = await self._update_persisted_manual_state(
+                group_id,
+                value=persisted,
+            )
+            if saved is None:
+                raise RuntimeError("手动爆破防护状态保存失败，请稍后重试")
+            self._arm_lockdown_until(
+                group_id,
+                until=until,
+                source="manual",
+                persisted_state=persisted,
+            )
+            self._recent_joins.pop(group_id, None)
+        try:
+            # Manual state notices, like automatic trigger/unlock notices, are
+            # persistent by design.
+            await self.bot.send_message(
+                group_id,
+                build_manual_raid_lockdown_text(duration_minutes=minutes),
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.exception("[%s] manual raid lockdown notice failed", group_id)
+        return until
+
+    async def disable_manual_lockdown(self, group_id: int) -> bool:
+        """End the current lockdown immediately and announce the recovery."""
+        group_id = int(group_id)
+        async with self._manual_state_lock(group_id):
+            source = self._lockdown_source.get(group_id)
+            if source is None:
+                return False
+            if source == "manual":
+                expected = self._manual_persisted_state.get(
+                    group_id,
+                    _manual_lockdown_state(self._lockdown_until.get(group_id)),
+                )
+                removed = await self._update_persisted_manual_state(
+                    group_id,
+                    value=_PERSISTENCE_DELETE,
+                    expected=expected,
+                )
+                if removed is None:
+                    raise RuntimeError("手动爆破防护状态保存失败，请稍后重试")
+                self._clear_lockdown(group_id)
+                if not removed:
+                    # A competing expiry/disable already won the persisted
+                    # transition and is responsible for its unlock notice.
+                    return True
+            else:
+                self._clear_lockdown(group_id)
+        await self._send_unlock_notice(group_id, source=source)
+        return True
+
+    def manual_lockdown_active(self, group_id: int) -> bool:
+        return bool(
+            self.lockdown_active(int(group_id))
+            and self._lockdown_source.get(int(group_id)) == "manual"
+        )
+
+    def lockdown_status(self, group_id: int) -> dict[str, object]:
+        """Current in-memory state for commands and Mini App status hints."""
+        group_id = int(group_id)
+        active = self.lockdown_active(group_id)
+        if not active:
+            return {"active": False, "source": "", "until": None}
+        return {
+            "active": True,
+            "source": self._lockdown_source.get(group_id, "automatic"),
+            "until": self._lockdown_until.get(group_id),
+        }
 
     def reset(self, group_id: int | None = None) -> None:
         if group_id is None:
+            for tracked_group in tuple(self._lockdown_timers):
+                self._cancel_lockdown_timer(tracked_group)
+            for task in tuple(self._lockdown_expiry_tasks.values()):
+                task.cancel()
+            self._lockdown_expiry_tasks.clear()
             self._recent_joins.clear()
             self._lockdown_until.clear()
+            self._lockdown_source.clear()
+            self._manual_persisted_state.clear()
+            self._manual_state_locks.clear()
             return
+        self._cancel_lockdown_timer(int(group_id))
+        task = self._lockdown_expiry_tasks.pop(int(group_id), None)
+        if task is not None:
+            task.cancel()
         self._recent_joins.pop(int(group_id), None)
         self._lockdown_until.pop(int(group_id), None)
+        self._lockdown_source.pop(int(group_id), None)
+        self._manual_persisted_state.pop(int(group_id), None)
+        self._manual_state_locks.pop(int(group_id), None)
 
     async def handle_join(
         self,
@@ -323,10 +1040,26 @@ class RaidGuardService:
         group_id = int(group_id)
         user_id = int(user_id)
         config = resolve_raid_guard_config(self.settings, group_settings)
-        if not config.enabled:
-            return False
         now = now_shanghai_naive()
 
+        manual_until = self._lockdown_until.get(group_id)
+        if (
+            self._lockdown_source.get(group_id) == "manual"
+            and isinstance(manual_until, datetime)
+            and manual_until <= now
+        ):
+            # Complete the persisted compare-and-delete before this join can
+            # start a fresh automatic lockdown and overwrite the in-memory
+            # source marker needed by the expiry task.
+            await self._expire_lockdown(group_id, manual_until)
+            if self._lockdown_source.get(group_id) == "manual":
+                # Persistence cleanup is retrying. The manual deadline is
+                # already over, so do not repel this member, but also do not
+                # overwrite the state with a fresh automatic lockdown yet.
+                return False
+
+        # A manual lockdown must continue to repel joins even when automatic
+        # detection is disabled in this group's persisted policy.
         if self.lockdown_active(group_id, now=now):
             kicked = await kick_member(self.bot, group_id, user_id)
             log.info(
@@ -336,6 +1069,8 @@ class RaidGuardService:
                 kicked,
             )
             return kicked
+        if not config.enabled:
+            return False
 
         suspects = self._observe(
             group_id,
@@ -350,6 +1085,12 @@ class RaidGuardService:
         )
         if suspects is None:
             return False
+
+        self._arm_lockdown(
+            group_id,
+            duration_seconds=config.lockdown_seconds,
+            source="automatic",
+        )
 
         log.warning(
             "raid detected | group=%s joins=%d window=%ss lockdown=%ss suspects=%d",
@@ -391,9 +1132,6 @@ class RaidGuardService:
         if len(distinct_in_window) < config.join_threshold:
             return None
 
-        self._lockdown_until[group_id] = now + timedelta(
-            seconds=config.lockdown_seconds
-        )
         # Latest event per user: a leave/rejoin bouncer is challenged once.
         latest: dict[int, _JoinEvent] = {}
         for item in joins:
@@ -417,7 +1155,7 @@ class RaidGuardService:
         config: RaidGuardConfig,
     ) -> list[RaidSuspect]:
         try:
-            sent = await self.bot.send_message(
+            await self.bot.send_message(
                 group_id,
                 build_raid_lockdown_text(
                     joined_count=config.join_threshold,
@@ -425,11 +1163,6 @@ class RaidGuardService:
                     lockdown_seconds=config.lockdown_seconds,
                 ),
                 parse_mode="HTML",
-            )
-            # The lockdown alert is a moderation notice ("审核通知"): honor the
-            # group's auto-delete retention like other moderation outcomes.
-            schedule_message_auto_delete(
-                sent, configured_auto_delete_seconds(self.settings, "moderation")
             )
         except Exception:
             # The lockdown itself still protects the group.

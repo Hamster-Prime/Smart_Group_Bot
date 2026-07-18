@@ -90,6 +90,7 @@ def build_bot_runtime_profile_context(
         "weibo_search": "微博热搜、搜索与链接内容提取",
         "sub2api_query": "本站模型网关查询：可用模型列表与指定模型测活（问模型能不能用时优先用它，不要联网搜索）",
         "doubao_tts": "文字转语音",
+        "vote_ban": "明确请求且回复目标消息时发起民主投票封禁（受用户额度限制）",
     }
 
     capabilities = [

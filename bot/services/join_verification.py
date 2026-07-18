@@ -32,6 +32,7 @@ import asyncio
 import html
 import logging
 import weakref
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
@@ -845,6 +846,32 @@ async def delete_join_verifications_for_user(
     return int(result.rowcount or 0)
 
 
+async def join_verification_prompts_for_user(
+    session: AsyncSession,
+    user_id: int,
+) -> tuple[tuple[int, int], ...]:
+    """Snapshot visible prompts before a bulk terminal delete.
+
+    Global ban/unban paths delete several verification records at once. The
+    Telegram messages are separate side effects, so callers retain these ids,
+    commit the database transition, then remove every stale keyboard.
+    """
+    await session.flush()
+    rows = (
+        await session.execute(
+            select(
+                JoinVerification.group_id,
+                JoinVerification.prompt_message_id,
+            ).where(JoinVerification.user_id == int(user_id))
+        )
+    ).all()
+    return tuple(
+        (int(group_id), int(message_id))
+        for group_id, message_id in rows
+        if int(message_id or 0) > 0
+    )
+
+
 async def claim_join_verification(
     session: AsyncSession,
     *,
@@ -1020,6 +1047,73 @@ async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     except Exception:
         log.exception("moderation challenge ban failed | chat=%s user=%s", chat_id, user_id)
         return False
+
+
+async def delete_verification_prompt(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """Best-effort cleanup for a terminal or superseded challenge prompt.
+
+    Verification records and Telegram messages are separate side effects. If
+    an edit fails, a member leaves, or a rejoin replaces the record, deleting
+    the old prompt prevents a live-looking keyboard from pointing at a record
+    that no longer exists.
+    """
+    message_id = int(message_id or 0)
+    if not message_id:
+        return True
+    try:
+        deleted = await bot.delete_message(int(chat_id), message_id)
+        return deleted is not False
+    except Exception:
+        log.debug(
+            "verification prompt delete skipped | group=%s message=%s",
+            chat_id,
+            message_id,
+            exc_info=True,
+        )
+    # If Telegram refuses deletion (for example a transient permission/state
+    # mismatch), at least retire the live keyboard so subsequent taps cannot
+    # keep reporting a confusing expired challenge.
+    try:
+        edited = await bot.edit_message_reply_markup(
+            chat_id=int(chat_id),
+            message_id=message_id,
+            reply_markup=None,
+        )
+        return edited is not False
+    except Exception:
+        log.debug(
+            "verification prompt keyboard cleanup skipped | group=%s message=%s",
+            chat_id,
+            message_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def delete_verification_prompts(
+    bot: Bot,
+    prompts: Iterable[tuple[int, int]],
+) -> int:
+    """Best-effort parallel cleanup for a set of stale prompt keyboards."""
+    unique = {
+        (int(group_id), int(message_id))
+        for group_id, message_id in prompts
+        if int(message_id or 0) > 0
+    }
+    if not unique:
+        return 0
+    results = await asyncio.gather(
+        *(
+            delete_verification_prompt(bot, group_id, message_id)
+            for group_id, message_id in unique
+        ),
+        return_exceptions=True,
+    )
+    return sum(result is True for result in results)
 
 
 async def begin_moderation_challenge(
@@ -1572,6 +1666,7 @@ class JoinVerificationSweeper:
                 message_id=message_id,
                 text=text,
                 parse_mode="HTML",
+                reply_markup=None,
             )
             schedule_message_auto_delete(
                 edited if not isinstance(edited, bool) else None, seconds
@@ -1579,6 +1674,13 @@ class JoinVerificationSweeper:
         except Exception:
             log.debug(
                 "join verification prompt finalize skipped | group=%s message=%s",
+                record.group_id,
+                message_id,
+            )
+            # The database row is already terminal. Do not leave a clickable
+            # keyboard behind when Telegram rejected the in-place edit.
+            await delete_verification_prompt(
+                self.bot,
                 record.group_id,
                 message_id,
             )

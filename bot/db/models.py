@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -85,8 +86,9 @@ class KeywordReply(Base):
     """Per-group keyword auto replies, managed from the Mini App.
 
     match_type: "contains" (substring), "exact" (whole message), or "regex".
-    Replies are sent verbatim; pin_message optionally pins the sent reply and
-    auto_delete opts the reply into the global "keyword" retention category.
+    Replies support the shared safe Markdown renderer and optional inline
+    buttons; pin_message optionally pins the sent reply and auto_delete opts
+    it into the global "keyword" retention category.
     """
 
     __tablename__ = "keyword_replies"
@@ -96,6 +98,10 @@ class KeywordReply(Base):
     keyword: Mapped[str] = mapped_column(String(255), default="")
     match_type: Mapped[str] = mapped_column(String(16), default="contains")
     reply_text: Mapped[str] = mapped_column(Text, default="")
+    # Shared template-button schema: [{text, action, value, row}, ...].
+    # JSON keeps the feature extensible without a join table for a small,
+    # ordered collection capped by the settings API.
+    buttons: Mapped[list] = mapped_column(JSON, default=list)
     pin_message: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_delete: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -121,6 +127,7 @@ class ScheduledMessage(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     group_id: Mapped[int] = mapped_column(BigInteger, index=True)
     text: Mapped[str] = mapped_column(Text, default="")
+    buttons: Mapped[list] = mapped_column(JSON, default=list)
     schedule_type: Mapped[str] = mapped_column(String(16), default="daily")
     schedule_time: Mapped[str] = mapped_column(String(5), default="09:00")
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
@@ -137,6 +144,146 @@ class ScheduledMessage(Base):
         DateTime,
         default=now_shanghai_naive,
         server_default=func.now(),
+    )
+
+
+class VoteBanSession(Base):
+    """Democratic vote-ban: one active poll per (group, target).
+
+    Any member replies to a message with /voteban to open a poll against the
+    replied-to user; approvals at or above the per-group threshold ban the
+    target in that group. The prompt message carries live buttons, so no
+    auto-delete timer is scheduled while status is "active"; the finalized
+    (edited) outcome notice joins the "vote" retention category. Expiry timers
+    are in-memory (raid-guard convention): a restart drops them, but the next
+    button press lazily finalizes an overdue session.
+    """
+
+    __tablename__ = "vote_ban_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    target_user_id: Mapped[int] = mapped_column(BigInteger)
+    target_display: Mapped[str] = mapped_column(String(255), default="")
+    target_username: Mapped[str] = mapped_column(String(255), default="")
+    starter_user_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    starter_display: Mapped[str] = mapped_column(String(255), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="command")
+    target_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    threshold: Mapped[int] = mapped_column(Integer, default=5)
+    message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    # active / enforcing / passed / failed / expired / cancelled
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    # Lease timestamp for the Telegram ban side effect.  If a worker dies
+    # while status is ``enforcing``, another worker may safely retry the
+    # idempotent ban after the lease becomes stale.
+    enforcing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    deadline_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_vote_ban_group_status", "group_id", "status"),
+        # One open/enforcing poll per (group, target), enforced at the DB level so
+        # two concurrent /voteban commands cannot both open a session.
+        Index(
+            "ix_vote_ban_open_target",
+            "group_id",
+            "target_user_id",
+            unique=True,
+            sqlite_where=text("status IN ('active', 'enforcing')"),
+            postgresql_where=text("status IN ('active', 'enforcing')"),
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+
+class VoteBanVote(Base):
+    __tablename__ = "vote_ban_votes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("vote_ban_sessions.id"), index=True
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_vote_ban_vote_session_user", "session_id", "user_id", unique=True),
+    )
+
+
+class VoteBanQuotaBucket(Base):
+    """Persistent fixed-window quota for opening democratic vote-ban polls."""
+
+    __tablename__ = "vote_ban_quota_buckets"
+
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+    )
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        onupdate=now_shanghai_naive,
+    )
+
+
+class BanAuditEvent(Base):
+    """Append-only facts about ban/unban decisions and Telegram outcomes.
+
+    ``group_id == 0`` denotes a global policy entry.  Current policy state
+    remains in ``GlobalBan`` / ``UserWarning``; this table preserves who,
+    why, source, and actual outcome for the bot's trusted knowledge context.
+    """
+
+    __tablename__ = "ban_audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, default=0, index=True)
+    target_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    target_display: Mapped[str] = mapped_column(String(255), default="")
+    target_username: Mapped[str] = mapped_column(String(255), default="")
+    action: Mapped[str] = mapped_column(String(16), default="ban")
+    source: Mapped[str] = mapped_column(String(64), default="unknown")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    actor_user_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    actor_display: Mapped[str] = mapped_column(String(255), default="")
+    outcome: Mapped[str] = mapped_column(String(32), default="succeeded")
+    reference_type: Mapped[str] = mapped_column(String(32), default="")
+    reference_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_ban_audit_group_created", "group_id", "created_at"),
+        Index(
+            "ix_ban_audit_group_target_created",
+            "group_id",
+            "target_user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_ban_audit_reference",
+            "reference_type",
+            "reference_id",
+        ),
     )
 
 

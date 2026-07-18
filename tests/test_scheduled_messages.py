@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 from bot.config import Settings
 from bot.db.models import ScheduledMessage
 from bot.services.scheduled_messages import (
@@ -18,6 +20,7 @@ def _entry(**overrides) -> ScheduledMessage:
         "id": 1,
         "group_id": -10001,
         "text": "每日播报",
+        "buttons": [],
         "schedule_type": "daily",
         "schedule_time": "09:00",
         "interval_minutes": 60,
@@ -144,7 +147,49 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
         session.commit.assert_awaited()
         bot.send_message.assert_awaited_once()
         self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], -10001)
+        self.assertEqual(bot.send_message.await_args.kwargs["parse_mode"], "HTML")
         bot.pin_chat_message.assert_not_awaited()
+
+    async def test_markdown_and_inline_button_are_rendered(self) -> None:
+        entry = _entry(
+            text="**公告**\n第二行",
+            buttons=[
+                {
+                    "text": "复制",
+                    "action": "copy",
+                    "value": "CODE",
+                    "row": 0,
+                }
+            ],
+        )
+        service, bot, _session = self._service([entry], authorized=[-10001])
+
+        await service.run_once(now=NOW)
+
+        kwargs = bot.send_message.await_args.kwargs
+        self.assertIn("<b>公告</b>\n第二行", kwargs["text"])
+        self.assertEqual(
+            kwargs["reply_markup"].inline_keyboard[0][0].copy_text.text,
+            "CODE",
+        )
+
+    async def test_formatted_length_error_retries_plain_text(self) -> None:
+        entry = _entry(text="**公告**\n第二行")
+        service, bot, _session = self._service([entry], authorized=[-10001])
+        bot.send_message.side_effect = [
+            TelegramBadRequest(
+                method=SendMessage(chat_id=-10001, text="x"),
+                message="Bad Request: message is too long",
+            ),
+            SimpleNamespace(message_id=901, chat=SimpleNamespace(id=-10001)),
+        ]
+
+        delivered = await service.run_once(now=NOW)
+
+        self.assertEqual(delivered, 1)
+        self.assertEqual(bot.send_message.await_count, 2)
+        self.assertEqual(bot.send_message.await_args.kwargs["text"], "**公告**\n第二行")
+        self.assertIsNone(bot.send_message.await_args.kwargs["parse_mode"])
 
     async def test_unauthorized_group_is_skipped(self) -> None:
         entry = _entry()

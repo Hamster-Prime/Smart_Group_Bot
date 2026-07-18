@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
+from aiogram.types import ChatPermissions
 from aiohttp.test_utils import TestClient, TestServer
 from sqlalchemy import select
 
@@ -27,6 +28,7 @@ from bot.db.models import (
     UserWarning,
 )
 from bot.services.runtime_config import RuntimeConfigManager
+from bot.services.group_permissions import PERMISSION_FIELDS
 from bot.services.verify_web import VerifyWebServer
 from bot.utils.telegram import configured_auto_delete_seconds
 
@@ -241,7 +243,15 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={
                 "keyword": "签到",
                 "match_type": "contains",
-                "reply_text": "欢迎签到！",
+                "reply_text": "**欢迎签到**\n请查看下方按钮",
+                "buttons": [
+                    {
+                        "text": "查看说明",
+                        "action": "url",
+                        "value": "https://example.com/help",
+                        "row": 0,
+                    }
+                ],
                 "pin_message": True,
                 "auto_delete": False,
             },
@@ -250,12 +260,15 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         document = (await created.json())["keyword_reply"]
         self.assertTrue(document["pin_message"])
         self.assertFalse(document["auto_delete"])
+        self.assertIn("\n", document["reply_text"])
+        self.assertEqual(document["buttons"][0]["text"], "查看说明")
         entry_id = document["id"]
 
         async with self.session_factory() as session:
             row = await session.get(KeywordReply, entry_id)
             self.assertEqual(row.group_id, -503)
             self.assertEqual(row.created_by, 99)
+            self.assertEqual(row.buttons[0]["action"], "url")
 
         invalid_regex = await self.client.post(
             "/api/v1/groups/-503/keyword-replies",
@@ -303,7 +316,15 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             "/api/v1/groups/-504/scheduled-messages",
             headers=self._headers(user_id=99),
             json={
-                "text": "每日公告",
+                "text": "# 每日公告\n请按时签到",
+                "buttons": [
+                    {
+                        "text": "复制口令",
+                        "action": "copy",
+                        "value": "CHECK-IN",
+                        "row": 0,
+                    }
+                ],
                 "schedule_type": "daily",
                 "schedule_time": "9:5",
                 "pin_message": True,
@@ -315,12 +336,15 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         document = (await created.json())["scheduled_message"]
         self.assertEqual(document["schedule_time"], "09:05")
         self.assertTrue(document["pin_message"])
+        self.assertIn("\n", document["text"])
+        self.assertEqual(document["buttons"][0]["action"], "copy")
         entry_id = document["id"]
 
         async with self.session_factory() as session:
             row = await session.get(ScheduledMessage, entry_id)
             self.assertEqual(row.group_id, -504)
             self.assertTrue(row.unpin_previous)
+            self.assertEqual(row.buttons[0]["value"], "CHECK-IN")
 
         bad_time = await self.client.post(
             "/api/v1/groups/-504/scheduled-messages",
@@ -394,6 +418,14 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             session.add(AuthorizedGroup(group_id=-502, authorized_by=42))
             session.add(Group(id=-502, title="Ban Group", settings={}))
             session.add(Admin(group_id=-502, user_id=99, role="admin"))
+            session.add(
+                GroupMember(
+                    group_id=-502,
+                    user_id=7001,
+                    full_name="测试用户",
+                    username="test_user",
+                )
+            )
             await session.commit()
 
         created = await self.client.post(
@@ -409,7 +441,10 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(user_id=99),
         )
         self.assertEqual(listed.status, 200)
-        self.assertEqual((await listed.json())["bans"][0]["user_id"], 7001)
+        listed_ban = (await listed.json())["bans"][0]
+        self.assertEqual(listed_ban["user_id"], 7001)
+        self.assertEqual(listed_ban["display_name"], "测试用户")
+        self.assertEqual(listed_ban["username"], "test_user")
 
         removed = await self.client.delete(
             "/api/v1/groups/-502/bans/7001",
@@ -646,18 +681,29 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(),
             json={
                 "revision": group_document["revision"],
-                "settings": {"welcome_message": "欢迎 {mention} 加入！"},
+                "settings": {
+                    "welcome_message": "**欢迎**\n{mention} 加入！",
+                    "welcome_buttons": [
+                        {
+                            "text": "群规",
+                            "action": "url",
+                            "value": "https://example.com/rules",
+                            "row": 0,
+                        }
+                    ],
+                },
             },
         )
         self.assertEqual(saved.status, 200)
         saved_group = (await saved.json())["group"]
         self.assertEqual(
-            saved_group["settings"]["welcome_message"], "欢迎 {mention} 加入！"
+            saved_group["settings"]["welcome_message"], "**欢迎**\n{mention} 加入！"
         )
+        self.assertEqual(saved_group["settings"]["welcome_buttons"][0]["text"], "群规")
         async with self.session_factory() as session:
             stored = await session.get(Group, -260)
             self.assertEqual(
-                stored.settings.get("welcome_message"), "欢迎 {mention} 加入！"
+                stored.settings.get("welcome_message"), "**欢迎**\n{mention} 加入！"
             )
 
         cleared = await self.client.put(
@@ -665,15 +711,133 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(),
             json={
                 "revision": saved_group["revision"],
-                "settings": {"welcome_message": ""},
+                "settings": {"welcome_message": "", "welcome_buttons": []},
             },
         )
         self.assertEqual(cleared.status, 200)
         cleared_group = (await cleared.json())["group"]
         self.assertEqual(cleared_group["settings"]["welcome_message"], "")
+        self.assertEqual(cleared_group["settings"]["welcome_buttons"], [])
         async with self.session_factory() as session:
             stored = await session.get(Group, -260)
             self.assertNotIn("welcome_message", stored.settings or {})
+            self.assertNotIn("welcome_buttons", stored.settings or {})
+
+    async def test_group_default_permissions_load_and_schedule_roundtrip(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-261, authorized_by=42))
+            session.add(Group(id=-261, title="Permissions Group", settings={}))
+            await session.commit()
+
+        live_permissions = {
+            field: field != "can_pin_messages" for field in PERMISSION_FIELDS
+        }
+        self.bot.get_chat = AsyncMock(
+            return_value=SimpleNamespace(
+                permissions=ChatPermissions(**live_permissions)
+            )
+        )
+        loaded = await self.client.get(
+            "/api/v1/groups/-261/default-permissions",
+            headers=self._headers(),
+        )
+        self.assertEqual(loaded.status, 200)
+        loaded_body = await loaded.json()
+        self.assertFalse(loaded_body["configured"])
+        self.assertFalse(
+            loaded_body["default_permissions"]["base"]["can_pin_messages"]
+        )
+        self.assertEqual(
+            len(loaded_body["permission_fields"]),
+            len(PERMISSION_FIELDS),
+        )
+
+        config = loaded_body["default_permissions"]
+        config["schedule_enabled"] = True
+        config["windows"] = [
+            {
+                "id": "night",
+                "name": "夜间禁图",
+                "enabled": True,
+                "start": "23:00",
+                "end": "07:00",
+                "days": list(range(7)),
+                "priority": 0,
+                "overrides": {"can_send_photos": False},
+            }
+        ]
+        group_document = await self._group_document(-261)
+        saved = await self.client.put(
+            "/api/v1/groups/-261/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"default_permissions": config},
+            },
+        )
+        self.assertEqual(saved.status, 200)
+        public = (await saved.json())["group"]["settings"]["default_permissions"]
+        self.assertTrue(public["schedule_enabled"])
+        self.assertFalse(public["windows"][0]["overrides"]["can_send_photos"])
+        async with self.session_factory() as session:
+            stored = await session.get(Group, -261)
+            self.assertEqual(
+                set(stored.settings["default_permissions"]["base"]),
+                set(PERMISSION_FIELDS),
+            )
+
+    async def test_invalid_legacy_group_permissions_can_be_repaired_from_telegram(self) -> None:
+        legacy_base = {field: True for field in PERMISSION_FIELDS}
+        legacy_base.pop("can_edit_tag")
+        legacy_base["can_send_photos"] = False
+        legacy = {
+            "version": 1,
+            "timezone": "Asia/Shanghai",
+            "schedule_enabled": True,
+            "base": legacy_base,
+            "windows": [
+                {
+                    "id": "night",
+                    "name": "夜间禁图",
+                    "enabled": True,
+                    "start": "23:00",
+                    "end": "07:00",
+                    "days": list(range(7)),
+                    "priority": 0,
+                    "overrides": {"can_send_photos": False},
+                }
+            ],
+        }
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-262, authorized_by=42))
+            session.add(
+                Group(
+                    id=-262,
+                    title="Legacy Permissions",
+                    settings={"default_permissions": legacy},
+                )
+            )
+            await session.commit()
+        live_permissions = {field: True for field in PERMISSION_FIELDS}
+        live_permissions["can_edit_tag"] = False
+        self.bot.get_chat = AsyncMock(
+            return_value=SimpleNamespace(
+                permissions=ChatPermissions(**live_permissions)
+            )
+        )
+
+        loaded = await self.client.get(
+            "/api/v1/groups/-262/default-permissions",
+            headers=self._headers(),
+        )
+
+        self.assertEqual(loaded.status, 200)
+        body = await loaded.json()
+        self.assertTrue(body["repaired"])
+        self.assertFalse(body["configured"])
+        self.assertFalse(body["default_permissions"]["base"]["can_edit_tag"])
+        self.assertFalse(body["default_permissions"]["base"]["can_send_photos"])
+        self.assertEqual(body["default_permissions"]["windows"][0]["id"], "night")
 
     async def test_per_category_auto_delete_seconds_apply_live(self) -> None:
         document = self.manager.api_document()
@@ -741,6 +905,176 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertEqual(samples.scalars().all(), [])
+
+
+    async def test_call_admin_and_vote_ban_group_settings_roundtrip(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-270, authorized_by=42))
+            session.add(Group(id=-270, title="CallAdmin Group", settings={}))
+            await session.commit()
+
+        group_document = await self._group_document(-270)
+        self.assertIsNone(group_document["settings"]["call_admin_enabled"])
+        self.assertEqual(group_document["settings"]["call_admin_targets"], [])
+        self.assertIsNone(group_document["settings"]["vote_ban_enabled"])
+        self.assertIsNone(group_document["settings"]["vote_ban_trigger_limit"])
+        self.assertIsNone(group_document["settings"]["vote_ban_trigger_window_seconds"])
+
+        saved = await self.client.put(
+            "/api/v1/groups/-270/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {
+                    "call_admin_enabled": True,
+                    "call_admin_targets": [9, 7, 7],
+                    "vote_ban_enabled": True,
+                    "vote_ban_threshold": 8,
+                    "vote_ban_duration_seconds": 900,
+                    "vote_ban_trigger_limit": 4,
+                    "vote_ban_trigger_window_seconds": 7200,
+                },
+            },
+        )
+        self.assertEqual(saved.status, 200)
+        public = (await saved.json())["group"]["settings"]
+        self.assertTrue(public["call_admin_enabled"])
+        self.assertEqual(public["call_admin_targets"], [7, 9])
+        self.assertTrue(public["vote_ban_enabled"])
+        self.assertEqual(public["vote_ban_threshold"], 8)
+        self.assertEqual(public["vote_ban_duration_seconds"], 900)
+        self.assertEqual(public["vote_ban_trigger_limit"], 4)
+        self.assertEqual(public["vote_ban_trigger_window_seconds"], 7200)
+
+        # Empty targets = "all admins" and clears the stored key; nulls
+        # clear the overrides back to inheritance.
+        cleared = await self.client.put(
+            "/api/v1/groups/-270/settings",
+            headers=self._headers(),
+            json={
+                "revision": (await saved.json())["group"]["revision"],
+                "settings": {
+                    "call_admin_enabled": None,
+                    "call_admin_targets": [],
+                    "vote_ban_enabled": None,
+                    "vote_ban_threshold": None,
+                    "vote_ban_duration_seconds": None,
+                    "vote_ban_trigger_limit": None,
+                    "vote_ban_trigger_window_seconds": None,
+                },
+            },
+        )
+        self.assertEqual(cleared.status, 200)
+        async with self.session_factory() as session:
+            stored = await session.get(Group, -270)
+            for key in (
+                "call_admin_enabled",
+                "call_admin_targets",
+                "vote_ban_enabled",
+                "vote_ban_threshold",
+                "vote_ban_duration_seconds",
+                "vote_ban_trigger_limit",
+                "vote_ban_trigger_window_seconds",
+            ):
+                self.assertNotIn(key, stored.settings or {})
+
+    async def test_vote_ban_threshold_bounds_rejected(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-271, authorized_by=42))
+            session.add(Group(id=-271, title="Bounds Group", settings={}))
+            await session.commit()
+        group_document = await self._group_document(-271)
+        response = await self.client.put(
+            "/api/v1/groups/-271/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"vote_ban_threshold": 1},
+            },
+        )
+        self.assertEqual(response.status, 400)
+
+        response = await self.client.put(
+            "/api/v1/groups/-271/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"call_admin_targets": [0]},
+            },
+        )
+        self.assertEqual(response.status, 400)
+
+        response = await self.client.put(
+            "/api/v1/groups/-271/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"vote_ban_trigger_limit": 0},
+            },
+        )
+        self.assertEqual(response.status, 400)
+
+        response = await self.client.put(
+            "/api/v1/groups/-271/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"vote_ban_trigger_window_seconds": 59},
+            },
+        )
+        self.assertEqual(response.status, 400)
+
+    async def test_telegram_admins_endpoint_group_admin_access(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-272, authorized_by=42))
+            session.add(Group(id=-272, title="Admins Group", settings={}))
+            session.add(Admin(group_id=-272, user_id=99, role="admin"))
+            session.add(
+                GroupMember(
+                    group_id=-272, user_id=99, full_name="管理甲", username="ga"
+                )
+            )
+            await session.commit()
+
+        # No live Telegram lookup on the stub bot: falls back to the local
+        # admin table with roster display names.
+        response = await self.client.get(
+            "/api/v1/groups/-272/telegram-admins",
+            headers=self._headers(99),
+        )
+        self.assertEqual(response.status, 200)
+        admins = (await response.json())["admins"]
+        self.assertEqual(admins[0]["user_id"], 99)
+        self.assertEqual(admins[0]["display_name"], "管理甲")
+
+        denied = await self.client.get(
+            "/api/v1/groups/-272/telegram-admins",
+            headers=self._headers(1234),
+        )
+        self.assertEqual(denied.status, 403)
+
+    async def test_auto_delete_mode_map_roundtrip(self) -> None:
+        document = self.manager.api_document()
+        payload = document["config"]
+        payload["bot"]["auto_delete_categories"] = ["moderation", "vote"]
+        payload["bot"]["auto_delete_category_mode"] = {
+            "moderation": "button",
+            "vote": "timer",
+        }
+        response = await self.client.put(
+            "/api/v1/settings",
+            headers=self._headers(),
+            json={"revision": document["revision"], "config": payload},
+        )
+        self.assertEqual(response.status, 200)
+        saved = (await response.json())["config"]
+        # "timer" is the default and must not persist.
+        self.assertEqual(
+            saved["bot"]["auto_delete_category_mode"], {"moderation": "button"}
+        )
+        self.assertEqual(
+            self.settings.bot.auto_delete_category_mode, {"moderation": "button"}
+        )
 
 
 if __name__ == "__main__":

@@ -198,6 +198,8 @@ class BotBehaviorConfig(StrictModel):
             "keyword",
             "scheduled",
             "welcome",
+            "call_admin",
+            "vote",
         ]
     ] = Field(default_factory=lambda: ["management", "moderation"])
     # Per-category retention overrides (seconds); 0 or missing inherits
@@ -212,8 +214,28 @@ class BotBehaviorConfig(StrictModel):
             "keyword",
             "scheduled",
             "welcome",
+            "call_admin",
+            "vote",
         ],
         int,
+    ] = Field(default_factory=dict)
+    # Per-category cleanup mode: "timer" (default, delayed delete) or
+    # "button" (inline delete button; mutually exclusive with the timer).
+    # Only "button" entries are persisted.
+    auto_delete_category_mode: dict[
+        Literal[
+            "reply",
+            "management",
+            "moderation",
+            "media",
+            "proactive",
+            "keyword",
+            "scheduled",
+            "welcome",
+            "call_admin",
+            "vote",
+        ],
+        Literal["timer", "button"],
     ] = Field(default_factory=dict)
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
@@ -242,6 +264,12 @@ class BotBehaviorConfig(StrictModel):
             if value > 0:
                 cleaned[category] = value
         self.auto_delete_category_seconds = cleaned
+        # "timer" is the default: store only "button" entries.
+        self.auto_delete_category_mode = {
+            category: mode
+            for category, mode in self.auto_delete_category_mode.items()
+            if mode == "button"
+        }
         return self
 
 
@@ -289,6 +317,23 @@ class RaidGuardSettingsConfig(StrictModel):
     lockdown_seconds: int = Field(default=600, ge=60, le=86400)
     lookback_seconds: int = Field(default=300, ge=0, le=86400)
     challenge_timeout_seconds: int = Field(default=600, ge=60, le=86400)
+
+
+class CallAdminSettingsConfig(StrictModel):
+    """@admin trigger: report a situation by pinging the group's admins."""
+
+    enabled: bool = True
+    cooldown_seconds: int = Field(default=60, ge=0, le=86400)
+
+
+class VoteBanSettingsConfig(StrictModel):
+    """Democratic vote-ban defaults; groups may override in the Mini App."""
+
+    enabled: bool = False
+    vote_threshold: int = Field(default=5, ge=2, le=1000)
+    duration_seconds: int = Field(default=1800, ge=60, le=86400)
+    trigger_limit: int = Field(default=3, ge=1, le=1000)
+    trigger_window_seconds: int = Field(default=3600, ge=60, le=604800)
 
 
 class VerificationSettingsConfig(StrictModel):
@@ -434,6 +479,8 @@ class RuntimeConfig(StrictModel):
     moderation: ModerationSettingsConfig = Field(default_factory=ModerationSettingsConfig)
     patrol: PatrolSettingsConfig = Field(default_factory=PatrolSettingsConfig)
     raid_guard: RaidGuardSettingsConfig = Field(default_factory=RaidGuardSettingsConfig)
+    call_admin: CallAdminSettingsConfig = Field(default_factory=CallAdminSettingsConfig)
+    vote_ban: VoteBanSettingsConfig = Field(default_factory=VoteBanSettingsConfig)
     verification: VerificationSettingsConfig = Field(default_factory=VerificationSettingsConfig)
     tts: TTSSettingsConfig = Field(default_factory=TTSSettingsConfig)
     music: MusicSettingsConfig = Field(default_factory=MusicSettingsConfig)
@@ -675,6 +722,9 @@ class RuntimeConfig(StrictModel):
         settings.bot.auto_delete_category_seconds = dict(
             bot.auto_delete_category_seconds
         )
+        settings.bot.auto_delete_category_mode = dict(
+            bot.auto_delete_category_mode
+        )
         settings.bot.decision_context_items = bot.decision_context_items
         settings.bot.max_context_tokens = bot.max_context_tokens
         settings.bot.max_output_tokens = bot.max_output_tokens
@@ -704,6 +754,13 @@ class RuntimeConfig(StrictModel):
         settings.raid_guard_challenge_timeout_seconds = (
             self.raid_guard.challenge_timeout_seconds
         )
+        settings.call_admin_enabled = self.call_admin.enabled
+        settings.call_admin_cooldown_seconds = self.call_admin.cooldown_seconds
+        settings.vote_ban_enabled = self.vote_ban.enabled
+        settings.vote_ban_threshold = self.vote_ban.vote_threshold
+        settings.vote_ban_duration_seconds = self.vote_ban.duration_seconds
+        settings.vote_ban_trigger_limit = self.vote_ban.trigger_limit
+        settings.vote_ban_trigger_window_seconds = self.vote_ban.trigger_window_seconds
         settings.join_verification_enabled = self.verification.enabled
         settings.join_verification_timeout_seconds = self.verification.timeout_seconds
         settings.join_verification_check_interval_seconds = self.verification.check_interval_seconds
@@ -1259,6 +1316,11 @@ def build_legacy_runtime_config(
                 else int(settings.bot_auto_delete_seconds)
                 or max(0, int(settings.bot_auto_delete_minutes)) * 60
             ),
+            auto_delete_categories=list(settings.bot.auto_delete_categories),
+            auto_delete_category_seconds=dict(
+                settings.bot.auto_delete_category_seconds
+            ),
+            auto_delete_category_mode=dict(settings.bot.auto_delete_category_mode),
             decision_context_items=settings.bot_decision_context_items,
             max_context_tokens=settings.max_context_tokens,
             max_output_tokens=settings.max_output_tokens,
@@ -1287,6 +1349,17 @@ def build_legacy_runtime_config(
             lockdown_seconds=settings.raid_guard_lockdown_seconds,
             lookback_seconds=settings.raid_guard_lookback_seconds,
             challenge_timeout_seconds=settings.raid_guard_challenge_timeout_seconds,
+        ),
+        call_admin=CallAdminSettingsConfig(
+            enabled=settings.call_admin_enabled,
+            cooldown_seconds=settings.call_admin_cooldown_seconds,
+        ),
+        vote_ban=VoteBanSettingsConfig(
+            enabled=settings.vote_ban_enabled,
+            vote_threshold=settings.vote_ban_threshold,
+            duration_seconds=settings.vote_ban_duration_seconds,
+            trigger_limit=settings.vote_ban_trigger_limit,
+            trigger_window_seconds=settings.vote_ban_trigger_window_seconds,
         ),
         verification=VerificationSettingsConfig(
             enabled=settings.join_verification_enabled,

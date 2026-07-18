@@ -19,6 +19,7 @@ def _rule(**overrides) -> KeywordReply:
         "keyword": "签到",
         "match_type": "contains",
         "reply_text": "欢迎签到！",
+        "buttons": [],
         "pin_message": False,
         "auto_delete": True,
         "enabled": True,
@@ -113,7 +114,31 @@ class SendKeywordReplyTests(unittest.IsolatedAsyncioTestCase):
         kwargs = answer_mock.await_args.kwargs
         self.assertEqual(kwargs["auto_delete_seconds"], 30)
         self.assertEqual(kwargs["reply_to_message_id"], 555)
+        self.assertEqual(kwargs["parse_mode"], "HTML")
         message.bot.pin_chat_message.assert_not_awaited()
+
+    async def test_markdown_and_inline_buttons_share_template_renderer(self) -> None:
+        message = _message()
+        rule = _rule(
+            reply_text="**欢迎**\n第二行",
+            buttons=[
+                {
+                    "text": "官网",
+                    "action": "url",
+                    "value": "https://example.com",
+                    "row": 0,
+                }
+            ],
+        )
+        with patch(
+            "bot.services.keyword_reply.answer_with_auto_delete",
+            new=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+        ) as answer_mock:
+            await send_keyword_reply(message, rule, _settings())
+
+        self.assertIn("<b>欢迎</b>\n第二行", answer_mock.await_args.args[1])
+        keyboard = answer_mock.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].url, "https://example.com")
 
     async def test_auto_delete_opt_out_sends_persistent_reply(self) -> None:
         message = _message()

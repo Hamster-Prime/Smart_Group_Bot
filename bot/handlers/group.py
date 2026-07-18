@@ -27,6 +27,7 @@ from bot.db.models import (
     ReplyMute,
     UserWarning,
     Violation,
+    VoteBanSession,
 )
 from bot.db.sqlite_session import is_database_locked_error
 from bot.services import memory_holder
@@ -38,6 +39,24 @@ from bot.services.authz import (
     is_super_admin_user_id,
 )
 from bot.services.callback_auth import is_group_admin_or_higher
+from bot.services.ban_audit import record_ban_event
+from bot.services.call_admin import handle_call_admin, is_call_admin_trigger
+from bot.services.vote_ban import (
+    VOTE_BAN_CALLBACK_PREFIX,
+    apply_vote_ban,
+    build_vote_keyboard,
+    build_vote_text,
+    cancel_vote_enforcement_recovery,
+    cancel_vote_expiry,
+    claim_session_status,
+    count_approvals,
+    expire_overdue,
+    finalize_vote_message,
+    recover_stale_vote_enforcement,
+    record_vote_ban_outcome,
+    record_vote,
+    schedule_vote_enforcement_recovery,
+)
 from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import (
@@ -70,11 +89,13 @@ from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
 from bot.services.proactive import note_group_activity, record_group_activity
 from bot.services.skills import SkillService
+from bot.services.skills.vote_ban import is_explicit_vote_ban_request
 from bot.services.sticker_library import sticker_library
 from bot.utils.security import format_history_message_line
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
+    DELETE_BUTTON_CALLBACK_PREFIX,
     extract_reply_context,
     extract_message_text,
     has_explicit_bot_mention,
@@ -511,7 +532,7 @@ async def _screen_bot_sender_message(
         except Exception:
             log.exception("[%s] bot ban failed | bot=%s", group_id, bot_id)
         # Record what actually happened so a failed ban is not logged as one.
-        await moderation.record_violation(
+        violation = await moderation.record_violation(
             session,
             group_id,
             bot_id,
@@ -519,7 +540,56 @@ async def _screen_bot_sender_message(
             "bot_ban" if ban_enforced else "bot_delete",
             rule,
         )
+        await session.flush()
         await session.commit()
+        # The violation is the primary moderation record. Persist the richer
+        # current-ban state and audit ledger best-effort afterwards so an
+        # auxiliary write can never undo an already-enforced Telegram ban.
+        if callable(getattr(session, "scalar", None)) and callable(
+            getattr(session, "add", None)
+        ):
+            try:
+                if ban_enforced:
+                    warning = await session.scalar(
+                        select(UserWarning).where(
+                            UserWarning.group_id == group_id,
+                            UserWarning.user_id == bot_id,
+                        )
+                    )
+                    if warning is None:
+                        session.add(
+                            UserWarning(
+                                group_id=group_id,
+                                user_id=bot_id,
+                                count=0,
+                                is_banned=True,
+                            )
+                        )
+                    else:
+                        warning.is_banned = True
+                violation_id = int(getattr(violation, "id", 0) or 0)
+                await record_ban_event(
+                    session,
+                    group_id=group_id,
+                    target_user_id=bot_id,
+                    target_display=warn_target,
+                    action="ban",
+                    source="bot_screening",
+                    outcome="succeeded" if ban_enforced else "failed",
+                    reason=verdict.reason or "Bot 消息命中高置信度封禁规则",
+                    evidence=input_text,
+                    reference_type="violation",
+                    reference_id=violation_id,
+                    details={"rule_id": int(rule.id) if rule is not None else 0},
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                log.exception(
+                    "bot-screening ban state/audit write failed | group=%s bot=%s",
+                    group_id,
+                    bot_id,
+                )
         notice = _build_moderation_notice(
             warn_target=warn_target,
             reason=verdict.reason,
@@ -752,6 +822,33 @@ async def _apply_counted_moderation_ban(
                     if rollback_clean
                     else "\n⚠️ Telegram 自动封禁失败且状态已变化，请管理员检查。"
                 )
+            if callable(getattr(session, "add", None)):
+                try:
+                    await record_ban_event(
+                        session,
+                        group_id=group_id,
+                        target_user_id=user_id,
+                        action="ban",
+                        source="moderation_threshold",
+                        outcome="succeeded" if ban_enforced else "failed",
+                        reason="审核警告次数达到自动封禁阈值",
+                        evidence=input_text,
+                        reference_type="violation",
+                        reference_id=violation_id,
+                        details={
+                            "warning_count": int(count),
+                            "rule_id": int(rule.id) if rule is not None else 0,
+                        },
+                    )
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    log.exception(
+                        "moderation ban audit failed | group=%s user=%s violation=%s",
+                        group_id,
+                        user_id,
+                        violation_id,
+                    )
         return count, violation_id, ban_enforced, ban_failure_note
 
 
@@ -766,6 +863,7 @@ async def _moderation_direct_ban(
     violation_id = int(violation.id)
     group_id = int(violation.group_id)
     target_id = int(violation.user_id)
+    violation_evidence = str(violation.message_text or "")
     if is_super_admin_user_id(target_id, settings):
         await callback.answer("不能封禁最高管理员", show_alert=True)
         return
@@ -889,6 +987,26 @@ async def _moderation_direct_ban(
             target_id,
             violation_id,
         )
+        try:
+            operator = callback.from_user
+            await record_ban_event(
+                session,
+                group_id=group_id,
+                target_user_id=target_id,
+                action="ban",
+                source="moderation_direct",
+                outcome="failed",
+                reason="管理员从审核通知执行直接封禁",
+                evidence=violation_evidence,
+                actor_user_id=int(getattr(operator, "id", 0) or 0),
+                actor_display=str(getattr(operator, "full_name", "") or ""),
+                reference_type="violation",
+                reference_id=violation_id,
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            log.exception("moderation direct-ban failure audit write failed")
         await callback.answer(
             "Telegram 封禁失败，数据库状态已恢复"
             if rollback_clean
@@ -899,6 +1017,21 @@ async def _moderation_direct_ban(
 
     try:
         await delete_join_verification(session, group_id, target_id)
+        operator = callback.from_user
+        await record_ban_event(
+            session,
+            group_id=group_id,
+            target_user_id=target_id,
+            action="ban",
+            source="moderation_direct",
+            outcome="succeeded",
+            reason="管理员从审核通知执行直接封禁",
+            evidence=violation_evidence,
+            actor_user_id=int(getattr(operator, "id", 0) or 0),
+            actor_display=str(getattr(operator, "full_name", "") or ""),
+            reference_type="violation",
+            reference_id=violation_id,
+        )
         await session.commit()
     except Exception:
         await session.rollback()
@@ -1266,6 +1399,293 @@ async def on_moderation_action(
 
         if outcome:
             await _apply_moderation_outcome_notice(callback, settings, outcome=outcome)
+
+
+async def _delete_callback_message(callback: CallbackQuery) -> bool:
+    """Delete the pressed message, tolerating >48h-old callbacks.
+
+    Old callbacks carry an InaccessibleMessage without a usable .delete();
+    the chat/message ids are still present, so fall back to the raw API.
+    """
+    message = callback.message
+    try:
+        delete = getattr(message, "delete", None)
+        if callable(delete):
+            await delete()
+            return True
+    except TypeError:
+        pass
+    except Exception:
+        return False
+    try:
+        await callback.bot.delete_message(
+            chat_id=int(message.chat.id),
+            message_id=int(message.message_id),
+        )
+        return True
+    except Exception:
+        return False
+
+
+@router.callback_query(F.data.startswith(f"{DELETE_BUTTON_CALLBACK_PREFIX}:"))
+async def on_delete_button(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    """Inline delete button for button-mode auto-delete categories.
+
+    Group admins and higher may delete; ordinary members are refused so the
+    button cannot be abused to strip moderation notices.
+    """
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    user = callback.from_user
+    if message is None or chat is None or user is None:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    if session is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+    # Private chats: the chat owner may always clear the bot's own notices.
+    if getattr(chat, "type", "") not in {"group", "supergroup"}:
+        if not await _delete_callback_message(callback):
+            await callback.answer("删除失败，消息可能已被删除", show_alert=True)
+            return
+        await callback.answer("已删除")
+        return
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=int(chat.id),
+        user_id=int(user.id),
+    ):
+        await callback.answer("仅群管理员及以上权限可删除", show_alert=True)
+        return
+    if not await _delete_callback_message(callback):
+        log.debug(
+            "delete button failed | group=%s message=%s",
+            chat.id,
+            getattr(message, "message_id", "?"),
+        )
+        await callback.answer("删除失败，消息可能已被删除", show_alert=True)
+        return
+    await callback.answer("已删除")
+
+
+@router.callback_query(F.data.startswith(f"{VOTE_BAN_CALLBACK_PREFIX}:"))
+async def on_vote_ban_action(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+    session_factory: Any | None = None,
+) -> None:
+    if session is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[0] != VOTE_BAN_CALLBACK_PREFIX or parts[1] != "vote":
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    try:
+        session_id = int(parts[2])
+    except (TypeError, ValueError):
+        session_id = 0
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    voter = callback.from_user
+    if session_id <= 0 or chat is None or voter is None:
+        await callback.answer("投票参数无效", show_alert=True)
+        return
+    if getattr(chat, "type", "") not in {"group", "supergroup"}:
+        await callback.answer("该操作只能在群内执行", show_alert=True)
+        return
+    group_id = int(chat.id)
+    if not await is_group_authorized(session, group_id):
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
+
+    record = await session.get(VoteBanSession, session_id)
+    if record is None or int(record.group_id) != group_id:
+        await callback.answer("投票不存在或不属于当前群", show_alert=True)
+        return
+    if record.status not in {"active", "enforcing"}:
+        await callback.answer("该投票已结束", show_alert=True)
+        return
+    target_id = int(record.target_user_id)
+    # The prompt-send commit can fail after the message went out, leaving
+    # message_id=0; the pressed button knows the real id, so self-heal here.
+    # Only trust messages that actually carry this poll's button — MTProto
+    # clients can forge callback data against arbitrary bot messages.
+    live_message_id = int(getattr(message, "message_id", 0) or 0)
+    trusted_live_message_id = 0
+    if not int(record.message_id or 0) and live_message_id:
+        markup_rows = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None) or []
+        carries_button = any(
+            getattr(button, "callback_data", None) == f"{VOTE_BAN_CALLBACK_PREFIX}:vote:{session_id}"
+            for row in markup_rows
+            for button in row
+        )
+        if carries_button:
+            trusted_live_message_id = live_message_id
+
+    async with _moderation_user_lock(group_id, target_id):
+        record = await session.get(VoteBanSession, session_id, populate_existing=True)
+        if record is None or record.status not in {"active", "enforcing"}:
+            await callback.answer("该投票已结束", show_alert=True)
+            return
+        if record.status == "enforcing":
+            recovered_status = await recover_stale_vote_enforcement(
+                bot=callback.bot,
+                session=session,
+                settings=settings,
+                record=record,
+            )
+            if recovered_status == "passed":
+                cancel_vote_enforcement_recovery(session_id)
+                await callback.answer("投票结果已恢复：该用户已封禁", show_alert=True)
+            elif recovered_status == "failed":
+                cancel_vote_enforcement_recovery(session_id)
+                await callback.answer("投票通过，但封禁失败", show_alert=True)
+            else:
+                await callback.answer("投票结果正在执行，请稍后", show_alert=True)
+            return
+        if not int(record.message_id or 0) and trusted_live_message_id:
+            record.message_id = trusted_live_message_id
+
+        # Lazy expiry: the in-memory timer dies on restart, so an overdue
+        # session is finalized on the next button press.
+        if expire_overdue(record):
+            if await claim_session_status(
+                session, session_id, expected="active", new_status="expired"
+            ):
+                approvals = await count_approvals(session, session_id)
+                await session.commit()
+                cancel_vote_expiry(session_id)
+                await finalize_vote_message(
+                    callback.bot,
+                    settings,
+                    record,
+                    outcome_line="投票超时，未达到封禁票数",
+                    approvals=approvals,
+                )
+            await callback.answer("该投票已超时结束", show_alert=True)
+            return
+
+        voter_id = int(voter.id)
+        if voter_id == target_id:
+            await callback.answer("不能给自己投票", show_alert=True)
+            return
+        # Public supergroups deliver callbacks from non-members too; only
+        # current members get a ballot. Fail closed on lookup errors.
+        try:
+            member = await callback.bot.get_chat_member(group_id, voter_id)
+            status = str(getattr(member, "status", "") or "")
+        except Exception:
+            status = ""
+        if status in {"", "left", "kicked"}:
+            await callback.answer("仅本群成员可以投票", show_alert=True)
+            return
+        if not await record_vote(session, session_id, voter_id):
+            await callback.answer("你已投过票", show_alert=True)
+            return
+        # Publish this ballot before counting. In multi-process deployments a
+        # concurrent voter can then observe it and exactly one side will claim
+        # the threshold transition instead of both seeing a stale count.
+        await session.commit()
+        approvals = await count_approvals(session, session_id)
+
+        if approvals < int(record.threshold):
+            try:
+                await callback.bot.edit_message_text(
+                    chat_id=group_id,
+                    message_id=int(record.message_id),
+                    text=build_vote_text(record, approvals=approvals),
+                    parse_mode="HTML",
+                    reply_markup=build_vote_keyboard(
+                        session_id, approvals, int(record.threshold)
+                    ),
+                )
+            except Exception:
+                log.debug(
+                    "vote message update failed | group=%s session=%s",
+                    group_id,
+                    session_id,
+                    exc_info=True,
+                )
+            await callback.answer(f"已投票（{approvals}/{record.threshold}）")
+            return
+
+        # Threshold reached: keep the target in an explicit enforcing state
+        # while Telegram is called. "passed" is reserved for a confirmed ban.
+        if not await claim_session_status(
+            session, session_id, expected="active", new_status="enforcing"
+        ):
+            await session.rollback()
+            await callback.answer("投票已由其他操作结束", show_alert=True)
+            return
+        await session.commit()
+        cancel_vote_expiry(session_id)
+        if session_factory is not None:
+            schedule_vote_enforcement_recovery(
+                session_factory=session_factory,
+                bot=callback.bot,
+                settings=settings,
+                session_id=session_id,
+            )
+
+        banned = await apply_vote_ban(
+            callback.bot,
+            session,
+            group_id=group_id,
+            target_user_id=target_id,
+        )
+        outcome_persisted = False
+        try:
+            if banned:
+                await delete_join_verification(session, group_id, target_id)
+            await record_vote_ban_outcome(
+                session,
+                record,
+                approvals=approvals,
+                banned=banned,
+            )
+            outcome_persisted = True
+        except Exception:
+            await session.rollback()
+            log.exception(
+                "vote-ban outcome persistence failed; enforcement lease retained | group=%s session=%s",
+                group_id,
+                session_id,
+            )
+
+        if outcome_persisted:
+            cancel_vote_enforcement_recovery(session_id)
+        if banned:
+            outcome_line = "票数达标，已封禁该用户"
+        else:
+            outcome_line = "票数达标，但 Telegram 封禁失败，请管理员手动处理"
+        if outcome_persisted:
+            await finalize_vote_message(
+                callback.bot,
+                settings,
+                record,
+                outcome_line=outcome_line,
+                approvals=approvals,
+            )
+            answer_text = "投票通过，已封禁" if banned else "投票通过，但封禁失败"
+        else:
+            answer_text = "投票结果已执行，状态正在自动同步"
+        await callback.answer(answer_text, show_alert=True)
+        log.info(
+            "[%s]【结束】民主投票封禁 | target=%s approvals=%s/%s banned=%s",
+            group_id,
+            target_id,
+            approvals,
+            record.threshold,
+            banned,
+        )
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
@@ -1992,6 +2412,11 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
 
     mentioned, is_reply, reply_to_bot, reply_to_other, mention_other, msg_type = _effective_batch_flags(items)
     explicit_mention = any(item.explicit_mention for item in items)
+    latest_is_direct_request = bool(
+        latest.explicit_mention
+        or latest.reply_to_bot
+        or is_explicit_vote_ban_request(latest.input_text)
+    )
 
     log.info(
         "[%s] pending batch flush started | user=%s messages=%d debounce=%.2fs",
@@ -2100,6 +2525,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_targets_context=reply_targets_context,
                         is_mentioned=mentioned,
                         is_reply_to_bot=reply_to_bot,
+                        is_direct_request=latest_is_direct_request,
                         style_profile_context=style_profile_context,
                     ),
                 )
@@ -2129,6 +2555,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         sender_is_owner=latest.sender_is_owner,
                         sender_is_tg_admin=sender_is_tg_admin,
                         message=latest.message,
+                        session_factory=session_factory,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
                         tts_mode=tts_mode,
@@ -2934,6 +3361,43 @@ async def on_group_message(
                 return
     else:
         log.info("[%s]【流程】审核 | 关闭", group_id)
+
+    # "@admin" summons run after moderation (violating text never pings the
+    # admins) but before the reply-mute gates: muting AI replies must not
+    # disable the reporting channel.
+    if (
+        (msg_type == "text" or "caption" in msg_type)
+        and not sender_identity.is_chat
+        and is_call_admin_trigger(text if msg_type == "text" else message.caption or "")
+    ):
+        called = await handle_call_admin(
+            message,
+            session,
+            settings,
+            group_settings=group_settings,
+            caller_id=user_id,
+            caller_name=display_name,
+        )
+        if called:
+            # The summon replaces the AI reply, but the report still belongs
+            # to group history like any other user message.
+            await memory_holder.get().add_message(
+                group_id,
+                "user",
+                f"[{user_tag}] {input_text}",
+                user_id=user_id,
+                sender_name=display_name,
+                message_type=msg_type,
+                message_id=str(message.message_id),
+                created_at=message.date,
+            )
+            log.info(
+                "[%s]【结束】呼叫管理员 | user=%s | 总耗时=%dms",
+                group_id,
+                user_id,
+                int((time.perf_counter() - flow_started) * 1000),
+            )
+            return
 
     if mute_all_replies:
         log.info(

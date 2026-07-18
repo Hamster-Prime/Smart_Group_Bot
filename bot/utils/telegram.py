@@ -124,25 +124,133 @@ AUTO_DELETE_CATEGORIES = frozenset(
         "keyword",
         "scheduled",
         "welcome",
+        "call_admin",
+        "vote",
     }
 )
+
+# Sentinel returned by configured_auto_delete_seconds for button-mode
+# categories: schedule_message_auto_delete attaches an inline delete button
+# instead of a timer, so every existing send site honors the mode without
+# threading extra flags. Config validation forbids negative seconds, so the
+# sentinel can never collide with a real retention value.
+AUTO_DELETE_BUTTON_SENTINEL = -1
+
+DELETE_BUTTON_CALLBACK_PREFIX = "adel"
+DELETE_BUTTON_CALLBACK_DATA = f"{DELETE_BUTTON_CALLBACK_PREFIX}:1"
+
+
+def configured_auto_delete_mode(settings: Settings, category: str) -> str:
+    """Return "timer", "button", or "off" for one message class.
+
+    Timer and button are mutually exclusive per category: button mode replaces
+    the delayed delete with an inline delete button on the sent message.
+    """
+    normalized = str(category or "").strip().lower()
+    if normalized not in AUTO_DELETE_CATEGORIES:
+        return "off"
+    enabled = {
+        str(item or "").strip().lower()
+        for item in getattr(settings.bot, "auto_delete_categories", [])
+    }
+    if normalized not in enabled:
+        return "off"
+    modes = getattr(settings.bot, "auto_delete_category_mode", None) or {}
+    try:
+        mode = str(modes.get(normalized) or "").strip().lower()
+    except AttributeError:
+        mode = ""
+    return "button" if mode == "button" else "timer"
+
+
+def build_delete_button_markup(base: object | None = None) -> object:
+    """Delete-button keyboard, appended below an existing inline keyboard."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    delete_row = [
+        InlineKeyboardButton(
+            text="🗑 删除消息",
+            callback_data=DELETE_BUTTON_CALLBACK_DATA,
+        )
+    ]
+    existing = list(getattr(base, "inline_keyboard", None) or [])
+    if any(
+        getattr(button, "callback_data", None) == DELETE_BUTTON_CALLBACK_DATA
+        for row in existing
+        for button in row
+    ):
+        from aiogram.types import InlineKeyboardMarkup
+
+        return InlineKeyboardMarkup(inline_keyboard=existing)
+    return InlineKeyboardMarkup(inline_keyboard=[*existing, delete_row])
+
+
+def preserve_delete_button(message: object, keyboard: object | None) -> object | None:
+    """Carry an appended delete row across in-place keyboard rebuilds.
+
+    Pagination edits replace reply_markup wholesale; without this the
+    button-mode cleanup row would vanish on the first page flip.
+    """
+    existing = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None) or []
+    has_delete_row = any(
+        getattr(button, "callback_data", None) == DELETE_BUTTON_CALLBACK_DATA
+        for row in existing
+        for button in row
+    )
+    if not has_delete_row:
+        return keyboard
+    return build_delete_button_markup(keyboard)
+
+
+def attach_delete_button(sent: Message | None) -> None:
+    """Best-effort delete-button attach for an already-sent message.
+
+    Runs as a fire-and-forget edit so send paths stay non-blocking; an
+    existing inline keyboard is preserved with the delete row appended.
+    """
+    if sent is None or isinstance(sent, bool):
+        return
+    existing = getattr(sent, "reply_markup", None)
+
+    async def _attach() -> None:
+        try:
+            await sent.edit_reply_markup(
+                reply_markup=build_delete_button_markup(existing)
+            )
+        except Exception:
+            log.debug(
+                "delete button attach skipped chat_id=%s message_id=%s",
+                getattr(getattr(sent, "chat", None), "id", "?"),
+                getattr(sent, "message_id", "?"),
+            )
+
+    try:
+        asyncio.create_task(
+            _attach(),
+            name=(
+                "delete-button:"
+                f"{getattr(getattr(sent, 'chat', None), 'id', 0)}:"
+                f"{getattr(sent, 'message_id', 0)}"
+            ),
+        )
+    except RuntimeError:
+        log.debug("delete button scheduling failed")
 
 
 def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
     """Resolve the seconds-based retention policy for one message class.
 
     A per-category seconds override wins; otherwise the category inherits the
-    global auto_delete_seconds value.
+    global auto_delete_seconds value. Button-mode categories return
+    AUTO_DELETE_BUTTON_SENTINEL so schedule_message_auto_delete attaches the
+    inline delete button instead of a timer.
     """
     normalized = str(category or "").strip().lower()
-    if normalized not in AUTO_DELETE_CATEGORIES:
+    mode = configured_auto_delete_mode(settings, normalized)
+    if mode == "off":
         return 0
-    enabled = {
-        str(item or "").strip().lower()
-        for item in getattr(settings.bot, "auto_delete_categories", [])
-    }
-    if normalized not in enabled:
-        return 0
+    if mode == "button":
+        return AUTO_DELETE_BUTTON_SENTINEL
     per_category = getattr(settings.bot, "auto_delete_category_seconds", None) or {}
     try:
         seconds = int(per_category.get(normalized) or 0)
@@ -158,8 +266,15 @@ def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
 
 
 def schedule_message_auto_delete(sent: Message | None, auto_delete_seconds: int) -> None:
-    """Best-effort delayed delete for outgoing bot messages."""
+    """Best-effort delayed delete for outgoing bot messages.
+
+    AUTO_DELETE_BUTTON_SENTINEL attaches the inline delete button instead of
+    scheduling a timer (button mode is exclusive with auto-delete).
+    """
     delay_seconds = int(auto_delete_seconds or 0)
+    if delay_seconds == AUTO_DELETE_BUTTON_SENTINEL:
+        attach_delete_button(sent)
+        return
     if not sent or delay_seconds <= 0:
         return
 
@@ -201,10 +316,13 @@ async def answer_with_auto_delete(
     *,
     auto_delete_seconds: int = 0,
     retry_tls_record_error: bool = False,
+    plain_text_fallback: str | None = None,
+    sanitize_mentions: bool = True,
+    drop_invalid_reply_markup: bool = False,
     **kwargs: object,
 ) -> Message:
     payload = sanitize_outgoing_text(text or "")
-    safe_text = sanitize_outgoing_mentions(payload)
+    safe_text = sanitize_outgoing_mentions(payload) if sanitize_mentions else payload
 
     async def _answer_with_network_retry(body: str, options: dict[str, object]) -> Message:
         try:
@@ -226,17 +344,54 @@ async def answer_with_auto_delete(
             await asyncio.sleep(TG_TLS_RECORD_RETRY_DELAY)
             return await message.answer(body, **options)
 
+    # Trusted admin-authored templates pass their original Markdown/plain
+    # source here. Without it, retain the legacy escaped fallback used by
+    # model-generated HTML output.
+    plain_text = (
+        sanitize_outgoing_text(plain_text_fallback)
+        if plain_text_fallback is not None
+        else html.escape(payload)
+    )
+    send_kwargs = dict(kwargs)
     try:
-        sent = await _answer_with_network_retry(safe_text, dict(kwargs))
+        sent = await _answer_with_network_retry(safe_text, send_kwargs)
     except TelegramBadRequest as exc:
         detail = str(exc).lower()
-        if "can't parse entities" not in detail:
+        formatted_rejected = (
+            "can't parse entities" in detail or "message is too long" in detail
+        )
+        has_markup = send_kwargs.get("reply_markup") is not None
+        if formatted_rejected:
+            log.warning("answer formatted send failed, retrying as plain text: %s", exc)
+            fallback_kwargs = dict(send_kwargs)
+            fallback_kwargs["parse_mode"] = None
+            try:
+                sent = await _answer_with_network_retry(plain_text, fallback_kwargs)
+            except TelegramBadRequest:
+                if not (drop_invalid_reply_markup and has_markup):
+                    raise
+                fallback_kwargs.pop("reply_markup", None)
+                sent = await _answer_with_network_retry(plain_text, fallback_kwargs)
+        elif drop_invalid_reply_markup and has_markup:
+            log.warning("answer keyboard send failed, retrying without markup: %s", exc)
+            no_markup_kwargs = dict(send_kwargs)
+            no_markup_kwargs.pop("reply_markup", None)
+            try:
+                sent = await _answer_with_network_retry(safe_text, no_markup_kwargs)
+            except TelegramBadRequest as retry_exc:
+                retry_detail = str(retry_exc).lower()
+                if (
+                    "can't parse entities" not in retry_detail
+                    and "message is too long" not in retry_detail
+                ):
+                    raise
+                no_markup_kwargs["parse_mode"] = None
+                sent = await _answer_with_network_retry(
+                    plain_text,
+                    no_markup_kwargs,
+                )
+        else:
             raise
-        log.warning("answer entity parse failed, retrying as plain text")
-        fallback_kwargs = dict(kwargs)
-        fallback_kwargs["parse_mode"] = None
-        plain_text = html.escape(payload)
-        sent = await _answer_with_network_retry(plain_text, fallback_kwargs)
     schedule_message_auto_delete(sent, auto_delete_seconds)
     return sent
 
@@ -656,6 +811,7 @@ async def send_reply(
         parse_mode: str | None,
         retries: int = 1,
         retry_delay: float = 0.8,
+        schedule_cleanup: bool = True,
     ) -> Message | None:
         attempt = 0
         current_reply_id = explicit_reply_target if send_as_reply else None
@@ -675,7 +831,8 @@ async def send_reply(
                         sent = await message.reply(body, parse_mode=parse_mode)
                 else:
                     sent = await message.answer(body, parse_mode=parse_mode)
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                if schedule_cleanup:
+                    schedule_message_auto_delete(sent, auto_delete_seconds)
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -767,13 +924,21 @@ async def send_reply(
             mid = max(1, len(segment) // 2)
             chunks = [segment[:mid], segment[mid:]]
 
+        # Cleanup is applied after the final edit: an inline delete button
+        # attached at send time would be dropped by the streaming edits.
         if len(chunks) <= 1:
-            sent = await _safe_send(segment, parse_mode=None, retries=3)
+            sent = await _safe_send(
+                segment, parse_mode=None, retries=3, schedule_cleanup=False
+            )
             if not sent:
                 return False
-            return await _finalize_stream_format(sent, segment)
+            ok = await _finalize_stream_format(sent, segment)
+            schedule_message_auto_delete(sent, auto_delete_seconds)
+            return ok
 
-        sent = await _safe_send(chunks[0], parse_mode=None, retries=3)
+        sent = await _safe_send(
+            chunks[0], parse_mode=None, retries=3, schedule_cleanup=False
+        )
         if not sent:
             return False
 
@@ -793,9 +958,12 @@ async def send_reply(
             # Do not send/delete as fallback to avoid duplicate notifications.
             markdown_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
             if not markdown_ok:
+                schedule_message_auto_delete(sent, auto_delete_seconds)
                 return False
 
-        return await _finalize_stream_format(sent, segment)
+        ok = await _finalize_stream_format(sent, segment)
+        schedule_message_auto_delete(sent, auto_delete_seconds)
+        return ok
 
     payload = sanitize_outgoing_text((text or "").strip())
     payload = sanitize_outgoing_mentions(payload)

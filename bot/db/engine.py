@@ -19,6 +19,24 @@ log = logging.getLogger(__name__)
 _SQLITE_TIMEOUT_SECONDS = 5
 _SQLITE_BUSY_TIMEOUT_MS = _SQLITE_TIMEOUT_SECONDS * 1000
 _SQLITE_SCHEMA_VERSION = 1
+_SQLITE_VOTE_BAN_DEDUPE_SQL = (
+    "UPDATE vote_ban_sessions AS candidate "
+    "SET status = 'cancelled' "
+    "WHERE candidate.status IN ('active', 'enforcing') "
+    "AND candidate.id <> ("
+    "SELECT keeper.id FROM vote_ban_sessions AS keeper "
+    "WHERE keeper.group_id = candidate.group_id "
+    "AND keeper.target_user_id = candidate.target_user_id "
+    "AND keeper.status IN ('active', 'enforcing') "
+    "ORDER BY CASE keeper.status WHEN 'enforcing' THEN 0 ELSE 1 END, "
+    "keeper.id DESC LIMIT 1"
+    ")"
+)
+_SQLITE_VOTE_BAN_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_vote_ban_open_target "
+    "ON vote_ban_sessions (group_id, target_user_id) "
+    "WHERE status IN ('active', 'enforcing')"
+)
 
 
 async def _sqlite_table_columns(conn, table: str) -> set[str]:
@@ -165,6 +183,38 @@ async def _sqlite_migrate_join_verification_autoincrement(conn) -> bool:
     return True
 
 
+async def _sqlite_ensure_vote_ban_open_index(conn) -> None:
+    """Repair legacy duplicate open polls before enforcing uniqueness."""
+    result = await conn.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'ix_vote_ban_open_target'"
+        )
+    )
+    row = result.first()
+    index_sql = str(row[0] or "") if row else ""
+    normalized = " ".join(index_sql.upper().split())
+    if index_sql and not (
+        "CREATE UNIQUE INDEX" in normalized
+        and "GROUP_ID" in normalized
+        and "TARGET_USER_ID" in normalized
+        and "STATUS" in normalized
+        and "ACTIVE" in normalized
+        and "ENFORCING" in normalized
+    ):
+        await conn.execute(text("DROP INDEX ix_vote_ban_open_target"))
+        log.warning("Migrated: replaced incompatible vote-ban open-session index")
+
+    # Earlier development builds could create more than one active/enforcing
+    # row before the partial unique index existed. Prefer an enforcing row
+    # (Telegram side effects may already be in progress), otherwise the newest
+    # active row, and close every duplicate before CREATE UNIQUE INDEX.
+    await conn.execute(
+        text(_SQLITE_VOTE_BAN_DEDUPE_SQL)
+    )
+    await conn.execute(text(_SQLITE_VOTE_BAN_INDEX_SQL))
+
+
 async def init_db(
     url: str = "sqlite+aiosqlite:///./data/bot.db",
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
@@ -269,6 +319,45 @@ async def init_db(
                 "group_members",
                 "patrol_hash",
                 "patrol_hash VARCHAR(64) NOT NULL DEFAULT ''",
+            )
+            # Vote-ban tables may already exist from an earlier development
+            # build. Keep them forward-compatible with the richer audit data.
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "evidence",
+                "evidence TEXT NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "source",
+                "source VARCHAR(32) NOT NULL DEFAULT 'command'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "target_message_id",
+                "target_message_id BIGINT NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "enforcing_started_at",
+                "enforcing_started_at DATETIME",
+            )
+            await _sqlite_ensure_vote_ban_open_index(conn)
+            await _sqlite_ensure_column(
+                conn,
+                "keyword_replies",
+                "buttons",
+                "buttons JSON NOT NULL DEFAULT '[]'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "scheduled_messages",
+                "buttons",
+                "buttons JSON NOT NULL DEFAULT '[]'",
             )
 
     session_factory = async_sessionmaker(

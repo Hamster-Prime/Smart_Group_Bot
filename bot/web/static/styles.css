@@ -451,6 +451,20 @@ button:disabled {
   font-size: 12px;
 }
 
+.delete-category-row .delete-category-mode {
+  width: 96px;
+  flex: none;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.call-admin-target-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 8px 0 4px;
+}
+
 .choice-row span,
 .notice span,
 .toast span,
@@ -1156,14 +1170,118 @@ button:disabled {
 
 .group-settings-grid .field.proactive-brief,
 .group-settings-grid .field.mimic-profile,
-.group-settings-grid .field.welcome-message {
+.group-settings-grid .field.welcome-message,
+.group-settings-grid .field.welcome-buttons,
+.group-settings-grid .field.group-permissions-editor {
   grid-column: 1 / -1;
 }
 
 .group-settings-grid .field.proactive-brief textarea,
 .group-settings-grid .field.mimic-profile textarea,
-.group-settings-grid .field.welcome-message textarea {
+.group-settings-grid .field.welcome-message textarea,
+.group-settings-grid .field.welcome-buttons textarea {
   min-height: 74px;
+}
+
+.group-permissions-editor {
+  margin: 8px 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+}
+
+.permission-editor-head,
+.permission-window-head,
+.permission-config-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.permission-editor-head > div {
+  min-width: 0;
+}
+
+.permission-config-row {
+  margin: 13px 0;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.permission-timezone {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.permission-timezone input,
+.permission-window-fields input,
+.permission-override-grid select {
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.group-permissions-editor h5 {
+  margin: 13px 0 8px;
+  font-size: 11px;
+}
+
+.permission-field-grid,
+.permission-override-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px 12px;
+}
+
+.permission-window-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.permission-window-card {
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.permission-window-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.4fr) repeat(3, minmax(84px, 1fr)) auto;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.permission-window-fields label,
+.permission-override-grid label {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.permission-window-fields .compact-check {
+  display: flex;
+  align-self: end;
+  min-height: 34px;
+}
+
+.permission-weekdays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 10px 0;
 }
 
 .group-settings-grid .patrol-trigger {
@@ -1226,9 +1344,10 @@ button:disabled {
   flex: 0 1 110px;
 }
 
-.entry-edit-form input[name="reply_text"],
-.entry-edit-form input[name="text"] {
-  flex: 1 1 180px;
+.entry-edit-form textarea[name="reply_text"],
+.entry-edit-form textarea[name="text"],
+.entry-edit-form textarea[name="buttons_text"] {
+  flex: 1 1 100%;
 }
 
 .entry-edit-form input[name="interval_minutes"] {
@@ -1252,8 +1371,14 @@ button:disabled {
   margin-bottom: 8px;
 }
 
+.inline-resource-form.template-resource-form,
+.inline-resource-form.multiline-resource-form {
+  flex-wrap: wrap;
+}
+
 .inline-resource-form input,
-.inline-resource-form select {
+.inline-resource-form select,
+.inline-resource-form textarea {
   min-width: 0;
   min-height: 36px;
   padding: 6px 8px;
@@ -1265,6 +1390,13 @@ button:disabled {
 
 .inline-resource-form input {
   flex: 1;
+}
+
+.inline-resource-form textarea {
+  min-height: 72px;
+  flex: 1 1 100%;
+  line-height: 1.45;
+  resize: vertical;
 }
 
 .resource-row {
@@ -1300,7 +1432,8 @@ button:disabled {
 }
 
 .rule-resource-form input,
-.rule-resource-form select {
+.rule-resource-form select,
+.rule-resource-form textarea {
   min-width: 0;
   min-height: 34px;
   padding: 5px 7px;
@@ -1311,7 +1444,15 @@ button:disabled {
   font-size: 11px;
 }
 
-.rule-resource-form input[name="pattern"] {
+.rule-resource-form textarea {
+  flex: 1 1 100%;
+  min-height: 68px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.rule-resource-form input[name="pattern"],
+.rule-resource-form textarea[name="pattern"] {
   flex: 1 1 180px;
 }
 
@@ -1326,6 +1467,14 @@ button:disabled {
   gap: 4px;
   font-size: 11px;
   white-space: nowrap;
+}
+
+.compact-check input[type="checkbox"] {
+  width: auto;
+  min-width: 13px;
+  min-height: 0;
+  flex: 0 0 auto;
+  margin: 0;
 }
 
 .toast-region {
@@ -1425,6 +1574,15 @@ button:disabled {
   }
 
   .overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .permission-field-grid,
+  .permission-override-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .permission-window-fields {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1552,8 +1710,21 @@ button:disabled {
   .toggle-field.full,
   .group-settings-grid .field.proactive-brief,
   .group-settings-grid .field.mimic-profile,
-  .group-settings-grid .field.welcome-message {
+  .group-settings-grid .field.welcome-message,
+  .group-settings-grid .field.welcome-buttons,
+  .group-settings-grid .field.group-permissions-editor {
     grid-column: auto;
+  }
+
+  .permission-editor-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .permission-field-grid,
+  .permission-override-grid,
+  .permission-window-fields {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .section-heading {
@@ -1629,7 +1800,8 @@ button:disabled {
     flex-wrap: wrap;
   }
 
-  .rule-resource-form input[name="pattern"] {
+  .rule-resource-form input[name="pattern"],
+  .rule-resource-form textarea[name="pattern"] {
     order: -1;
     flex-basis: 100%;
   }

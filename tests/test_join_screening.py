@@ -519,17 +519,25 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
 
     def _message(self, text: str) -> SimpleNamespace:
         return SimpleNamespace(
-            chat=SimpleNamespace(id=-100, type="supergroup", ban=AsyncMock()),
-            from_user=SimpleNamespace(id=1, username="root"),
+            chat=SimpleNamespace(
+                id=-100,
+                type="supergroup",
+                ban=AsyncMock(),
+                get_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+            ),
+            from_user=SimpleNamespace(id=1, username="root", full_name="Root"),
             text=text,
             reply_to_message=None,
             bot=SimpleNamespace(
                 ban_chat_member=AsyncMock(),
                 unban_chat_member=AsyncMock(),
+                restrict_chat_member=AsyncMock(return_value=True),
+                get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
             ),
+            answer=AsyncMock(return_value=SimpleNamespace(message_id=900)),
         )
 
-    async def test_ban_command_bans_in_configured_group(self) -> None:
+    async def test_super_admin_ban_command_prompts_for_scope(self) -> None:
         from unittest.mock import patch
 
         from bot.handlers import admin as admin_handlers
@@ -540,11 +548,17 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
                 await admin_handlers.cmd_ban(message, session=session, settings=self._settings())
             await session.commit()
 
-            self.assertTrue(await is_globally_banned(session, 777))
-            message.bot.ban_chat_member.assert_awaited_once_with(-100, 777)
-            self.assertIn("封禁结果", answer_mock.await_args.args[2])
+            self.assertFalse(await is_globally_banned(session, 777))
+            message.bot.ban_chat_member.assert_not_awaited()
+            message.answer.assert_awaited_once()
+            self.assertIn("请选择封禁范围", message.answer.await_args.args[0])
+            self.assertEqual(
+                len(message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0]),
+                2,
+            )
+            answer_mock.assert_not_awaited()
 
-    async def test_unban_command_unbans_and_records_exemption(self) -> None:
+    async def test_super_admin_unban_command_prompts_for_scope(self) -> None:
         from unittest.mock import patch
 
         from bot.handlers import admin as admin_handlers
@@ -559,18 +573,18 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
                 await admin_handlers.cmd_unban(message, session=session, settings=self._settings())
             await session.commit()
 
-            self.assertFalse(await is_globally_banned(session, 778))
-            self.assertTrue(await is_join_screening_exempt(session, 778))
+            self.assertTrue(await is_globally_banned(session, 778))
+            self.assertFalse(await is_join_screening_exempt(session, 778))
             warning_result = await session.execute(
                 select(UserWarning).where(
                     UserWarning.group_id == -100,
                     UserWarning.user_id == 778,
                 )
             )
-            self.assertIsNone(warning_result.scalar_one_or_none())
-            message.bot.unban_chat_member.assert_awaited_once_with(-100, 778, only_if_banned=True)
-            self.assertIn("解封结果", answer_mock.await_args.args[2])
-            self.assertIn("累计 3 次", answer_mock.await_args.args[2])
+            self.assertIsNotNone(warning_result.scalar_one_or_none())
+            message.bot.unban_chat_member.assert_not_awaited()
+            self.assertIn("请选择解封范围", message.answer.await_args.args[0])
+            answer_mock.assert_not_awaited()
 
     async def test_clearwarnings_command_clears_count_by_user_id(self) -> None:
         from unittest.mock import patch
@@ -627,21 +641,32 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(warning_result.scalar_one_or_none())
             self.assertIn("不会解封", answer_mock.await_args.args[2])
 
-    async def test_ban_rejects_non_super_admin(self) -> None:
+    async def test_telegram_group_admin_bans_only_current_group(self) -> None:
         from unittest.mock import patch
 
         from bot.handlers import admin as admin_handlers
 
         message = self._message("/ban 777")
-        message.from_user = SimpleNamespace(id=42, username="mallory")
-        message.answer = AsyncMock(return_value=None)
+        message.from_user = SimpleNamespace(id=42, username="manager", full_name="Manager")
+        message.chat.get_member = AsyncMock(
+            return_value=SimpleNamespace(status="administrator")
+        )
 
         async with self.session_factory() as session:
-            with patch("bot.handlers.admin._answer", new=AsyncMock()):
+            with patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock:
                 await admin_handlers.cmd_ban(message, session=session, settings=self._settings())
 
             self.assertFalse(await is_globally_banned(session, 777))
-            message.bot.ban_chat_member.assert_not_awaited()
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 777,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
+            message.bot.ban_chat_member.assert_awaited_once_with(-100, 777)
+            self.assertIn("本群封禁完成", answer_mock.await_args.args[2])
 
 
 class GlobalBanMiddlewareTests(unittest.IsolatedAsyncioTestCase):

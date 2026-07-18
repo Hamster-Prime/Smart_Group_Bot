@@ -1,11 +1,4 @@
-"""Per-group join welcome messages, configured from the Mini App.
-
-The template lives in Group.settings["welcome_message"]; an empty value
-disables the welcome. The text is treated as plain text with {name} and
-{mention} placeholders — it is HTML-escaped before substitution so admin
-input can never break HTML parse mode. Sent messages join the "welcome"
-auto-delete category.
-"""
+"""Per-group Markdown welcome messages, configured from the Mini App."""
 from __future__ import annotations
 
 import html
@@ -15,6 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Group
+from bot.services.message_templates import (
+    build_template_keyboard,
+    normalize_template_buttons,
+    render_markdown_html,
+    render_plain_template,
+    send_template_with_fallback,
+)
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete,
@@ -23,6 +23,7 @@ from bot.utils.telegram import (
 log = logging.getLogger(__name__)
 
 WELCOME_SETTINGS_KEY = "welcome_message"
+WELCOME_BUTTONS_SETTINGS_KEY = "welcome_buttons"
 
 
 def group_welcome_template(group_settings: dict | None) -> str:
@@ -31,11 +32,33 @@ def group_welcome_template(group_settings: dict | None) -> str:
     return str(group_settings.get(WELCOME_SETTINGS_KEY) or "").strip()
 
 
+def group_welcome_buttons(group_settings: dict | None) -> list[dict]:
+    if not isinstance(group_settings, dict):
+        return []
+    try:
+        return normalize_template_buttons(
+            group_settings.get(WELCOME_BUTTONS_SETTINGS_KEY)
+        )
+    except ValueError:
+        return []
+
+
 def render_welcome_text(template: str, *, user_id: int, display_name: str) -> str:
     shown = html.escape(str(display_name or "").strip() or str(user_id))
-    escaped = html.escape(template)
-    return escaped.replace("{name}", shown).replace(
-        "{mention}", f'<a href="tg://user?id={int(user_id)}">{shown}</a>'
+    return render_markdown_html(
+        template,
+        replacements={
+            "{name}": shown,
+            "{mention}": f'<a href="tg://user?id={int(user_id)}">{shown}</a>',
+        },
+    )
+
+
+def render_welcome_plain(template: str, *, user_id: int, display_name: str) -> str:
+    shown = str(display_name or "").strip() or str(user_id)
+    return render_plain_template(
+        template,
+        replacements={"{name}": shown, "{mention}": shown},
     )
 
 
@@ -51,7 +74,9 @@ async def send_group_welcome(
     """Best-effort welcome for one admitted member; False if none was sent."""
     try:
         group = await session.get(Group, int(group_id))
-        template = group_welcome_template(group.settings if group else None)
+        group_settings = group.settings if group else None
+        template = group_welcome_template(group_settings)
+        buttons = group_welcome_buttons(group_settings)
         # End the read transaction before the Telegram call so this never
         # holds the SQLite snapshot across network I/O.
         await session.commit()
@@ -66,8 +91,23 @@ async def send_group_welcome(
     if not template:
         return False
     text = render_welcome_text(template, user_id=user_id, display_name=display_name)
+    plain_text = render_welcome_plain(
+        template,
+        user_id=user_id,
+        display_name=display_name,
+    )
+    keyboard = build_template_keyboard(buttons)
     try:
-        sent = await bot.send_message(int(group_id), text, parse_mode="HTML")
+        sent = await send_template_with_fallback(
+            lambda body, **kwargs: bot.send_message(
+                int(group_id),
+                body,
+                **kwargs,
+            ),
+            formatted_text=text,
+            plain_text=plain_text,
+            reply_markup=keyboard,
+        )
     except Exception:
         log.warning("welcome send failed | group=%s user=%s", group_id, user_id)
         return False
@@ -75,3 +115,14 @@ async def send_group_welcome(
         sent, configured_auto_delete_seconds(settings, "welcome")
     )
     return True
+
+
+__all__ = [
+    "WELCOME_BUTTONS_SETTINGS_KEY",
+    "WELCOME_SETTINGS_KEY",
+    "group_welcome_buttons",
+    "group_welcome_template",
+    "render_welcome_plain",
+    "render_welcome_text",
+    "send_group_welcome",
+]

@@ -5,13 +5,15 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from functools import wraps
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
@@ -30,6 +32,7 @@ from bot.db.models import (
     UserWarning,
 )
 from bot.services.at_reply import is_at_reply_enabled, set_at_reply_enabled
+from bot.services.ban_audit import record_ban_event
 from bot.services.doubao_tts import normalize_tts_mode, set_tts_mode
 from bot.services.proactive import (
     get_cooldown_task_state,
@@ -40,12 +43,27 @@ from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     delete_join_verification,
     delete_join_verifications_for_user,
+    delete_verification_prompts,
+    get_join_verification,
+    join_verification_prompts_for_user,
     join_verification_policy,
     restore_member_permissions,
     turnstile_verification_configured,
     verification_provider,
     verification_service_ready,
 )
+from bot.services.group_permissions import (
+    GROUP_PERMISSIONS_SETTINGS_KEY,
+    PERMISSION_FIELDS,
+    fetch_telegram_default_permissions,
+    get_group_permission_service,
+    normalize_group_permission_config,
+    permission_field_document,
+    repair_group_permissions_config,
+    resolve_group_permissions,
+)
+from bot.services.message_templates import normalize_template_buttons
+from bot.services.member_identity import member_identity_document
 from bot.services.patrol import get_patrol_service, parse_schedule_time, patrol_policy
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
@@ -71,6 +89,8 @@ _GROUP_SETTING_FIELDS = {
     "join_verification_enabled",
     "join_verification_provider",
     "welcome_message",
+    "welcome_buttons",
+    GROUP_PERMISSIONS_SETTINGS_KEY,
     "patrol_enabled",
     "raid_guard_enabled",
     "raid_guard_join_threshold",
@@ -78,6 +98,13 @@ _GROUP_SETTING_FIELDS = {
     "raid_guard_lockdown_seconds",
     "raid_guard_lookback_seconds",
     "raid_guard_challenge_timeout_seconds",
+    "call_admin_enabled",
+    "call_admin_targets",
+    "vote_ban_enabled",
+    "vote_ban_threshold",
+    "vote_ban_duration_seconds",
+    "vote_ban_trigger_limit",
+    "vote_ban_trigger_window_seconds",
     "proactive_enabled",
     "proactive_task_brief",
     "mimic_target_user_id",
@@ -92,9 +119,31 @@ _RAID_GUARD_GROUP_INT_FIELDS = {
     "raid_guard_lookback_seconds": (0, 86400),
     "raid_guard_challenge_timeout_seconds": (60, 86400),
 }
+# Per-group vote-ban numeric overrides, same null-inherits convention.
+_VOTE_BAN_GROUP_INT_FIELDS = {
+    "vote_ban_threshold": (2, 1000),
+    "vote_ban_duration_seconds": (60, 86400),
+    "vote_ban_trigger_limit": (1, 1000),
+    "vote_ban_trigger_window_seconds": (60, 604800),
+}
 _SCHEDULED_TASKS_KEY = "scheduled_tasks"
 _COOLDOWN_TASK_KEY = "cooldown_topic"
 _GROUP_UPDATE_LOCKS: dict[int, asyncio.Lock] = {}
+_MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS = 5.0
+_MEMBER_IDENTITY_CACHE_TTL_SECONDS = 300.0
+_MEMBER_IDENTITY_NEGATIVE_CACHE_TTL_SECONDS = 30.0
+_MEMBER_IDENTITY_CACHE_MAX_ENTRIES = 4096
+_MEMBER_IDENTITY_LOOKUP_CONCURRENCY = 8
+_MEMBER_IDENTITY_CACHE: dict[
+    tuple[int, int, int],
+    tuple[float, tuple[str, str, bool] | None],
+] = {}
+_MEMBER_IDENTITY_INFLIGHT: dict[
+    tuple[int, int, int],
+    asyncio.Task[tuple[str, str, bool] | None],
+] = {}
+_MEMBER_IDENTITY_LOOKUP_LOOP: asyncio.AbstractEventLoop | None = None
+_MEMBER_IDENTITY_LOOKUP_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 class _RuntimeSettingsUpdate(BaseModel):
@@ -118,6 +167,8 @@ class _GroupSettingsUpdate(BaseModel):
         Literal["turnstile", "hcaptcha", "turnstile_hcaptcha"] | None
     ) = None
     welcome_message: str | None = Field(default=None, max_length=4000)
+    welcome_buttons: list[dict[str, Any]] | None = Field(default=None, max_length=12)
+    default_permissions: dict[str, Any] | None = None
     patrol_enabled: StrictBool | None = None
     raid_guard_enabled: StrictBool | None = None
     raid_guard_join_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
@@ -130,6 +181,21 @@ class _GroupSettingsUpdate(BaseModel):
     )
     raid_guard_challenge_timeout_seconds: StrictInt | None = Field(
         default=None, ge=60, le=86400
+    )
+    # None inherits the global default; targets [] or missing = all admins.
+    call_admin_enabled: StrictBool | None = None
+    call_admin_targets: list[Annotated[StrictInt, Field(gt=0)]] | None = Field(
+        default=None,
+        max_length=100,
+    )
+    vote_ban_enabled: StrictBool | None = None
+    vote_ban_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
+    vote_ban_duration_seconds: StrictInt | None = Field(
+        default=None, ge=60, le=86400
+    )
+    vote_ban_trigger_limit: StrictInt | None = Field(default=None, ge=1, le=1000)
+    vote_ban_trigger_window_seconds: StrictInt | None = Field(
+        default=None, ge=60, le=604800
     )
     proactive_enabled: StrictBool | None = None
     proactive_task_brief: str | None = Field(default=None, max_length=240)
@@ -151,6 +217,7 @@ class _KeywordReplyCreate(BaseModel):
     keyword: str = Field(min_length=1, max_length=255)
     match_type: Literal["contains", "exact", "regex"] = "contains"
     reply_text: str = Field(min_length=1, max_length=4000)
+    buttons: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     pin_message: StrictBool = False
     auto_delete: StrictBool = True
     enabled: StrictBool = True
@@ -161,6 +228,7 @@ class _KeywordReplyUpdate(BaseModel):
     keyword: str | None = Field(default=None, min_length=1, max_length=255)
     match_type: Literal["contains", "exact", "regex"] | None = None
     reply_text: str | None = Field(default=None, min_length=1, max_length=4000)
+    buttons: list[dict[str, Any]] | None = Field(default=None, max_length=12)
     pin_message: StrictBool | None = None
     auto_delete: StrictBool | None = None
     enabled: StrictBool | None = None
@@ -169,6 +237,7 @@ class _KeywordReplyUpdate(BaseModel):
 class _ScheduledMessageCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=4000)
+    buttons: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     schedule_type: Literal["daily", "interval"] = "daily"
     schedule_time: str = Field(default="09:00", max_length=5)
     interval_minutes: StrictInt = Field(default=60, ge=5, le=10080)
@@ -181,6 +250,7 @@ class _ScheduledMessageCreate(BaseModel):
 class _ScheduledMessageUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: str | None = Field(default=None, min_length=1, max_length=4000)
+    buttons: list[dict[str, Any]] | None = Field(default=None, max_length=12)
     schedule_type: Literal["daily", "interval"] | None = None
     schedule_time: str | None = Field(default=None, max_length=5)
     interval_minutes: StrictInt | None = Field(default=None, ge=5, le=10080)
@@ -302,6 +372,22 @@ def _setting_int(settings_data: dict[str, Any], key: str) -> int | None:
 def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
     proactive_state = get_cooldown_task_state(settings_data)
     style_state = get_style_state(settings_data)
+    try:
+        welcome_buttons = normalize_template_buttons(
+            settings_data.get("welcome_buttons")
+        )
+    except ValueError:
+        welcome_buttons = []
+    try:
+        default_permissions = (
+            normalize_group_permission_config(
+                settings_data.get(GROUP_PERMISSIONS_SETTINGS_KEY)
+            )
+            if settings_data.get(GROUP_PERMISSIONS_SETTINGS_KEY) is not None
+            else None
+        )
+    except ValueError:
+        default_permissions = None
     return {
         "av_enabled": _setting_bool(settings_data, "av_enabled"),
         "mute_all_replies": _setting_bool(settings_data, "mute_all_replies"),
@@ -319,6 +405,8 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         "welcome_message": str(settings_data.get("welcome_message") or ""),
+        "welcome_buttons": welcome_buttons,
+        GROUP_PERMISSIONS_SETTINGS_KEY: default_permissions,
         "patrol_enabled": (
             _setting_bool(settings_data, "patrol_enabled")
             if settings_data.get("patrol_enabled") is not None
@@ -332,6 +420,25 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         **{
             key: _setting_int(settings_data, key)
             for key in _RAID_GUARD_GROUP_INT_FIELDS
+        },
+        "call_admin_enabled": (
+            _setting_bool(settings_data, "call_admin_enabled")
+            if settings_data.get("call_admin_enabled") is not None
+            else None
+        ),
+        "call_admin_targets": sorted({
+            int(item)
+            for item in (settings_data.get("call_admin_targets") or [])
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0
+        }),
+        "vote_ban_enabled": (
+            _setting_bool(settings_data, "vote_ban_enabled")
+            if settings_data.get("vote_ban_enabled") is not None
+            else None
+        ),
+        **{
+            key: _setting_int(settings_data, key)
+            for key in _VOTE_BAN_GROUP_INT_FIELDS
         },
         # None means the group inherits the global default.
         "proactive_enabled": (
@@ -388,11 +495,16 @@ def _rule_document(rule: ModerationRule) -> dict[str, Any]:
 
 
 def _keyword_reply_document(row: KeywordReply) -> dict[str, Any]:
+    try:
+        buttons = normalize_template_buttons(getattr(row, "buttons", None))
+    except ValueError:
+        buttons = []
     return {
         "id": int(row.id),
         "keyword": str(row.keyword or ""),
         "match_type": str(row.match_type or "contains"),
         "reply_text": str(row.reply_text or ""),
+        "buttons": buttons,
         "pin_message": bool(row.pin_message),
         "auto_delete": bool(row.auto_delete),
         "enabled": bool(row.enabled),
@@ -400,9 +512,14 @@ def _keyword_reply_document(row: KeywordReply) -> dict[str, Any]:
 
 
 def _scheduled_message_document(row: ScheduledMessage) -> dict[str, Any]:
+    try:
+        buttons = normalize_template_buttons(getattr(row, "buttons", None))
+    except ValueError:
+        buttons = []
     return {
         "id": int(row.id),
         "text": str(row.text or ""),
+        "buttons": buttons,
         "schedule_type": str(row.schedule_type or "daily"),
         "schedule_time": str(row.schedule_time or "09:00"),
         "interval_minutes": int(row.interval_minutes or 60),
@@ -437,6 +554,13 @@ def _validated_schedule_time(raw: str) -> str:
     return f"{parsed[0]:02d}:{parsed[1]:02d}"
 
 
+def _validated_template_buttons(value: object) -> list[dict[str, Any]]:
+    try:
+        return normalize_template_buttons(value)
+    except ValueError as exc:
+        raise _APIError(400, "invalid_template_buttons", str(exc)) from exc
+
+
 def _memory_document(memory: GroupPermanentMemory) -> dict[str, Any]:
     return {
         "id": int(memory.id),
@@ -447,8 +571,221 @@ def _memory_document(memory: GroupPermanentMemory) -> dict[str, Any]:
     }
 
 
-def _user_policy_document(row: Any) -> dict[str, Any]:
-    payload = {"user_id": int(row.user_id)}
+def _member_identity(member: GroupMember | None, user_id: int) -> dict[str, Any]:
+    full_name = str(getattr(member, "full_name", "") or "").strip()
+    username = str(getattr(member, "username", "") or "").strip().lstrip("@")
+    identity = member_identity_document(
+        user_id,
+        full_name=full_name,
+        username=username,
+    )
+    # Keep an explicit human label even when Telegram no longer exposes the
+    # profile; the stable ID remains a separate field for operations.
+    if not full_name and not username:
+        identity["display_name"] = f"用户 {user_id}"
+    return identity
+
+
+def _member_identity_lookup_semaphore() -> asyncio.Semaphore:
+    """Return a bounded semaphore tied to the active aiohttp event loop."""
+    global _MEMBER_IDENTITY_LOOKUP_LOOP, _MEMBER_IDENTITY_LOOKUP_SEMAPHORE
+    loop = asyncio.get_running_loop()
+    if (
+        _MEMBER_IDENTITY_LOOKUP_LOOP is not loop
+        or _MEMBER_IDENTITY_LOOKUP_SEMAPHORE is None
+    ):
+        # Tests and graceful restarts may create a new event loop in the same
+        # process. Never reuse an asyncio primitive or in-flight Task across
+        # loops; completed value-cache entries remain safe.
+        _MEMBER_IDENTITY_LOOKUP_LOOP = loop
+        _MEMBER_IDENTITY_LOOKUP_SEMAPHORE = asyncio.Semaphore(
+            _MEMBER_IDENTITY_LOOKUP_CONCURRENCY
+        )
+        _MEMBER_IDENTITY_INFLIGHT.clear()
+    return _MEMBER_IDENTITY_LOOKUP_SEMAPHORE
+
+
+def _cache_member_identity(
+    key: tuple[int, int, int],
+    value: tuple[str, str, bool] | None,
+) -> None:
+    now = time.monotonic()
+    ttl = (
+        _MEMBER_IDENTITY_CACHE_TTL_SECONDS
+        if value is not None
+        else _MEMBER_IDENTITY_NEGATIVE_CACHE_TTL_SECONDS
+    )
+    _MEMBER_IDENTITY_CACHE[key] = (now + ttl, value)
+    if len(_MEMBER_IDENTITY_CACHE) <= _MEMBER_IDENTITY_CACHE_MAX_ENTRIES:
+        return
+    for cached_key, (expires_at, _cached_value) in list(
+        _MEMBER_IDENTITY_CACHE.items()
+    ):
+        if expires_at <= now:
+            _MEMBER_IDENTITY_CACHE.pop(cached_key, None)
+    while len(_MEMBER_IDENTITY_CACHE) > _MEMBER_IDENTITY_CACHE_MAX_ENTRIES:
+        _MEMBER_IDENTITY_CACHE.pop(next(iter(_MEMBER_IDENTITY_CACHE)), None)
+
+
+async def _lookup_member_identity(
+    bot_obj: Any,
+    group_id: int,
+    user_id: int,
+) -> tuple[str, str, bool] | None:
+    """Deduplicate, bound and time-limit Telegram profile lookups."""
+    key = (id(bot_obj), int(group_id), int(user_id))
+    cached = _MEMBER_IDENTITY_CACHE.get(key)
+    if cached is not None:
+        if cached[0] > time.monotonic():
+            return cached[1]
+        _MEMBER_IDENTITY_CACHE.pop(key, None)
+
+    task = _MEMBER_IDENTITY_INFLIGHT.get(key)
+    if task is None:
+        lookup = getattr(bot_obj, "get_chat_member", None)
+        if not callable(lookup):
+            return None
+
+        async def _fetch() -> tuple[str, str, bool] | None:
+            profile_data: tuple[str, str, bool] | None = None
+            try:
+                async with _member_identity_lookup_semaphore():
+                    chat_member = await asyncio.wait_for(
+                        lookup(int(group_id), int(user_id)),
+                        timeout=_MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS,
+                    )
+                profile = getattr(chat_member, "user", None)
+                if profile is not None:
+                    full_name = str(getattr(profile, "full_name", "") or "")[:255]
+                    username = str(getattr(profile, "username", "") or "")[:255]
+                    if full_name or username:
+                        profile_data = (
+                            full_name,
+                            username,
+                            bool(getattr(profile, "is_bot", False)),
+                        )
+            except TimeoutError:
+                log.debug(
+                    "member identity lookup timed out | group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+            except Exception:
+                log.debug(
+                    "member identity lookup failed | group=%s user=%s",
+                    group_id,
+                    user_id,
+                    exc_info=True,
+                )
+            _cache_member_identity(key, profile_data)
+            return profile_data
+
+        task = asyncio.create_task(
+            _fetch(),
+            name=f"member-identity:{int(group_id)}:{int(user_id)}",
+        )
+        _MEMBER_IDENTITY_INFLIGHT[key] = task
+
+        def _retire(done: asyncio.Task[tuple[str, str, bool] | None]) -> None:
+            if _MEMBER_IDENTITY_INFLIGHT.get(key) is done:
+                _MEMBER_IDENTITY_INFLIGHT.pop(key, None)
+
+        task.add_done_callback(_retire)
+    return await asyncio.shield(task)
+
+
+async def _group_member_map(
+    session: AsyncSession,
+    group_id: int,
+    user_ids: list[int],
+    *,
+    bot_obj: Any | None = None,
+) -> dict[int, GroupMember]:
+    ids = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
+    if not ids:
+        return {}
+    rows = (
+        await session.scalars(
+            select(GroupMember).where(
+                GroupMember.group_id == int(group_id),
+                GroupMember.user_id.in_(ids),
+            )
+        )
+    ).all()
+    members = {int(row.user_id): row for row in rows}
+    if bot_obj is None or not callable(getattr(bot_obj, "get_chat_member", None)):
+        return members
+    missing_ids = [
+        user_id
+        for user_id in ids
+        if user_id not in members
+        or not (
+            str(getattr(members[user_id], "full_name", "") or "").strip()
+            or str(getattr(members[user_id], "username", "") or "").strip()
+        )
+    ]
+    if not missing_ids:
+        return members
+    profiles = await asyncio.gather(
+        *(
+            _lookup_member_identity(bot_obj, int(group_id), user_id)
+            for user_id in missing_ids
+        )
+    )
+    changed = False
+    for user_id, profile_data in zip(missing_ids, profiles, strict=True):
+        if profile_data is None:
+            continue
+        full_name, username, is_bot = profile_data
+        row = members.get(user_id)
+        if row is None:
+            row = GroupMember(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                full_name=full_name,
+                username=username,
+                is_bot=is_bot,
+                left=False,
+            )
+            session.add(row)
+            members[user_id] = row
+            changed = True
+            continue
+        if full_name and not str(row.full_name or "").strip():
+            row.full_name = full_name
+            changed = True
+        if username and not str(row.username or "").strip():
+            row.username = username
+            changed = True
+        if bool(row.is_bot) != is_bot:
+            row.is_bot = is_bot
+            changed = True
+    if changed:
+        try:
+            await session.commit()
+        except Exception:
+            # Roster middleware or another settings request may have inserted
+            # the same member concurrently. Identity display is best-effort;
+            # a conflict must not fail the whole policy-list response.
+            await session.rollback()
+            rows = (
+                await session.scalars(
+                    select(GroupMember).where(
+                        GroupMember.group_id == int(group_id),
+                        GroupMember.user_id.in_(ids),
+                    )
+                )
+            ).all()
+            members = {int(row.user_id): row for row in rows}
+    return members
+
+
+def _user_policy_document(
+    row: Any,
+    member: GroupMember | None = None,
+) -> dict[str, Any]:
+    user_id = int(row.user_id)
+    payload = {"user_id": user_id, **_member_identity(member, user_id)}
     if isinstance(row, UserWarning):
         payload.update({"count": int(row.count or 0), "is_banned": bool(row.is_banned)})
     if hasattr(row, "created_by"):
@@ -458,9 +795,66 @@ def _user_policy_document(row: Any) -> dict[str, Any]:
     return payload
 
 
-def _ban_document(row: UserWarning) -> dict[str, Any]:
+def _ban_document(
+    row: UserWarning,
+    member: GroupMember | None = None,
+) -> dict[str, Any]:
     """Expose group-ban state without leaking global moderation thresholds."""
-    return {"user_id": int(row.user_id), "is_banned": bool(row.is_banned)}
+    user_id = int(row.user_id)
+    return {
+        "user_id": user_id,
+        "is_banned": bool(row.is_banned),
+        **_member_identity(member, user_id),
+    }
+
+
+async def _set_group_banned_after_telegram(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+) -> UserWarning:
+    """Upsert only the ban flag, preserving concurrent warning increments."""
+    updated = await session.execute(
+        update(UserWarning)
+        .where(
+            UserWarning.group_id == int(group_id),
+            UserWarning.user_id == int(user_id),
+        )
+        .values(is_banned=True)
+    )
+    if int(updated.rowcount or 0) == 0:
+        try:
+            async with session.begin_nested():
+                session.add(
+                    UserWarning(
+                        group_id=int(group_id),
+                        user_id=int(user_id),
+                        count=0,
+                        is_banned=True,
+                    )
+                )
+                await session.flush()
+        except IntegrityError:
+            updated = await session.execute(
+                update(UserWarning)
+                .where(
+                    UserWarning.group_id == int(group_id),
+                    UserWarning.user_id == int(user_id),
+                )
+                .values(is_banned=True)
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise
+    row = await session.scalar(
+        select(UserWarning).where(
+            UserWarning.group_id == int(group_id),
+            UserWarning.user_id == int(user_id),
+        )
+    )
+    if row is None:
+        raise RuntimeError("group ban row was not persisted")
+    return row
 
 
 def _set_proactive_task_brief(
@@ -496,9 +890,15 @@ def _apply_group_settings(
             "join_verification_enabled",
             "join_verification_provider",
             "welcome_message",
+            "welcome_buttons",
+            GROUP_PERMISSIONS_SETTINGS_KEY,
             "patrol_enabled",
             "raid_guard_enabled",
             *_RAID_GUARD_GROUP_INT_FIELDS,
+            "call_admin_enabled",
+            "call_admin_targets",
+            "vote_ban_enabled",
+            *_VOTE_BAN_GROUP_INT_FIELDS,
         }
         and getattr(update, name) is None
     )
@@ -540,6 +940,26 @@ def _apply_group_settings(
             updated["welcome_message"] = welcome_text
         else:
             updated.pop("welcome_message", None)
+    if "welcome_buttons" in fields:
+        welcome_buttons = _validated_template_buttons(update.welcome_buttons or [])
+        if welcome_buttons:
+            updated["welcome_buttons"] = welcome_buttons
+        else:
+            updated.pop("welcome_buttons", None)
+    if GROUP_PERMISSIONS_SETTINGS_KEY in fields:
+        if update.default_permissions is None:
+            updated.pop(GROUP_PERMISSIONS_SETTINGS_KEY, None)
+        else:
+            try:
+                updated[GROUP_PERMISSIONS_SETTINGS_KEY] = (
+                    normalize_group_permission_config(update.default_permissions)
+                )
+            except ValueError as exc:
+                raise _APIError(
+                    400,
+                    "invalid_default_permissions",
+                    str(exc),
+                ) from exc
     if fields & {"join_verification_enabled", "join_verification_provider"}:
         verification_enabled, provider = join_verification_policy(settings, updated)
         provider_selected = (
@@ -581,6 +1001,34 @@ def _apply_group_settings(
                 )
             updated["raid_guard_enabled"] = bool(update.raid_guard_enabled)
     for key in _RAID_GUARD_GROUP_INT_FIELDS:
+        if key not in fields:
+            continue
+        value = getattr(update, key)
+        if value is None:
+            updated.pop(key, None)
+        else:
+            updated[key] = int(value)
+    if "call_admin_enabled" in fields:
+        if update.call_admin_enabled is None:
+            updated.pop("call_admin_enabled", None)
+        else:
+            updated["call_admin_enabled"] = bool(update.call_admin_enabled)
+    if "call_admin_targets" in fields:
+        targets = sorted(
+            {int(item) for item in (update.call_admin_targets or []) if int(item) > 0}
+        )
+        # An empty selection means "mention all admins" (the default), so it
+        # is not persisted.
+        if targets:
+            updated["call_admin_targets"] = targets
+        else:
+            updated.pop("call_admin_targets", None)
+    if "vote_ban_enabled" in fields:
+        if update.vote_ban_enabled is None:
+            updated.pop("vote_ban_enabled", None)
+        else:
+            updated["vote_ban_enabled"] = bool(update.vote_ban_enabled)
+    for key in _VOTE_BAN_GROUP_INT_FIELDS:
         if key not in fields:
             continue
         value = getattr(update, key)
@@ -850,9 +1298,12 @@ def register_settings_routes(
         username = str(getattr(member_user, "username", None) or "").strip()
         return full_name or (f"@{username}" if username else "")
 
-    @authenticated
-    async def list_group_admins_api(request: web.Request, _user: Any) -> web.Response:
+    @any_admin
+    async def list_group_admins_api(request: web.Request, user: Any) -> web.Response:
+        # Group admins may read this list too: the Mini App call-admin picker
+        # renders it for every group they manage. Mutations stay super-admin.
         group_id = int(request.match_info["id"])
+        await _require_group_access(group_id, int(user.id))
         async with session_factory() as session:
             rows = (await session.execute(
                 select(Admin, GroupMember.full_name, GroupMember.username)
@@ -879,6 +1330,65 @@ def register_settings_routes(
                 "role": str(row.role or "admin"),
                 "display_name": display_name,
             })
+        return _success_response({"admins": admins})
+
+    @any_admin
+    async def list_telegram_admins_api(request: web.Request, user: Any) -> web.Response:
+        """Live Telegram admins for the call-admin target picker.
+
+        Falls back to the locally authorized admin list (with roster display
+        names) when the Telegram lookup is unavailable.
+        """
+        group_id = int(request.match_info["id"])
+        await _require_group_access(group_id, int(user.id))
+        admins: list[dict[str, Any]] = []
+        get_admins = getattr(bot, "get_chat_administrators", None)
+        if callable(get_admins):
+            try:
+                me_id = 0
+                get_me = getattr(bot, "me", None)
+                if callable(get_me):
+                    me_id = int(getattr(await get_me(), "id", 0) or 0)
+                members = await asyncio.wait_for(get_admins(group_id), timeout=5.0)
+                for member in members or []:
+                    member_user = getattr(member, "user", None)
+                    if member_user is None or getattr(member_user, "is_bot", False):
+                        continue
+                    user_id = int(member_user.id)
+                    if user_id == me_id:
+                        continue
+                    full_name = str(getattr(member_user, "full_name", "") or "").strip()
+                    username = str(getattr(member_user, "username", "") or "").strip()
+                    admins.append({
+                        "user_id": user_id,
+                        "display_name": full_name or (f"@{username}" if username else str(user_id)),
+                        "username": username,
+                    })
+            except Exception:
+                log.info("telegram admin list failed | group=%s", group_id)
+                admins = []
+        if not admins:
+            async with session_factory() as session:
+                rows = (await session.execute(
+                    select(Admin.user_id, GroupMember.full_name, GroupMember.username)
+                    .outerjoin(
+                        GroupMember,
+                        (GroupMember.group_id == Admin.group_id)
+                        & (GroupMember.user_id == Admin.user_id),
+                    )
+                    .where(Admin.group_id == group_id)
+                    .order_by(Admin.id)
+                )).all()
+            for user_id, full_name, username in rows:
+                clean_username = str(username or "").strip()
+                display = str(full_name or "").strip() or (
+                    f"@{clean_username}" if clean_username else str(int(user_id))
+                )
+                admins.append({
+                    "user_id": int(user_id),
+                    "display_name": display,
+                    "username": clean_username,
+                })
         return _success_response({"admins": admins})
 
     @authenticated
@@ -951,9 +1461,13 @@ def register_settings_routes(
                 source="manual",
                 created_by=int(user.id),
             )
+            prompts = await join_verification_prompts_for_user(
+                session, body.user_id
+            )
             await delete_join_verifications_for_user(session, body.user_id)
             group_ids = [int(value) for value in (await session.scalars(select(AuthorizedGroup.group_id))).all()]
             await session.commit()
+        await delete_verification_prompts(bot, prompts)
         succeeded = 0
         failures = 0
         for group_id in group_ids:
@@ -1001,9 +1515,11 @@ def register_settings_routes(
             )
         async with session_factory() as session:
             removed = await remove_global_ban(session, target_id, operator_id=int(user.id))
+            prompts = await join_verification_prompts_for_user(session, target_id)
             await delete_join_verifications_for_user(session, target_id)
             await session.execute(delete(UserWarning).where(UserWarning.user_id == target_id))
             await session.commit()
+        await delete_verification_prompts(bot, prompts)
         return _success_response({
             "removed": removed,
             "unbanned_groups": succeeded,
@@ -1034,7 +1550,69 @@ def register_settings_routes(
                 _group_document(group_id, title, group_settings)
                 for group_id, title, group_settings in result.all()
             ]
-        return _success_response({"groups": groups})
+        return _success_response(
+            {"groups": groups, "permission_fields": permission_field_document()}
+        )
+
+    @any_admin
+    async def get_group_default_permissions(
+        request: web.Request,
+        user: Any,
+    ) -> web.Response:
+        group_id = _group_id(request)
+        await _require_group_access(group_id, int(user.id))
+        async with session_factory() as session:
+            group = await session.get(Group, group_id)
+            stored = (
+                (group.settings or {}).get(GROUP_PERMISSIONS_SETTINGS_KEY)
+                if group is not None and isinstance(group.settings, dict)
+                else None
+            )
+        configured = stored is not None
+        repaired = False
+        repair_reason = ""
+        if stored is not None:
+            try:
+                config = normalize_group_permission_config(stored)
+            except ValueError as exc:
+                # A previously complete document can become incomplete when a
+                # newer Bot API adds permission fields. Let the group admin
+                # reopen and save it instead of trapping the Mini App behind a
+                # 500 response. Current Telegram values fill newly introduced
+                # fields while compatible base/window choices are retained.
+                configured = False
+                repaired = True
+                repair_reason = str(exc)
+                config = None
+        else:
+            config = None
+        if config is None:
+            try:
+                base = await fetch_telegram_default_permissions(bot, group_id)
+            except Exception as exc:
+                raise _APIError(
+                    502,
+                    "telegram_permissions_unavailable",
+                    "无法读取当前 Telegram 群默认权限，请确认 bot 仍在群内。",
+                ) from exc
+            config = repair_group_permissions_config(
+                stored,
+                fallback_base=base,
+            )
+        resolved = resolve_group_permissions(config)
+        service = get_group_permission_service()
+        return _success_response(
+            {
+                "default_permissions": config,
+                "permission_fields": permission_field_document(),
+                "configured": configured,
+                "repaired": repaired,
+                "repair_reason": repair_reason,
+                "effective": resolved.permissions,
+                "active_window_ids": list(resolved.active_window_ids),
+                "status": service.status(group_id) if service is not None else {},
+            }
+        )
 
     @any_admin
     async def put_group_settings(request: web.Request, user: Any) -> web.Response:
@@ -1061,10 +1639,13 @@ def register_settings_routes(
                 "unknown_group_settings",
                 f"包含不允许修改的群设置：{names}",
             )
-        update = _GroupSettingsUpdate.model_validate(body)
-        if not update.model_fields_set:
+        settings_update = _GroupSettingsUpdate.model_validate(body)
+        if not settings_update.model_fields_set:
             raise _APIError(400, "empty_group_settings", "至少需要提供一个群设置。")
 
+        permissions_changed = (
+            GROUP_PERMISSIONS_SETTINGS_KEY in settings_update.model_fields_set
+        )
         lock = _GROUP_UPDATE_LOCKS.setdefault(group_id, asyncio.Lock())
         async with lock:
             async with session_factory() as session:
@@ -1072,10 +1653,12 @@ def register_settings_routes(
                 if authorized is None:
                     raise _APIError(404, "group_not_found", "该群未授权或不存在。")
                 group = await session.get(Group, group_id)
+                created_group = group is None
                 if group is None:
                     group = Group(id=group_id, title="", settings={})
                     session.add(group)
-                actual_revision = _group_revision(group.settings or {})
+                stored_settings = dict(group.settings or {})
+                actual_revision = _group_revision(stored_settings)
                 if actual_revision != expected_revision:
                     raise _APIError(
                         409,
@@ -1083,11 +1666,15 @@ def register_settings_routes(
                         "群设置已被其他会话更新，请刷新后重试。",
                     )
                 previous_style_target = int(
-                    get_style_state(group.settings).get("target_user_id") or 0
+                    get_style_state(stored_settings).get("target_user_id") or 0
                 )
-                group.settings = _apply_group_settings(group.settings, update, settings)
+                updated_settings = _apply_group_settings(
+                    stored_settings,
+                    settings_update,
+                    settings,
+                )
                 current_style_target = int(
-                    get_style_state(group.settings).get("target_user_id") or 0
+                    get_style_state(updated_settings).get("target_user_id") or 0
                 )
                 if current_style_target != previous_style_target:
                     await session.execute(
@@ -1095,9 +1682,54 @@ def register_settings_routes(
                             SpeechStyleSample.group_id == group_id
                         )
                     )
-                await session.commit()
-                document = _group_document(group.id, group.title, group.settings)
-        return _success_response({"group": document})
+                if created_group:
+                    group.settings = updated_settings
+                    try:
+                        await session.commit()
+                    except IntegrityError as exc:
+                        await session.rollback()
+                        raise _APIError(
+                            409,
+                            "group_revision_conflict",
+                            "群设置已被其他会话更新，请刷新后重试。",
+                        ) from exc
+                else:
+                    changed = await session.execute(
+                        update(Group)
+                        .where(
+                            Group.id == group_id,
+                            Group.settings == stored_settings,
+                        )
+                        .values(settings=updated_settings)
+                        .execution_options(synchronize_session=False)
+                    )
+                    if int(changed.rowcount or 0) != 1:
+                        await session.rollback()
+                        raise _APIError(
+                            409,
+                            "group_revision_conflict",
+                            "群设置已被其他会话更新，请刷新后重试。",
+                        )
+                    await session.commit()
+                document = _group_document(group.id, group.title, updated_settings)
+        permission_apply: dict[str, Any] | None = None
+        if permissions_changed:
+            service = get_group_permission_service()
+            config = document["settings"].get(GROUP_PERMISSIONS_SETTINGS_KEY)
+            if service is not None and config is not None:
+                applied = await service.apply_group_now(group_id, config)
+                permission_apply = {
+                    **service.status(group_id),
+                    "applied": bool(applied),
+                }
+            elif service is not None:
+                service.forget_group(group_id)
+                permission_apply = {"applied": False, "removed": True}
+            else:
+                permission_apply = {"applied": False, "service_unavailable": True}
+        return _success_response(
+            {"group": document, "permission_apply": permission_apply}
+        )
 
     def _group_id(request: web.Request) -> int:
         try:
@@ -1222,6 +1854,7 @@ def register_settings_routes(
             keyword=_validated_keyword(body.keyword, body.match_type),
             match_type=body.match_type,
             reply_text=reply_text,
+            buttons=_validated_template_buttons(body.buttons),
             pin_message=body.pin_message,
             auto_delete=body.auto_delete,
             enabled=body.enabled,
@@ -1262,6 +1895,8 @@ def register_settings_routes(
                 ).strip()
                 if not row.reply_text:
                     raise _APIError(400, "empty_reply_text", "回复内容不能为空。")
+            if "buttons" in body.model_fields_set:
+                row.buttons = _validated_template_buttons(body.buttons or [])
             if "pin_message" in body.model_fields_set:
                 row.pin_message = bool(body.pin_message)
             if "auto_delete" in body.model_fields_set:
@@ -1312,6 +1947,7 @@ def register_settings_routes(
         row = ScheduledMessage(
             group_id=group_id,
             text=text,
+            buttons=_validated_template_buttons(body.buttons),
             schedule_type=body.schedule_type,
             schedule_time=_validated_schedule_time(body.schedule_time),
             interval_minutes=int(body.interval_minutes),
@@ -1351,6 +1987,8 @@ def register_settings_routes(
                 row.text = clean_multiline_text(str(body.text or ""), max_len=4000).strip()
                 if not row.text:
                     raise _APIError(400, "empty_message_text", "消息内容不能为空。")
+            if "buttons" in body.model_fields_set:
+                row.buttons = _validated_template_buttons(body.buttons or [])
             if "schedule_type" in body.model_fields_set:
                 row.schedule_type = str(body.schedule_type)
             if "schedule_time" in body.model_fields_set:
@@ -1480,7 +2118,20 @@ def register_settings_routes(
             if model is UserWarning:
                 stmt = stmt.where(UserWarning.count > 0)
             rows = (await session.scalars(stmt)).all()
-        return _success_response({key: [_user_policy_document(row) for row in rows]})
+            members = await _group_member_map(
+                session,
+                group_id,
+                [int(row.user_id) for row in rows],
+                bot_obj=bot,
+            )
+        return _success_response(
+            {
+                key: [
+                    _user_policy_document(row, members.get(int(row.user_id)))
+                    for row in rows
+                ]
+            }
+        )
 
     @any_admin
     async def list_warnings(request: web.Request, user: Any) -> web.Response:
@@ -1520,7 +2171,20 @@ def register_settings_routes(
                 )
                 .order_by(UserWarning.count.desc(), UserWarning.user_id.asc())
             )).all()
-        return _success_response({"bans": [_ban_document(row) for row in rows]})
+            members = await _group_member_map(
+                session,
+                group_id,
+                [int(row.user_id) for row in rows],
+                bot_obj=bot,
+            )
+        return _success_response(
+            {
+                "bans": [
+                    _ban_document(row, members.get(int(row.user_id)))
+                    for row in rows
+                ]
+            }
+        )
 
     @any_admin
     async def create_group_ban(request: web.Request, user: Any) -> web.Response:
@@ -1532,7 +2196,7 @@ def register_settings_routes(
         ban_member = getattr(bot, "ban_chat_member", None)
         if not callable(ban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 封禁接口。")
-        previous_warning: tuple[int, bool] | None = None
+        prompts: set[tuple[int, int]] = set()
         async with session_factory() as session:
             if await is_globally_banned(session, body.user_id):
                 raise _APIError(
@@ -1540,42 +2204,66 @@ def register_settings_routes(
                     "group_ban_locked",
                     "该用户的封禁状态只能由最高管理员处理。",
                 )
-            row = await session.scalar(select(UserWarning).where(
-                UserWarning.group_id == group_id,
-                UserWarning.user_id == body.user_id,
-            ))
-            if row is not None:
-                previous_warning = (int(row.count or 0), bool(row.is_banned))
-            if row is None:
-                row = UserWarning(
-                    group_id=group_id,
-                    user_id=body.user_id,
-                    count=0,
-                    is_banned=True,
-                )
-                session.add(row)
-            else:
-                row.is_banned = True
-            await session.commit()
-            await session.refresh(row)
+            verification = await get_join_verification(
+                session, group_id, body.user_id
+            )
+            if verification is not None and int(verification.prompt_message_id or 0) > 0:
+                prompts.add((group_id, int(verification.prompt_message_id)))
         try:
-            await ban_member(group_id, body.user_id)
+            result = await ban_member(group_id, body.user_id)
+            if result is False:
+                raise RuntimeError("Telegram returned false")
         except Exception as exc:
-            async with session_factory() as session:
-                current = await session.scalar(select(UserWarning).where(
-                    UserWarning.group_id == group_id,
-                    UserWarning.user_id == body.user_id,
-                ))
-                if current is not None:
-                    if previous_warning is None:
-                        await session.delete(current)
-                    else:
-                        current.count, current.is_banned = previous_warning
-                await session.commit()
+            try:
+                async with session_factory() as session:
+                    await record_ban_event(
+                        session,
+                        group_id=group_id,
+                        target_user_id=body.user_id,
+                        action="ban",
+                        source="miniapp_group",
+                        outcome="failed",
+                        reason="Mini App 管理员手动封禁",
+                        actor_user_id=int(user.id),
+                        details={"telegram_error": type(exc).__name__},
+                    )
+                    await session.commit()
+            except Exception:
+                log.exception(
+                    "web group ban failure audit write failed | group=%s user=%s",
+                    group_id,
+                    body.user_id,
+                )
             raise _APIError(502, "telegram_ban_failed", "Telegram 群内封禁失败，请稍后重试。") from exc
         async with session_factory() as session:
+            current_verification = await get_join_verification(
+                session, group_id, body.user_id
+            )
+            if (
+                current_verification is not None
+                and int(current_verification.prompt_message_id or 0) > 0
+            ):
+                prompts.add(
+                    (group_id, int(current_verification.prompt_message_id))
+                )
+            row = await _set_group_banned_after_telegram(
+                session,
+                group_id=group_id,
+                user_id=body.user_id,
+            )
             await delete_join_verification(session, group_id, body.user_id)
+            await record_ban_event(
+                session,
+                group_id=group_id,
+                target_user_id=body.user_id,
+                action="ban",
+                source="miniapp_group",
+                outcome="succeeded",
+                reason="Mini App 管理员手动封禁",
+                actor_user_id=int(user.id),
+            )
             await session.commit()
+        await delete_verification_prompts(bot, prompts)
         return _success_response({"ban": _ban_document(row)})
 
     @any_admin
@@ -1583,6 +2271,7 @@ def register_settings_routes(
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         target_id = _path_int(request, "user_id")
+        prompts: set[tuple[int, int]] = set()
         async with session_factory() as session:
             if await is_globally_banned(session, target_id):
                 raise _APIError(
@@ -1596,35 +2285,124 @@ def register_settings_routes(
             ))
             if row is None or not row.is_banned:
                 return _success_response({"deleted": False, "restored": False})
+            warning_snapshot = (
+                int(row.id),
+                max(0, int(row.count or 0)),
+                bool(row.is_banned),
+            )
+            verification = await get_join_verification(session, group_id, target_id)
+            if verification is not None and int(verification.prompt_message_id or 0) > 0:
+                prompts.add((group_id, int(verification.prompt_message_id)))
         unban_member = getattr(bot, "unban_chat_member", None)
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
         try:
-            await unban_member(group_id, target_id, only_if_banned=True)
+            result = await unban_member(group_id, target_id, only_if_banned=True)
+            if result is False:
+                raise RuntimeError("Telegram returned false")
         except Exception as exc:
             raise _APIError(502, "telegram_unban_failed", "Telegram 群内解封失败，请稍后重试。") from exc
-        restored = await restore_member_permissions(bot, group_id, target_id)
-        if not restored:
-            raise _APIError(
-                502,
-                "telegram_restore_failed",
-                "群内解封成功，但恢复发言权限失败；请重试解封操作。",
-            )
         async with session_factory() as session:
             if await is_globally_banned(session, target_id):
+                await session.rollback()
+                try:
+                    await bot.ban_chat_member(group_id, target_id)
+                except Exception:
+                    log.exception(
+                        "web group unban global-race reban failed | group=%s user=%s",
+                        group_id,
+                        target_id,
+                    )
                 raise _APIError(
                     409,
                     "group_ban_locked",
-                    "该用户的封禁状态只能由最高管理员处理。",
+                    "解封期间该用户被加入全局封禁名单，已保留封禁状态。",
                 )
-            row = await session.scalar(select(UserWarning).where(
-                UserWarning.group_id == group_id,
-                UserWarning.user_id == target_id,
-            ))
-            if row is not None:
-                await session.delete(row)
-            await session.commit()
-        return _success_response({"deleted": row is not None, "restored": True})
+            warning_id, previous_count, was_banned = warning_snapshot
+            deleted = await session.execute(
+                delete(UserWarning).where(
+                    UserWarning.id == warning_id,
+                    UserWarning.group_id == group_id,
+                    UserWarning.user_id == target_id,
+                    UserWarning.count == previous_count,
+                    UserWarning.is_banned.is_(was_banned),
+                )
+            )
+            if int(deleted.rowcount or 0) != 1:
+                await session.rollback()
+                current = await session.scalar(
+                    select(UserWarning).where(
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == target_id,
+                    )
+                )
+                current_banned = current is not None and bool(current.is_banned)
+                await session.rollback()
+                if current_banned:
+                    try:
+                        await bot.ban_chat_member(group_id, target_id)
+                    except Exception:
+                        log.exception(
+                            "web group unban concurrent-state reban failed | group=%s user=%s",
+                            group_id,
+                            target_id,
+                        )
+                raise _APIError(
+                    409,
+                    "group_ban_state_changed",
+                    "解封期间警告或封禁状态已被其他管理操作更新，请刷新后重试。",
+                )
+            current_verification = await get_join_verification(
+                session, group_id, target_id
+            )
+            if (
+                current_verification is not None
+                and int(current_verification.prompt_message_id or 0) > 0
+            ):
+                prompts.add(
+                    (group_id, int(current_verification.prompt_message_id))
+                )
+            await delete_join_verification(session, group_id, target_id)
+            try:
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                try:
+                    await bot.ban_chat_member(group_id, target_id)
+                except Exception:
+                    log.exception(
+                        "web group unban database-failure reban failed | group=%s user=%s",
+                        group_id,
+                        target_id,
+                    )
+                raise _APIError(
+                    500,
+                    "group_unban_state_failed",
+                    "Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请重试。",
+                ) from exc
+        await delete_verification_prompts(bot, prompts)
+        restored = await restore_member_permissions(bot, group_id, target_id)
+        try:
+            async with session_factory() as session:
+                await record_ban_event(
+                    session,
+                    group_id=group_id,
+                    target_user_id=target_id,
+                    action="unban",
+                    source="miniapp_group",
+                    outcome="succeeded",
+                    reason="Mini App 管理员解除群内封禁",
+                    actor_user_id=int(user.id),
+                    details={"permissions_restored": bool(restored)},
+                )
+                await session.commit()
+        except Exception:
+            log.exception(
+                "web group unban audit write failed | group=%s user=%s",
+                group_id,
+                target_id,
+            )
+        return _success_response({"deleted": True, "restored": bool(restored)})
 
     async def _create_user_row(
         request: web.Request,
@@ -1733,12 +2511,17 @@ def register_settings_routes(
     app.router.add_post("/api/v1/authorized-groups", create_authorized_group_api)
     app.router.add_delete("/api/v1/authorized-groups/{id}", delete_authorized_group_api)
     app.router.add_get("/api/v1/groups/{id}/admins", list_group_admins_api)
+    app.router.add_get("/api/v1/groups/{id}/telegram-admins", list_telegram_admins_api)
     app.router.add_post("/api/v1/groups/{id}/admins", create_group_admin_api)
     app.router.add_delete("/api/v1/groups/{id}/admins/{user_id}", delete_group_admin_api)
     app.router.add_get("/api/v1/global-bans", list_global_bans_api)
     app.router.add_post("/api/v1/global-bans", create_global_ban_api)
     app.router.add_delete("/api/v1/global-bans/{user_id}", delete_global_ban_api)
     app.router.add_get("/api/v1/groups", get_groups)
+    app.router.add_get(
+        "/api/v1/groups/{id}/default-permissions",
+        get_group_default_permissions,
+    )
     app.router.add_put("/api/v1/groups/{id}/settings", put_group_settings)
     app.router.add_get("/api/v1/groups/{id}/rules", list_rules)
     app.router.add_post("/api/v1/groups/{id}/rules", create_rule)

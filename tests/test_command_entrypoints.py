@@ -38,6 +38,32 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("command: /clearwarnings", guide)
         self.assertIn("清空某用户的累计违规次数", guide)
+        self.assertIn("command: /raidguard", guide)
+
+    async def test_raidguard_numeric_argument_uses_minutes(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/raidguard 15",
+        )
+        service = SimpleNamespace(
+            enable_manual_lockdown=AsyncMock(),
+            disable_manual_lockdown=AsyncMock(),
+            lockdown_status=lambda _group_id: {"active": False},
+        )
+        with (
+            patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin._ensure_ban_command_admin", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.get_raid_guard_service", return_value=service),
+            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await admin.cmd_raidguard(message, session=object(), settings=_settings())
+
+        service.enable_manual_lockdown.assert_awaited_once_with(
+            -10001,
+            duration_minutes=15,
+        )
+        self.assertIn("15 分钟", answer_mock.await_args.args[2])
 
     async def test_settings_entry_allows_authorized_group_admin(self) -> None:
         message = SimpleNamespace(
@@ -98,13 +124,14 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleared, (4, True))
         session.delete.assert_awaited_once_with(warning)
 
-    async def test_unban_calls_warning_reset_for_target(self) -> None:
+    async def test_super_admin_unban_prompts_for_scope(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),
-            from_user=SimpleNamespace(id=123, username="admin"),
+            from_user=SimpleNamespace(id=123, username="admin", full_name="Admin"),
             text="/unban 456",
             reply_to_message=None,
             bot=SimpleNamespace(unban_chat_member=AsyncMock()),
+            answer=AsyncMock(return_value=SimpleNamespace(message_id=900)),
         )
         session = SimpleNamespace(commit=AsyncMock())
         settings = _settings()
@@ -112,28 +139,80 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.handlers.admin.ensure_group_authorized", new=AsyncMock(return_value=True)),
-            patch("bot.handlers.admin.ensure_super_admin", new=AsyncMock(return_value=True)),
-            patch("bot.handlers.admin.remove_global_ban", new=AsyncMock(return_value=False)),
-            patch("bot.handlers.admin.delete_join_verifications_for_user", new=AsyncMock()),
-            patch(
-                "bot.handlers.admin._authorized_group_ids",
-                new=AsyncMock(return_value=[-10001]),
-            ),
-            patch(
-                "bot.handlers.admin._clear_user_warning",
-                new=AsyncMock(return_value=(3, True)),
-            ) as clear_mock,
-            patch(
-                "bot.handlers.admin.restore_member_permissions",
-                new=AsyncMock(return_value=True),
-            ),
-            patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
+            patch("bot.handlers.admin._answer", new=AsyncMock()),
         ):
             await admin.cmd_unban(message, session=session, settings=settings)
 
-        clear_mock.assert_awaited_once_with(session, -10001, 456)
-        session.commit.assert_awaited_once()
-        self.assertIn("累计 3 次", answer_mock.await_args.args[2])
+        message.answer.assert_awaited_once()
+        kwargs = message.answer.await_args.kwargs
+        self.assertIn("请选择解封范围", message.answer.await_args.args[0])
+        self.assertEqual(len(kwargs["reply_markup"].inline_keyboard[0]), 2)
+        message.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_group_ban_failure_keeps_pending_verification(self) -> None:
+        verification = SimpleNamespace(prompt_message_id=321)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            reply_to_message=None,
+            bot=SimpleNamespace(
+                ban_chat_member=AsyncMock(side_effect=RuntimeError("denied")),
+            ),
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+
+        with (
+            patch("bot.handlers.admin._target_is_group_admin", new=AsyncMock(return_value=False)),
+            patch("bot.handlers.admin.get_join_verification", new=AsyncMock(return_value=verification)),
+            patch("bot.handlers.admin.delete_join_verification", new=AsyncMock()) as delete_record,
+            patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()) as delete_prompts,
+            patch("bot.handlers.admin.record_ban_event", new=AsyncMock()),
+        ):
+            text = await admin._perform_group_ban_locked(
+                message,
+                session,
+                _settings(),
+                target_id=456,
+                reason="test",
+            )
+
+        self.assertIn("原警告和真人验证状态均已保留", text)
+        delete_record.assert_not_awaited()
+        delete_prompts.assert_not_awaited()
+
+    async def test_group_ban_success_cleans_verification_prompt_after_commit(self) -> None:
+        verification = SimpleNamespace(prompt_message_id=322)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            reply_to_message=None,
+            bot=SimpleNamespace(ban_chat_member=AsyncMock(return_value=True)),
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+
+        with (
+            patch("bot.handlers.admin._target_is_group_admin", new=AsyncMock(return_value=False)),
+            patch(
+                "bot.handlers.admin.get_join_verification",
+                new=AsyncMock(side_effect=[verification, verification]),
+            ),
+            patch("bot.handlers.admin._mark_group_banned_after_telegram", new=AsyncMock()) as mark_banned,
+            patch("bot.handlers.admin.delete_join_verification", new=AsyncMock()) as delete_record,
+            patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()) as delete_prompts,
+            patch("bot.handlers.admin.record_ban_event", new=AsyncMock()),
+        ):
+            text = await admin._perform_group_ban_locked(
+                message,
+                session,
+                _settings(),
+                target_id=456,
+                reason="test",
+            )
+
+        self.assertIn("本群封禁完成", text)
+        mark_banned.assert_awaited_once()
+        delete_record.assert_awaited_once_with(session, -10001, 456)
+        delete_prompts.assert_awaited_once_with(message.bot, {(-10001, 322)})
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(

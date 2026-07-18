@@ -1,4 +1,4 @@
-"""Scheduled group messages: per-group timed announcements with optional pin.
+"""Scheduled group Markdown templates with optional buttons and pinning.
 
 Rows live in the scheduled_messages table and are managed from the Mini App.
 A lightweight background loop (same shape as the profile patrol) wakes every
@@ -14,18 +14,22 @@ import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import ScheduledMessage
+from bot.services.message_templates import (
+    build_template_keyboard,
+    render_markdown_html,
+    render_plain_template,
+    send_template_with_fallback,
+)
 from bot.services.authz import list_authorized_groups
 from bot.services.patrol import parse_schedule_time
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete,
-    sanitize_outgoing_mentions,
     sanitize_outgoing_text,
 )
 from bot.utils.timezone import now_shanghai_naive
@@ -124,20 +128,23 @@ class ScheduledMessageService:
 
     async def _deliver(self, entry: ScheduledMessage) -> bool:
         group_id = int(entry.group_id)
-        payload = sanitize_outgoing_mentions(
-            sanitize_outgoing_text(str(entry.text or "").strip())
-        )
-        if not payload:
+        source_text = sanitize_outgoing_text(str(entry.text or "").strip())
+        if not source_text:
             return False
+        payload = render_markdown_html(source_text)
+        plain_fallback = render_plain_template(source_text)
+        keyboard = build_template_keyboard(getattr(entry, "buttons", None))
         try:
-            try:
-                sent = await self.bot.send_message(chat_id=group_id, text=payload)
-            except TelegramBadRequest as exc:
-                if "can't parse entities" not in str(exc).lower():
-                    raise
-                sent = await self.bot.send_message(
-                    chat_id=group_id, text=payload, parse_mode=None
-                )
+            sent = await send_template_with_fallback(
+                lambda text, **kwargs: self.bot.send_message(
+                    chat_id=group_id,
+                    text=text,
+                    **kwargs,
+                ),
+                formatted_text=payload,
+                plain_text=plain_fallback,
+                reply_markup=keyboard,
+            )
         except Exception:
             log.exception(
                 "scheduled message send failed | group=%s entry=%s",

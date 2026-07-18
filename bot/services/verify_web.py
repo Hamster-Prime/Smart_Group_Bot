@@ -50,6 +50,7 @@ from bot.services.join_verification import (
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
+    delete_verification_prompt,
     extend_pending_verification_deadlines,
     get_join_verification,
     get_pending_verification_by_id_for_user,
@@ -1618,6 +1619,7 @@ class VerifyWebServer:
                     message_id=prompt_message_id,
                     text=text,
                     parse_mode="HTML",
+                    reply_markup=None,
                 )
                 # Repurposed challenge prompt is now a moderation outcome
                 # notice: honor the group's auto-delete retention.
@@ -1629,6 +1631,15 @@ class VerifyWebServer:
             except Exception:
                 log.debug(
                     "verification pass edit failed | group=%s message=%s",
+                    group_id,
+                    prompt_message_id,
+                )
+                # The record has already been consumed. If the edit failed,
+                # remove the original prompt before sending a standalone
+                # outcome so its old buttons cannot report a confusing
+                # "expired" state forever.
+                await delete_verification_prompt(
+                    self.bot,
                     group_id,
                     prompt_message_id,
                 )

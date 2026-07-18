@@ -1,4 +1,4 @@
-"""Keyword auto replies: fixed answers triggered by per-group keyword rules.
+"""Keyword auto replies: Markdown templates triggered by per-group rules.
 
 Rules live in the keyword_replies table and are managed from the Mini App.
 Matching runs inside the group message handler after moderation, so a
@@ -18,6 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import KeywordReply
+from bot.services.message_templates import (
+    build_template_keyboard,
+    render_markdown_html,
+    render_plain_template,
+)
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
@@ -89,12 +94,20 @@ async def send_keyword_reply(
     auto_delete_seconds = (
         configured_auto_delete_seconds(settings, "keyword") if rule.auto_delete else 0
     )
+    source_text = str(rule.reply_text or "")
+    rendered_text = render_markdown_html(source_text)
+    keyboard = build_template_keyboard(getattr(rule, "buttons", None))
     try:
         sent = await answer_with_auto_delete(
             message,
-            str(rule.reply_text or ""),
+            rendered_text,
             auto_delete_seconds=auto_delete_seconds,
             reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            plain_text_fallback=render_plain_template(source_text),
+            sanitize_mentions=False,
+            drop_invalid_reply_markup=True,
         )
     except Exception:
         log.exception(

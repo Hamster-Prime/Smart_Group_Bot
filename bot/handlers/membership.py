@@ -42,6 +42,7 @@ from bot.services.join_verification import (
     build_private_deep_link,
     claim_join_verification,
     delete_join_verification,
+    delete_verification_prompt,
     get_join_verification,
     join_verification_ready,
     join_verification_policy,
@@ -58,7 +59,11 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
-from bot.services.raid_guard import get_raid_guard_service
+from bot.services.raid_guard import (
+    RAID_REMOVE_CALLBACK_DATA,
+    get_raid_guard_service,
+    remove_raid_challenged_users,
+)
 from bot.services.welcome import send_group_welcome
 from bot.utils.bot_identity import get_bot_identity
 from bot.utils.telegram import (
@@ -169,6 +174,9 @@ async def _start_join_verification(
             user_id,
         )
         return
+    old_prompt_message_id = (
+        int(existing.prompt_message_id or 0) if existing is not None else 0
+    )
     if not await restrict_new_member(event.bot, group_id, user_id):
         return
 
@@ -195,15 +203,38 @@ async def _start_join_verification(
     deadline = now_shanghai_naive() + timedelta(
         seconds=settings.join_verification_timeout_seconds
     )
-    await upsert_join_verification(
-        session,
-        group_id=group_id,
-        user_id=user_id,
-        deadline_at=deadline,
-        display_name=display_name,
-        prompt_message_id=prompt_message_id,
-        provider=provider,
-    )
+    try:
+        await upsert_join_verification(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            deadline_at=deadline,
+            display_name=display_name,
+            prompt_message_id=prompt_message_id,
+            provider=provider,
+        )
+        # Make the new message id durable before retiring a superseded prompt.
+        # Fast clicks are delivered as a separate update and must see the row.
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "join verification persistence failed | group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        # Never leave a live-looking keyboard or a mute without a durable
+        # challenge record. A pre-existing prompt remains valid after rollback.
+        await delete_verification_prompt(event.bot, group_id, prompt_message_id)
+        if not old_prompt_message_id:
+            await restore_member_permissions(event.bot, group_id, user_id)
+        return
+    if old_prompt_message_id and old_prompt_message_id != prompt_message_id:
+        await delete_verification_prompt(
+            event.bot,
+            group_id,
+            old_prompt_message_id,
+        )
     log.info("join verification issued | group=%s user=%s", group_id, user_id)
 
 
@@ -373,6 +404,10 @@ async def _verification_callback_record(
         or int(record.prompt_message_id or 0) != message_id
         or verification_deadline_passed(record.deadline_at)
     ):
+        # Clean up the stale keyboard immediately. This covers old prompts
+        # left by a duplicate join, manual leave, or a transient terminal-edit
+        # failure and prevents repeated "expired" clicks.
+        await delete_verification_prompt(callback.bot, int(chat.id), message_id)
         await callback.answer("验证已失效、过期或已处理", show_alert=True)
         return None
     return record
@@ -408,6 +443,11 @@ async def _edit_verification_prompt(
             chat.id,
             message.message_id,
             exc_info=True,
+        )
+        await delete_verification_prompt(
+            callback.bot,
+            int(chat.id),
+            int(message.message_id),
         )
 
 
@@ -673,6 +713,77 @@ async def on_raid_verify_callback(
     )
 
 
+@router.callback_query(F.data == RAID_REMOVE_CALLBACK_DATA)
+async def on_raid_remove_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Administrator-only bulk removal for one raid challenge message."""
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    if message is None or chat is None or chat.type not in ("group", "supergroup"):
+        await callback.answer("质询消息已失效", show_alert=True)
+        return
+    if operator is None:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return
+    group_id = int(chat.id)
+    if not await is_group_authorized(session, group_id):
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=int(operator.id),
+    ):
+        await callback.answer("仅群管理员可一键移除追溯用户", show_alert=True)
+        return
+
+    group = await session.get(Group, group_id)
+    group_settings = (
+        dict(group.settings or {})
+        if group is not None and isinstance(group.settings, dict)
+        else None
+    )
+    result = await remove_raid_challenged_users(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        prompt_message_id=int(message.message_id),
+        group_settings=group_settings,
+    )
+    removed_count = len(result.removed_user_ids)
+    failed_count = len(result.failed_user_ids)
+    if failed_count == 0:
+        try:
+            await callback.bot.edit_message_reply_markup(
+                chat_id=group_id,
+                message_id=int(message.message_id),
+                reply_markup=None,
+            )
+        except Exception:
+            log.debug(
+                "raid bulk-remove keyboard cleanup failed | group=%s message=%s",
+                group_id,
+                message.message_id,
+                exc_info=True,
+            )
+    if result.pending_count == 0:
+        await callback.answer("该批追溯用户已全部处理", show_alert=True)
+    elif failed_count:
+        await callback.answer(
+            f"已移除 {removed_count} 人，{failed_count} 人移除失败，可稍后重试",
+            show_alert=True,
+        )
+    else:
+        await callback.answer(f"已移除 {removed_count} 名被追溯用户")
+
+
 @router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def on_member_join(
     event: ChatMemberUpdated, session: AsyncSession, settings: Settings
@@ -883,7 +994,18 @@ async def on_member_leave(
             user.id,
         )
         return
+    prompt_message_id = int(record.prompt_message_id or 0)
     if await delete_join_verification(session, event.chat.id, user.id):
+        # Commit before the Telegram call so a transient API failure cannot
+        # roll back the terminal leave cleanup. The message is best-effort.
+        await session.commit()
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            await delete_verification_prompt(
+                bot,
+                int(event.chat.id),
+                prompt_message_id,
+            )
         log.info(
             "join verification cancelled | reason=left group=%s user=%s",
             event.chat.id,

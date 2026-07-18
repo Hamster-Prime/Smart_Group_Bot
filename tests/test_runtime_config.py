@@ -10,6 +10,7 @@ from bot.db.models import RuntimeConfigRecord, RuntimeConfigSecret
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
     RuntimeConfigManager,
+    build_legacy_runtime_config,
 )
 
 
@@ -49,11 +50,49 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.main_model.max_tokens, 2048)
         self.assertEqual(self.settings.bot.max_context_tokens, 256000)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
+        self.assertEqual(self.settings.vote_ban_trigger_limit, 3)
+        self.assertEqual(self.settings.vote_ban_trigger_window_seconds, 3600)
         async with self.session_factory() as session:
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertIsNotNone(row)
             self.assertEqual(row.revision, 1)
             self.assertEqual(row.payload["models"]["providers"][0]["api_key"], "")
+
+    async def test_first_start_imports_call_vote_and_auto_delete_settings(self) -> None:
+        legacy = Settings(_env_file=None)
+        legacy.call_admin_enabled = False
+        legacy.call_admin_cooldown_seconds = 123
+        legacy.vote_ban_enabled = True
+        legacy.vote_ban_threshold = 9
+        legacy.vote_ban_duration_seconds = 2400
+        legacy.vote_ban_trigger_limit = 7
+        legacy.vote_ban_trigger_window_seconds = 5400
+        legacy.bot.auto_delete_categories = ["reply", "call_admin", "vote"]
+        legacy.bot.auto_delete_category_seconds = {"vote": 90}
+        legacy.bot.auto_delete_category_mode = {"call_admin": "button"}
+
+        imported = build_legacy_runtime_config(
+            "/tmp/nonexistent-smart-group-bot.toml",
+            settings=legacy,
+            raw_env={},
+        )
+
+        self.assertFalse(imported.call_admin.enabled)
+        self.assertEqual(imported.call_admin.cooldown_seconds, 123)
+        self.assertTrue(imported.vote_ban.enabled)
+        self.assertEqual(imported.vote_ban.vote_threshold, 9)
+        self.assertEqual(imported.vote_ban.duration_seconds, 2400)
+        self.assertEqual(imported.vote_ban.trigger_limit, 7)
+        self.assertEqual(imported.vote_ban.trigger_window_seconds, 5400)
+        self.assertEqual(
+            imported.bot.auto_delete_categories,
+            ["reply", "call_admin", "vote"],
+        )
+        self.assertEqual(imported.bot.auto_delete_category_seconds, {"vote": 90})
+        self.assertEqual(
+            imported.bot.auto_delete_category_mode,
+            {"call_admin": "button"},
+        )
 
     async def test_secret_is_encrypted_masked_and_preserved_on_regular_save(self) -> None:
         payload = self.manager.config.public_payload()

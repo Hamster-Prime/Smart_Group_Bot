@@ -49,6 +49,8 @@ from bot.utils.command_catalog import build_help_text
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
+    is_group,
+    preserve_delete_button,
     typing_action,
 )
 
@@ -722,6 +724,44 @@ async def cmd_help(message: Message, session: AsyncSession, settings: Settings) 
     await _answer(message, settings, build_help_text())
 
 
+_VOTEBAN_USAGE = (
+    "<b>命令用法</b>\n"
+    "回复目标用户的消息后发送 /voteban [举报理由]\n\n"
+    "对被回复用户发起民主投票封禁；达到本群设定票数后立即封禁。"
+)
+
+
+@router.message(Command("voteban"))
+async def cmd_voteban(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: object | None = None,
+) -> None:
+    """Open a vote through the same quota-enforcing service used by the AI skill."""
+    from bot.services.vote_ban import start_vote_ban
+
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if getattr(message, "reply_to_message", None) is None:
+        await _answer(message, settings, _VOTEBAN_USAGE)
+        return
+    reason = str(message.text or "").partition(" ")[2].strip()
+    result = await start_vote_ban(
+        message,
+        session,
+        settings,
+        reason_override=reason,
+        trigger_source="command",
+        session_factory=session_factory,
+    )
+    if not result.ok:
+        await _answer(message, settings, result.summary)
+
+
 @router.message(Command("settings"))
 async def cmd_settings(
     message: Message,
@@ -888,7 +928,7 @@ async def on_memory_list_paging(
     items = await memory_holder.get().list_permanent_memories(msg.chat.id, limit=200)
     text, keyboard = _build_memory_list_page(items, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             await callback.answer("列表刷新失败，请重试 /lm", show_alert=True)
@@ -944,7 +984,7 @@ async def on_memory_delete(
     page = min(max(page_hint, 0), total_pages - 1)
     text, keyboard = _build_memory_list_page(items, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except Exception:
         await callback.answer("删除成功，但列表刷新失败，请重试 /lm", show_alert=True)
         return
@@ -1124,7 +1164,7 @@ async def on_av_search_paging(
 
     text, keyboard = _build_av_search_page(av_session, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except Exception:
         await msg.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
     await callback.answer()

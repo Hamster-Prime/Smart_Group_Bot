@@ -19,6 +19,10 @@ from bot.services.join_verification import (
     verification_service_ready,
     warn_if_bot_cannot_verify,
 )
+from bot.services.group_permissions import (
+    GroupPermissionService,
+    init_group_permission_service,
+)
 from bot.services.llm import LLMService
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
@@ -30,6 +34,7 @@ from bot.services.runtime_config import (
     turnstile_key_configuration_issue,
 )
 from bot.services.scheduled_messages import ScheduledMessageService
+from bot.services.vote_ban import restore_vote_ban_tasks
 from bot.services.update_delivery import resolve_webhook_config, run_update_delivery
 from bot.utils.bot_identity import set_bot_identity
 from bot.utils.logging_setup import configure_logging
@@ -113,6 +118,11 @@ async def main() -> None:
         display_name=me.full_name or me.first_name or "",
     )
     log.info("Bot identity resolved: @%s (%s)", me.username, me.full_name)
+    await restore_vote_ban_tasks(
+        session_factory=session_factory,
+        bot=bot,
+        settings=settings,
+    )
     proactive = ProactiveTopicService(
         settings=settings,
         bot=bot,
@@ -156,15 +166,25 @@ async def main() -> None:
         scheduled_messages.run_forever(),
         name="scheduled-message-runner",
     )
-    # Event-driven (no background loop): joins feed the detector from the
-    # membership handler; challenge deadlines ride the shared sweeper.
-    init_raid_guard_service(
-        RaidGuardService(
-            bot=bot,
-            settings=settings,
-            session_factory=session_factory,
-        )
+    group_permissions = GroupPermissionService(
+        bot=bot,
+        session_factory=session_factory,
     )
+    init_group_permission_service(group_permissions)
+    group_permission_runner = asyncio.create_task(
+        group_permissions.run_forever(),
+        name="group-permission-runner",
+    )
+    # Event-driven (no background loop): joins feed the detector from the
+    # membership handler; challenge deadlines ride the shared sweeper. Manual
+    # lockdowns are restored before update delivery starts so no join can slip
+    # through the restart window.
+    raid_guard = RaidGuardService(
+        bot=bot,
+        settings=settings,
+        session_factory=session_factory,
+    )
+    init_raid_guard_service(raid_guard)
 
     async def apply_runtime_update(_config: RuntimeConfig) -> None:
         llm.reconfigure(
@@ -198,19 +218,23 @@ async def main() -> None:
         webhook_secret=webhook.secret if webhook is not None else "",
     )
     try:
+        await raid_guard.restore_manual_lockdowns()
         await verify_web.start()
     except Exception:
         proactive_runner.cancel()
         verification_runner.cancel()
         patrol_runner.cancel()
         scheduled_message_runner.cancel()
+        group_permission_runner.cancel()
         await asyncio.gather(
             proactive_runner,
             verification_runner,
             patrol_runner,
             scheduled_message_runner,
+            group_permission_runner,
             return_exceptions=True,
         )
+        raid_guard.reset()
         try:
             await bot.session.close()
         except Exception:
@@ -268,6 +292,9 @@ async def main() -> None:
         await asyncio.gather(patrol_runner, return_exceptions=True)
         scheduled_message_runner.cancel()
         await asyncio.gather(scheduled_message_runner, return_exceptions=True)
+        group_permission_runner.cancel()
+        await asyncio.gather(group_permission_runner, return_exceptions=True)
+        raid_guard.reset()
         try:
             await patrol.shutdown()
         except Exception:

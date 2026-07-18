@@ -4,12 +4,12 @@ import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
 
 from bot.db.engine import init_db
-from bot.db.models import UserWarning
+from bot.db.models import Group, UserWarning
 from bot.handlers import membership
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
@@ -21,11 +21,15 @@ from bot.services.join_verification import (
     verification_timeout_seconds_for_kind,
 )
 from bot.services.raid_guard import (
+    MANUAL_LOCKDOWN_SETTINGS_KEY,
+    RAID_REMOVE_CALLBACK_DATA,
     RaidGuardService,
     RaidSuspect,
     build_raid_challenge_keyboard,
     build_raid_challenge_text,
     build_raid_lockdown_text,
+    build_raid_unlock_text,
+    normalize_manual_lockdown_minutes,
     raid_guard_policy,
     resolve_raid_guard_config,
 )
@@ -224,6 +228,24 @@ class MessageTests(unittest.TestCase):
         keyboard = build_raid_challenge_keyboard()
         button = keyboard.inline_keyboard[0][0]
         self.assertEqual(button.callback_data, RAID_VERIFY_CALLBACK_DATA)
+        self.assertEqual(len(keyboard.inline_keyboard), 2)
+        self.assertEqual(
+            keyboard.inline_keyboard[1][0].callback_data,
+            RAID_REMOVE_CALLBACK_DATA,
+        )
+        self.assertIn("仅管理员", keyboard.inline_keyboard[1][0].text)
+
+    def test_unlock_text_describes_recovery(self) -> None:
+        text = build_raid_unlock_text()
+        self.assertIn("爆破防护已解除", text)
+        self.assertIn("恢复接收新成员", text)
+
+    def test_manual_duration_is_always_minutes(self) -> None:
+        self.assertIsNone(normalize_manual_lockdown_minutes(None))
+        self.assertEqual(normalize_manual_lockdown_minutes("15"), 15)
+        for invalid in (0, -1, "abc", True):
+            with self.assertRaises(ValueError):
+                normalize_manual_lockdown_minutes(invalid)
 
 
 class DetectionTests(_DbTestCase):
@@ -264,7 +286,7 @@ class DetectionTests(_DbTestCase):
                 self.assertEqual(record.kind, VERIFICATION_KIND_RAID)
                 self.assertEqual(record.prompt_message_id, 777)
 
-    async def test_lockdown_notice_honors_moderation_auto_delete(self) -> None:
+    async def test_lockdown_notice_is_not_auto_deleted(self) -> None:
         from unittest.mock import patch
 
         settings = _settings()
@@ -273,19 +295,17 @@ class DetectionTests(_DbTestCase):
         service, _bot = self._service(settings=settings)
 
         with patch(
-            "bot.services.raid_guard.schedule_message_auto_delete"
+            "bot.services.raid_guard.schedule_message_auto_delete",
+            create=True,
         ) as schedule_mock:
             await self._join(service, 1, username="one")
             await self._join(service, 2, username="two")
             self.assertTrue(await self._join(service, 3, username="three"))
 
         self.assertTrue(service.lockdown_active(-100))
-        # Only the lockdown alert is auto-deleted; the shared raid challenge
-        # prompt (a live, sweeper-tracked message) must be left intact.
-        schedule_mock.assert_called_once()
-        sent_arg, seconds_arg = schedule_mock.call_args.args
-        self.assertEqual(sent_arg.message_id, 777)
-        self.assertEqual(seconds_arg, 30)
+        # State-change notices are intentionally persistent regardless of the
+        # generic moderation retention policy.
+        schedule_mock.assert_not_called()
 
     async def test_joins_outside_window_do_not_trigger(self) -> None:
         service, _bot = self._service()
@@ -338,6 +358,153 @@ class DetectionTests(_DbTestCase):
         self.assertFalse(service.lockdown_active(-100))
         # A join after expiry flows through normal handling again.
         self.assertFalse(await self._join(service, 50))
+
+    async def test_lockdown_expiry_sends_persistent_unlock_notice(self) -> None:
+        service, bot = self._service()
+        for user_id in (1, 2, 3):
+            await self._join(service, user_id)
+        service._cancel_lockdown_timer(-100)
+        expired_at = now_shanghai_naive() - timedelta(seconds=1)
+        service._lockdown_until[-100] = expired_at
+        bot.send_message.reset_mock()
+
+        self.assertTrue(await service._expire_lockdown(-100, expired_at))
+        self.assertFalse(service.lockdown_active(-100))
+        bot.send_message.assert_awaited_once()
+        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+
+    async def test_manual_lockdown_works_when_automatic_policy_is_off(self) -> None:
+        settings = _settings(raid_guard_enabled=False)
+        service, bot = self._service(settings)
+
+        deadline = await service.enable_manual_lockdown(
+            -100,
+            duration_minutes="5",
+        )
+        self.assertIsNotNone(deadline)
+        self.assertTrue(service.manual_lockdown_active(-100))
+        self.assertIn("5 分钟", bot.send_message.await_args.args[1])
+
+        bot.send_message.reset_mock()
+        self.assertTrue(await self._join(service, 99))
+        bot.ban_chat_member.assert_awaited_once_with(-100, 99)
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        self.assertFalse(service.lockdown_active(-100))
+        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+
+    async def test_manual_lockdown_persists_without_replacing_group_settings(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                Group(
+                    id=-100,
+                    title="测试群",
+                    settings={"welcome_message": "原有欢迎语", "nested": {"ok": True}},
+                )
+            )
+            await session.commit()
+
+        service, _bot = self._service()
+        self.assertIsNone(await service.enable_manual_lockdown(-100))
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertEqual(group.settings["welcome_message"], "原有欢迎语")
+            self.assertEqual(group.settings["nested"], {"ok": True})
+            self.assertEqual(
+                group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY],
+                {"version": 1, "indefinite": True},
+            )
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
+            self.assertEqual(group.settings["welcome_message"], "原有欢迎语")
+            self.assertEqual(group.settings["nested"], {"ok": True})
+
+    async def test_timed_manual_lockdown_is_restored_after_restart(self) -> None:
+        first, _first_bot = self._service()
+        deadline = await first.enable_manual_lockdown(-100, duration_minutes=5)
+        self.assertIsNotNone(deadline)
+        first.reset()
+
+        restored, restored_bot = self._service()
+        summary = await restored.restore_manual_lockdowns()
+        self.assertEqual(summary, {"restored": 1, "expired": 0, "invalid": 0})
+        self.assertTrue(restored.manual_lockdown_active(-100))
+        self.assertEqual(restored.lockdown_status(-100)["until"], deadline)
+        # A restart restores state silently; the original activation notice is
+        # not repeated.
+        restored_bot.send_message.assert_not_awaited()
+        await restored.disable_manual_lockdown(-100)
+
+    async def test_indefinite_manual_lockdown_is_restored_after_restart(self) -> None:
+        first, _first_bot = self._service()
+        await first.enable_manual_lockdown(-100)
+        first.reset()
+
+        restored, restored_bot = self._service()
+        summary = await restored.restore_manual_lockdowns()
+        self.assertEqual(summary["restored"], 1)
+        self.assertTrue(restored.manual_lockdown_active(-100))
+        self.assertIsNone(restored.lockdown_status(-100)["until"])
+        restored_bot.send_message.assert_not_awaited()
+        await restored.disable_manual_lockdown(-100)
+
+    async def test_expired_persisted_lockdown_is_cleaned_and_announced_once(self) -> None:
+        expired_until = (now_shanghai_naive() - timedelta(minutes=1)).isoformat()
+        async with self.session_factory() as session:
+            session.add(
+                Group(
+                    id=-100,
+                    title="测试群",
+                    settings={
+                        "welcome_message": "保留",
+                        MANUAL_LOCKDOWN_SETTINGS_KEY: {
+                            "version": 1,
+                            "until": expired_until,
+                        },
+                    },
+                )
+            )
+            await session.commit()
+
+        first, first_bot = self._service()
+        self.assertEqual(
+            await first.restore_manual_lockdowns(),
+            {"restored": 0, "expired": 1, "invalid": 0},
+        )
+        first_bot.send_message.assert_awaited_once()
+        self.assertIn("爆破防护已解除", first_bot.send_message.await_args.args[1])
+
+        second, second_bot = self._service()
+        self.assertEqual(
+            await second.restore_manual_lockdowns(),
+            {"restored": 0, "expired": 0, "invalid": 0},
+        )
+        second_bot.send_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertEqual(group.settings["welcome_message"], "保留")
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
+
+    async def test_manual_timer_expiry_clears_persisted_state_before_notice(self) -> None:
+        service, bot = self._service()
+        deadline = await service.enable_manual_lockdown(-100, duration_minutes=1)
+        self.assertIsNotNone(deadline)
+        service._cancel_lockdown_timer(-100)
+        bot.send_message.reset_mock()
+
+        with patch(
+            "bot.services.raid_guard.now_shanghai_naive",
+            return_value=deadline + timedelta(seconds=1),
+        ):
+            self.assertTrue(await service._expire_lockdown(-100, deadline))
+
+        bot.send_message.assert_awaited_once()
+        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
 
     async def test_disabled_group_override_bypasses_detection(self) -> None:
         service, bot = self._service()
@@ -505,12 +672,20 @@ class DetectionTests(_DbTestCase):
 
 
 class CallbackTests(_DbTestCase):
-    def _callback(self, operator_id: int) -> SimpleNamespace:
+    def _callback(
+        self,
+        operator_id: int,
+        *,
+        data: str = RAID_VERIFY_CALLBACK_DATA,
+    ) -> SimpleNamespace:
         bot = SimpleNamespace(
             me=AsyncMock(return_value=SimpleNamespace(username="my_bot")),
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+            edit_message_reply_markup=AsyncMock(return_value=True),
         )
         return SimpleNamespace(
-            data=RAID_VERIFY_CALLBACK_DATA,
+            data=data,
             from_user=SimpleNamespace(id=operator_id),
             message=SimpleNamespace(
                 message_id=777,
@@ -574,6 +749,56 @@ class CallbackTests(_DbTestCase):
         callback.answer.assert_awaited_once_with(
             "仅被点名的违规成员可点击", show_alert=True
         )
+
+    async def test_admin_can_bulk_remove_pending_suspects_for_prompt(self) -> None:
+        from unittest.mock import patch
+
+        await self._add_raid_record(73)
+        await self._add_raid_record(74)
+        callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=True),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_raid_remove_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        self.assertEqual(callback.bot.ban_chat_member.await_count, 2)
+        self.assertEqual(callback.bot.unban_chat_member.await_count, 2)
+        callback.bot.edit_message_reply_markup.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            reply_markup=None,
+        )
+        self.assertIn("已移除 2", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 73))
+            self.assertIsNone(await get_join_verification(session, -100, 74))
+
+    async def test_non_admin_cannot_bulk_remove_suspects(self) -> None:
+        from unittest.mock import patch
+
+        await self._add_raid_record(75)
+        callback = self._callback(99, data=RAID_REMOVE_CALLBACK_DATA)
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=False),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_raid_remove_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        callback.bot.ban_chat_member.assert_not_awaited()
+        self.assertIn("仅群管理员", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await get_join_verification(session, -100, 75))
 
 
 class TimeoutTests(_DbTestCase):

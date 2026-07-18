@@ -82,6 +82,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             restrict_chat_member=AsyncMock(),
             get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
             edit_message_text=AsyncMock(),
+            delete_message=AsyncMock(return_value=True),
             send_message=AsyncMock(),
         )
         self.settings = _settings()
@@ -512,8 +513,25 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertTrue((await resp.json())["ok"])
         self.bot.edit_message_text.assert_awaited_once()
+        self.assertIsNone(
+            self.bot.edit_message_text.await_args.kwargs["reply_markup"]
+        )
         self.bot.send_message.assert_not_awaited()
         schedule_mock.assert_called_once_with(edited, 20)
+
+    async def test_pass_edit_failure_deletes_stale_prompt_before_fallback(self) -> None:
+        self.bot.edit_message_text = AsyncMock(side_effect=RuntimeError("edit failed"))
+        self.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=900))
+        await self._seed(user_id=112)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            resp = await self._submit(112)
+
+        self.assertEqual(resp.status, 200)
+        self.bot.delete_message.assert_awaited_once_with(-100, 777)
+        self.bot.send_message.assert_awaited_once()
 
     async def test_shared_kind_pass_notice_honors_moderation_auto_delete(self) -> None:
         # Patrol/raid prompts are shared, so the pass outcome is a standalone

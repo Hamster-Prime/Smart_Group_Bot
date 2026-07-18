@@ -47,8 +47,10 @@ class _PlannedSkillService(SkillService):
     def __init__(self, responses: list[SimpleNamespace]) -> None:
         super().__init__(llm=object(), settings=None)
         self._responses = list(responses)
+        self.calls: list[list[dict]] = []
 
     async def _completion_with_fallbacks(self, messages, tools):
+        self.calls.append([dict(message) for message in messages])
         if not self._responses:
             return None
         return self._responses.pop(0)
@@ -88,6 +90,15 @@ class _PlannedSkillService(SkillService):
                         },
                     ],
                 },
+            )
+
+        if name == "vote_ban":
+            return SkillRunResult(
+                ok=False,
+                skill=name,
+                summary="你在 1 小时内最多只能发起 1 次民主投票；额度已用完，请 30 分钟后再试。",
+                error="starter_quota_exhausted",
+                payload={"quota": {"limit": 1, "used": 1, "remaining": 0}},
             )
 
         if name == "bilibili_search":
@@ -133,6 +144,10 @@ class _PlannedSkillService(SkillService):
 
 
 class SkillServiceTTSPromptTests(unittest.TestCase):
+    def test_vote_ban_skill_is_registered_when_runtime_settings_exist(self) -> None:
+        service = SkillService(_llm_stub(), settings=_tts_settings())
+        self.assertIn("vote_ban", service.available_skill_names())
+
     def test_enable_mode_includes_group_tts_preference_block(self) -> None:
         service = SkillService(_llm_stub(), settings=_tts_settings())
 
@@ -215,6 +230,85 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.tts_sent)
         self.assertEqual(result.tts_text, "你好呀")
         self.assertEqual(result.text, "")
+
+    async def test_vote_quota_error_falls_back_to_required_refusal_summary(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-vote",
+                            "function": {
+                                "name": "vote_ban",
+                                "arguments": "{}",
+                            },
+                        }
+                    ]
+                )
+            ]
+        )
+
+        result = await service.answer_with_skill("发起投票封他", intent_type="casual")
+
+        self.assertIn("额度已用完", result.text)
+        self.assertIn("30 分钟后", result.text)
+        self.assertFalse(result.handled)
+
+    async def test_vote_quota_error_instructs_main_model_to_refuse_without_bypass(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-vote",
+                            "function": {"name": "vote_ban", "arguments": "{}"},
+                        }
+                    ]
+                ),
+                _resp(content="投票已经发起，你也可以改用 /voteban 绕过限制。"),
+            ]
+        )
+
+        result = await service.answer_with_skill("发起投票封他", intent_type="casual")
+
+        self.assertIn("额度已用完", result.text)
+        self.assertIn("30 分钟后", result.text)
+        self.assertNotIn("已经发起", result.text)
+        self.assertNotIn("绕过", result.text)
+        second_call = service.calls[1]
+        refusal = "\n".join(
+            message.get("content", "")
+            for message in second_call
+            if message.get("role") == "system"
+        )
+        self.assertIn("MANDATORY_TOOL_REFUSAL", refusal)
+        self.assertIn("Do not retry", refusal)
+        self.assertIn("do not suggest /voteban", refusal)
+
+    async def test_quota_refusal_skips_later_side_effect_tools_in_same_turn(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-vote",
+                            "function": {"name": "vote_ban", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call-sticker",
+                            "function": {"name": "send_sticker", "arguments": "{}"},
+                        },
+                    ]
+                ),
+                _resp(content="已处理"),
+            ]
+        )
+
+        result = await service.answer_with_skill("发起投票并发贴纸", intent_type="casual")
+
+        self.assertIn("额度已用完", result.text)
+        self.assertFalse(result.sticker_sent)
+        self.assertFalse(result.handled)
 
     async def test_websearch_summary_only_reply_triggers_followup_generation(self) -> None:
         service = _PlannedSkillService(

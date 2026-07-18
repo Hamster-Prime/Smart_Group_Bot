@@ -31,6 +31,7 @@ from bot.services.join_verification import (
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
+    delete_verification_prompt,
     get_join_verification,
     get_pending_verification_for_user,
     join_verification_ready,
@@ -250,6 +251,19 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await ban_member(bot, -100, 42))
         self.assertFalse(await kick_member(bot, -100, 42))
         bot.unban_chat_member.assert_not_awaited()
+
+    async def test_prompt_delete_failure_still_removes_live_keyboard(self) -> None:
+        bot = SimpleNamespace(
+            delete_message=AsyncMock(side_effect=RuntimeError("cannot delete")),
+            edit_message_reply_markup=AsyncMock(return_value=True),
+        )
+
+        self.assertTrue(await delete_verification_prompt(bot, -100, 77))
+        bot.edit_message_reply_markup.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=77,
+            reply_markup=None,
+        )
 
 
 class VerificationStoreTests(_DbTestCase):
@@ -565,6 +579,7 @@ def _join_event(*, user_id: int = 900, full_name: str = "新人", username: str 
         bot=SimpleNamespace(
             get_chat=AsyncMock(return_value=SimpleNamespace(bio="正经简介")),
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=777)),
+            delete_message=AsyncMock(return_value=True),
             restrict_chat_member=AsyncMock(),
             ban_chat_member=AsyncMock(),
             unban_chat_member=AsyncMock(),
@@ -604,6 +619,26 @@ class JoinTriggersVerificationTests(_DbTestCase):
 
         async with self.session_factory() as session:
             row = await get_join_verification(session, -100, 910)
+            self.assertIsNotNone(row)
+            self.assertEqual(row.prompt_message_id, 777)
+
+    async def test_duplicate_join_replaces_and_deletes_old_prompt(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=918,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                prompt_message_id=700,
+            )
+            await session.commit()
+
+        event = _join_event(user_id=918)
+        await self._run_join(event, _settings())
+
+        event.bot.delete_message.assert_awaited_once_with(-100, 700)
+        async with self.session_factory() as session:
+            row = await get_join_verification(session, -100, 918)
             self.assertIsNotNone(row)
             self.assertEqual(row.prompt_message_id, 777)
 
@@ -875,6 +910,7 @@ def _verification_callback(
     bot = SimpleNamespace(
         me=AsyncMock(return_value=SimpleNamespace(username="my_bot")),
         edit_message_text=AsyncMock(),
+        delete_message=AsyncMock(return_value=True),
     )
     return SimpleNamespace(
         data=build_verification_callback_data(action, target_user_id),
@@ -972,6 +1008,7 @@ class VerificationCallbackTests(_DbTestCase):
 
         self.assertTrue(callback.answer.await_args.kwargs["show_alert"])
         self.assertIn("失效", callback.answer.await_args.args[0])
+        callback.bot.delete_message.assert_awaited_once_with(-100, 999)
 
     async def test_non_admin_cannot_approve(self) -> None:
         await self._add_record(user_id=943, message_id=843)
@@ -1702,6 +1739,7 @@ class SweeperTests(_DbTestCase):
         edit_kwargs = bot.edit_message_text.await_args.kwargs
         self.assertEqual(edit_kwargs["message_id"], 781)
         self.assertEqual(edit_kwargs["parse_mode"], "HTML")
+        self.assertIsNone(edit_kwargs["reply_markup"])
         # Name shown like the pass notice, and the outcome auto-deletes.
         self.assertIn("<b>张三</b>", edit_kwargs["text"])
         self.assertIn("验证超时", edit_kwargs["text"])
@@ -1904,6 +1942,7 @@ class MemberLeaveCleanupTests(_DbTestCase):
                 group_id=-100,
                 user_id=940,
                 deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                prompt_message_id=880,
             )
             await session.commit()
 
@@ -1912,11 +1951,13 @@ class MemberLeaveCleanupTests(_DbTestCase):
                 new_chat_member=SimpleNamespace(
                     user=SimpleNamespace(id=940, is_bot=False)
                 ),
+                bot=SimpleNamespace(delete_message=AsyncMock(return_value=True)),
             )
             await membership.on_member_leave(event, session=session, settings=_settings())
             await session.commit()
 
             self.assertIsNone(await get_join_verification(session, -100, 940))
+            event.bot.delete_message.assert_awaited_once_with(-100, 880)
 
     async def test_leave_retains_pending_moderation_challenge(self) -> None:
         from bot.handlers import membership

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class SkillContext:
     session: AsyncSession | None = None
+    session_factory: Any | None = None
     message: Message | None = None
     bot: Any | None = None
     chat_id: int = 0
@@ -26,6 +27,7 @@ class SkillContext:
     sender_is_owner: bool = False
     sender_is_tg_admin: bool = False
     current_user_text: str = ""
+    is_direct_request: bool = False
     default_sticker_file_ids: list[str] = field(default_factory=list)
     auto_delete_media_seconds: int = 0
     handled: bool = False

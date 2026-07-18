@@ -96,6 +96,35 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(second_kwargs["parse_mode"])
         self.assertEqual(message.answer.await_args_list[1].args[0], "&lt;内容&gt;今天群聊总结&lt;/内容&gt;")
 
+    async def test_template_answer_keeps_body_when_keyboard_is_rejected(self) -> None:
+        markup = object()
+        message = SimpleNamespace(
+            answer=AsyncMock(
+                side_effect=[
+                    TelegramBadRequest(
+                        method=SimpleNamespace(),
+                        message="Bad Request: BUTTON_URL_INVALID",
+                    ),
+                    SimpleNamespace(message_id=89, chat=SimpleNamespace(id=-10001)),
+                ]
+            )
+        )
+
+        sent = await answer_with_auto_delete(
+            message,
+            "<b>公告</b>",
+            auto_delete_seconds=0,
+            parse_mode="HTML",
+            reply_markup=markup,
+            plain_text_fallback="**公告**",
+            drop_invalid_reply_markup=True,
+        )
+
+        self.assertEqual(sent.message_id, 89)
+        self.assertEqual(message.answer.await_count, 2)
+        self.assertNotIn("reply_markup", message.answer.await_args.kwargs)
+        self.assertEqual(message.answer.await_args.args[0], "<b>公告</b>")
+
     async def test_missing_reply_target_falls_back_to_direct_mention(self) -> None:
         bot = SimpleNamespace(
             send_message=AsyncMock(

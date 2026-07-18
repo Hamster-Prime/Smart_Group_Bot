@@ -94,6 +94,9 @@ class BotConfig(BaseModel):
     # Per-category retention overrides (seconds); 0/missing inherits
     # auto_delete_seconds.
     auto_delete_category_seconds: dict[str, int] = Field(default_factory=dict)
+    # Per-category cleanup mode: missing/"timer" schedules the delayed
+    # delete; "button" attaches an inline delete button instead.
+    auto_delete_category_mode: dict[str, str] = Field(default_factory=dict)
     decision_context_items: int = 5
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = 180
@@ -293,6 +296,17 @@ class Settings(BaseSettings):
     raid_guard_lockdown_seconds: int = 600
     raid_guard_lookback_seconds: int = 300
     raid_guard_challenge_timeout_seconds: int = 600
+
+    # 呼叫管理员：群成员发送 @admin 时 @ 全部（或选定）群管理员。
+    call_admin_enabled: bool = True
+    call_admin_cooldown_seconds: int = 60
+
+    # 骚扰民主投票封禁：回复消息发起投票，达到阈值即封禁被回复用户。
+    vote_ban_enabled: bool = False
+    vote_ban_threshold: int = 5
+    vote_ban_duration_seconds: int = 1800
+    vote_ban_trigger_limit: int = 3
+    vote_ban_trigger_window_seconds: int = 3600
 
     bot: BotConfig = BotConfig()
     moderation: ModerationConfig = ModerationConfig()

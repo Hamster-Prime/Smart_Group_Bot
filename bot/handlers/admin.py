@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import time
+from dataclasses import dataclass
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +18,7 @@ from bot.config import Settings
 from bot.db.models import Group, ModerationExemption, ModerationRule, ReplyMute, UserWarning
 from bot.services.at_reply import build_at_reply_status_text, set_at_reply_enabled
 from bot.services.bot_screening import remove_bot_whitelist
+from bot.services.ban_audit import record_ban_event
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
@@ -30,13 +34,19 @@ from bot.services.authz import (
 )
 from bot.services.join_screening import (
     add_global_ban,
+    is_globally_banned,
     list_global_bans,
     remove_global_ban,
 )
 from bot.services.join_verification import (
+    delete_join_verification,
     delete_join_verifications_for_user,
+    delete_verification_prompts,
+    get_join_verification,
+    join_verification_prompts_for_user,
     restore_member_permissions,
 )
+from bot.services.admin_status import is_user_admin_cached
 from bot.services.speech_style import get_style_state, set_style_target
 from bot.services.doubao_tts import (
     DoubaoTTSService,
@@ -51,11 +61,16 @@ from bot.services.proactive import (
     get_cooldown_status_text,
     set_cooldown_task_enabled,
 )
+from bot.services.raid_guard import (
+    get_raid_guard_service,
+    normalize_manual_lockdown_minutes,
+)
 from bot.services.skills import SkillService
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
     is_group,
+    preserve_delete_button,
 )
 
 router = Router()
@@ -98,13 +113,13 @@ _BAN_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /ban [原因]\n"
     "2. /ban &lt;用户ID&gt; [原因]\n\n"
-    "封禁：加入封禁名单并立即在本群封禁；此后其任何消息都会被自动删除。"
+    "群管理员默认只在当前群封禁；最高管理员会收到「仅本群 / 全局」选择按钮。"
 )
 _UNBAN_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /unban\n"
     "2. /unban &lt;用户ID&gt;\n\n"
-    "解封：移出封禁名单、清空违规次数，并永久豁免资料审查（消息仍会被正常审核）。"
+    "群管理员默认只解除当前群封禁；最高管理员会收到「仅本群 / 全局」选择按钮。"
 )
 _CLEAR_WARNINGS_USAGE = (
     "<b>命令用法</b>\n"
@@ -742,76 +757,489 @@ async def _clear_user_warning(
     return previous_count, was_banned
 
 
-@router.message(Command("ban"))
-async def cmd_ban(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not await ensure_super_admin(message, settings):
-        return
+_BAN_SCOPE_CALLBACK_PREFIX = "bsc"
+_BAN_SCOPE_TTL_SECONDS = 15 * 60
 
-    args = (message.text or "").partition(" ")[2].strip()
-    target_id, reason = _resolve_ban_target(message, args)
-    if target_id is None:
-        await _answer(message, settings, _BAN_USAGE)
+
+@dataclass(slots=True)
+class _BanScopeRequest:
+    action: str
+    target_id: int
+    reason: str
+    created_at: float
+
+
+_BAN_SCOPE_REQUESTS: dict[tuple[int, int], _BanScopeRequest] = {}
+_MANUAL_BAN_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+async def _mark_group_banned_after_telegram(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    target_id: int,
+) -> None:
+    """Set the local policy without overwriting a concurrent warning count."""
+    updated = await session.execute(
+        update(UserWarning)
+        .where(
+            UserWarning.group_id == int(group_id),
+            UserWarning.user_id == int(target_id),
+        )
+        .values(is_banned=True)
+    )
+    if int(updated.rowcount or 0) == 1:
         return
+    try:
+        async with session.begin_nested():
+            session.add(
+                UserWarning(
+                    group_id=int(group_id),
+                    user_id=int(target_id),
+                    count=0,
+                    is_banned=True,
+                )
+            )
+            await session.flush()
+        return
+    except IntegrityError:
+        # Another moderation path inserted the row after our UPDATE. Change
+        # only the ban flag; its newly written warning count remains intact.
+        updated = await session.execute(
+            update(UserWarning)
+            .where(
+                UserWarning.group_id == int(group_id),
+                UserWarning.user_id == int(target_id),
+            )
+            .values(is_banned=True)
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise
+
+
+async def _ensure_ban_command_admin(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    if not is_group(message):
+        await _answer(message, settings, "该命令仅可在群内使用。")
+        return False
+    user = message.from_user
+    if user is None:
+        await _answer(message, settings, "无法识别操作者。")
+        return False
+    if is_super_admin_user_id(int(user.id), settings):
+        return True
+    if await is_group_admin_authorized(session, int(message.chat.id), int(user.id)):
+        return True
+    if await is_user_admin_cached(message):
+        return True
+    await _answer(message, settings, "仅本群管理员可使用该命令。")
+    return False
+
+
+async def _target_is_group_admin(message: Message, target_id: int) -> bool:
+    try:
+        member = await message.bot.get_chat_member(int(message.chat.id), int(target_id))
+    except Exception:
+        return False
+    status = str(getattr(member, "status", "") or "").lower()
+    return status in {"administrator", "creator", "chatmemberstatus.administrator", "chatmemberstatus.creator"}
+
+
+async def _perform_group_ban(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    target_id: int,
+    reason: str,
+    operator_id: int = 0,
+    operator_display: str = "",
+) -> str:
+    key = (int(message.chat.id), int(target_id))
+    lock = _MANUAL_BAN_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _perform_group_ban_locked(
+            message,
+            session,
+            settings,
+            target_id=target_id,
+            reason=reason,
+            operator_id=operator_id,
+            operator_display=operator_display,
+        )
+
+
+async def _perform_group_ban_locked(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    target_id: int,
+    reason: str,
+    operator_id: int = 0,
+    operator_display: str = "",
+) -> str:
+    group_id = int(message.chat.id)
+    actor_id = int(operator_id or getattr(message.from_user, "id", 0) or 0)
+    actor_display = operator_display or str(
+        getattr(message.from_user, "full_name", "") or ""
+    )
     if is_super_admin_user_id(target_id, settings):
-        await _answer(message, settings, "不能封禁最高管理员。")
-        return
+        return "不能封禁最高管理员。"
+    if await _target_is_group_admin(message, target_id):
+        return "不能直接封禁本群管理员，请先在 Telegram 中撤销其管理员身份。"
 
-    operator = message.from_user
+    prompts: set[tuple[int, int]] = set()
+    verification = await get_join_verification(session, group_id, target_id)
+    if verification is not None and int(verification.prompt_message_id or 0) > 0:
+        prompts.add((group_id, int(verification.prompt_message_id)))
+    # Do not hold a SQLite read snapshot across the Telegram API call. The
+    # post-enforcement transaction must observe challenges/warnings written by
+    # other moderation entry points while the request was in flight.
+    await session.commit()
+
+    try:
+        result = await message.bot.ban_chat_member(group_id, target_id)
+        if result is False:
+            raise RuntimeError("Telegram returned false")
+    except Exception as exc:
+        log.info("group ban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+        await session.rollback()
+        try:
+            await record_ban_event(
+                session,
+                group_id=group_id,
+                target_user_id=target_id,
+                action="ban",
+                source="manual_command",
+                outcome="failed",
+                reason=reason,
+                actor_user_id=actor_id,
+                actor_display=actor_display,
+                details={"error": str(exc)[:300]},
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            log.exception(
+                "group ban failure audit write failed | group=%s user=%s",
+                group_id,
+                target_id,
+            )
+        return "Telegram 群内封禁失败，原警告和真人验证状态均已保留，请检查 bot 的封禁用户权限。"
+
+    target_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+    persisted = False
+    for attempt in range(1, 4):
+        try:
+            current_verification = await get_join_verification(
+                session, group_id, target_id
+            )
+            if (
+                current_verification is not None
+                and int(current_verification.prompt_message_id or 0) > 0
+            ):
+                prompts.add(
+                    (group_id, int(current_verification.prompt_message_id))
+                )
+            await _mark_group_banned_after_telegram(
+                session,
+                group_id=group_id,
+                target_id=target_id,
+            )
+            await delete_join_verification(session, group_id, target_id)
+            await record_ban_event(
+                session,
+                group_id=group_id,
+                target_user_id=target_id,
+                target_display=str(getattr(target_user, "full_name", "") or ""),
+                target_username=str(getattr(target_user, "username", "") or ""),
+                action="ban",
+                source="manual_command",
+                outcome="succeeded",
+                reason=reason or "管理员手动本群封禁",
+                actor_user_id=actor_id,
+                actor_display=actor_display,
+            )
+            await session.commit()
+            persisted = True
+            break
+        except Exception:
+            await session.rollback()
+            log.exception(
+                "group ban state persistence failed | group=%s user=%s attempt=%s/3",
+                group_id,
+                target_id,
+                attempt,
+            )
+    await delete_verification_prompts(message.bot, prompts)
+    if not persisted:
+        return (
+            "Telegram 已完成本群封禁，但数据库状态连续写入失败。"
+            "旧验证按钮已清理，请尽快在 Mini App 中核对封禁记录。"
+        )
+
+    lines = [
+        "<b>本群封禁完成</b>",
+        f"<b>用户ID</b>: <code>{target_id}</code>",
+        f"<b>群ID</b>: <code>{group_id}</code>",
+    ]
+    if reason:
+        lines.append(f"<b>原因</b>: {html.escape(reason)}")
+    lines.append("此操作不会影响其他群组，也不会加入全局封禁名单。")
+    return "\n".join(lines)
+
+
+async def _perform_group_unban(
+    message: Message,
+    session: AsyncSession,
+    *,
+    target_id: int,
+    operator_id: int = 0,
+    operator_display: str = "",
+) -> str:
+    key = (int(message.chat.id), int(target_id))
+    lock = _MANUAL_BAN_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _perform_group_unban_locked(
+            message,
+            session,
+            target_id=target_id,
+            operator_id=operator_id,
+            operator_display=operator_display,
+        )
+
+
+async def _perform_group_unban_locked(
+    message: Message,
+    session: AsyncSession,
+    *,
+    target_id: int,
+    operator_id: int = 0,
+    operator_display: str = "",
+) -> str:
+    group_id = int(message.chat.id)
+    actor_id = int(operator_id or getattr(message.from_user, "id", 0) or 0)
+    actor_display = operator_display or str(
+        getattr(message.from_user, "full_name", "") or ""
+    )
+    if await is_globally_banned(session, target_id):
+        return (
+            "该用户仍在全局封禁名单中，不能只解除本群封禁；"
+            "请由最高管理员重新发送 /unban 并选择「全局解封」。"
+        )
+    row = await session.scalar(
+        select(UserWarning).where(
+            UserWarning.group_id == group_id,
+            UserWarning.user_id == target_id,
+        )
+    )
+    warning_snapshot = (
+        (
+            int(row.id),
+            max(0, int(row.count or 0)),
+            bool(row.is_banned),
+        )
+        if row is not None
+        else None
+    )
+    cleared_count = warning_snapshot[1] if warning_snapshot is not None else 0
+    prompts: set[tuple[int, int]] = set()
+    verification = await get_join_verification(session, group_id, target_id)
+    if verification is not None and int(verification.prompt_message_id or 0) > 0:
+        prompts.add((group_id, int(verification.prompt_message_id)))
+    # Release the read snapshot before awaiting Telegram. Any policy change
+    # during the network call must be visible to the CAS below.
+    await session.commit()
+    try:
+        result = await message.bot.unban_chat_member(
+            group_id,
+            target_id,
+            only_if_banned=True,
+        )
+        if result is False:
+            raise RuntimeError("Telegram returned false")
+    except Exception as exc:
+        log.info("group unban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+        return "Telegram 群内解封失败，请检查 bot 的封禁用户权限后重试。"
+
+    # A global ban added while Telegram was in flight wins. Re-enforce it
+    # immediately instead of leaving Telegram and the policy registry split.
+    if await is_globally_banned(session, target_id):
+        await session.rollback()
+        try:
+            await message.bot.ban_chat_member(group_id, target_id)
+        except Exception:
+            log.exception(
+                "group unban global-race reban failed | group=%s user=%s",
+                group_id,
+                target_id,
+            )
+        return "解封期间该用户被加入全局封禁名单，已保留封禁状态。"
+
+    claimed = False
+    if warning_snapshot is None:
+        current = await session.scalar(
+            select(UserWarning).where(
+                UserWarning.group_id == group_id,
+                UserWarning.user_id == target_id,
+            )
+        )
+        claimed = current is None
+    else:
+        warning_id, previous_count, was_banned = warning_snapshot
+        result = await session.execute(
+            delete(UserWarning).where(
+                UserWarning.id == warning_id,
+                UserWarning.group_id == group_id,
+                UserWarning.user_id == target_id,
+                UserWarning.count == previous_count,
+                UserWarning.is_banned.is_(was_banned),
+            )
+        )
+        claimed = int(result.rowcount or 0) == 1
+    if not claimed:
+        await session.rollback()
+        current = await session.scalar(
+            select(UserWarning).where(
+                UserWarning.group_id == group_id,
+                UserWarning.user_id == target_id,
+            )
+        )
+        if current is not None and bool(current.is_banned):
+            await session.rollback()
+            try:
+                await message.bot.ban_chat_member(group_id, target_id)
+            except Exception:
+                log.exception(
+                    "group unban concurrent-state reban failed | group=%s user=%s",
+                    group_id,
+                    target_id,
+                )
+            return "解封期间封禁状态已被其他管理操作更新，已保留最新封禁状态。"
+        await session.rollback()
+        return "群内解封已执行，但警告记录同时被其他操作更新，因此保留了最新记录。"
+
+    current_verification = await get_join_verification(session, group_id, target_id)
+    if (
+        current_verification is not None
+        and int(current_verification.prompt_message_id or 0) > 0
+    ):
+        prompts.add((group_id, int(current_verification.prompt_message_id)))
+    await delete_join_verification(session, group_id, target_id)
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        try:
+            await message.bot.ban_chat_member(group_id, target_id)
+        except Exception:
+            log.exception(
+                "group unban database-failure reban failed | group=%s user=%s",
+                group_id,
+                target_id,
+            )
+        return "Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请稍后重试。"
+
+    await delete_verification_prompts(message.bot, prompts)
+    restored = await restore_member_permissions(message.bot, group_id, target_id)
+    target_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+    try:
+        await record_ban_event(
+            session,
+            group_id=group_id,
+            target_user_id=target_id,
+            target_display=str(getattr(target_user, "full_name", "") or ""),
+            target_username=str(getattr(target_user, "username", "") or ""),
+            action="unban",
+            source="manual_command",
+            outcome="succeeded",
+            reason="管理员解除本群封禁",
+            actor_user_id=actor_id,
+            actor_display=actor_display,
+            details={"permissions_restored": bool(restored)},
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "group unban audit write failed | group=%s user=%s",
+            group_id,
+            target_id,
+        )
+    lines = [
+        "<b>本群解封完成</b>",
+        f"<b>用户ID</b>: <code>{target_id}</code>",
+        f"<b>群ID</b>: <code>{group_id}</code>",
+        (
+            f"<b>违规次数</b>: 已清零（原 {cleared_count} 次）"
+            if cleared_count
+            else "<b>违规次数</b>: 原本无记录"
+        ),
+        "此操作不会修改其他群组或全局封禁名单。",
+    ]
+    if not restored:
+        lines.append("⚠️ 已解除封禁，但 Telegram 未确认权限恢复；用户重新入群后将按群默认权限生效。")
+    return "\n".join(lines)
+
+
+async def _perform_global_ban(
+    message: Message,
+    session: AsyncSession,
+    *,
+    target_id: int,
+    reason: str,
+    operator_id: int,
+) -> str:
     created = await add_global_ban(
         session,
         target_id,
         reason=reason or "手动封禁",
         source="manual",
-        created_by=operator.id if operator else 0,
+        created_by=operator_id,
     )
+    prompts = await join_verification_prompts_for_user(session, target_id)
     await delete_join_verifications_for_user(session, target_id)
     group_ids = await _authorized_group_ids(session)
-    # Publish the registry entry and challenge cancellation before Telegram
-    # calls so an in-flight CF callback cannot restore a manually banned user.
     await session.commit()
-
+    await delete_verification_prompts(message.bot, prompts)
     banned_groups = 0
     for group_id in group_ids:
         try:
-            await message.bot.ban_chat_member(group_id, target_id)
-            banned_groups += 1
+            result = await message.bot.ban_chat_member(group_id, target_id)
+            if result is not False:
+                banned_groups += 1
         except Exception as exc:
-            log.info("ban failed | group=%s user=%s error=%s", group_id, target_id, exc)
-
-    status = "已加入封禁名单" if created else "已在封禁名单（信息已更新）"
+            log.info("global ban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+    status = "已加入全局封禁名单" if created else "已在全局封禁名单（信息已更新）"
     lines = [
-        "<b>封禁结果</b>",
+        "<b>全局封禁完成</b>",
         f"<b>用户ID</b>: <code>{target_id}</code>",
         f"<b>状态</b>: {status}",
+        f"<b>群内封禁</b>: {banned_groups}/{len(group_ids)} 个授权群成功",
+        "该用户此后发言或重新入群时都会被全局封禁策略拦截。",
     ]
     if reason:
-        lines.append(f"<b>原因</b>: {html.escape(reason)}")
-    lines.append(f"<b>群内封禁</b>: {banned_groups}/{len(group_ids)} 个授权群成功")
-    lines.append("该用户此后发言或再入群都会被自动封禁。")
-    await _answer(message, settings, "\n".join(lines))
+        lines.insert(3, f"<b>原因</b>: {html.escape(reason)}")
+    return "\n".join(lines)
 
 
-@router.message(Command("unban"))
-async def cmd_unban(message: Message, session: AsyncSession, settings: Settings) -> None:
-    if not await ensure_group_authorized(message, session, settings):
-        return
-    if not await ensure_super_admin(message, settings):
-        return
-
-    args = (message.text or "").partition(" ")[2].strip()
-    target_id, _ = _resolve_ban_target(message, args)
-    if target_id is None:
-        await _answer(message, settings, _UNBAN_USAGE)
-        return
-
-    operator = message.from_user
+async def _perform_global_unban(
+    message: Message,
+    session: AsyncSession,
+    *,
+    target_id: int,
+    operator_id: int,
+) -> str:
     removed = await remove_global_ban(
         session,
         target_id,
-        operator_id=operator.id if operator else 0,
+        operator_id=operator_id,
     )
+    prompts = await join_verification_prompts_for_user(session, target_id)
     await delete_join_verifications_for_user(session, target_id)
     group_ids = await _authorized_group_ids(session)
     cleared_total = 0
@@ -819,33 +1247,338 @@ async def cmd_unban(message: Message, session: AsyncSession, settings: Settings)
         cleared_count, _ = await _clear_user_warning(session, group_id, target_id)
         cleared_total += cleared_count
     await session.commit()
+    await delete_verification_prompts(message.bot, prompts)
 
     unbanned_groups = 0
     restored_groups = 0
     for group_id in group_ids:
         try:
-            await message.bot.unban_chat_member(group_id, target_id, only_if_banned=True)
+            result = await message.bot.unban_chat_member(
+                group_id,
+                target_id,
+                only_if_banned=True,
+            )
+            if result is False:
+                continue
             unbanned_groups += 1
             if await restore_member_permissions(message.bot, group_id, target_id):
                 restored_groups += 1
         except Exception as exc:
-            log.info("unban failed | group=%s user=%s error=%s", group_id, target_id, exc)
+            log.info("global unban failed | group=%s user=%s error=%s", group_id, target_id, exc)
 
-    status = "已移出封禁名单" if removed else "原本不在封禁名单"
+    return "\n".join(
+        [
+            "<b>全局解封完成</b>",
+            f"<b>用户ID</b>: <code>{target_id}</code>",
+            f"<b>状态</b>: {'已移出全局封禁名单' if removed else '原本不在全局封禁名单'}",
+            f"<b>群内解封</b>: {unbanned_groups}/{len(group_ids)} 个授权群成功",
+            f"<b>发言权限恢复</b>: {restored_groups} 个群成功",
+            (
+                f"<b>违规次数</b>: 已清零（累计 {cleared_total} 次）"
+                if cleared_total
+                else "<b>违规次数</b>: 原本无记录"
+            ),
+            "<b>资料审查</b>: 已加入资料审查豁免（消息内容仍会正常审核）",
+        ]
+    )
+
+
+def _scope_keyboard(action: str, target_id: int) -> InlineKeyboardMarkup:
+    verb = "封禁" if action == "ban" else "解封"
+    short = "b" if action == "ban" else "u"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"仅本群{verb}",
+                    callback_data=f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:l:{target_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"全局{verb}",
+                    callback_data=f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:g:{target_id}",
+                ),
+            ]
+        ]
+    )
+
+
+async def _ask_super_admin_scope(
+    message: Message,
+    *,
+    action: str,
+    target_id: int,
+    reason: str = "",
+) -> None:
+    verb = "封禁" if action == "ban" else "解封"
     lines = [
-        "<b>解封结果</b>",
+        f"<b>请选择{verb}范围</b>",
         f"<b>用户ID</b>: <code>{target_id}</code>",
-        f"<b>状态</b>: {status}",
-        f"<b>群内解封</b>: {unbanned_groups}/{len(group_ids)} 个授权群成功",
-        f"<b>发言权限恢复</b>: {restored_groups} 个群成功",
-        (
-            f"<b>违规次数</b>: 已清零（累计 {cleared_total} 次）"
-            if cleared_total
-            else "<b>违规次数</b>: 原本无记录"
-        ),
-        "<b>资料审查</b>: 已永久豁免（消息仍会被正常审核）",
+        "「仅本群」只修改当前群；「全局」会作用于全部授权群和全局名单。",
     ]
-    await _answer(message, settings, "\n".join(lines))
+    if reason:
+        lines.insert(2, f"<b>原因</b>: {html.escape(reason)}")
+    sent = await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=_scope_keyboard(action, target_id),
+    )
+    now = time.monotonic()
+    for key, request in list(_BAN_SCOPE_REQUESTS.items()):
+        if now - request.created_at > _BAN_SCOPE_TTL_SECONDS:
+            _BAN_SCOPE_REQUESTS.pop(key, None)
+    _BAN_SCOPE_REQUESTS[(int(message.chat.id), int(sent.message_id))] = _BanScopeRequest(
+        action=action,
+        target_id=int(target_id),
+        reason=str(reason or ""),
+        created_at=now,
+    )
+
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await _ensure_ban_command_admin(message, session, settings):
+        return
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, reason = _resolve_ban_target(message, args)
+    if target_id is None or target_id <= 0:
+        await _answer(message, settings, _BAN_USAGE)
+        return
+    if is_super_admin_user_id(target_id, settings):
+        await _answer(message, settings, "不能封禁最高管理员。")
+        return
+    operator = message.from_user
+    if operator and is_super_admin_user_id(int(operator.id), settings):
+        await _ask_super_admin_scope(
+            message,
+            action="ban",
+            target_id=target_id,
+            reason=reason,
+        )
+        return
+    text = await _perform_group_ban(
+        message,
+        session,
+        settings,
+        target_id=target_id,
+        reason=reason,
+    )
+    await _answer(message, settings, text)
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await _ensure_ban_command_admin(message, session, settings):
+        return
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, _ = _resolve_ban_target(message, args)
+    if target_id is None or target_id <= 0:
+        await _answer(message, settings, _UNBAN_USAGE)
+        return
+    operator = message.from_user
+    if operator and is_super_admin_user_id(int(operator.id), settings):
+        await _ask_super_admin_scope(
+            message,
+            action="unban",
+            target_id=target_id,
+        )
+        return
+    text = await _perform_group_unban(
+        message,
+        session,
+        target_id=target_id,
+    )
+    await _answer(message, settings, text)
+
+
+@router.callback_query(F.data.startswith(f"{_BAN_SCOPE_CALLBACK_PREFIX}:"))
+async def on_ban_scope_choice(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    operator = callback.from_user
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    if operator is None or not is_super_admin_user_id(int(operator.id), settings):
+        await callback.answer("仅最高管理员可选择全局操作范围", show_alert=True)
+        return
+    if message is None or chat is None or getattr(chat, "type", "") not in {"group", "supergroup"}:
+        await callback.answer("操作消息已失效", show_alert=True)
+        return
+    parts = str(callback.data or "").split(":")
+    if len(parts) != 4 or parts[0] != _BAN_SCOPE_CALLBACK_PREFIX:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    action = "ban" if parts[1] == "b" else "unban" if parts[1] == "u" else ""
+    scope = parts[2]
+    try:
+        target_id = int(parts[3])
+    except (TypeError, ValueError):
+        target_id = 0
+    if not action or scope not in {"l", "g"} or target_id <= 0:
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    if action == "ban" and is_super_admin_user_id(target_id, settings):
+        await callback.answer("不能封禁最高管理员", show_alert=True)
+        return
+
+    key = (int(chat.id), int(message.message_id))
+    request = _BAN_SCOPE_REQUESTS.pop(key, None)
+    if (
+        request is None
+        or request.action != action
+        or request.target_id != target_id
+        or time.monotonic() - request.created_at > _BAN_SCOPE_TTL_SECONDS
+    ):
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("该范围选择已失效，请重新发送命令", show_alert=True)
+        return
+    reason = request.reason
+    await callback.answer("正在执行…")
+    if action == "ban" and scope == "l":
+        result_text = await _perform_group_ban(
+            message,
+            session,
+            settings,
+            target_id=target_id,
+            reason=reason,
+            operator_id=int(operator.id),
+            operator_display=str(getattr(operator, "full_name", "") or ""),
+        )
+    elif action == "ban":
+        result_text = await _perform_global_ban(
+            message,
+            session,
+            target_id=target_id,
+            reason=reason,
+            operator_id=int(operator.id),
+        )
+    elif scope == "l":
+        result_text = await _perform_group_unban(
+            message,
+            session,
+            target_id=target_id,
+            operator_id=int(operator.id),
+            operator_display=str(getattr(operator, "full_name", "") or ""),
+        )
+    else:
+        result_text = await _perform_global_unban(
+            message,
+            session,
+            target_id=target_id,
+            operator_id=int(operator.id),
+        )
+    try:
+        await message.edit_text(result_text, parse_mode="HTML", reply_markup=None)
+    except Exception:
+        await message.answer(result_text, parse_mode="HTML")
+
+
+_RAID_GUARD_USAGE = (
+    "<b>命令用法</b>\n"
+    "/raidguard on：手动开启，直到管理员关闭\n"
+    "/raidguard on &lt;分钟&gt;：按分钟限时开启\n"
+    "/raidguard &lt;分钟&gt;：限时开启的简写\n"
+    "/raidguard off：立即解除\n"
+    "/raidguard status：查看当前状态"
+)
+
+
+@router.message(Command("raidguard", "raid"))
+async def cmd_raidguard(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await _ensure_ban_command_admin(message, session, settings):
+        return
+    service = get_raid_guard_service()
+    if service is None:
+        await _answer(message, settings, "爆破防护服务尚未启动，请稍后重试。")
+        return
+    raw = (message.text or "").partition(" ")[2].strip()
+    parts = raw.split()
+    action = parts[0].lower() if parts else "status"
+    group_id = int(message.chat.id)
+
+    if action in {"status", "state"}:
+        status = service.lockdown_status(group_id)
+        if not status["active"]:
+            await _answer(message, settings, "<b>爆破防护状态</b>\n当前未处于锁定防护状态。")
+            return
+        until = status.get("until")
+        source = "管理员手动开启" if status.get("source") == "manual" else "自动检测触发"
+        deadline = "管理员手动关闭前" if until is None else until.strftime("%Y-%m-%d %H:%M:%S")
+        await _answer(
+            message,
+            settings,
+            "<b>爆破防护状态</b>\n"
+            f"<b>状态</b>: 已开启（{source}）\n"
+            f"<b>解除时间</b>: {deadline}",
+        )
+        return
+
+    if action in {"off", "disable", "stop"}:
+        try:
+            disabled = await service.disable_manual_lockdown(group_id)
+        except Exception as exc:
+            log.exception("manual raid disable failed | group=%s", group_id)
+            detail = str(exc) if isinstance(exc, RuntimeError) else "手动爆破防护状态保存失败，请稍后重试"
+            await _answer(message, settings, html.escape(detail))
+            return
+        await _answer(
+            message,
+            settings,
+            "爆破防护已解除。" if disabled else "当前没有正在运行的爆破锁定。",
+        )
+        return
+
+    duration: object | None
+    if action in {"on", "enable", "start"}:
+        if len(parts) > 2:
+            await _answer(message, settings, _RAID_GUARD_USAGE)
+            return
+        duration = parts[1] if len(parts) == 2 else None
+    elif len(parts) == 1:
+        duration = parts[0]
+    else:
+        await _answer(message, settings, _RAID_GUARD_USAGE)
+        return
+    try:
+        minutes = normalize_manual_lockdown_minutes(duration)
+    except ValueError as exc:
+        await _answer(message, settings, f"{html.escape(str(exc))}\n\n{_RAID_GUARD_USAGE}")
+        return
+    try:
+        await service.enable_manual_lockdown(
+            group_id,
+            duration_minutes=minutes,
+        )
+    except Exception as exc:
+        log.exception("manual raid enable failed | group=%s", group_id)
+        detail = str(exc) if isinstance(exc, RuntimeError) else "手动爆破防护状态保存失败，请稍后重试"
+        await _answer(message, settings, html.escape(detail))
+        return
+    # The service has already posted the persistent state-change notice. The
+    # command acknowledgement follows the normal management retention policy.
+    await _answer(
+        message,
+        settings,
+        (
+            f"爆破防护已手动开启 {minutes} 分钟。"
+            if minutes is not None
+            else "爆破防护已手动开启，将持续到管理员发送 /raidguard off。"
+        ),
+    )
 
 
 async def _clear_style_samples(session: AsyncSession, group_id: int) -> None:
@@ -1027,7 +1760,7 @@ async def on_rule_list_paging(
 
     text, keyboard = _build_rule_list_page(rules, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             await callback.answer("列表刷新失败，请重试 /rules", show_alert=True)
@@ -1094,7 +1827,7 @@ async def on_rule_delete(
     page = min(max(page_hint, 0), total_pages - 1)
     text, keyboard = _build_rule_list_page(rules, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except Exception:
         await callback.answer("删除成功，但列表刷新失败，请重试 /rules", show_alert=True)
         return
@@ -1135,7 +1868,7 @@ async def on_authlist_paging(
 
     text, keyboard = _build_auth_group_list_page(rows, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             await callback.answer("列表刷新失败，请重试 /authlist", show_alert=True)
@@ -1191,7 +1924,7 @@ async def on_adminlist_paging(
 
     text, keyboard = _build_admin_list_page(rows, group_id=group_id, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             await callback.answer("列表刷新失败，请重试 /adminlist", show_alert=True)
@@ -1250,7 +1983,7 @@ async def on_warnings_paging(
     threshold = max(1, settings.moderation.warn_threshold)
     text, keyboard = _build_warning_list_page(rows, threshold=threshold, page=page)
     try:
-        await msg.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+        await msg.edit_text(text, reply_markup=preserve_delete_button(msg, keyboard), disable_web_page_preview=True)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             await callback.answer("列表刷新失败，请重试 /warnings", show_alert=True)
