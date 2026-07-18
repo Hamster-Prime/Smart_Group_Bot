@@ -626,16 +626,6 @@ async def start_vote_ban(
     if member_status in {"creator", "administrator"}:
         return VoteBanStartResult(False, "admin_target", "不能对群管理员发起投票。")
 
-    warning = await session.scalar(
-        select(UserWarning).where(
-            UserWarning.group_id == group_id,
-            UserWarning.user_id == target_id,
-            UserWarning.is_banned.is_(True),
-        )
-    )
-    if warning is not None or member_status == "kicked" or await is_globally_banned(session, target_id):
-        return VoteBanStartResult(False, "already_banned", "该用户已处于封禁状态，无需重复投票。")
-
     reason = " ".join(str(reason_override or "").split()).strip()[:1000]
     evidence = " ".join(
         str(getattr(reply, "text", None) or getattr(reply, "caption", None) or "").split()
@@ -659,6 +649,24 @@ async def start_vote_ban(
                 else "该用户已有进行中的投票。"
             )
             return VoteBanStartResult(False, "active_vote_exists", message, record=existing)
+
+        warning = await session.scalar(
+            select(UserWarning).where(
+                UserWarning.group_id == group_id,
+                UserWarning.user_id == target_id,
+                UserWarning.is_banned.is_(True),
+            )
+        )
+        if (
+            warning is not None
+            or member_status == "kicked"
+            or await is_globally_banned(session, target_id)
+        ):
+            return VoteBanStartResult(
+                False,
+                "already_banned",
+                "该用户已处于封禁状态，无需重复投票。",
+            )
 
         quota = await reserve_vote_ban_quota(
             session,
@@ -817,8 +825,33 @@ async def record_vote_ban_outcome(
     *,
     approvals: int,
     banned: bool,
-) -> None:
-    """Persist the actual Telegram result and a trusted audit event."""
+    lease_token: datetime | None,
+) -> bool:
+    """Persist the real outcome only while this worker owns the lease.
+
+    The terminal status CAS, local ban mirror, and audit append share one
+    transaction.  A slow worker whose lease was taken over cannot overwrite
+    a newer result or append a second final fact.
+    """
+    if lease_token is None:
+        await session.rollback()
+        return False
+    terminal_status = "passed" if banned else "failed"
+    claimed = await session.execute(
+        update(VoteBanSession)
+        .where(
+            VoteBanSession.id == int(record.id),
+            VoteBanSession.status == "enforcing",
+            VoteBanSession.enforcing_started_at == lease_token,
+        )
+        .values(
+            status=terminal_status,
+            enforcing_started_at=None,
+        )
+    )
+    if int(claimed.rowcount or 0) != 1:
+        await session.rollback()
+        return False
     if banned:
         warning = await session.scalar(
             select(UserWarning).where(
@@ -837,8 +870,6 @@ async def record_vote_ban_outcome(
             )
         else:
             warning.is_banned = True
-    record.status = "passed" if banned else "failed"
-    record.enforcing_started_at = None
     source = "democratic_vote_skill" if record.source == "skill" else "democratic_vote_command"
     await record_ban_event(
         session,
@@ -863,6 +894,8 @@ async def record_vote_ban_outcome(
         },
     )
     await session.commit()
+    await session.refresh(record)
+    return True
 
 
 async def recover_stale_vote_enforcement(
@@ -920,11 +953,12 @@ async def recover_stale_vote_enforcement(
                 int(fresh.group_id),
                 int(fresh.target_user_id),
             )
-        await record_vote_ban_outcome(
+        persisted = await record_vote_ban_outcome(
             session,
             fresh,
             approvals=approvals,
             banned=banned,
+            lease_token=current,
         )
     except Exception:
         await session.rollback()
@@ -933,6 +967,16 @@ async def recover_stale_vote_enforcement(
             fresh.group_id,
             fresh.id,
         )
+        return None
+
+    if not persisted:
+        latest = await session.get(
+            VoteBanSession,
+            int(fresh.id),
+            populate_existing=True,
+        )
+        if latest is not None and latest.status in {"passed", "failed"}:
+            return str(latest.status)
         return None
 
     cancel_vote_expiry(int(fresh.id))

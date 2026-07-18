@@ -26,6 +26,7 @@ from bot.services.vote_ban import (
     count_approvals,
     open_vote_session,
     recover_stale_vote_enforcement,
+    record_vote_ban_outcome,
     record_vote,
     resolve_vote_ban_config,
 )
@@ -339,6 +340,77 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(record.enforcing_started_at)
             self.assertTrue(warning.is_banned)
             self.assertEqual(event.outcome, "succeeded")
+
+    async def test_old_enforcement_lease_cannot_overwrite_new_owner(self) -> None:
+        session_id = await self._open_session(threshold=2)
+        async with self.session_factory() as session:
+            self.assertTrue(await record_vote(session, session_id, 11))
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="enforcing",
+                )
+            )
+            await session.commit()
+            record = await session.get(VoteBanSession, session_id)
+            old_token = record.enforcing_started_at
+            new_token = old_token + timedelta(minutes=2)
+            record.enforcing_started_at = new_token
+            await session.commit()
+
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            persisted = await record_vote_ban_outcome(
+                session,
+                record,
+                approvals=2,
+                banned=False,
+                lease_token=old_token,
+            )
+        self.assertFalse(persisted)
+
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "enforcing")
+            self.assertEqual(record.enforcing_started_at, new_token)
+            events = list(
+                (
+                    await session.scalars(
+                        select(BanAuditEvent).where(
+                            BanAuditEvent.reference_type == "vote_session",
+                            BanAuditEvent.reference_id == session_id,
+                        )
+                    )
+                ).all()
+            )
+            self.assertEqual(events, [])
+
+            persisted = await record_vote_ban_outcome(
+                session,
+                record,
+                approvals=2,
+                banned=True,
+                lease_token=new_token,
+            )
+            self.assertTrue(persisted)
+
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            events = list(
+                (
+                    await session.scalars(
+                        select(BanAuditEvent).where(
+                            BanAuditEvent.reference_type == "vote_session",
+                            BanAuditEvent.reference_id == session_id,
+                        )
+                    )
+                ).all()
+            )
+            self.assertEqual(record.status, "passed")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].outcome, "succeeded")
 
     async def test_threshold_ban_failure_is_persisted_as_failed_outcome(self) -> None:
         session_id = await self._open_session(threshold=2)

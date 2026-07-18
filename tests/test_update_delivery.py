@@ -34,7 +34,11 @@ def _dispatcher() -> SimpleNamespace:
 
 class WebhookConfigTests(unittest.TestCase):
     def test_missing_webhook_url_uses_fallback_reason(self) -> None:
-        webhook, reason = resolve_webhook_config(_settings())
+        # Explicitly override any operator WEBHOOK_URL inherited by the test
+        # process; this case is about the unconfigured branch itself.
+        webhook, reason = resolve_webhook_config(
+            _settings(webhook_url="", webhook_secret="")
+        )
 
         self.assertIsNone(webhook)
         self.assertEqual(reason, "未配置 WEBHOOK_URL")

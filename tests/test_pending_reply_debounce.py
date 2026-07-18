@@ -203,6 +203,13 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             fake_skill.answer_with_skill.await_args.kwargs["session_factory"],
             memory.session_factory,
         )
+        self.assertTrue(
+            fake_skill.answer_with_skill.await_args.kwargs["is_direct_request"]
+        )
+        self.assertNotIn(
+            "is_direct_request",
+            fake_skill.build_answer_prompt_payload.call_args.kwargs,
+        )
 
     async def test_admin_revalidation_error_fails_closed(self) -> None:
         item = _item(

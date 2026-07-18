@@ -53,6 +53,9 @@ class SkillRunResult:
 class SkillAnswerResult:
     text: str = ""
     handled: bool = False
+    # Quota/security refusals must remain visible even when an earlier TTS
+    # tool in the same model turn already emitted audio.
+    must_deliver_text: bool = False
     sticker_sent: bool = False
     sticker_file_id: str = ""
     tts_sent: bool = False

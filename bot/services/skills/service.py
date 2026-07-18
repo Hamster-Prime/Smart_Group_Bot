@@ -1007,6 +1007,7 @@ class SkillService:
             return SkillAnswerResult(
                 text=text,
                 handled=context.handled,
+                must_deliver_text=bool(mandatory_refusal_summary and text),
                 sticker_sent=context.sticker_sent,
                 sticker_file_id=context.sticker_file_id,
                 tts_sent=context.tts_sent,

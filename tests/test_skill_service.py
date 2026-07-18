@@ -310,6 +310,35 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.sticker_sent)
         self.assertFalse(result.handled)
 
+    async def test_quota_refusal_forces_visible_text_after_earlier_tts(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-tts",
+                            "function": {
+                                "name": "doubao_tts",
+                                "arguments": '{"text":"先说一句"}',
+                            },
+                        },
+                        {
+                            "id": "call-vote",
+                            "function": {"name": "vote_ban", "arguments": "{}"},
+                        },
+                    ]
+                ),
+                _resp(content="投票已经发起"),
+            ]
+        )
+
+        result = await service.answer_with_skill("语音说完再发起投票", intent_type="casual")
+
+        self.assertTrue(result.tts_sent)
+        self.assertTrue(result.must_deliver_text)
+        self.assertIn("额度已用完", result.text)
+        self.assertNotIn("已经发起", result.text)
+
     async def test_websearch_summary_only_reply_triggers_followup_generation(self) -> None:
         service = _PlannedSkillService(
             [

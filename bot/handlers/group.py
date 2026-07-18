@@ -1626,6 +1626,8 @@ async def on_vote_ban_action(
             await callback.answer("投票已由其他操作结束", show_alert=True)
             return
         await session.commit()
+        await session.refresh(record)
+        lease_token = record.enforcing_started_at
         cancel_vote_expiry(session_id)
         if session_factory is not None:
             schedule_vote_enforcement_recovery(
@@ -1645,13 +1647,13 @@ async def on_vote_ban_action(
         try:
             if banned:
                 await delete_join_verification(session, group_id, target_id)
-            await record_vote_ban_outcome(
+            outcome_persisted = await record_vote_ban_outcome(
                 session,
                 record,
                 approvals=approvals,
                 banned=banned,
+                lease_token=lease_token,
             )
-            outcome_persisted = True
         except Exception:
             await session.rollback()
             log.exception(
@@ -2496,6 +2498,7 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
             sent_reply_messages: list[str] = []
             delivery_plans: list[_ReplyDeliveryPlan] = []
             skill_handled = False
+            skill_must_deliver_text = False
             sticker_sent_ok = False
             tts_sent_ok = False
             sticker_file = ""
@@ -2525,7 +2528,6 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_targets_context=reply_targets_context,
                         is_mentioned=mentioned,
                         is_reply_to_bot=reply_to_bot,
-                        is_direct_request=latest_is_direct_request,
                         style_profile_context=style_profile_context,
                     ),
                 )
@@ -2564,9 +2566,13 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                         reply_targets_context=reply_targets_context,
                         is_mentioned=mentioned,
                         is_reply_to_bot=reply_to_bot,
+                        is_direct_request=latest_is_direct_request,
                         style_profile_context=style_profile_context,
                     )
                     skill_handled = bool(skill_result.handled)
+                    skill_must_deliver_text = bool(
+                        getattr(skill_result, "must_deliver_text", False)
+                    )
                     sticker_sent_ok = bool(skill_result.sticker_sent)
                     tts_sent_ok = bool(skill_result.tts_sent)
                     sticker_file = skill_result.sticker_file_id or ""
@@ -2585,7 +2591,12 @@ async def _process_pending_reply_batch(items: list[_PendingReplyItem], settings:
                             sticker_sent_ok,
                             sticker_file[:32] if sticker_file else "-",
                         )
-                    if is_tts_always_enabled(tts_mode) and tts_sent_ok and raw_reply:
+                    if (
+                        is_tts_always_enabled(tts_mode)
+                        and tts_sent_ok
+                        and raw_reply
+                        and not skill_must_deliver_text
+                    ):
                         log.info("[%s] pending batch suppressing text because TTS already sent", group_id)
                         raw_reply = ""
                         reply_source = "skill"
