@@ -427,6 +427,46 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 102))
 
+    async def test_join_pass_sends_group_welcome_after_restore(self) -> None:
+        from bot.db.models import Group
+
+        async with self.session_factory() as session:
+            session.add(
+                Group(id=-100, title="", settings={"welcome_message": "欢迎 {name}"})
+            )
+            await session.commit()
+        await self._seed(user_id=112)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            resp = await self._submit(112)
+
+        self.assertEqual(resp.status, 200)
+        self.bot.send_message.assert_awaited_once()
+        args = self.bot.send_message.await_args.args
+        self.assertEqual(args[0], -100)
+        self.assertIn("欢迎 新人", args[1])
+
+    async def test_moderation_pass_sends_no_welcome(self) -> None:
+        from bot.db.models import Group
+
+        async with self.session_factory() as session:
+            session.add(
+                Group(id=-100, title="", settings={"welcome_message": "欢迎 {name}"})
+            )
+            await session.commit()
+        await self._seed(user_id=113, kind=VERIFICATION_KIND_MODERATION)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(return_value=(True, [])),
+        ):
+            resp = await self._submit(113)
+
+        self.assertEqual(resp.status, 200)
+        # The pass notice edits the prompt; no extra welcome is sent.
+        self.bot.send_message.assert_not_awaited()
+
     async def test_successful_moderation_submit_uses_moderation_notice(self) -> None:
         await self._seed(
             user_id=109,

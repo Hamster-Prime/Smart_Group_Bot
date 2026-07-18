@@ -91,6 +91,9 @@ class BotConfig(BaseModel):
     auto_delete_categories: list[str] = Field(
         default_factory=lambda: ["management", "moderation"]
     )
+    # Per-category retention overrides (seconds); 0/missing inherits
+    # auto_delete_seconds.
+    auto_delete_category_seconds: dict[str, int] = Field(default_factory=dict)
     decision_context_items: int = 5
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = 180

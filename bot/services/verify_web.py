@@ -42,6 +42,7 @@ from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
     SHARED_PROMPT_VERIFICATION_KINDS,
+    VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_PATROL,
     VERIFICATION_KIND_RAID,
@@ -1512,6 +1513,21 @@ class VerifyWebServer:
             kind=kind,
             restored=True,
         )
+        if kind == VERIFICATION_KIND_JOIN:
+            from bot.services.welcome import send_group_welcome
+
+            try:
+                async with self.session_factory() as session:
+                    await send_group_welcome(
+                        self.bot,
+                        session,
+                        self.settings,
+                        group_id=group_id,
+                        user_id=user_id,
+                        display_name=display_name,
+                    )
+            except Exception:
+                log.debug("welcome after verification failed | group=%s", group_id)
         return web.json_response({"ok": True})
 
     async def _recover_claimed_verification(

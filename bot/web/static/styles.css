@@ -432,6 +432,25 @@ button:disabled {
   font-size: 12px;
 }
 
+.delete-category-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.delete-category-row .choice-row {
+  flex: 1;
+  min-width: 0;
+}
+
+.delete-category-row .delete-category-seconds {
+  width: 86px;
+  flex: none;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
 .choice-row span,
 .notice span,
 .toast span,
@@ -1136,12 +1155,14 @@ button:disabled {
 }
 
 .group-settings-grid .field.proactive-brief,
-.group-settings-grid .field.mimic-profile {
+.group-settings-grid .field.mimic-profile,
+.group-settings-grid .field.welcome-message {
   grid-column: 1 / -1;
 }
 
 .group-settings-grid .field.proactive-brief textarea,
-.group-settings-grid .field.mimic-profile textarea {
+.group-settings-grid .field.mimic-profile textarea,
+.group-settings-grid .field.welcome-message textarea {
   min-height: 74px;
 }
 
@@ -1530,7 +1551,8 @@ button:disabled {
   .field.full,
   .toggle-field.full,
   .group-settings-grid .field.proactive-brief,
-  .group-settings-grid .field.mimic-profile {
+  .group-settings-grid .field.mimic-profile,
+  .group-settings-grid .field.welcome-message {
     grid-column: auto;
   }
 

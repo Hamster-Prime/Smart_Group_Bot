@@ -330,6 +330,78 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await is_globally_banned(session, 902))
             self.assertNotEqual(await get_profile_screen_hash(session, 902), "")
 
+    async def test_clean_join_sends_configured_welcome(self) -> None:
+        from unittest.mock import patch
+
+        from bot.db.models import Group
+        from bot.handlers import membership
+
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            if group is None:
+                session.add(
+                    Group(id=-100, title="", settings={"welcome_message": "欢迎 {name}"})
+                )
+            else:
+                group.settings = {"welcome_message": "欢迎 {name}"}
+            await session.commit()
+
+        event = _join_event(user_id=906, full_name="Ada")
+        async with self.session_factory() as session:
+            fake_moderation = SimpleNamespace(
+                check_rules=AsyncMock(return_value=(False, "", None))
+            )
+            with (
+                patch("bot.handlers.membership.ModerationService", return_value=fake_moderation),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+            ):
+                await membership.on_member_join(event, session=session, settings=self._settings())
+
+        event.bot.send_message.assert_awaited_once()
+        args = event.bot.send_message.await_args.args
+        self.assertEqual(args[0], -100)
+        self.assertIn("欢迎 Ada", args[1])
+
+    async def test_welcome_deferred_when_join_verification_starts(self) -> None:
+        from unittest.mock import patch
+
+        from bot.db.models import Group
+        from bot.handlers import membership
+
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            if group is None:
+                session.add(
+                    Group(id=-100, title="", settings={"welcome_message": "欢迎 {name}"})
+                )
+            else:
+                group.settings = {"welcome_message": "欢迎 {name}"}
+            await session.commit()
+
+        settings = self._settings()
+        settings.moderation.enabled = False
+        event = _join_event(user_id=907, full_name="Ada")
+        async with self.session_factory() as session:
+            with (
+                patch(
+                    "bot.handlers.membership.join_verification_policy",
+                    return_value=(True, "turnstile"),
+                ),
+                patch(
+                    "bot.handlers.membership.join_verification_ready",
+                    return_value=True,
+                ),
+                patch(
+                    "bot.handlers.membership._start_join_verification",
+                    new=AsyncMock(),
+                ) as start_verification,
+            ):
+                await membership.on_member_join(event, session=session, settings=settings)
+
+        start_verification.assert_awaited_once()
+        # The welcome must wait for the verification outcome, not the raw join.
+        event.bot.send_message.assert_not_awaited()
+
     async def test_globally_banned_user_is_rebanned_on_rejoin_without_screening(self) -> None:
         from unittest.mock import patch
 

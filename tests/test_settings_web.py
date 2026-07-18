@@ -27,6 +27,7 @@ from bot.db.models import (
 )
 from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.verify_web import VerifyWebServer
+from bot.utils.telegram import configured_auto_delete_seconds
 
 BOT_TOKEN = "42:TEST_TOKEN"
 
@@ -595,6 +596,74 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         inherited_settings = (await inherited.json())["group"]["settings"]
         self.assertIsNone(inherited_settings["join_verification_enabled"])
         self.assertIsNone(inherited_settings["join_verification_provider"])
+
+    async def test_group_welcome_message_roundtrip_and_clear(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-260, authorized_by=42))
+            session.add(Group(id=-260, title="Welcome Group", settings={}))
+            await session.commit()
+
+        group_document = await self._group_document(-260)
+        saved = await self.client.put(
+            "/api/v1/groups/-260/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"welcome_message": "欢迎 {mention} 加入！"},
+            },
+        )
+        self.assertEqual(saved.status, 200)
+        saved_group = (await saved.json())["group"]
+        self.assertEqual(
+            saved_group["settings"]["welcome_message"], "欢迎 {mention} 加入！"
+        )
+        async with self.session_factory() as session:
+            stored = await session.get(Group, -260)
+            self.assertEqual(
+                stored.settings.get("welcome_message"), "欢迎 {mention} 加入！"
+            )
+
+        cleared = await self.client.put(
+            "/api/v1/groups/-260/settings",
+            headers=self._headers(),
+            json={
+                "revision": saved_group["revision"],
+                "settings": {"welcome_message": ""},
+            },
+        )
+        self.assertEqual(cleared.status, 200)
+        cleared_group = (await cleared.json())["group"]
+        self.assertEqual(cleared_group["settings"]["welcome_message"], "")
+        async with self.session_factory() as session:
+            stored = await session.get(Group, -260)
+            self.assertNotIn("welcome_message", stored.settings or {})
+
+    async def test_per_category_auto_delete_seconds_apply_live(self) -> None:
+        document = self.manager.api_document()
+        payload = document["config"]
+        payload["bot"]["auto_delete_seconds"] = 30
+        payload["bot"]["auto_delete_categories"] = ["welcome", "keyword"]
+        payload["bot"]["auto_delete_category_seconds"] = {"welcome": 90, "keyword": 0}
+        response = await self.client.put(
+            "/api/v1/settings",
+            headers=self._headers(),
+            json={"revision": document["revision"], "config": payload},
+        )
+        self.assertEqual(response.status, 200)
+        saved = (await response.json())["config"]
+        # Zero means inherit and must not persist as an override.
+        self.assertEqual(
+            saved["bot"]["auto_delete_category_seconds"], {"welcome": 90}
+        )
+        self.assertEqual(
+            configured_auto_delete_seconds(self.settings, "welcome"), 90
+        )
+        self.assertEqual(
+            configured_auto_delete_seconds(self.settings, "keyword"), 30
+        )
+        self.assertEqual(
+            configured_auto_delete_seconds(self.settings, "moderation"), 0
+        )
 
     async def test_mimic_target_and_profile_are_visually_configurable(self) -> None:
         async with self.session_factory() as session:

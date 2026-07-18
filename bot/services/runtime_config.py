@@ -197,8 +197,24 @@ class BotBehaviorConfig(StrictModel):
             "proactive",
             "keyword",
             "scheduled",
+            "welcome",
         ]
     ] = Field(default_factory=lambda: ["management", "moderation"])
+    # Per-category retention overrides (seconds); 0 or missing inherits
+    # auto_delete_seconds.
+    auto_delete_category_seconds: dict[
+        Literal[
+            "reply",
+            "management",
+            "moderation",
+            "media",
+            "proactive",
+            "keyword",
+            "scheduled",
+            "welcome",
+        ],
+        int,
+    ] = Field(default_factory=dict)
     # Accepted only while reading records written before the seconds migration.
     auto_delete_minutes: int | None = Field(default=None, ge=0, le=10080, exclude=True)
     decision_context_items: int = Field(default=5, ge=0, le=20)
@@ -217,6 +233,15 @@ class BotBehaviorConfig(StrictModel):
         if self.auto_delete_seconds <= 0 and self.auto_delete_minutes:
             self.auto_delete_seconds = int(self.auto_delete_minutes) * 60
         self.auto_delete_categories = list(dict.fromkeys(self.auto_delete_categories))
+        # Zero means "inherit the global seconds": store only real overrides.
+        cleaned: dict[str, int] = {}
+        for category, seconds in self.auto_delete_category_seconds.items():
+            value = int(seconds)
+            if value < 0 or value > 604800:
+                raise ValueError("分类自动删除时间必须在 0-604800 秒之间")
+            if value > 0:
+                cleaned[category] = value
+        self.auto_delete_category_seconds = cleaned
         return self
 
 
@@ -647,6 +672,9 @@ class RuntimeConfig(StrictModel):
         settings.bot.auto_delete_seconds = bot.auto_delete_seconds
         settings.bot.auto_delete_minutes = bot.auto_delete_seconds // 60
         settings.bot.auto_delete_categories = list(bot.auto_delete_categories)
+        settings.bot.auto_delete_category_seconds = dict(
+            bot.auto_delete_category_seconds
+        )
         settings.bot.decision_context_items = bot.decision_context_items
         settings.bot.max_context_tokens = bot.max_context_tokens
         settings.bot.max_output_tokens = bot.max_output_tokens

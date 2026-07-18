@@ -69,6 +69,7 @@ _GROUP_SETTING_FIELDS = {
     "tts_mode",
     "join_verification_enabled",
     "join_verification_provider",
+    "welcome_message",
     "patrol_enabled",
     "raid_guard_enabled",
     "raid_guard_join_threshold",
@@ -115,6 +116,7 @@ class _GroupSettingsUpdate(BaseModel):
     join_verification_provider: (
         Literal["turnstile", "hcaptcha", "turnstile_hcaptcha"] | None
     ) = None
+    welcome_message: str | None = Field(default=None, max_length=4000)
     patrol_enabled: StrictBool | None = None
     raid_guard_enabled: StrictBool | None = None
     raid_guard_join_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
@@ -315,6 +317,7 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
             in {"turnstile", "hcaptcha", "turnstile_hcaptcha"}
             else None
         ),
+        "welcome_message": str(settings_data.get("welcome_message") or ""),
         "patrol_enabled": (
             _setting_bool(settings_data, "patrol_enabled")
             if settings_data.get("patrol_enabled") is not None
@@ -491,6 +494,7 @@ def _apply_group_settings(
             "proactive_enabled",
             "join_verification_enabled",
             "join_verification_provider",
+            "welcome_message",
             "patrol_enabled",
             "raid_guard_enabled",
             *_RAID_GUARD_GROUP_INT_FIELDS,
@@ -527,6 +531,14 @@ def _apply_group_settings(
             updated["join_verification_provider"] = str(
                 update.join_verification_provider
             )
+    if "welcome_message" in fields:
+        welcome_text = clean_multiline_text(
+            str(update.welcome_message or ""), max_len=4000
+        ).strip()
+        if welcome_text:
+            updated["welcome_message"] = welcome_text
+        else:
+            updated.pop("welcome_message", None)
     if fields & {"join_verification_enabled", "join_verification_provider"}:
         verification_enabled, provider = join_verification_policy(settings, updated)
         provider_selected = (

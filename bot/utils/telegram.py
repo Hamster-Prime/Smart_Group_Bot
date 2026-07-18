@@ -115,12 +115,25 @@ def sanitize_outgoing_text(text: str) -> str:
 
 
 AUTO_DELETE_CATEGORIES = frozenset(
-    {"reply", "management", "moderation", "media", "proactive", "keyword", "scheduled"}
+    {
+        "reply",
+        "management",
+        "moderation",
+        "media",
+        "proactive",
+        "keyword",
+        "scheduled",
+        "welcome",
+    }
 )
 
 
 def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
-    """Resolve the global seconds-based retention policy for one message class."""
+    """Resolve the seconds-based retention policy for one message class.
+
+    A per-category seconds override wins; otherwise the category inherits the
+    global auto_delete_seconds value.
+    """
     normalized = str(category or "").strip().lower()
     if normalized not in AUTO_DELETE_CATEGORIES:
         return 0
@@ -130,7 +143,13 @@ def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
     }
     if normalized not in enabled:
         return 0
-    seconds = int(getattr(settings.bot, "auto_delete_seconds", 0) or 0)
+    per_category = getattr(settings.bot, "auto_delete_category_seconds", None) or {}
+    try:
+        seconds = int(per_category.get(normalized) or 0)
+    except (TypeError, ValueError, AttributeError):
+        seconds = 0
+    if seconds <= 0:
+        seconds = int(getattr(settings.bot, "auto_delete_seconds", 0) or 0)
     if seconds <= 0:
         # Keep integrations that still populate the deprecated alias working
         # while all persisted/runtime configuration uses seconds.

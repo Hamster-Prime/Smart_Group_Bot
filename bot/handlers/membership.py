@@ -59,6 +59,7 @@ from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.services.raid_guard import get_raid_guard_service
+from bot.services.welcome import send_group_welcome
 from bot.utils.bot_identity import get_bot_identity
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
@@ -527,6 +528,15 @@ async def _handle_verification_admin_callback(
         )
         await _edit_verification_prompt(callback, settings, text=approved_text)
         await callback.answer("已直接通过验证")
+        if kind == VERIFICATION_KIND_JOIN:
+            await send_group_welcome(
+                callback.bot,
+                session,
+                settings,
+                group_id=group_id,
+                user_id=target_user_id,
+                display_name=str(snapshot["display_name"] or ""),
+            )
         return
 
     ban_state = None
@@ -744,7 +754,7 @@ async def on_member_join(
         )
         return
 
-    async def _maybe_start_verification() -> None:
+    async def _maybe_start_verification() -> bool:
         group = await session.get(Group, group_id)
         group_settings = group.settings if group is not None else None
         enabled, provider = join_verification_policy(settings, group_settings)
@@ -757,9 +767,25 @@ async def on_member_join(
                 display_name=user.full_name or "",
                 provider=provider,
             )
+            return True
+        return False
+
+    async def _admit_member() -> None:
+        # Verification (when enabled) owns the admission moment: the welcome
+        # is sent after the challenge passes instead of on the raw join.
+        if await _maybe_start_verification():
+            return
+        await send_group_welcome(
+            event.bot,
+            session,
+            settings,
+            group_id=group_id,
+            user_id=user_id,
+            display_name=user.full_name or "",
+        )
 
     if not settings.moderation.enabled:
-        await _maybe_start_verification()
+        await _admit_member()
         return
 
     bio = await _fetch_user_bio(event, user_id)
@@ -769,7 +795,7 @@ async def on_member_join(
         bio=bio,
     )
     if not profile_text.strip():
-        await _maybe_start_verification()
+        await _admit_member()
         return
 
     moderation = ModerationService(settings.moderation, _build_llm(settings))
@@ -804,7 +830,7 @@ async def on_member_join(
                     rules_fingerprint=rules_fp,
                 ),
             )
-        await _maybe_start_verification()
+        await _admit_member()
         return
 
     await add_global_ban(

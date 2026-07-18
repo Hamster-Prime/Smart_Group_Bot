@@ -61,6 +61,7 @@
     "at_reply_mode",
     "join_verification_enabled",
     "join_verification_provider",
+    "welcome_message",
     "patrol_enabled",
     "raid_guard_enabled",
     "raid_guard_join_threshold",
@@ -103,6 +104,7 @@
     accessAdminGroup: null,
     promptKey: "decision",
     listPages: new Map(),
+    groupSearch: "",
   };
 
   const LIST_PAGE_SIZE = 8;
@@ -607,11 +609,19 @@
 
   function renderBot() {
     const deleteCategories = new Set(state.config.bot.auto_delete_categories || []);
-    const categoryToggle = (value, label) => `
-      <label class="choice-row">
-        <input type="checkbox" data-auto-delete-category="${value}"${deleteCategories.has(value) ? " checked" : ""}>
-        <span>${escapeHtml(label)}</span>
-      </label>`;
+    const categorySeconds = state.config.bot.auto_delete_category_seconds || {};
+    const categoryRow = (value, label) => {
+      const enabled = deleteCategories.has(value);
+      const seconds = categorySeconds[value];
+      return `
+      <div class="delete-category-row">
+        <label class="choice-row">
+          <input type="checkbox" data-auto-delete-category="${value}"${enabled ? " checked" : ""}>
+          <span>${escapeHtml(label)}</span>
+        </label>
+        <input class="delete-category-seconds" type="number" min="0" max="604800" step="1" data-auto-delete-seconds="${value}" value="${attr(seconds == null ? "" : seconds)}" placeholder="默认" aria-label="${attr(label)}自动删除秒数" title="留空使用上方全局秒数"${enabled ? "" : " disabled"}>
+      </div>`;
+    };
     return `
       ${pageHead("Bot 行为", "调整消息处理、上下文预算与主动发言节奏。")}
       <datalist id="parse-modes"><option value="HTML"></option><option value="Markdown"></option><option value="MarkdownV2"></option></datalist>
@@ -621,7 +631,7 @@
           <div class="field-grid three">
             ${field("bot.parse_mode", "消息解析格式", { maxlength: 32, list: "parse-modes", placeholder: "留空发送纯文本" })}
             ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true })}
-            ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除" })}
+            ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除；作为各类别的默认秒数" })}
             ${toggle("bot.drop_pending_updates", "启动时丢弃待处理消息", "避免重启后集中处理历史更新")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
@@ -629,14 +639,16 @@
             ${field("bot.stream_edit_interval_sec", "编辑间隔（秒）", { type: "number", min: 0.3, max: 30, step: 0.1, required: true })}
           </div>
           <div class="choice-grid full-width-control">
-            ${categoryToggle("reply", "普通 AI 回复")}
-            ${categoryToggle("management", "命令与管理提示")}
-            ${categoryToggle("moderation", "审核通知")}
-            ${categoryToggle("media", "语音、音乐与贴纸")}
-            ${categoryToggle("proactive", "主动话题")}
-            ${categoryToggle("keyword", "关键词回复")}
-            ${categoryToggle("scheduled", "定时消息")}
+            ${categoryRow("reply", "普通 AI 回复")}
+            ${categoryRow("management", "命令与管理提示")}
+            ${categoryRow("moderation", "审核通知")}
+            ${categoryRow("media", "语音、音乐与贴纸")}
+            ${categoryRow("proactive", "主动话题")}
+            ${categoryRow("keyword", "关键词回复")}
+            ${categoryRow("scheduled", "定时消息")}
+            ${categoryRow("welcome", "入群欢迎")}
           </div>
+          <p class="field-hint">勾选的类别会自动删除；右侧秒数留空表示使用全局「自动删除（秒）」。</p>
         </section>
         <section class="settings-section">
           ${sectionHead("上下文预算")}
@@ -858,6 +870,7 @@
       join_verification_provider: ["turnstile", "hcaptcha", "turnstile_hcaptcha"].includes(settings.join_verification_provider)
         ? settings.join_verification_provider
         : null,
+      welcome_message: String(settings.welcome_message || ""),
       patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
       raid_guard_enabled: settings.raid_guard_enabled == null ? null : Boolean(settings.raid_guard_enabled),
       ...Object.fromEntries(RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => [
@@ -928,6 +941,11 @@
                 <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
                 <option value="turnstile_hcaptcha"${group.settings.join_verification_provider === "turnstile_hcaptcha" ? " selected" : ""}>Turnstile + hCaptcha（双重验证）</option>
               </select>
+            </div>
+            <div class="field welcome-message">
+              <label class="field-label" for="group-${attr(group.id)}-welcome">入群欢迎语</label>
+              <textarea id="group-${attr(group.id)}-welcome" data-group-id="${attr(group.id)}" data-group-key="welcome_message" data-kind="string" maxlength="4000" placeholder="留空不发送欢迎语；{name} 为新成员名称，{mention} 为可点击提及"${saving ? " disabled" : ""}>${escapeHtml(group.settings.welcome_message)}</textarea>
+              <span class="field-hint">开启入群验证时，欢迎语在验证通过后发送；自动删除按全局「入群欢迎」类别执行</span>
             </div>
             <div class="field">
               <label class="field-label" for="group-${attr(group.id)}-patrol-enabled">自动巡检</label>
@@ -1153,7 +1171,7 @@
     return `
       ${pageHead("群组设置", "逐群配置入群验证、回复、语音、主动发言与内容检索。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size ? " disabled" : ""}>${icon("refresh-cw")}刷新群组</button>`)}
       <div class="group-toolbar">
-        <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" autocomplete="off"></div>
+        <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" autocomplete="off" value="${attr(state.groupSearch)}"></div>
         <span class="badge info">${state.groups.length} 个群组</span>
       </div>
       <div class="group-list">
@@ -1214,7 +1232,14 @@
       </div>`;
   }
 
-  function renderContent() {
+  function applyGroupSearchFilter() {
+    const query = state.groupSearch.trim().toLowerCase();
+    content.querySelectorAll("[data-group-card]").forEach(card => {
+      card.hidden = Boolean(query) && !card.dataset.search.includes(query);
+    });
+  }
+
+  function renderContent({ resetScroll = false } = {}) {
     if (!state.config) return;
     const renderers = {
       overview: renderOverview,
@@ -1229,9 +1254,19 @@
       access: renderAccess,
     };
     const renderer = renderers[state.activeTab] || renderGroups;
+    // Replacing innerHTML collapses the document height and lets the browser
+    // clamp the scroll position; restore it so partial refreshes (saving a
+    // group, loading resources) do not jump the page back to the top.
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
     content.innerHTML = renderer();
-    content.scrollTop = 0;
+    applyGroupSearchFilter();
     refreshIcons();
+    if (resetScroll) {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    } else {
+      window.scrollTo(scrollX, scrollY);
+    }
   }
 
   function render() {
@@ -1262,6 +1297,9 @@
       state.config.bot.auto_delete_seconds = Number(state.config.bot.auto_delete_minutes || 0) * 60;
     }
     if (state.config?.bot) delete state.config.bot.auto_delete_minutes;
+    if (state.config?.bot && (typeof state.config.bot.auto_delete_category_seconds !== "object" || state.config.bot.auto_delete_category_seconds == null)) {
+      state.config.bot.auto_delete_category_seconds = {};
+    }
     if (state.config?.verification) {
       state.config.verification.provider ||= "turnstile";
       state.config.verification.hcaptcha_site_key ||= "";
@@ -1675,6 +1713,16 @@
 
   content.addEventListener("input", event => {
     const target = event.target;
+    if (target.matches("[data-auto-delete-seconds]")) {
+      const category = target.dataset.autoDeleteSeconds;
+      const overrides = { ...(state.config.bot.auto_delete_category_seconds || {}) };
+      const seconds = target.value === "" ? 0 : Math.max(0, Math.floor(Number(target.value) || 0));
+      if (seconds > 0) overrides[category] = seconds;
+      else delete overrides[category];
+      state.config.bot.auto_delete_category_seconds = overrides;
+      updateChrome();
+      return;
+    }
     if (target.matches("[data-path]")) {
       setPath(state.config, target.dataset.path, readControlValue(target));
       updateChrome();
@@ -1715,10 +1763,8 @@
       return;
     }
     if (target.id === "group-search") {
-      const query = target.value.trim().toLowerCase();
-      content.querySelectorAll("[data-group-card]").forEach(card => {
-        card.hidden = Boolean(query) && !card.dataset.search.includes(query);
-      });
+      state.groupSearch = target.value;
+      applyGroupSearchFilter();
     }
   });
 
@@ -1734,6 +1780,20 @@
       const selected = [...content.querySelectorAll("[data-auto-delete-category]:checked")]
         .map(control => control.dataset.autoDeleteCategory);
       state.config.bot.auto_delete_categories = selected;
+      const secondsInput = content.querySelector(
+        `[data-auto-delete-seconds="${CSS.escape(target.dataset.autoDeleteCategory)}"]`,
+      );
+      if (secondsInput) secondsInput.disabled = !target.checked;
+      updateChrome();
+      return;
+    }
+    if (target.matches("[data-auto-delete-seconds]")) {
+      const category = target.dataset.autoDeleteSeconds;
+      const overrides = { ...(state.config.bot.auto_delete_category_seconds || {}) };
+      const seconds = target.value === "" ? 0 : Math.max(0, Math.floor(Number(target.value) || 0));
+      if (seconds > 0) overrides[category] = seconds;
+      else delete overrides[category];
+      state.config.bot.auto_delete_category_seconds = overrides;
       updateChrome();
       return;
     }
@@ -2070,8 +2130,7 @@
     app.classList.remove("sidebar-open");
     sidebar.classList.remove("mobile-open");
     updateChrome();
-    renderContent();
-    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    renderContent({ resetScroll: true });
     const activeMobile = mobileNav.querySelector(`[data-nav="${CSS.escape(tab)}"]`);
     if (activeMobile) {
       const left = activeMobile.offsetLeft - (mobileNav.clientWidth - activeMobile.offsetWidth) / 2;
