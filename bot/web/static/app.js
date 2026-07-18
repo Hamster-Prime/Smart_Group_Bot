@@ -1218,7 +1218,7 @@
             <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
             <button class="icon-button" type="submit" aria-label="授权管理员" title="授权管理员">${icon("plus")}</button>
           </form>
-          ${rows(groupAdmins, "admins", item => `${item.user_id}`, "user_id", "该群暂无管理员")}
+          ${rows(groupAdmins, "admins", item => item.display_name ? `${item.display_name} · ${item.user_id}` : `${item.user_id}`, "user_id", "该群暂无管理员")}
         </section>
         <section class="settings-section">
           ${sectionHead("全局封禁")}

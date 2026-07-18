@@ -18,6 +18,7 @@ from bot.db.models import (
     Admin,
     AuthorizedGroup,
     Group,
+    GroupMember,
     GroupPermanentMemory,
     KeywordReply,
     ModerationRule,
@@ -351,6 +352,42 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(user_id=99),
         )
         self.assertEqual((await listed.json())["scheduled_messages"], [])
+
+    async def test_group_admin_list_includes_display_names(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    AuthorizedGroup(group_id=-505, authorized_by=42),
+                    Group(id=-505, title="Names Group", settings={}),
+                    Admin(group_id=-505, user_id=99, role="admin"),
+                    Admin(group_id=-505, user_id=100, role="admin"),
+                    Admin(group_id=-505, user_id=101, role="admin"),
+                    GroupMember(
+                        group_id=-505, user_id=99, full_name="张三", username="zhang"
+                    ),
+                    GroupMember(group_id=-505, user_id=100, full_name="", username="lisi"),
+                ]
+            )
+            await session.commit()
+        self.bot.get_chat_member = AsyncMock(
+            return_value=SimpleNamespace(
+                user=SimpleNamespace(full_name="王五", username="wangwu")
+            )
+        )
+
+        listed = await self.client.get(
+            "/api/v1/groups/-505/admins",
+            headers=self._headers(),
+        )
+        self.assertEqual(listed.status, 200)
+        admins = {
+            item["user_id"]: item["display_name"]
+            for item in (await listed.json())["admins"]
+        }
+        self.assertEqual(admins[99], "张三")
+        self.assertEqual(admins[100], "@lisi")
+        self.assertEqual(admins[101], "王五")
+        self.bot.get_chat_member.assert_awaited_once_with(-505, 101)
 
     async def test_group_admin_can_manage_group_bans_without_global_access(self) -> None:
         async with self.session_factory() as session:

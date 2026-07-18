@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.config import Settings
 from bot.handlers import commands
+from bot.services import authz
 from bot.utils.telegram import configured_auto_delete_seconds
 
 
@@ -28,6 +29,18 @@ class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
             await commands._answer(SimpleNamespace(), settings, "hello", auto_delete_seconds=0)
 
         self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
+
+    async def test_authz_notices_honor_per_category_seconds(self) -> None:
+        settings = _settings(auto_delete_seconds=0)
+        settings.bot.auto_delete_category_seconds = {"management": 45}
+        sent = SimpleNamespace(chat=SimpleNamespace(id=-1), message_id=5)
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete"
+        ) as schedule_mock:
+            authz._schedule_auto_delete(sent, settings)
+
+        schedule_mock.assert_called_once_with(sent, 45)
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(

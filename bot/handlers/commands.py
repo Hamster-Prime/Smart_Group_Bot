@@ -745,7 +745,6 @@ async def cmd_settings(
             message,
             settings,
             "<b>设置中心</b>\n请私聊机器人后使用 /settings。",
-            auto_delete_seconds=0,
             retry_tls_record_error=True,
         )
         return
@@ -822,7 +821,6 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
                 "/lm：查看永久记忆\n"
                 "/lm add &lt;内容&gt;\n"
                 "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;",
-                auto_delete_seconds=0,
             )
             return
         request_text = f"添加一条永久记忆：{content}"
@@ -835,7 +833,6 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
                 settings,
                 "<b>/lm replace 用法</b>\n"
                 "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;",
-                auto_delete_seconds=0,
             )
             return
         request_text = f"把永久记忆 {parts[0].strip()} 改成 {parts[1].strip()}"
@@ -848,7 +845,6 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
             "/lm add &lt;内容&gt;\n"
             "/lm replace &lt;#ID或关键词&gt; =&gt; &lt;新内容&gt;\n\n"
             "删除请直接使用 /lm 列表里的按钮。",
-            auto_delete_seconds=0,
         )
         return
 
@@ -865,7 +861,7 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
             chat_id=message.chat.id,
             current_user_text=request_text,
         )
-    await _answer(message, settings, result.summary, auto_delete_seconds=0)
+    await _answer(message, settings, result.summary)
 
 
 @router.callback_query(F.data.startswith("lml:"))
@@ -975,7 +971,6 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>最高管理员命令（群内）</b>\n"
             "4. /av enable（启用本群 AV 查询）\n"
             "5. /av disable（停用本群 AV 查询）",
-            auto_delete_seconds=0,
         )
         return
 
@@ -1010,7 +1005,6 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 开关</b>\n"
             f"<b>群ID</b>: {message.chat.id}\n"
             f"<b>结果</b>: {state_text}（{status_line}）",
-            auto_delete_seconds=0,
         )
         return
 
@@ -1021,13 +1015,12 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                 message,
                 settings,
                 "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
-                auto_delete_seconds=0,
             )
             return
 
     svc = AVSearchService(settings)
     if not svc.enabled:
-        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。", auto_delete_seconds=0)
+        await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。")
         return
 
     owner_user_id = message.from_user.id if message.from_user else 0
@@ -1064,7 +1057,6 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
                         message,
                         settings,
                         "<b>AV 查询</b>\n详情发送失败，请稍后重试。",
-                        auto_delete_seconds=0,
                     )
                 return
 
@@ -1077,7 +1069,6 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "<b>AV 查询结果</b>\n"
             f"关键词: {html.escape(query)}\n"
             "未找到匹配内容。",
-            auto_delete_seconds=0,
         )
         return
 

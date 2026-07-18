@@ -19,6 +19,7 @@ from bot.db.models import (
     Admin,
     AuthorizedGroup,
     Group,
+    GroupMember,
     GroupPermanentMemory,
     KeywordReply,
     ModerationExemption,
@@ -836,17 +837,49 @@ def register_settings_routes(
             await session.commit()
         return _success_response({"deleted": row is not None})
 
+    async def _lookup_admin_display_name(group_id: int, user_id: int) -> str:
+        get_member = getattr(bot, "get_chat_member", None)
+        if not callable(get_member):
+            return ""
+        try:
+            member = await asyncio.wait_for(get_member(group_id, user_id), timeout=3.0)
+        except Exception:
+            return ""
+        member_user = getattr(member, "user", None)
+        full_name = str(getattr(member_user, "full_name", None) or "").strip()
+        username = str(getattr(member_user, "username", None) or "").strip()
+        return full_name or (f"@{username}" if username else "")
+
     @authenticated
     async def list_group_admins_api(request: web.Request, _user: Any) -> web.Response:
         group_id = int(request.match_info["id"])
         async with session_factory() as session:
-            rows = (await session.scalars(
-                select(Admin).where(Admin.group_id == group_id).order_by(Admin.id)
+            rows = (await session.execute(
+                select(Admin, GroupMember.full_name, GroupMember.username)
+                .outerjoin(
+                    GroupMember,
+                    (GroupMember.group_id == Admin.group_id)
+                    & (GroupMember.user_id == Admin.user_id),
+                )
+                .where(Admin.group_id == group_id)
+                .order_by(Admin.id)
             )).all()
-        return _success_response({"admins": [
-            {"user_id": int(row.user_id), "role": str(row.role or "admin")}
-            for row in rows
-        ]})
+        admins = []
+        for row, full_name, username in rows:
+            display_name = str(full_name or "").strip()
+            if not display_name:
+                clean_username = str(username or "").strip()
+                display_name = f"@{clean_username}" if clean_username else ""
+            if not display_name:
+                display_name = await _lookup_admin_display_name(
+                    group_id, int(row.user_id)
+                )
+            admins.append({
+                "user_id": int(row.user_id),
+                "role": str(row.role or "admin"),
+                "display_name": display_name,
+            })
+        return _success_response({"admins": admins})
 
     @authenticated
     async def create_group_admin_api(request: web.Request, _user: Any) -> web.Response:

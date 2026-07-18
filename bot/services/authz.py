@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 from aiogram.types import Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,25 +9,16 @@ from bot.db.models import Admin, AuthorizedGroup
 
 
 def _schedule_auto_delete(sent: Message | None, settings: Settings) -> None:
-    categories = {
-        str(item or "").strip().lower()
-        for item in getattr(settings.bot, "auto_delete_categories", [])
-    }
-    seconds = int(getattr(settings.bot, "auto_delete_seconds", 0) or 0)
-    if not sent or seconds <= 0 or "management" not in categories:
-        return
+    # Deferred import: bot.utils.telegram imports is_super_admin_user_id from
+    # this module, so a top-level import would be circular.
+    from bot.utils.telegram import (
+        configured_auto_delete_seconds,
+        schedule_message_auto_delete,
+    )
 
-    async def _delete_later() -> None:
-        await asyncio.sleep(seconds)
-        try:
-            await sent.delete()
-        except Exception:
-            pass
-
-    try:
-        asyncio.create_task(_delete_later(), name=f"auto-delete-authz:{sent.chat.id}:{sent.message_id}")
-    except RuntimeError:
-        pass
+    schedule_message_auto_delete(
+        sent, configured_auto_delete_seconds(settings, "management")
+    )
 
 
 def is_super_admin_user_id(user_id: int, settings: Settings) -> bool:
