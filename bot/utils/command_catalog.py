@@ -41,6 +41,7 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/unmute all", "/unmute all", "恢复本群正常回复", "管理员想退出全群静默回复模式", "群审核管理"),
     CommandEntry("/proactive", "/proactive on|off|status", "控制主动话题开关和状态", "管理员要控制 bot 主动开话题", "群审核管理"),
     CommandEntry("/mimic", "回复用户后 /mimic，或 /mimic status|off", "学习指定用户的说话风格并应用", "管理员想让 bot 模仿某个群友说话", "群审核管理"),
+    CommandEntry("/compact", "/compact", "立即把本群临时对话历史压缩进背景摘要", "管理员想手动压缩上下文、清理临时对话历史", "群审核管理"),
     CommandEntry("/authgroup", "/authgroup <群ID> 或群内直接 /authgroup", "授权群组", "最高管理员要授权新群", "最高管理员命令"),
     CommandEntry("/unauthgroup", "/unauthgroup <群ID> 或群内直接 /unauthgroup", "撤销群组授权", "最高管理员要取消群授权", "最高管理员命令"),
     CommandEntry("/authlist", "/authlist", "查看授权群组列表", "最高管理员要查看所有已授权群", "最高管理员命令"),
@@ -84,7 +85,8 @@ def build_help_text() -> str:
         "/unmute：回复目标用户消息后恢复其回复\n"
         "/unmute all：恢复本群正常回复\n"
         "/proactive on|off|status：主动话题开关/状态\n"
-        "/mimic：回复用户后学习其说话风格（status 查看 / off 停止）\n\n"
+        "/mimic：回复用户后学习其说话风格（status 查看 / off 停止）\n"
+        "/compact：立即压缩本群临时对话历史进背景摘要\n\n"
         "<b>最高管理员命令</b>\n"
         "/authgroup / unauthgroup / authlist\n"
         "/banlist：查看全局封禁名单\n"

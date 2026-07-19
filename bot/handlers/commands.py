@@ -939,6 +939,43 @@ async def cmd_lm(
     await _answer(message, settings, result.summary)
 
 
+@router.message(Command("compact"))
+async def cmd_compact(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await ensure_group_admin_permission(message, session, settings):
+        return
+    # Authorization queries have completed. Release their connection before
+    # the compression LLM call, typing heartbeat or Telegram send.
+    await session.commit()
+    if not message.chat or message.chat.type not in ("group", "supergroup"):
+        await _answer(message, settings, "<b>上下文压缩</b>\n请在目标群内使用 /compact。")
+        return
+
+    memory = memory_holder.get()
+    async with typing_action(message, enabled=settings.bot.enable_typing):
+        result = await memory.compact_now(message.chat.id)
+
+    status = str(result.get("status", ""))
+    if status == "ok":
+        await _answer(
+            message,
+            settings,
+            "<b>上下文压缩完成</b>\n"
+            f"已把 {int(result.get('compacted_messages', 0))} 条临时对话历史压缩进背景摘要。",
+        )
+    elif status == "empty":
+        await _answer(message, settings, "<b>上下文压缩</b>\n当前群没有可压缩的临时对话历史。")
+    elif status == "db_locked":
+        await _answer(message, settings, "<b>上下文压缩失败</b>\n数据库暂时繁忙，历史已保留，请稍后重试。")
+    else:
+        await _answer(message, settings, "<b>上下文压缩失败</b>\n压缩模型未返回摘要，历史已保留，请稍后重试。")
+
+
 @router.callback_query(F.data.startswith("lml:"))
 async def on_memory_list_paging(
     callback: CallbackQuery,

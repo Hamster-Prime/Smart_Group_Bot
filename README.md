@@ -213,6 +213,7 @@ Mini App 群组页可读取并完整编辑 Telegram 当前 `ChatPermissions` 全
 | `/unmute all` | 恢复全群正常回复 |
 | `/proactive on\|off\|status` | 主动话题开关/状态 |
 | `/mimic [status\|off]` | 回复用户后学习其说话风格 |
+| `/compact` | 立即把本群临时对话历史压缩进背景摘要 |
 
 ### 最高管理员命令
 

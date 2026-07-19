@@ -544,6 +544,120 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 await engine.dispose()
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    async def test_compact_now_forces_compaction_below_token_budget(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=200000, max_output_tokens=512),
+                _SummaryStubLLM(),
+                session_factory=session_factory,
+            )
+            group_id = 12345
+            other_group_id = 67890
+
+            for idx in range(3):
+                await memory.add_message(
+                    group_id,
+                    "user",
+                    f"manual-compact-source-{idx}",
+                    message_id=f"manual-{idx}",
+                )
+            await memory.add_message(
+                other_group_id,
+                "user",
+                "other-group-history",
+                message_id="other-1",
+            )
+
+            # Way below the automatic budget, so only compact_now can trigger this.
+            self.assertFalse(await memory.compact_if_needed(group_id))
+
+            result = await memory.compact_now(group_id)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["compacted_messages"], 3)
+            self.assertEqual(memory.get_history(group_id), [])
+            self.assertEqual(await memory._get_summary(group_id), "压缩后摘要")
+
+            # Other groups are untouched.
+            self.assertEqual(
+                [item["content"] for item in memory.get_history(other_group_id)],
+                ["other-group-history"],
+            )
+
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector).order_by(MessageVector.id.asc())
+                        )
+                    ).scalars()
+                )
+            self.assertEqual(
+                [(row.group_id, row.content) for row in rows],
+                [(other_group_id, "other-group-history")],
+            )
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_compact_now_reports_empty_history(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _SummaryStubLLM(),
+                session_factory=session_factory,
+            )
+
+            result = await memory.compact_now(12345)
+            self.assertEqual(result, {"status": "empty", "compacted_messages": 0})
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_compact_now_preserves_history_when_llm_returns_empty(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _StubLLM(),
+                session_factory=session_factory,
+            )
+            group_id = 12345
+            await memory.add_message(
+                group_id,
+                "user",
+                "must-survive-manual-compact",
+                message_id="manual-preserved",
+            )
+
+            result = await memory.compact_now(group_id)
+            self.assertEqual(result, {"status": "llm_empty", "compacted_messages": 0})
+            self.assertEqual(
+                [item["content"] for item in memory.get_history(group_id)],
+                ["must-survive-manual-compact"],
+            )
+            self.assertEqual(await memory._get_summary(group_id), "")
+
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector).where(MessageVector.group_id == group_id)
+                        )
+                    ).scalars()
+                )
+            self.assertEqual([row.content for row in rows], ["must-survive-manual-compact"])
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

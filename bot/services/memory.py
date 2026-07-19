@@ -699,57 +699,68 @@ class MemoryService:
             if candidate_tokens < budget_tokens:
                 return False
 
-            history_lines = self._render_compact_history(history)
-            if not history_lines:
-                return False
-
             log.info(
                 "memory context nearing limit: group=%s prompt_tokens=%d/%d -> compact",
                 group_id,
                 candidate_tokens,
                 budget_tokens,
             )
-            old_summary = await self._get_summary(group_id)
-            payload = (
-                "[EXISTING_SUMMARY]\n"
-                f"{old_summary or '(none)'}\n\n"
-                "[NEW_DIALOGUE_FRAGMENT]\n"
-                f"{chr(10).join(history_lines)}\n\n"
-                "Please write an updated Chinese summary that keeps durable facts, preferences, "
-                "agreements, unfinished tasks, and any recent context that still matters."
-            )
-            compressed = (await self.llm.compress(get_prompt("compress"), payload)).strip()
-            if not compressed:
-                log.warning(
-                    "memory compact skipped because compression returned empty: "
-                    "group=%s preserved_messages=%d",
-                    group_id,
-                    len(history),
-                )
-                return False
+            return await self._compress_and_publish_locked(group_id, history) == "ok"
 
-            try:
-                await self._save_summary_and_clear_history(
-                    group_id,
-                    compressed,
-                    message_ids=[str(item.get("message_id") or "") for item in history],
-                )
-            except OperationalError as exc:
-                if not is_database_locked_error(exc):
-                    raise
-                log.warning("memory compact skipped due sqlite lock: group=%s", group_id)
-                return False
-            # add_message only appends, so the snapshot is a prefix of the
-            # working list; keep messages that arrived during the LLM await.
-            self._history[group_id] = self._working(group_id)[len(history):]
-            log.info(
-                "memory context compacted: group=%s cleared_messages=%d kept_messages=%d summary_chars=%d",
+    async def _compress_and_publish_locked(
+        self,
+        group_id: int,
+        history: list[dict[str, Any]],
+    ) -> str:
+        """Compress a history snapshot into the summary; caller holds the lock.
+
+        Returns "ok", "empty", "llm_empty", or "db_locked".
+        """
+        history_lines = self._render_compact_history(history)
+        if not history_lines:
+            return "empty"
+
+        old_summary = await self._get_summary(group_id)
+        payload = (
+            "[EXISTING_SUMMARY]\n"
+            f"{old_summary or '(none)'}\n\n"
+            "[NEW_DIALOGUE_FRAGMENT]\n"
+            f"{chr(10).join(history_lines)}\n\n"
+            "Please write an updated Chinese summary that keeps durable facts, preferences, "
+            "agreements, unfinished tasks, and any recent context that still matters."
+        )
+        compressed = (await self.llm.compress(get_prompt("compress"), payload)).strip()
+        if not compressed:
+            log.warning(
+                "memory compact skipped because compression returned empty: "
+                "group=%s preserved_messages=%d",
                 group_id,
                 len(history),
-                len(self._history[group_id]),
-                len(compressed),
             )
-            return True
+            return "llm_empty"
+
+        try:
+            await self._save_summary_and_clear_history(
+                group_id,
+                compressed,
+                message_ids=[str(item.get("message_id") or "") for item in history],
+            )
+        except OperationalError as exc:
+            if not is_database_locked_error(exc):
+                raise
+            log.warning("memory compact skipped due sqlite lock: group=%s", group_id)
+            return "db_locked"
+        # add_message only appends, so the snapshot is a prefix of the
+        # working list; keep messages that arrived during the LLM await.
+        self._history[group_id] = self._working(group_id)[len(history):]
+        log.info(
+            "memory context compacted: group=%s cleared_messages=%d kept_messages=%d summary_chars=%d",
+            group_id,
+            len(history),
+            len(self._history[group_id]),
+            len(compressed),
+        )
+        return "ok"
 
     async def compact_if_needed(
         self,
@@ -762,6 +773,29 @@ class MemoryService:
             group_id,
             budget_tokens=budget_tokens,
         )
+
+    async def compact_now(self, group_id: int) -> dict[str, Any]:
+        """Force-compact one group's dialogue history regardless of token budget.
+
+        Returns {"status": ..., "compacted_messages": int} where status is one
+        of "ok", "empty" (nothing to compact), "llm_empty" (compression model
+        returned nothing), or "db_locked" (sqlite busy; history preserved).
+        """
+        lock = self._summary_locks.setdefault(group_id, asyncio.Lock())
+        async with lock:
+            history = list(self._working(group_id))
+            if not history:
+                return {"status": "empty", "compacted_messages": 0}
+            log.info(
+                "memory manual compact requested: group=%s messages=%d",
+                group_id,
+                len(history),
+            )
+            status = await self._compress_and_publish_locked(group_id, history)
+            return {
+                "status": status,
+                "compacted_messages": len(history) if status == "ok" else 0,
+            }
 
     def _trim_by_token_budget(
         self,

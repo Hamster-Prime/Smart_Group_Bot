@@ -490,6 +490,95 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             session_factory,
         )
 
+    async def test_compact_command_is_registered_on_router(self) -> None:
+        callbacks = [handler.callback for handler in commands.router.message.handlers]
+
+        self.assertIn(commands.cmd_compact, callbacks)
+
+    async def test_memory_list_paging_callback_stays_registered(self) -> None:
+        callbacks = [handler.callback for handler in commands.router.callback_query.handlers]
+
+        self.assertIn(commands.on_memory_list_paging, callbacks)
+        self.assertIn(commands.on_memory_delete, callbacks)
+
+    async def test_compact_releases_auth_session_before_compaction(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/compact",
+        )
+        settings = _settings()
+        events: list[str] = []
+        session = SimpleNamespace(
+            commit=AsyncMock(side_effect=lambda: events.append("commit"))
+        )
+
+        async def compact_after_commit(_group_id: int) -> dict:
+            self.assertEqual(events, ["commit"])
+            events.append("compact")
+            return {"status": "ok", "compacted_messages": 7}
+
+        fake_memory = SimpleNamespace(compact_now=AsyncMock(side_effect=compact_after_commit))
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.memory_holder.get", return_value=fake_memory),
+            patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await commands.cmd_compact(message, session=session, settings=settings)
+
+        fake_memory.compact_now.assert_awaited_once_with(-10001)
+        self.assertIn("上下文压缩完成", answer_mock.await_args.args[2])
+        self.assertIn("7", answer_mock.await_args.args[2])
+
+    async def test_compact_rejects_private_chat(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123, type="private"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/compact",
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        fake_memory = SimpleNamespace(compact_now=AsyncMock())
+
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.memory_holder.get", return_value=fake_memory),
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await commands.cmd_compact(message, session=session, settings=_settings())
+
+        fake_memory.compact_now.assert_not_awaited()
+        self.assertIn("请在目标群内使用", answer_mock.await_args.args[2])
+
+    async def test_compact_reports_empty_and_failure_states(self) -> None:
+        settings = _settings()
+        for status, expected in (
+            ("empty", "没有可压缩"),
+            ("db_locked", "数据库暂时繁忙"),
+            ("llm_empty", "压缩模型未返回摘要"),
+        ):
+            message = SimpleNamespace(
+                chat=SimpleNamespace(id=-10001, type="supergroup"),
+                from_user=SimpleNamespace(id=123, username="admin"),
+                text="/compact",
+            )
+            session = SimpleNamespace(commit=AsyncMock())
+            fake_memory = SimpleNamespace(
+                compact_now=AsyncMock(return_value={"status": status, "compacted_messages": 0})
+            )
+            with (
+                patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+                patch("bot.handlers.commands.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+                patch("bot.handlers.commands.memory_holder.get", return_value=fake_memory),
+                patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
+                patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+            ):
+                await commands.cmd_compact(message, session=session, settings=settings)
+
+            self.assertIn(expected, answer_mock.await_args.args[2], msg=f"status={status}")
+
     async def test_addrule_uses_rule_manage_skill(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),
