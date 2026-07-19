@@ -5,8 +5,9 @@ non-bot, non-banned join is recorded into an in-memory sliding window per
 group. Reaching the configured threshold within the window triggers a
 lockdown:
 
-- For its duration every new join is kicked immediately (ban + unban, so the
-  member may rejoin after the lockdown ends). No per-join notices are sent —
+- For its duration every new join is removed immediately without banning or
+  deleting message history, so the member may rejoin after the lockdown ends.
+  No per-join notices are sent —
   the group only sees the single raid-protection announcement. The lockdown
   runs for a fixed duration: repelled joins do not extend it (a single
   bouncing account must not be able to lock the group forever), and a raid
@@ -703,8 +704,8 @@ async def remove_raid_challenged_users(
             continue
         await session.commit()
         snapshot["lease_until"] = renewed_lease
-        # A global ban already keeps this account out. kick_member would ban
-        # and immediately unban it, accidentally lifting Telegram enforcement.
+        # A global ban already keeps this account out. Direct removal uses
+        # unban_chat_member and would accidentally lift Telegram enforcement.
         async def preserve_ban() -> bool:
             blocked = await verification_release_blocked_by_ban(
                 session,
@@ -715,7 +716,7 @@ async def remove_raid_challenged_users(
             return blocked
 
         authorized = await is_group_authorized(session, group_id)
-        # End the read transaction before ban/unban HTTP calls. A slow
+        # End the read transaction before the Telegram removal call. A slow
         # Telegram response must not pin a pooled DB connection or SQLite
         # snapshot for the full network timeout.
         await session.commit()
@@ -741,10 +742,8 @@ async def remove_raid_challenged_users(
                 await session.rollback()
             continue
         failed.append(user_id)
-        # Keep the punitive intent durable. kick_member has attempted its
-        # idempotent unban cleanup; if that still failed, the sweeper must retry
-        # the full kick cleanup rather than exposing this as a passable pending
-        # challenge.
+        # Keep the removal intent durable. If Telegram did not confirm it, the
+        # sweeper must retry instead of exposing this as a passable challenge.
     return RaidRemovalResult(
         pending_count=len(records),
         removed_user_ids=tuple(removed),
@@ -1467,7 +1466,7 @@ class RaidGuardService:
         full_name: str,
         now: datetime,
     ) -> bool:
-        """Persist/lease lockdown kick cleanup before Telegram ban+unban."""
+        """Persist/lease lockdown removal before the Telegram request."""
         if not await self._group_authorized(group_id):
             return False
         lease_until = now + timedelta(seconds=TERMINAL_LEASE_SECONDS)

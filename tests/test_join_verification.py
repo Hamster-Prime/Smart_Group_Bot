@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
 
@@ -318,13 +318,22 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(
             restrict_chat_member=AsyncMock(return_value=False),
             ban_chat_member=AsyncMock(return_value=False),
-            unban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=False),
         )
 
         self.assertFalse(await restrict_new_member(bot, -100, 42))
         self.assertFalse(await ban_member(bot, -100, 42))
-        self.assertFalse(await kick_member(bot, -100, 42))
-        bot.unban_chat_member.assert_not_awaited()
+        with patch(
+            "bot.services.join_verification.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            self.assertFalse(await kick_member(bot, -100, 42))
+        self.assertEqual(bot.unban_chat_member.await_count, 3)
+        bot.unban_chat_member.assert_awaited_with(
+            -100,
+            42,
+            only_if_banned=False,
+        )
 
     async def test_ban_response_loss_is_confirmed_from_telegram_state(self) -> None:
         bot = SimpleNamespace(
@@ -333,9 +342,14 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(await ban_member(bot, -100, 44))
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            44,
+            revoke_messages=True,
+        )
         bot.get_chat_member.assert_awaited_once_with(-100, 44)
 
-    async def test_kick_cleanup_preserves_new_durable_ban_policy(self) -> None:
+    async def test_kick_preserves_existing_durable_ban_policy(self) -> None:
         bot = SimpleNamespace(
             ban_chat_member=AsyncMock(return_value=True),
             unban_chat_member=AsyncMock(return_value=True),
@@ -352,6 +366,37 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         )
         preserve_ban.assert_awaited_once()
         bot.unban_chat_member.assert_not_awaited()
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            45,
+            revoke_messages=True,
+        )
+
+    async def test_kick_reenforces_ban_created_during_removal(self) -> None:
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+        )
+        preserve_ban = AsyncMock(side_effect=(False, True))
+
+        self.assertTrue(
+            await kick_member(
+                bot,
+                -100,
+                46,
+                preserve_ban=preserve_ban,
+            )
+        )
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            46,
+            only_if_banned=False,
+        )
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            46,
+            revoke_messages=True,
+        )
 
     async def test_lost_moderation_lease_unbans_when_policy_was_removed(self) -> None:
         bot = SimpleNamespace(
@@ -394,34 +439,26 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
                 preserve_ban=preserve_ban,
             )
         )
-        bot.ban_chat_member.assert_awaited_once_with(-100, 47)
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            47,
+            revoke_messages=True,
+        )
         bot.unban_chat_member.assert_not_awaited()
 
-    async def test_kick_cancellation_still_runs_idempotent_unban(self) -> None:
-        started = asyncio.Event()
-
-        async def slow_ban(*args: object, **kwargs: object) -> bool:
-            del args, kwargs
-            started.set()
-            await asyncio.sleep(60)
-            return True
-
+    async def test_kick_directly_removes_without_ban_or_history_revoke(self) -> None:
         bot = SimpleNamespace(
-            ban_chat_member=AsyncMock(side_effect=slow_ban),
+            ban_chat_member=AsyncMock(),
             unban_chat_member=AsyncMock(return_value=True),
         )
-        task = asyncio.create_task(kick_member(bot, -100, 42))
-        await asyncio.wait_for(started.wait(), timeout=1.0)
-        task.cancel()
 
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-
+        self.assertTrue(await kick_member(bot, -100, 42))
         bot.unban_chat_member.assert_awaited_once_with(
             -100,
             42,
-            only_if_banned=True,
+            only_if_banned=False,
         )
+        bot.ban_chat_member.assert_not_awaited()
 
     async def test_cancellation_during_unban_does_not_cancel_cleanup(self) -> None:
         unban_started = asyncio.Event()
@@ -456,8 +493,9 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         bot.unban_chat_member.assert_awaited_once_with(
             -100,
             43,
-            only_if_banned=True,
+            only_if_banned=False,
         )
+        bot.ban_chat_member.assert_not_awaited()
 
     async def test_stubborn_telegram_children_are_capacity_limited_and_boundedly_drained(
         self,
@@ -1541,7 +1579,11 @@ class JoinTriggersVerificationTests(_DbTestCase):
                 await membership.on_member_join(event, session=session, settings=_settings())
             await session.commit()
 
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 914)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                914,
+                revoke_messages=True,
+            )
             event.bot.restrict_chat_member.assert_not_awaited()
             self.assertIsNone(await get_join_verification(session, -100, 914))
 
@@ -1555,7 +1597,11 @@ class JoinTriggersVerificationTests(_DbTestCase):
 
             await membership.on_member_join(event, session=session, settings=_settings())
 
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 915)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                915,
+                revoke_messages=True,
+            )
             event.bot.restrict_chat_member.assert_not_awaited()
 
     async def test_locally_banned_rejoin_is_durably_rebanned(self) -> None:
@@ -1577,7 +1623,11 @@ class JoinTriggersVerificationTests(_DbTestCase):
                 settings=_settings(),
             )
 
-        event.bot.ban_chat_member.assert_awaited_once_with(-100, 930)
+        event.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            930,
+            revoke_messages=True,
+        )
         event.bot.get_chat.assert_not_awaited()
         event.bot.restrict_chat_member.assert_not_awaited()
 
@@ -3126,13 +3176,16 @@ class SweeperTests(_DbTestCase):
         swept = await sweeper.sweep_once()
 
         self.assertEqual(swept, 2)
-        bot.ban_chat_member.assert_has_awaits(
-            [
-                call(-100, 930),
-                call(-100, 932),
-            ]
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            930,
+            only_if_banned=False,
         )
-        bot.unban_chat_member.assert_awaited_once_with(-100, 930, only_if_banned=True)
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            932,
+            revoke_messages=True,
+        )
         self.assertEqual(bot.edit_message_text.await_count, 2)
         finalized = {
             item.kwargs["message_id"]: item.kwargs["text"]
@@ -3345,7 +3398,12 @@ class SweeperTests(_DbTestCase):
         )
 
         self.assertEqual(await sweeper.sweep_once(), 1)
-        bot.ban_chat_member.assert_awaited_once_with(-100, 934)
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            934,
+            only_if_banned=False,
+        )
+        bot.ban_chat_member.assert_not_awaited()
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 934))
             hcaptcha_record = await get_join_verification(session, -100, 935)

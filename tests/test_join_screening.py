@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 from bot.db.engine import init_db
 from bot.db.models import Group, ModerationRule, UserWarning
@@ -314,7 +314,11 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
                 await membership.on_member_join(event, session=session, settings=self._settings())
             await session.commit()
 
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 901)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                901,
+                revoke_messages=True,
+            )
             event.bot.send_message.assert_awaited_once()
             self.assertTrue(await is_globally_banned(session, 901))
             row = await get_global_ban(session, 901)
@@ -466,7 +470,11 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await membership.on_member_join(event, session=session, settings=self._settings())
 
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 903)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                903,
+                revoke_messages=True,
+            )
             fake_moderation.check_rules.assert_not_awaited()
             event.bot.get_chat.assert_not_awaited()
 
@@ -496,7 +504,11 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await membership.on_member_join(event, session=session, settings=settings)
 
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 906)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                906,
+                revoke_messages=True,
+            )
             event.bot.send_message.assert_awaited_once()
             # The ban notice ("审核通知") must inherit the moderation retention.
             schedule_mock.assert_awaited_once_with(sent, 42)
@@ -724,7 +736,11 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(warning)
             self.assertTrue(warning.is_banned)
-            message.bot.ban_chat_member.assert_awaited_once_with(-100, 777)
+            message.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                777,
+                revoke_messages=True,
+            )
             self.assertIn("本群封禁完成", answer_mock.await_args.args[2])
 
 
@@ -783,7 +799,11 @@ class GlobalBanMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         handler.assert_not_awaited()
         self.assertIsNone(result)
         event.delete.assert_awaited_once()
-        event.bot.ban_chat_member.assert_awaited_once_with(-100, 666)
+        event.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            666,
+            revoke_messages=True,
+        )
 
     async def test_local_ban_retries_any_next_message_until_telegram_confirms(self) -> None:
         from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
@@ -825,7 +845,13 @@ class GlobalBanMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             reset_update_completion(token)
         self.assertFalse(successful_receipt.deferred)
         handler.assert_not_awaited()
-        self.assertEqual(event.bot.ban_chat_member.await_count, 2)
+        self.assertEqual(
+            event.bot.ban_chat_member.await_args_list,
+            [
+                call(-100, 667, revoke_messages=True),
+                call(-100, 667, revoke_messages=True),
+            ],
+        )
 
     async def test_normal_user_message_passes_through(self) -> None:
         from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware

@@ -448,7 +448,11 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={"user_id": 7001},
         )
         self.assertEqual(created.status, 200)
-        self.bot.ban_chat_member.assert_awaited_once_with(-502, 7001)
+        self.bot.ban_chat_member.assert_awaited_once_with(
+            -502,
+            7001,
+            revoke_messages=True,
+        )
 
         listed = await self.client.get(
             "/api/v1/groups/-502/bans",
@@ -483,6 +487,11 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={"user_id": 7002},
         )
         self.assertEqual(response.status, 502)
+        self.bot.ban_chat_member.assert_awaited_once_with(
+            -503,
+            7002,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             row = await session.scalar(select(UserWarning).where(
                 UserWarning.group_id == -503,

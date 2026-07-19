@@ -489,7 +489,11 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(screen.await_count, 2)
         self.handler.assert_awaited_once_with(clean_event, {"settings": _settings()})
         changed_event.delete.assert_awaited_once()
-        changed_event.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
+        changed_event.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
 
 
 class ProfileScreenConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -572,7 +576,11 @@ class ProfileScreenConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         screen.assert_awaited_once()
         for event in events:
             event.delete.assert_awaited_once()
-            event.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                42,
+                revoke_messages=True,
+            )
 
         async with self.session_factory() as session:
             row = await get_global_ban(session, 42)

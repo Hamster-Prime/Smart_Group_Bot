@@ -710,9 +710,13 @@ class PatrolTimeoutTests(_DbTestCase):
         handled = await sweeper.sweep_once()
         self.assertEqual(handled, 1)
 
-        # Kick = ban + unban; no group-ban row, no permanent global ban.
-        bot.ban_chat_member.assert_awaited_once_with(-100, 80)
-        bot.unban_chat_member.assert_awaited_once_with(-100, 80, only_if_banned=True)
+        # Direct removal preserves history and creates no durable ban.
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            80,
+            only_if_banned=False,
+        )
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 80))
             warning = await session.scalar(

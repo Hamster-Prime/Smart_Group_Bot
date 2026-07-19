@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from sqlalchemy import select
 
@@ -226,7 +226,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         await self._invoke(callback)
 
-        callback.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
+        callback.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
             self.assertEqual(violation.action_taken, "warn_direct")
@@ -256,6 +260,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         await self._invoke(callback)
 
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
         bot.get_chat_member.assert_awaited_once_with(-100, 42)
         async with self.session_factory() as session:
             warning = await session.scalar(
@@ -283,6 +292,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         await self._invoke(callback)
 
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
             self.assertEqual(violation.action_taken, "ban_warning_direct")
@@ -326,7 +340,13 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         third = self._callback("ban", violation_id, bot=bot)
         await self._invoke(third)
 
-        self.assertEqual(bot.ban_chat_member.await_count, 2)
+        self.assertEqual(
+            bot.ban_chat_member.await_args_list,
+            [
+                call(-100, 42, revoke_messages=True),
+                call(-100, 42, revoke_messages=True),
+            ],
+        )
         self.assertIn("执行过", third.answer.await_args.args[0])
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
@@ -363,6 +383,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         await self._invoke(callback)
 
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
             warning = await session.scalar(
@@ -832,7 +857,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         await self._invoke(callback)
 
         # Action still applied; the notice rewrite is simply skipped.
-        callback.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
+        callback.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
         callback.bot.edit_message_text.assert_not_awaited()
 
 

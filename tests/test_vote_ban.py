@@ -299,7 +299,11 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=edit_without_db_lease
             )
             await group.on_vote_ban_action(callback, self.settings, session=session)
-        callback.bot.ban_chat_member.assert_awaited_once_with(-100, 555)
+        callback.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            555,
+            revoke_messages=True,
+        )
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("已封禁", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
@@ -393,6 +397,11 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 bot, session, group_id=-100, target_user_id=555
             )
         self.assertTrue(banned)
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            555,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             warning = await session.scalar(
                 select(UserWarning).where(
@@ -434,7 +443,11 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 record=record,
             )
         self.assertEqual(status, "passed")
-        bot.ban_chat_member.assert_awaited_once_with(-100, 555)
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            555,
+            revoke_messages=True,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             warning = await session.scalar(

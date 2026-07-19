@@ -544,8 +544,12 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result.removed_user_ids, (79,))
-        bot.ban_chat_member.assert_awaited_once()
-        bot.unban_chat_member.assert_awaited_once()
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            79,
+            only_if_banned=False,
+        )
 
 
 class DetectionTests(_DbTestCase):
@@ -721,8 +725,12 @@ class DetectionTests(_DbTestCase):
         bot.unban_chat_member.reset_mock()
 
         self.assertTrue(await self._join(service, 99))
-        bot.ban_chat_member.assert_awaited_once_with(-100, 99)
-        bot.unban_chat_member.assert_awaited_once_with(-100, 99, only_if_banned=True)
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            99,
+            only_if_banned=False,
+        )
         # No extra notice during lockdown: only the original announcement.
         bot.send_message.assert_not_awaited()
         async with self.session_factory() as session:
@@ -766,7 +774,12 @@ class DetectionTests(_DbTestCase):
 
         bot.send_message.reset_mock()
         self.assertTrue(await self._join(service, 99))
-        bot.ban_chat_member.assert_awaited_once_with(-100, 99)
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            99,
+            only_if_banned=False,
+        )
         self.assertTrue(await service.disable_manual_lockdown(-100))
         self.assertFalse(service.lockdown_active(-100))
         self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
@@ -914,9 +927,10 @@ class DetectionTests(_DbTestCase):
         service, bot = self._service()
         for user_id in (1, 2, 3):
             await self._join(service, user_id)
-        bot.ban_chat_member.side_effect = Exception("flood wait")
+        bot.unban_chat_member.side_effect = Exception("flood wait")
         # Kick failed: the join must fall through to the normal pipeline.
         self.assertFalse(await self._join(service, 99))
+        bot.ban_chat_member.assert_not_awaited()
 
     async def test_lockdown_existing_non_raid_challenge_falls_through(self) -> None:
         service, bot = self._service()
@@ -1201,8 +1215,15 @@ class CallbackTests(_DbTestCase):
                     settings=_settings(),
                 )
 
-        self.assertEqual(callback.bot.ban_chat_member.await_count, 2)
+        callback.bot.ban_chat_member.assert_not_awaited()
         self.assertEqual(callback.bot.unban_chat_member.await_count, 2)
+        for user_id, await_call in zip(
+            (73, 74),
+            callback.bot.unban_chat_member.await_args_list,
+            strict=True,
+        ):
+            self.assertEqual(await_call.args, (-100, user_id))
+            self.assertEqual(await_call.kwargs, {"only_if_banned": False})
         callback.bot.edit_message_reply_markup.assert_awaited_once_with(
             chat_id=-100,
             message_id=777,
@@ -1213,11 +1234,11 @@ class CallbackTests(_DbTestCase):
             self.assertIsNone(await get_join_verification(session, -100, 73))
             self.assertIsNone(await get_join_verification(session, -100, 74))
 
-    async def test_cancelled_bulk_remove_cleans_ambiguous_ban_and_keeps_lease(self) -> None:
+    async def test_cancelled_bulk_remove_keeps_lease(self) -> None:
         await self._add_raid_record(76)
         callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
 
-        async def cancelled_ban(*_args, **_kwargs):
+        async def cancelled_remove(*_args, **_kwargs):
             async with self.session_factory() as check_session:
                 row = await get_join_verification(check_session, -100, 76)
                 self.assertIsNotNone(row)
@@ -1225,7 +1246,7 @@ class CallbackTests(_DbTestCase):
                 self.assertIsNotNone(row.lease_until)
             raise asyncio.CancelledError()
 
-        callback.bot.ban_chat_member.side_effect = cancelled_ban
+        callback.bot.unban_chat_member.side_effect = cancelled_remove
         with patch(
             "bot.handlers.membership.is_group_admin_or_higher",
             new=AsyncMock(return_value=True),
@@ -1238,11 +1259,10 @@ class CallbackTests(_DbTestCase):
                         settings=_settings(),
                     )
 
-        # Cancellation does not prove that Telegram failed to apply the ban.
-        # The kick helper must therefore issue an idempotent unban while the
-        # durable enforcing lease remains available for a later retry.
+        # A cancelled direct removal leaves the durable enforcing lease for retry.
+        callback.bot.ban_chat_member.assert_not_awaited()
         callback.bot.unban_chat_member.assert_awaited_once_with(
-            -100, 76, only_if_banned=True
+            -100, 76, only_if_banned=False
         )
         async with self.session_factory() as session:
             row = await get_join_verification(session, -100, 76)
@@ -1335,7 +1355,8 @@ class CallbackTests(_DbTestCase):
 class TimeoutTests(_DbTestCase):
     async def test_expired_challenge_of_banned_member_is_not_kicked(self) -> None:
         # Screening global-banned the member after the raid challenge was
-        # issued; the sweeper must NOT kick (ban+unban would lift the ban).
+        # issued; the sweeper must NOT remove it because direct removal uses
+        # unban_chat_member and would lift the ban.
         from bot.services.join_screening import add_global_ban
 
         bot = _bot_mock()
@@ -1386,9 +1407,13 @@ class TimeoutTests(_DbTestCase):
         handled = await sweeper.sweep_once()
         self.assertEqual(handled, 1)
 
-        # Kick = ban + unban; no group-ban row.
-        bot.ban_chat_member.assert_awaited_once_with(-100, 80)
-        bot.unban_chat_member.assert_awaited_once_with(-100, 80, only_if_banned=True)
+        # Direct removal preserves history and creates no group-ban row.
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            80,
+            only_if_banned=False,
+        )
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 80))
             warning = await session.scalar(

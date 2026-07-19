@@ -888,7 +888,11 @@ async def apply_vote_ban(
         )
         return False
     try:
-        banned = await bot.ban_chat_member(int(group_id), int(target_user_id))
+        banned = await bot.ban_chat_member(
+            int(group_id),
+            int(target_user_id),
+            revoke_messages=True,
+        )
         if banned is False:
             raise RuntimeError("Telegram returned false")
     except Exception:

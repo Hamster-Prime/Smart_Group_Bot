@@ -6,7 +6,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 from aiogram import Bot, Dispatcher
 from sqlalchemy import func, select, update
@@ -162,7 +162,14 @@ class ModerationDurableRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(violation.ban_enforced)
             self.assertEqual(audit_count, 1)
 
-        self.assertEqual(telegram.ban_chat_member.await_count, 3)
+        self.assertEqual(
+            telegram.ban_chat_member.await_args_list,
+            [
+                call(-100, 42, revoke_messages=True),
+                call(-100, 42, revoke_messages=True),
+                call(-100, 42, revoke_messages=True),
+            ],
+        )
         downstream.assert_not_awaited()
         await queue.stop()
 

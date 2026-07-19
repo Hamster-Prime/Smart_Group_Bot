@@ -343,6 +343,11 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("崩溃恢复工单", text)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            -10001,
+            456,
+            revoke_messages=True,
+        )
         delete_record.assert_not_awaited()
         delete_prompts.assert_not_awaited()
 
@@ -402,6 +407,11 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("本群封禁完成", text)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            -10001,
+            456,
+            revoke_messages=True,
+        )
         mark_banned.assert_awaited_once()
         delete_record.assert_awaited_once_with(session, -10001, 456)
         delete_prompts.assert_awaited_once_with(message.bot, {(-10001, 322)})

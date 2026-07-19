@@ -378,7 +378,11 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.handlers.group.answer_with_auto_delete", new=answer):
             message = await self._run(moderation_service=moderation)
 
-        message.bot.ban_chat_member.assert_awaited_once_with(GROUP_ID, BOT_ID)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            GROUP_ID,
+            BOT_ID,
+            revoke_messages=True,
+        )
         self.assertEqual(moderation.record_violation.await_args.args[4], "ban_applied")
 
     async def test_high_confidence_ban_rule_bans_bot(self) -> None:
@@ -398,7 +402,11 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             message = await self._run(moderation_service=moderation)
 
         message.delete.assert_awaited_once()
-        message.bot.ban_chat_member.assert_awaited_once_with(GROUP_ID, BOT_ID)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            GROUP_ID,
+            BOT_ID,
+            revoke_messages=True,
+        )
         self.assertEqual(moderation.record_violation.await_args.args[4], "bot_ban")
 
     async def test_low_confidence_ban_rule_takes_counted_path(self) -> None:

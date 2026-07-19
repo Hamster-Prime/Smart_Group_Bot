@@ -488,7 +488,11 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(moderation.record_violation.await_args.args[4], "ban_warning")
         self.assertEqual(violation_event.action_taken, "ban_applied")
-        message.bot.ban_chat_member.assert_awaited_once_with(-10001, 42)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            -10001,
+            42,
+            revoke_messages=True,
+        )
         self.assertEqual(
             answer.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
             "mact:ban:655",
@@ -535,6 +539,11 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(message._test_session.execute.await_count, 0)
         self.assertEqual(message._test_session.commit.await_count, 4)
+        message.bot.ban_chat_member.assert_awaited_once_with(
+            -10001,
+            42,
+            revoke_messages=True,
+        )
         self.assertIn("封禁结果未确认", answer.await_args.args[1])
         self.assertTrue(receipt.deferred)
         self.assertFalse(await receipt.wait())
