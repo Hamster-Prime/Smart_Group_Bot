@@ -4,7 +4,13 @@ import logging
 from urllib.parse import urlparse
 
 from bot.services.skills.base import SkillContext, SkillRunResult
-from bot.services.skills.platform_common import fetch_text, parse_html_summary
+from bot.services.skills.platform_common import (
+    ResponseTooLargeError,
+    UnsafeUrlError,
+    UnsupportedContentTypeError,
+    fetch_text,
+    parse_html_summary,
+)
 from bot.utils.security import clean_multiline_text, clean_text
 
 log = logging.getLogger(__name__)
@@ -26,7 +32,14 @@ class WebFetchSkill:
     def _valid_url(url: str) -> bool:
         try:
             p = urlparse(url)
-            return p.scheme in {"http", "https"} and bool(p.netloc)
+            _ = p.port
+            return (
+                p.scheme.lower() in {"http", "https"}
+                and bool(p.netloc)
+                and bool(p.hostname)
+                and p.username is None
+                and p.password is None
+            )
         except Exception:
             return False
 
@@ -57,6 +70,17 @@ class WebFetchSkill:
                 headers=headers,
                 timeout_sec=15.0,
                 allow_redirects=True,
+                allowed_content_types=(
+                    "text/html",
+                    "application/xhtml+xml",
+                    "text/plain",
+                    "application/json",
+                    "application/xml",
+                    "text/xml",
+                ),
+                max_response_bytes=1024 * 1024,
+                max_decoded_bytes=2 * 1024 * 1024,
+                max_redirects=4,
             )
             if status >= 400:
                 return SkillRunResult(
@@ -87,6 +111,35 @@ class WebFetchSkill:
                     "title": title,
                     "content": content,
                 },
+            )
+        except UnsafeUrlError as exc:
+            log.warning("webfetch rejected unsafe URL: %s", exc)
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="该地址不可安全访问",
+                error=str(exc) or "unsafe_url",
+            )
+        except ResponseTooLargeError as exc:
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="网页响应体过大，已停止抓取",
+                error=str(exc) or "response_too_large",
+            )
+        except UnsupportedContentTypeError as exc:
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="该链接不是可读取的文本网页",
+                error=str(exc) or "unsupported_content_type",
+            )
+        except TimeoutError:
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="网页抓取超时",
+                error="timeout",
             )
         except Exception as e:
             log.exception("webfetch failed")

@@ -7,8 +7,10 @@ import html
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
+from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
@@ -17,13 +19,86 @@ from aiogram.types import Message
 
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
+from bot.utils.timezone import now_shanghai_naive
+
+if TYPE_CHECKING:
+    from bot.services.telegram_cleanup import TelegramCleanupScheduler
 
 log = logging.getLogger(__name__)
+
+_TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
+_TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
+_UNINITIALIZED_AUTO_DELETE_WARNED = False
+
+
+def _observe_telegram_background_task(task: asyncio.Task[object]) -> None:
+    _TELEGRAM_BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_telegram_background_task(task: asyncio.Task[object]) -> None:
+    """Keep a detached Telegram operation observable until it really exits."""
+
+    _TELEGRAM_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_observe_telegram_background_task)
+
+
+def _schedule_telegram_background_task(
+    awaitable: Awaitable[object],
+    *,
+    name: str,
+) -> None:
+    task = asyncio.create_task(awaitable, name=name)
+    _track_telegram_background_task(task)
+
+
+async def flush_telegram_background_tasks(*, timeout_seconds: float = 2.0) -> None:
+    """Cancel short Telegram helper tasks before closing the Bot session.
+
+    Timer-based deletion is owned by the durable cleanup scheduler and is
+    intentionally not part of this set.
+    """
+
+    tasks = {task for task in _TELEGRAM_BACKGROUND_TASKS if not task.done()}
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=max(0.0, float(timeout_seconds)),
+    )
+    for task in done:
+        _observe_telegram_background_task(task)
+    if pending:
+        log.error(
+            "%d Telegram background tasks ignored shutdown cancellation",
+            len(pending),
+        )
+
+
+def configure_telegram_cleanup_scheduler(
+    scheduler: TelegramCleanupScheduler | None,
+) -> None:
+    """Install/remove the process-wide durable deletion scheduler."""
+
+    global _TELEGRAM_CLEANUP_SCHEDULER, _UNINITIALIZED_AUTO_DELETE_WARNED
+    _TELEGRAM_CLEANUP_SCHEDULER = scheduler
+    if scheduler is not None:
+        _UNINITIALIZED_AUTO_DELETE_WARNED = False
 
 TG_MESSAGE_LIMIT = 4096
 TG_STREAM_SAFE_LIMIT = 3800
 CHAT_SEND_PARALLEL = 3
 TG_TLS_RECORD_RETRY_DELAY = 0.35
+_TYPING_SEND_TIMEOUT_SECONDS = 3.0
+_TELEGRAM_CANCEL_GRACE_SECONDS = 0.25
+_TYPING_WORKER_CANCEL_GRACE_SECONDS = 1.0
 _SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 _MENTION_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_/])@([A-Za-z][A-Za-z0-9_]{4,31})")
 _TG_USER_LINK_HTML_RE = re.compile(
@@ -225,7 +300,7 @@ def attach_delete_button(sent: Message | None) -> None:
             )
 
     try:
-        asyncio.create_task(
+        _schedule_telegram_background_task(
             _attach(),
             name=(
                 "delete-button:"
@@ -266,10 +341,11 @@ def configured_auto_delete_seconds(settings: Settings, category: str) -> int:
 
 
 def schedule_message_auto_delete(sent: Message | None, auto_delete_seconds: int) -> None:
-    """Best-effort delayed delete for outgoing bot messages.
+    """Compatibility-only best-effort cleanup scheduling.
 
     AUTO_DELETE_BUTTON_SENTINEL attaches the inline delete button instead of
-    scheduling a timer (button mode is exclusive with auto-delete).
+    scheduling a timer. Production asynchronous send paths must await
+    :func:`schedule_message_auto_delete_durable` for timer mode.
     """
     delay_seconds = int(auto_delete_seconds or 0)
     if delay_seconds == AUTO_DELETE_BUTTON_SENTINEL:
@@ -278,31 +354,78 @@ def schedule_message_auto_delete(sent: Message | None, auto_delete_seconds: int)
     if not sent or delay_seconds <= 0:
         return
 
-    chat_id = sent.chat.id
-    message_id = sent.message_id
-
-    async def _delete_later() -> None:
-        await asyncio.sleep(delay_seconds)
-        try:
-            await sent.delete()
-        except Exception:
-            log.debug(
-                "auto delete skipped chat_id=%s message_id=%s",
-                chat_id,
-                message_id,
+    chat_id = int(sent.chat.id)
+    message_id = int(sent.message_id)
+    scheduler = _TELEGRAM_CLEANUP_SCHEDULER
+    if scheduler is None:
+        # Imports and isolated utility tests legitimately run without the main
+        # process lifecycle.  A safe no-op is preferable to recreating the old
+        # unbounded per-message sleep tasks.  Production installs the scheduler
+        # before update delivery starts.
+        global _UNINITIALIZED_AUTO_DELETE_WARNED
+        if not _UNINITIALIZED_AUTO_DELETE_WARNED:
+            _UNINITIALIZED_AUTO_DELETE_WARNED = True
+            log.warning(
+                "auto-delete requested before durable scheduler initialization; "
+                "timer jobs are disabled in this process"
             )
+        return
 
-    try:
-        asyncio.create_task(
-            _delete_later(),
-            name=f"auto-delete:{chat_id}:{message_id}",
-        )
-    except RuntimeError:
-        log.debug(
-            "auto delete scheduling failed chat_id=%s message_id=%s",
+    accepted = scheduler.enqueue(
+        chat_id=chat_id,
+        message_id=message_id,
+        due_at=now_shanghai_naive() + timedelta(seconds=delay_seconds),
+    )
+    if not accepted:
+        log.error(
+            "auto delete persistence rejected | chat_id=%s message_id=%s",
             chat_id,
             message_id,
         )
+
+
+async def schedule_message_auto_delete_durable(
+    sent: Message | None,
+    auto_delete_seconds: int,
+) -> bool:
+    """Persist timer cleanup before the enclosing send path returns.
+
+    Button mode has no delayed timer and keeps its existing best-effort markup
+    edit. A ``False`` timer result means the scheduler is unhealthy; callers
+    must not resend the already-delivered Telegram message.
+    """
+
+    delay_seconds = int(auto_delete_seconds or 0)
+    if delay_seconds == AUTO_DELETE_BUTTON_SENTINEL:
+        attach_delete_button(sent)
+        return True
+    if not sent or delay_seconds <= 0:
+        return True
+
+    chat_id = int(sent.chat.id)
+    message_id = int(sent.message_id)
+    scheduler = _TELEGRAM_CLEANUP_SCHEDULER
+    if scheduler is None:
+        global _UNINITIALIZED_AUTO_DELETE_WARNED
+        if not _UNINITIALIZED_AUTO_DELETE_WARNED:
+            _UNINITIALIZED_AUTO_DELETE_WARNED = True
+            log.critical(
+                "durable auto-delete requested before scheduler initialization"
+            )
+        return False
+
+    accepted = await scheduler.enqueue_durable(
+        chat_id=chat_id,
+        message_id=message_id,
+        due_at=now_shanghai_naive() + timedelta(seconds=delay_seconds),
+    )
+    if not accepted:
+        log.error(
+            "durable auto delete persistence rejected | chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+    return accepted
 
 
 def is_reply_target_missing_error(detail: str) -> bool:
@@ -392,7 +515,7 @@ async def answer_with_auto_delete(
                 )
         else:
             raise
-    schedule_message_auto_delete(sent, auto_delete_seconds)
+    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
     return sent
 
 
@@ -404,7 +527,7 @@ async def reply_sticker_with_auto_delete(
     **kwargs: object,
 ) -> Message:
     sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    schedule_message_auto_delete(sent, auto_delete_seconds)
+    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
     return sent
 
 
@@ -420,7 +543,7 @@ async def send_sticker_with_auto_delete(
         sent = await message.answer_sticker(sticker=sticker, **kwargs)
     else:
         sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    schedule_message_auto_delete(sent, auto_delete_seconds)
+    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
     return sent
 
 
@@ -565,7 +688,7 @@ async def ensure_admin(message: Message, settings: Settings | None = None) -> bo
 
     sent = await message.answer("仅群管理员可使用该命令。")
     if settings:
-        schedule_message_auto_delete(
+        await schedule_message_auto_delete_durable(
             sent,
             configured_auto_delete_seconds(settings, "management"),
         )
@@ -749,13 +872,53 @@ async def typing_action(
     chat_id = message.chat.id
 
     async def _send_typing_once() -> bool:
+        task = asyncio.create_task(
+            message.bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+            ),
+            name=f"typing-send:{chat_id}",
+        )
         try:
-            await asyncio.wait_for(
-                message.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
-                timeout=3.0,
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=_TYPING_SEND_TIMEOUT_SECONDS,
             )
-            return True
+            if task in done:
+                await task
+                return True
+            task.cancel()
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=_TELEGRAM_CANCEL_GRACE_SECONDS,
+            )
+            if task in done:
+                _observe_telegram_background_task(task)
+            else:
+                _track_telegram_background_task(task)
+            return False
+        except asyncio.CancelledError:
+            task.cancel()
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=_TELEGRAM_CANCEL_GRACE_SECONDS,
+            )
+            if task in done:
+                _observe_telegram_background_task(task)
+            else:
+                _track_telegram_background_task(task)
+            raise
         except Exception:
+            if not task.done():
+                task.cancel()
+                done, _pending = await asyncio.wait(
+                    {task},
+                    timeout=_TELEGRAM_CANCEL_GRACE_SECONDS,
+                )
+                if task in done:
+                    _observe_telegram_background_task(task)
+                else:
+                    _track_telegram_background_task(task)
             return False
 
     async def _worker() -> None:
@@ -778,8 +941,15 @@ async def typing_action(
         stop.set()
         if not task.done():
             task.cancel()
-        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
-            await asyncio.wait_for(task, timeout=1.0)
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_TYPING_WORKER_CANCEL_GRACE_SECONDS,
+        )
+        if task in done:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        else:
+            _track_telegram_background_task(task)
 
 
 async def send_reply(
@@ -832,7 +1002,10 @@ async def send_reply(
                 else:
                     sent = await message.answer(body, parse_mode=parse_mode)
                 if schedule_cleanup:
-                    schedule_message_auto_delete(sent, auto_delete_seconds)
+                    await schedule_message_auto_delete_durable(
+                        sent,
+                        auto_delete_seconds,
+                    )
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -933,7 +1106,7 @@ async def send_reply(
             if not sent:
                 return False
             ok = await _finalize_stream_format(sent, segment)
-            schedule_message_auto_delete(sent, auto_delete_seconds)
+            await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
             return ok
 
         sent = await _safe_send(
@@ -958,11 +1131,14 @@ async def send_reply(
             # Do not send/delete as fallback to avoid duplicate notifications.
             markdown_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
             if not markdown_ok:
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                await schedule_message_auto_delete_durable(
+                    sent,
+                    auto_delete_seconds,
+                )
                 return False
 
         ok = await _finalize_stream_format(sent, segment)
-        schedule_message_auto_delete(sent, auto_delete_seconds)
+        await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
         return ok
 
     payload = sanitize_outgoing_text((text or "").strip())
@@ -1076,7 +1252,10 @@ async def send_chat_message(
                     parse_mode=current_parse_mode,
                     reply_to_message_id=current_reply_id,
                 )
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                await schedule_message_auto_delete_durable(
+                    sent,
+                    auto_delete_seconds,
+                )
                 return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2

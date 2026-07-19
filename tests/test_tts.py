@@ -1,7 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiogram.exceptions import TelegramBadRequest
 
@@ -192,7 +192,11 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ),
             ) as synth_mock,
-            patch("bot.services.doubao_tts.asyncio.to_thread", new=AsyncMock(return_value=b"ogg-data")),
+            patch.object(
+                service,
+                "_convert_mp3_to_ogg_opus",
+                new=AsyncMock(return_value=b"ogg-data"),
+            ),
         ):
             result = await service.synthesize_voice_payload("test", uid="1")
 
@@ -200,6 +204,54 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.audio_format, "ogg_opus")
         self.assertEqual(result.audio_bytes, b"ogg-data")
         self.assertEqual(synth_mock.await_args.kwargs["audio_format"], "mp3")
+
+    async def test_stream_parser_enforces_wire_and_frame_limits(self) -> None:
+        async def chunks():
+            yield b"abc"
+            yield b"def"
+
+        response = SimpleNamespace(
+            content=SimpleNamespace(iter_any=lambda: chunks())
+        )
+        with (
+            patch("bot.services.doubao_tts._TTS_MAX_WIRE_BYTES", 100),
+            patch("bot.services.doubao_tts._TTS_MAX_JSON_FRAME_CHARS", 4),
+            self.assertRaisesRegex(ValueError, "json frame too large"),
+        ):
+            _ = [
+                item
+                async for item in DoubaoTTSService._iter_json_objects(response)
+            ]
+
+        async def oversized_wire():
+            yield b"12345"
+
+        response.content.iter_any = lambda: oversized_wire()
+        with (
+            patch("bot.services.doubao_tts._TTS_MAX_WIRE_BYTES", 4),
+            self.assertRaisesRegex(ValueError, "response too large"),
+        ):
+            _ = [
+                item
+                async for item in DoubaoTTSService._iter_json_objects(response)
+            ]
+
+    async def test_transcoder_rejects_oversized_output(self) -> None:
+        process = SimpleNamespace(
+            returncode=0,
+            communicate=AsyncMock(return_value=(b"12345", b"")),
+            kill=Mock(),
+            wait=AsyncMock(),
+        )
+        with (
+            patch(
+                "bot.services.doubao_tts.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=process),
+            ),
+            patch("bot.services.doubao_tts._TTS_MAX_AUDIO_BYTES", 4),
+            self.assertRaisesRegex(RuntimeError, "ffmpeg_output_too_large"),
+        ):
+            await DoubaoTTSService._convert_mp3_to_ogg_opus(b"mp3")
 
 
 class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -228,7 +280,9 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
                 service_ready=False,
             ),
         )
-        session.flush.assert_not_awaited()
+        # The helper may have created/refreshed the group row.  Release that
+        # transaction before awaiting the Telegram reply.
+        session.flush.assert_awaited_once()
 
     async def test_cmd_tts_rejects_enable_when_service_not_configured(self) -> None:
         message = SimpleNamespace(
@@ -248,7 +302,7 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
             await admin.cmd_tts(message, session=session, settings=settings)
 
         self.assertEqual(group_row.settings, {})
-        session.flush.assert_not_awaited()
+        session.flush.assert_awaited_once()
         self.assertIn("尚未配置完成", answer_mock.await_args.args[2])
 
     async def test_cmd_tts_requires_super_admin(self) -> None:
@@ -290,7 +344,7 @@ class AdminTTSCommandTests(unittest.IsolatedAsyncioTestCase):
             await admin.cmd_tts(message, session=session, settings=settings)
 
         self.assertEqual(group_row.settings, {})
-        session.flush.assert_not_awaited()
+        session.flush.assert_awaited_once()
         self.assertEqual(answer_mock.await_args.args[2], admin._TTS_USAGE)
 
     async def test_cmd_tts_sets_always_mode_when_service_ready(self) -> None:

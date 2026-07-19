@@ -35,6 +35,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.db.models import AuthorizedGroup, Group
+from bot.services.background_health import record_background_failure
 
 log = logging.getLogger(__name__)
 
@@ -589,16 +590,29 @@ class GroupPermissionService:
 
     async def run_forever(self) -> None:
         log.info("group default permission service started")
+        consecutive_failures = 0
         while True:
             try:
-                await self.run_once()
+                await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log.exception("group default permission pass failed")
+                consecutive_failures = record_background_failure(
+                    service="group default permission service",
+                    previous_failures=consecutive_failures,
+                    error=exc,
+                )
+            else:
+                consecutive_failures = 0
             await asyncio.sleep(self.check_interval_seconds)
 
-    async def run_once(self, *, at: datetime | None = None) -> int:
+    async def run_once(
+        self,
+        *,
+        at: datetime | None = None,
+        raise_on_total_failure: bool = False,
+    ) -> int:
         """Reconcile all authorized configured groups; return API successes."""
         async with self.session_factory() as session:
             rows = (
@@ -609,9 +623,16 @@ class GroupPermissionService:
                 )
             ).all()
         applied = 0
+        failed = 0
         for (group_id,) in rows:
             if await self.apply_group(int(group_id), at=at):
                 applied += 1
+            elif int(group_id) in self._last_errors:
+                failed += 1
+        if raise_on_total_failure and failed and applied == 0:
+            raise RuntimeError(
+                f"group permission apply failed for all {failed} attempted groups"
+            )
         return applied
 
     async def apply_group(

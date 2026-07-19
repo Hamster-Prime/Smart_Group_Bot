@@ -703,8 +703,8 @@
           <div class="field-grid three">
             ${field("bot.parse_mode", "消息解析格式", { maxlength: 32, list: "parse-modes", placeholder: "留空发送纯文本" })}
             ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true })}
+            ${field("bot.reply_batch_timeout_seconds", "单次回复总时限（秒）", { type: "number", min: 5, max: 120, step: 1, required: true, hint: "覆盖决策、工具、生成和投递的总预算" })}
             ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除；作为各类别的默认秒数" })}
-            ${toggle("bot.drop_pending_updates", "启动时丢弃待处理消息", "避免重启后集中处理历史更新")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
             ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}

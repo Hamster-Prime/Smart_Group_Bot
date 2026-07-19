@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from sqlalchemy import select
 
 from bot.db.engine import init_db
 from bot.db.models import (
+    Group,
     GroupMember,
     JoinVerification,
     MessageVector,
@@ -89,6 +91,7 @@ class _DbTestCase(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             await authorize_group(session, -100, 1)
+            session.add(Group(id=-100, title="test", settings={}))
             session.add(
                 ModerationRule(
                     group_id=-100,
@@ -191,6 +194,48 @@ class ScheduleHelperTests(unittest.TestCase):
             verification_timeout_seconds_for_kind(settings, VERIFICATION_KIND_PATROL),
             600,
         )
+
+
+class PatrolTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_is_bounded_when_manual_run_ignores_cancellation(self) -> None:
+        service = PatrolService(
+            bot=_bot_mock(),
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        task: asyncio.Task | None = None
+
+        async def stubborn_manual_run(_group_id: int) -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        service._manual_patrol = stubborn_manual_run  # type: ignore[method-assign]
+        try:
+            result = service.start_manual_patrol(-100)
+            self.assertTrue(result["started"])
+            task = next(iter(service._manual_tasks))
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+
+            before = asyncio.get_running_loop().time()
+            await service.shutdown(timeout_seconds=0.02)
+            self.assertLess(
+                asyncio.get_running_loop().time() - before,
+                0.2,
+            )
+            self.assertIn(task, service._manual_tasks)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(service._manual_tasks, set())
 
 
 class WarningMessageTests(unittest.TestCase):
@@ -346,6 +391,92 @@ class PatrolScanTests(_DbTestCase):
             self.assertIsNotNone(run)
             self.assertEqual(run.last_violations, 1)
             self.assertFalse(run.running)
+
+    async def test_patrol_preparation_is_durable_before_mute(self) -> None:
+        service, bot = self._service()
+
+        async def assert_prepared(_chat_id: int, user_id: int, **_kwargs):
+            async with self.session_factory() as session:
+                record = await get_join_verification(session, -100, user_id)
+                self.assertIsNotNone(record)
+                self.assertEqual(record.status, "preparing")
+            return True
+
+        bot.restrict_chat_member.side_effect = assert_prepared
+        enforced = await service._enforce_violators(
+            -100,
+            [PatrolViolator(14, "准备中用户", "preparing", "违规")],
+        )
+
+        self.assertEqual([item.user_id for item in enforced], [14])
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 14)
+            self.assertEqual(record.status, "pending")
+
+    async def test_deauthorization_mid_batch_stops_patrol_and_restores_mute(self) -> None:
+        from bot.services.authz import deauthorize_group
+
+        service, bot = self._service()
+        calls = 0
+
+        async def deauthorize_after_first_mute(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                async with self.session_factory() as session:
+                    await deauthorize_group(session, -100)
+                    await session.commit()
+            return True
+
+        bot.restrict_chat_member.side_effect = deauthorize_after_first_mute
+        enforced = await service._enforce_violators(
+            -100,
+            [
+                PatrolViolator(17, "首个用户", "first", "违规"),
+                PatrolViolator(18, "第二用户", "second", "违规"),
+            ],
+        )
+
+        self.assertEqual(enforced, [])
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        self.assertEqual(
+            [item.args[1] for item in bot.restrict_chat_member.await_args_list],
+            [17, 17],
+        )
+        bot.send_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 17))
+            self.assertIsNone(await get_join_verification(session, -100, 18))
+
+    async def test_cancelled_patrol_prompt_restores_and_removes_preparation(self) -> None:
+        service, bot = self._service()
+        bot.send_message.side_effect = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await service._enforce_violators(
+                -100,
+                [PatrolViolator(15, "取消用户", "cancelled", "违规")],
+            )
+
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 15))
+
+    async def test_patrol_activation_failure_restores_and_removes_preparation(self) -> None:
+        service, bot = self._service()
+        with patch(
+            "bot.services.patrol.activate_prepared_join_verification",
+            new=AsyncMock(return_value=False),
+        ):
+            enforced = await service._enforce_violators(
+                -100,
+                [PatrolViolator(16, "激活失败", "activate_fail", "违规")],
+            )
+
+        self.assertEqual(enforced, [])
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 16))
 
     async def test_second_patrol_skips_cached_profiles(self) -> None:
         await self._add_member(21, full_name="正常用户")
@@ -607,7 +738,7 @@ class PatrolTimeoutTests(_DbTestCase):
             # Cache is per-group: another group sees no pass.
             self.assertEqual(await get_patrol_screen_hash(session, -200, 90), "")
             # The message-middleware profile cache is untouched.
-            row = await session.get(UserProfileScreen, 90)
+            row = await session.get(UserProfileScreen, (-100, 90))
             self.assertIsNone(row)
 
 

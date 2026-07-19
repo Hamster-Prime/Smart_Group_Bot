@@ -20,11 +20,13 @@ import asyncio
 import hashlib
 import html
 import ipaddress
+import json
 import logging
 import secrets
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,50 +35,77 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.methods import TelegramMethod
 from aiogram.utils.web_app import safe_parse_webapp_init_data
-from sqlalchemy import select
+from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import JoinVerification, UserWarning
+from bot.db.models import JoinVerification, UserWarning, WebhookInboxUpdate
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
     SHARED_PROMPT_VERIFICATION_KINDS,
+    TERMINAL_LEASE_SECONDS,
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_PATROL,
     VERIFICATION_KIND_RAID,
     VERIFICATION_PROVIDERS,
+    VERIFICATION_STATUS_RELEASING,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
+    complete_leased_join_verification,
     delete_join_verification,
     delete_verification_prompt,
     extend_pending_verification_deadlines,
-    get_join_verification,
     get_pending_verification_by_id_for_user,
     get_pending_verification_for_user,
     get_sole_pending_verification_for_user,
     mark_turnstile_configuration_unavailable,
     normalize_verification_provider,
+    renew_join_verification_lease,
     restore_member_permissions,
     turnstile_verification_configured,
-    upsert_join_verification,
     verification_deadline_passed,
     verification_keys_for_provider,
     verification_provider,
     verification_subproviders,
-    verification_timeout_seconds_for_kind,
 )
 from bot.services.runtime_config import RuntimeConfigManager
 from bot.services.update_delivery import WEBHOOK_MAX_CONCURRENT_UPDATES
+from bot.services.update_completion import (
+    UpdateCompletionReceipt,
+    bind_update_completion,
+    reset_update_completion,
+)
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
-    schedule_message_auto_delete,
+    schedule_message_auto_delete_durable,
 )
 from bot.utils.timezone import now_shanghai_naive
-from bot.web.settings_api import register_settings_routes
+from bot.web.auth import (
+    MAX_INIT_DATA_AGE_SECONDS,
+    MAX_INIT_DATA_FUTURE_SECONDS,
+    _auth_timestamp,
+)
+from bot.web.settings_api import flush_member_identity_tasks, register_settings_routes
 
 log = logging.getLogger(__name__)
+
+
+async def _read_siteverify_json(response: Any) -> Any:
+    """Read a provider response without allowing an unbounded error body."""
+    content = getattr(response, "content", None)
+    read = getattr(content, "read", None)
+    if not callable(read):
+        return await response.json(content_type=None)
+    content_length = getattr(response, "content_length", None)
+    if content_length is not None and int(content_length) > 64 * 1024:
+        raise ValueError("siteverify response too large")
+    raw = await read(64 * 1024 + 1)
+    if len(raw) > 64 * 1024:
+        raise ValueError("siteverify response too large")
+    return json.loads(raw.decode("utf-8", errors="strict"))
 
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 HCAPTCHA_VERIFY_URL = "https://api.hcaptcha.com/siteverify"
@@ -118,9 +147,98 @@ _COMPLETED_VERIFICATION_TTL_SECONDS = 5 * 60
 _ACTIVE_VERIFICATION_TTL_SECONDS = 2 * 60
 _VERIFICATION_WAIT_TIMEOUT_SECONDS = 60.0
 _VERIFICATION_CACHE_MAX_ENTRIES = 2048
+_VERIFICATION_MAX_CHALLENGE_TOKEN_CHARS = 8 * 1024
+_VERIFICATION_MAX_INIT_DATA_CHARS = 16 * 1024
+_VERIFICATION_MAX_CONFIG_TAG_CHARS = 128
+_VERIFICATION_MAX_PROVIDER_CHARS = 32
+_VERIFICATION_MAX_ID_CHARS = 20
+_VERIFICATION_MAX_CONCURRENT_UPSTREAM = 8
+_VERIFICATION_RATE_WINDOW_SECONDS = 60.0
+_VERIFICATION_USER_RATE_LIMIT = 8
+_VERIFICATION_IP_RATE_LIMIT = 30
+_VERIFICATION_RATE_CACHE_MAX_ENTRIES = 4096
+_WEBHOOK_REQUEST_BODY_TIMEOUT_SECONDS = 5.0
+_PUBLIC_JSON_BODY_TIMEOUT_SECONDS = 5.0
+_WEB_MAX_REQUEST_BYTES = 1024 * 1024
+# A group-message handler can defer completion to its bounded reply worker. Its
+# configured budget is at most 120s, so the delivery deadline must cover that
+# work plus debounce and the synchronous moderation/indexing prefix. The HTTP
+# request may disconnect sooner; the shielded shared result remains available
+# to Telegram's retry and still prevents duplicate execution.
+_WEBHOOK_UPDATE_TIMEOUT_SECONDS = 150.0
+_WEBHOOK_HTTP_RESPONSE_TIMEOUT_SECONDS = 155.0
+_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS = 2.0
+_WEBHOOK_DRAIN_TIMEOUT_SECONDS = 15.0
+_WEBHOOK_REQUEST_DRAIN_TIMEOUT_SECONDS = 3.0
+_WEBHOOK_WORKER_STOP_TIMEOUT_SECONDS = 3.0
+_WEBHOOK_FAILURE_THRESHOLD = 3
+_WEBHOOK_DEDUP_TTL_SECONDS = 60.0 * 60.0
+_WEBHOOK_DEDUP_MAX_UPDATES = 4096
+_WEBHOOK_INBOX_LEASE_SECONDS = 5 * 60
+_WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS = 2.0
+_WEBHOOK_INBOX_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_WEBHOOK_INBOX_DLQ_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_WEBHOOK_INBOX_RECOVERY_BATCH = 64
+_WEBHOOK_INBOX_MAX_ATTEMPTS = 12
+_WEBHOOK_INBOX_RETRY_BASE_SECONDS = 2.0
+_WEBHOOK_INBOX_RETRY_MAX_SECONDS = 5 * 60.0
+_WEBHOOK_INBOX_CLEANUP_INTERVAL_SECONDS = 60.0
+_WEBHOOK_INBOX_CLEANUP_BATCH = 256
+_WEB_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 25.0
+_PUBLIC_BODY_READ_TASK_LIMIT = 64
 _SETTINGS_STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
+_PUBLIC_BODY_READ_TASKS: set[asyncio.Task[Any]] = set()
 
 _VerificationFingerprint = tuple[int, int, str, str, str, str, int]
+
+
+def _observe_public_body_task(task: asyncio.Task[Any]) -> None:
+    _PUBLIC_BODY_READ_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _read_json_body_hard(
+    request: web.Request,
+    *,
+    timeout_seconds: float,
+    loads: Any | None = None,
+) -> Any:
+    active = sum(not task.done() for task in _PUBLIC_BODY_READ_TASKS)
+    if active >= _PUBLIC_BODY_READ_TASK_LIMIT:
+        raise RuntimeError("public request body reader is saturated")
+    awaitable = request.json(loads=loads) if loads is not None else request.json()
+    task = asyncio.create_task(awaitable, name="public-json-body")
+    _PUBLIC_BODY_READ_TASKS.add(task)
+    task.add_done_callback(_observe_public_body_task)
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=max(0.01, float(timeout_seconds)),
+        )
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    raise TimeoutError("request body deadline exceeded")
+
+
+async def _flush_public_body_tasks(*, timeout_seconds: float = 1.0) -> None:
+    tasks = {task for task in _PUBLIC_BODY_READ_TASKS if not task.done()}
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+        for task in done:
+            _observe_public_body_task(task)
+        for task in pending:
+            task.add_done_callback(_observe_public_body_task)
 
 
 @dataclass(slots=True)
@@ -140,7 +258,7 @@ def _public_ip(value: object) -> str:
 
 
 def _client_public_ip(request: web.Request) -> str:
-    peer = str(request.remote or "").strip()
+    peer = str(getattr(request, "remote", "") or "").strip()
     try:
         peer_address = ipaddress.ip_address(peer)
     except ValueError:
@@ -148,7 +266,8 @@ def _client_public_ip(request: web.Request) -> str:
     if peer_address.is_global:
         return peer_address.compressed
     if peer_address.is_loopback or peer_address.is_private:
-        return _public_ip(request.headers.get("CF-Connecting-IP"))
+        headers = getattr(request, "headers", {}) or {}
+        return _public_ip(headers.get("CF-Connecting-IP"))
     return ""
 
 
@@ -170,7 +289,8 @@ _SETTINGS_CSP = (
     "script-src 'self' https://telegram.org; "
     "style-src 'self'; connect-src 'self'; "
     "img-src 'self' data:; font-src 'self'; "
-    "object-src 'none'; base-uri 'none'; form-action 'self'"
+    "object-src 'none'; base-uri 'none'; form-action 'self'; "
+    "frame-ancestors https://web.telegram.org https://telegram.org https://*.telegram.org"
 )
 
 _CHALLENGE_CSP_BASE = (
@@ -182,7 +302,8 @@ _CHALLENGE_CSP_BASE = (
     "https://*.hcaptcha.com https://api.hcaptcha.com; "
     "frame-src https://challenges.cloudflare.com https://hcaptcha.com https://*.hcaptcha.com; "
     "img-src 'self' data: https://hcaptcha.com https://*.hcaptcha.com; font-src 'self'; "
-    "object-src 'none'; base-uri 'none'; form-action 'self'"
+    "object-src 'none'; base-uri 'none'; form-action 'self'; "
+    "frame-ancestors https://web.telegram.org https://telegram.org https://*.telegram.org"
 )
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -376,7 +497,7 @@ async def verify_turnstile_token(
                 if resp.status == 429 or resp.status >= 500:
                     log.warning("turnstile siteverify unavailable | status=%s", resp.status)
                     return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
-                data = await resp.json(content_type=None)
+                data = await _read_siteverify_json(resp)
     except Exception:
         log.exception("turnstile siteverify request failed")
         return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
@@ -421,7 +542,7 @@ async def verify_hcaptcha_token(
                 if resp.status == 429 or resp.status >= 500:
                     log.warning("hcaptcha siteverify unavailable | status=%s", resp.status)
                     return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
-                data = await resp.json(content_type=None)
+                data = await _read_siteverify_json(resp)
     except Exception:
         log.exception("hcaptcha siteverify request failed")
         return False, [TURNSTILE_ERROR_UPSTREAM_UNAVAILABLE]
@@ -461,46 +582,739 @@ async def verify_hcaptcha_token(
     return success, errors
 
 
+@dataclass(slots=True)
+class _QueuedWebhookUpdate:
+    update: dict[str, Any]
+    update_id: int
+    enqueued_at: float
+    result: asyncio.Future[bool]
+    lease_until: datetime | None = None
+
+
+class _WebhookUpdateDeadlineExceeded(TimeoutError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        unfinished_task: asyncio.Task[Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.unfinished_task = unfinished_task
+
+
 class _WebhookUpdateQueue:
     def __init__(
         self,
         *,
         dispatcher: Dispatcher,
         bot: Bot,
+        session_factory: async_sessionmaker[AsyncSession] | None,
         secret_token: str,
         worker_count: int,
     ) -> None:
         self.dispatcher = dispatcher
         self.bot = bot
+        self.session_factory = session_factory
         self.secret_token = secret_token
         self.worker_count = max(1, int(worker_count))
-        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+        self.queue: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
             maxsize=self.worker_count * 4
         )
         self._workers: list[asyncio.Task[None]] = []
+        self._workers_started = False
+        self._processing_tasks: set[asyncio.Task[Any]] = set()
+        self._orphaned_tasks: set[asyncio.Task[Any]] = set()
+        self._deferred_tasks: set[asyncio.Task[Any]] = set()
+        self._late_finalizers: dict[int, asyncio.Task[Any]] = {}
+        self._recovery_task: asyncio.Task[None] | None = None
+        self._last_cleanup_at = 0.0
+        self._active_started_at: dict[int, float] = {}
         self._start_lock = asyncio.Lock()
+        self._dedup_lock = asyncio.Lock()
         self._stopped = False
+        self._stop_task: asyncio.Task[None] | None = None
+        self._fatal_error: str | None = None
+        self._consecutive_failures = 0
+        self._inflight_updates: dict[int, asyncio.Future[bool]] = {}
+        self._completed_update_ids: dict[int, float] = {}
+        self._seen_update_ids: dict[int, float] = {}
+        self._accepted_updates = 0
+        self._completed_updates = 0
+        self._failed_updates = 0
+        self._timed_out_updates = 0
+        self._retried_updates = 0
+        self._dropped_updates = 0
+        self._deferred_failed_updates = 0
+        self._late_failed_updates = 0
+        self._dead_lettered_updates = 0
+        self._retry_scheduled_updates = 0
+        self._cleaned_inbox_updates = 0
+        self._recovery_failures = 0
+        self._last_business_error: str | None = None
+        self._business_failure_issue: str | None = None
+        self._failed_update_ids_since_success: set[int] = set()
+        self._last_recovery_error: str | None = None
+        self._last_success_at: float | None = None
+        self._last_failure_at: float | None = None
+
+    @property
+    def _durable_inbox_enabled(self) -> bool:
+        return callable(self.session_factory)
 
     def verify_secret(self, request: web.Request) -> bool:
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         return secrets.compare_digest(supplied, self.secret_token)
 
+    async def _ensure_durable_update(
+        self,
+        update_id: int,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Persist raw update; return True when it is already terminal."""
+
+        if not self._durable_inbox_enabled:
+            return False
+        assert self.session_factory is not None
+        async with self.session_factory() as session:
+            dialect = getattr(getattr(session, "bind", None), "dialect", None)
+            if getattr(dialect, "name", "") == "sqlite":
+                await session.execute(
+                    sqlite_insert(WebhookInboxUpdate)
+                    .values(update_id=int(update_id), payload=dict(payload))
+                    .on_conflict_do_nothing(index_elements=[WebhookInboxUpdate.update_id])
+                )
+            else:
+                row = await session.get(WebhookInboxUpdate, int(update_id))
+                if row is None:
+                    session.add(
+                        WebhookInboxUpdate(
+                            update_id=int(update_id),
+                            payload=dict(payload),
+                        )
+                    )
+            await session.commit()
+            row = await session.get(WebhookInboxUpdate, int(update_id))
+            return bool(
+                row is not None
+                and (row.completed_at is not None or row.dead_lettered_at is not None)
+            )
+
+    async def accept_durable_update(self, payload: dict[str, Any]) -> int:
+        """Persist one update before a transport is allowed to acknowledge it.
+
+        Both webhook HTTP delivery and getUpdates polling use this boundary.
+        Once this method returns, a process crash can at worst delay execution:
+        the recovery loop still owns the canonical payload. Publishing to the
+        bounded in-memory worker queue is deliberately best effort and never
+        weakens that durability guarantee.
+        """
+
+        if not self._durable_inbox_enabled:
+            raise RuntimeError("durable Telegram update inbox is unavailable")
+        if self._stopped:
+            raise RuntimeError("durable Telegram update inbox is stopping")
+        if not isinstance(payload, dict):
+            raise ValueError("Telegram update payload must be an object")
+        update_id_value = payload.get("update_id")
+        if isinstance(update_id_value, bool) or not isinstance(update_id_value, int):
+            raise ValueError("Telegram update payload has no valid update_id")
+        update_id = int(update_id_value)
+
+        terminal = await self._ensure_durable_update(update_id, payload)
+        self._recovery_failures = 0
+        self._last_recovery_error = None
+        if terminal:
+            return update_id
+
+        await self._ensure_workers()
+
+        async def _publish_persisted() -> None:
+            try:
+                await self._enqueue_durable_update(update_id)
+            except Exception:
+                # Persistence, not queue publication, is the acknowledgement
+                # boundary. Recovery will retry this row after queue pressure or
+                # a transient claim/load failure.
+                log.exception(
+                    "durable Telegram update persisted but immediate enqueue "
+                    "failed | update=%s",
+                    update_id,
+                )
+
+        publish = asyncio.create_task(
+            _publish_persisted(),
+            name=f"telegram-inbox-publish:{update_id}",
+        )
+        self._track_deferred_task(publish)
+        return update_id
+
+    async def _claim_durable_update(self, update_id: int) -> datetime | None:
+        if not self._durable_inbox_enabled:
+            return None
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        lease_until = now + timedelta(seconds=_WEBHOOK_INBOX_LEASE_SECONDS)
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.update_id == int(update_id),
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                    or_(
+                        WebhookInboxUpdate.next_attempt_at.is_(None),
+                        WebhookInboxUpdate.next_attempt_at <= now,
+                    ),
+                    or_(
+                        WebhookInboxUpdate.lease_until.is_(None),
+                        WebhookInboxUpdate.lease_until <= now,
+                    ),
+                )
+                .values(
+                    lease_until=lease_until,
+                    attempts=WebhookInboxUpdate.attempts + 1,
+                    next_attempt_at=None,
+                    last_error="",
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            return lease_until if int(result.rowcount or 0) == 1 else None
+
+    async def _load_durable_payload(self, update_id: int) -> dict[str, Any] | None:
+        if not self._durable_inbox_enabled:
+            return None
+        assert self.session_factory is not None
+        async with self.session_factory() as session:
+            payload = await session.scalar(
+                select(WebhookInboxUpdate.payload).where(
+                    WebhookInboxUpdate.update_id == int(update_id)
+                )
+            )
+        return dict(payload) if isinstance(payload, dict) else None
+
+    async def _renew_durable_lease(self, queued: _QueuedWebhookUpdate) -> bool:
+        """Extend a live lease without making the update claimable in between."""
+
+        if not self._durable_inbox_enabled or queued.lease_until is None:
+            return True
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        lease_until = now + timedelta(seconds=_WEBHOOK_INBOX_LEASE_SECONDS)
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.update_id == queued.update_id,
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.lease_until == queued.lease_until,
+                )
+                .values(lease_until=lease_until, updated_at=now)
+            )
+            await session.commit()
+        if int(result.rowcount or 0) != 1:
+            return False
+        queued.lease_until = lease_until
+        return True
+
+    async def _complete_durable_update(self, queued: _QueuedWebhookUpdate) -> bool:
+        if not self._durable_inbox_enabled or queued.lease_until is None:
+            return True
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.update_id == queued.update_id,
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.lease_until == queued.lease_until,
+                )
+                .values(
+                    payload={},
+                    completed_at=now,
+                    lease_until=None,
+                    next_attempt_at=None,
+                    last_error="",
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            if int(result.rowcount or 0) == 1:
+                return True
+            row = await session.get(WebhookInboxUpdate, queued.update_id)
+            return bool(row is not None and row.completed_at is not None)
+
+    @staticmethod
+    def _retry_delay_seconds(attempts: int, *, update_id: int = 0) -> float:
+        exponent = max(0, int(attempts) - 1)
+        base_delay = min(
+            _WEBHOOK_INBOX_RETRY_MAX_SECONDS,
+            _WEBHOOK_INBOX_RETRY_BASE_SECONDS * (2**exponent),
+        )
+        # Stable per-update jitter avoids a wave of poison/transient rows all
+        # becoming claimable on the same recovery tick after an outage.
+        jitter = 0.90 + ((abs(int(update_id)) * 17) % 21) / 100.0
+        return min(_WEBHOOK_INBOX_RETRY_MAX_SECONDS, base_delay * jitter)
+
+    async def _release_durable_update(
+        self,
+        queued: _QueuedWebhookUpdate,
+        *,
+        error: str,
+    ) -> str:
+        if not self._durable_inbox_enabled or queued.lease_until is None:
+            return "noop"
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(WebhookInboxUpdate.attempts).where(
+                        WebhookInboxUpdate.update_id == queued.update_id,
+                        WebhookInboxUpdate.completed_at.is_(None),
+                        WebhookInboxUpdate.dead_lettered_at.is_(None),
+                        WebhookInboxUpdate.lease_until == queued.lease_until,
+                    )
+                )
+            ).first()
+            if row is None:
+                return "lost"
+            attempts = max(0, int(row[0] or 0))
+            is_dead = attempts >= _WEBHOOK_INBOX_MAX_ATTEMPTS
+            next_attempt_at = None
+            if not is_dead:
+                next_attempt_at = now + timedelta(
+                    seconds=self._retry_delay_seconds(
+                        attempts,
+                        update_id=queued.update_id,
+                    )
+                )
+            result = await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.update_id == queued.update_id,
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.lease_until == queued.lease_until,
+                )
+                .values(
+                    lease_until=None,
+                    next_attempt_at=next_attempt_at,
+                    dead_lettered_at=now if is_dead else None,
+                    last_error=str(error or "")[:500],
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+        if int(result.rowcount or 0) != 1:
+            return "lost"
+        if is_dead:
+            self._dead_lettered_updates += 1
+            self._last_business_error = (
+                f"update {queued.update_id} moved to dead letter after "
+                f"{attempts} attempts: {str(error or '')[:300]}"
+            )
+            return "dead"
+        self._retry_scheduled_updates += 1
+        return "retry"
+
+    async def _unclaim_durable_update(
+        self,
+        queued: _QueuedWebhookUpdate,
+        *,
+        reason: str,
+    ) -> None:
+        """Undo a claim that never reached a worker (queue pressure only)."""
+
+        if not self._durable_inbox_enabled or queued.lease_until is None:
+            return
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(WebhookInboxUpdate.attempts).where(
+                        WebhookInboxUpdate.update_id == queued.update_id,
+                        WebhookInboxUpdate.completed_at.is_(None),
+                        WebhookInboxUpdate.dead_lettered_at.is_(None),
+                        WebhookInboxUpdate.lease_until == queued.lease_until,
+                    )
+                )
+            ).first()
+            if row is None:
+                return
+            await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.update_id == queued.update_id,
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.lease_until == queued.lease_until,
+                )
+                .values(
+                    attempts=max(0, int(row[0] or 0) - 1),
+                    lease_until=None,
+                    next_attempt_at=None,
+                    last_error=str(reason or "")[:500],
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+
+    async def _cleanup_durable_inbox(self) -> int:
+        if not self._durable_inbox_enabled:
+            return 0
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        completed_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_RETENTION_SECONDS)
+        dead_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_DLQ_RETENTION_SECONDS)
+        async with self.session_factory() as session:
+            stale_ids = (
+                select(WebhookInboxUpdate.update_id)
+                .where(
+                    or_(
+                        and_(
+                            WebhookInboxUpdate.completed_at.is_not(None),
+                            WebhookInboxUpdate.completed_at < completed_cutoff,
+                        ),
+                        and_(
+                            WebhookInboxUpdate.dead_lettered_at.is_not(None),
+                            WebhookInboxUpdate.dead_lettered_at < dead_cutoff,
+                        ),
+                    )
+                )
+                .order_by(WebhookInboxUpdate.updated_at)
+                .limit(_WEBHOOK_INBOX_CLEANUP_BATCH)
+            )
+            result = await session.execute(
+                delete(WebhookInboxUpdate).where(
+                    WebhookInboxUpdate.update_id.in_(stale_ids)
+                )
+            )
+            await session.commit()
+        cleaned = max(0, int(result.rowcount or 0))
+        self._cleaned_inbox_updates += cleaned
+        return cleaned
+
+    async def _prepare_durable_recovery(self) -> None:
+        if not self._durable_inbox_enabled:
+            return
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            # Never revoke a live lease merely because another processor has
+            # started. Rolling deploys, an accidental second instance, or an
+            # overlapping shutdown can all leave the original handler active.
+            # Recovery queries already reclaim a row as soon as its lease
+            # naturally expires.
+            await session.execute(
+                update(WebhookInboxUpdate)
+                .where(
+                    WebhookInboxUpdate.completed_at.is_(None),
+                    WebhookInboxUpdate.dead_lettered_at.is_(None),
+                    WebhookInboxUpdate.attempts >= _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                    or_(
+                        WebhookInboxUpdate.lease_until.is_(None),
+                        WebhookInboxUpdate.lease_until <= now,
+                    ),
+                )
+                .values(
+                    lease_until=None,
+                    next_attempt_at=None,
+                    dead_lettered_at=now,
+                    last_error="attempt limit reached before recovery",
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+        await self._cleanup_durable_inbox()
+        self._last_cleanup_at = time.monotonic()
+
+    async def start_recovery(self) -> None:
+        if not self._durable_inbox_enabled or self._recovery_task is not None:
+            return
+        await self._prepare_durable_recovery()
+        await self._ensure_workers()
+        self._recovery_task = asyncio.create_task(
+            self._recovery_loop(),
+            name="telegram-webhook-inbox-recovery",
+        )
+
+    async def _recover_durable_once(self) -> int:
+        if not self._durable_inbox_enabled or self._stopped:
+            return 0
+        assert self.session_factory is not None
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        WebhookInboxUpdate.update_id,
+                        WebhookInboxUpdate.payload,
+                    )
+                    .where(
+                        WebhookInboxUpdate.completed_at.is_(None),
+                        WebhookInboxUpdate.dead_lettered_at.is_(None),
+                        WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                        or_(
+                            WebhookInboxUpdate.next_attempt_at.is_(None),
+                            WebhookInboxUpdate.next_attempt_at <= now,
+                        ),
+                        or_(
+                            WebhookInboxUpdate.lease_until.is_(None),
+                            WebhookInboxUpdate.lease_until <= now,
+                        ),
+                    )
+                    .order_by(WebhookInboxUpdate.created_at)
+                    .limit(_WEBHOOK_INBOX_RECOVERY_BATCH)
+                )
+            ).all()
+
+        recovered = 0
+        for update_id, payload in rows:
+            if self._stopped or self.queue.full():
+                break
+            async with self._dedup_lock:
+                self._prune_dedup_state(now=asyncio.get_running_loop().time())
+                if int(update_id) in self._inflight_updates:
+                    continue
+            lease_until = await self._claim_durable_update(int(update_id))
+            if lease_until is None:
+                continue
+            loop = asyncio.get_running_loop()
+            result = loop.create_future()
+            queued = _QueuedWebhookUpdate(
+                update=dict(payload or {}),
+                update_id=int(update_id),
+                enqueued_at=time.monotonic(),
+                result=result,
+                lease_until=lease_until,
+            )
+            must_unclaim = False
+            async with self._dedup_lock:
+                if int(update_id) in self._inflight_updates or self.queue.full():
+                    must_unclaim = True
+                else:
+                    try:
+                        self.queue.put_nowait(queued)
+                    except asyncio.QueueFull:
+                        must_unclaim = True
+                    else:
+                        self._completed_update_ids.pop(int(update_id), None)
+                        self._inflight_updates[int(update_id)] = result
+                        recovered += 1
+            if must_unclaim:
+                await self._unclaim_durable_update(
+                    queued,
+                    reason="recovery queue full or update already active",
+                )
+                if self.queue.full():
+                    break
+        return recovered
+
+    async def _enqueue_durable_update(self, update_id: int) -> bool:
+        """Best-effort publish of a persisted row to the in-process queue."""
+
+        if self._stopped or self.queue.full():
+            return False
+        loop = asyncio.get_running_loop()
+        async with self._dedup_lock:
+            self._prune_dedup_state(now=loop.time())
+            if update_id in self._inflight_updates:
+                return True
+
+        lease_until = await self._claim_durable_update(update_id)
+        if lease_until is None:
+            # Completed, delayed, dead-lettered, or already owned. Every case is
+            # safe to ACK because the canonical payload is already durable.
+            return False
+        payload = await self._load_durable_payload(update_id)
+        if payload is None:
+            placeholder = _QueuedWebhookUpdate(
+                update={},
+                update_id=update_id,
+                enqueued_at=time.monotonic(),
+                result=asyncio.get_running_loop().create_future(),
+                lease_until=lease_until,
+            )
+            await self._unclaim_durable_update(
+                placeholder,
+                reason="durable webhook payload is missing or invalid",
+            )
+            return False
+        result = loop.create_future()
+        queued = _QueuedWebhookUpdate(
+            update=payload,
+            update_id=update_id,
+            enqueued_at=time.monotonic(),
+            result=result,
+            lease_until=lease_until,
+        )
+        must_unclaim = False
+        async with self._dedup_lock:
+            if update_id in self._inflight_updates or self.queue.full():
+                must_unclaim = True
+            else:
+                try:
+                    self.queue.put_nowait(queued)
+                except asyncio.QueueFull:
+                    must_unclaim = True
+                else:
+                    now = loop.time()
+                    if update_id in self._seen_update_ids:
+                        self._retried_updates += 1
+                    self._seen_update_ids[update_id] = now
+                    self._inflight_updates[update_id] = result
+                    self._accepted_updates += 1
+        if must_unclaim:
+            await self._unclaim_durable_update(
+                queued,
+                reason="webhook queue full or update already active",
+            )
+            return False
+        return True
+
+    async def _recovery_loop(self) -> None:
+        while not self._stopped:
+            try:
+                await self._recover_durable_once()
+                now = time.monotonic()
+                if (
+                    now - self._last_cleanup_at
+                    >= _WEBHOOK_INBOX_CLEANUP_INTERVAL_SECONDS
+                ):
+                    await self._cleanup_durable_inbox()
+                    self._last_cleanup_at = now
+                self._recovery_failures = 0
+                self._last_recovery_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recovery_failures += 1
+                self._last_recovery_error = str(exc)[:500]
+                if self._recovery_failures >= _WEBHOOK_FAILURE_THRESHOLD:
+                    self._set_fatal(
+                        "durable webhook inbox recovery failed "
+                        f"{self._recovery_failures} consecutive times: {exc}"
+                    )
+                log.exception("durable webhook inbox recovery failed")
+            try:
+                await asyncio.sleep(_WEBHOOK_INBOX_RECOVERY_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+
     async def handle_verified(self, request: web.Request) -> web.Response:
         try:
-            update = await request.json(loads=self.bot.session.json_loads)
+            update = await _read_json_body_hard(
+                request,
+                loads=self.bot.session.json_loads,
+                timeout_seconds=_WEBHOOK_REQUEST_BODY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return web.Response(text="Update body timeout", status=408)
         except Exception:
             return web.Response(text="Invalid update", status=400)
         if not isinstance(update, dict):
             return web.Response(text="Invalid update", status=400)
+        update_id_value = update.get("update_id")
+        if isinstance(update_id_value, bool) or not isinstance(update_id_value, int):
+            return web.Response(text="Invalid update id", status=400)
+        update_id = int(update_id_value)
+
+        try:
+            if self._durable_inbox_enabled:
+                await self.accept_durable_update(update)
+                return web.json_response({}, dumps=self.bot.session.json_dumps)
+            terminal = await self._ensure_durable_update(update_id, update)
+            if terminal:
+                return web.json_response({}, dumps=self.bot.session.json_dumps)
+        except Exception:
+            self._recovery_failures += 1
+            self._last_recovery_error = "webhook inbox persistence unavailable"
+            if self._recovery_failures >= _WEBHOOK_FAILURE_THRESHOLD:
+                self._set_fatal(self._last_recovery_error)
+            log.exception("failed to persist webhook update before acknowledgement")
+            return web.Response(text="Webhook persistence unavailable", status=503)
 
         await self._ensure_workers()
-        if self._stopped:
-            return web.Response(text="Webhook disabled", status=503)
+        loop = asyncio.get_running_loop()
+        async with self._dedup_lock:
+            self._prune_dedup_state(now=loop.time())
+            if update_id in self._completed_update_ids:
+                return web.json_response({}, dumps=self.bot.session.json_dumps)
+
+            result = self._inflight_updates.get(update_id)
+            if result is None:
+                issue = self.delivery_issue()
+                if issue is not None:
+                    return web.Response(text="Webhook unavailable", status=503)
+                lease_until = None
+                result = loop.create_future()
+                queued = _QueuedWebhookUpdate(
+                    update=update,
+                    update_id=update_id,
+                    enqueued_at=time.monotonic(),
+                    result=result,
+                    lease_until=lease_until,
+                )
+                try:
+                    self.queue.put_nowait(queued)
+                except asyncio.QueueFull:
+                    return web.Response(text="Webhook busy", status=503)
+                if update_id in self._seen_update_ids:
+                    self._retried_updates += 1
+                self._seen_update_ids[update_id] = loop.time()
+                self._inflight_updates[update_id] = result
+                self._accepted_updates += 1
+
+        # The worker returns success only after synchronous handlers finish, or
+        # after a detached group-reply job is both enqueued and represented by
+        # the durable inbox row. Concurrent deliveries share this future.
         try:
-            self.queue.put_nowait(update)
-        except asyncio.QueueFull:
-            return web.Response(text="Webhook busy", status=503)
+            succeeded = await asyncio.wait_for(
+                asyncio.shield(result),
+                timeout=_WEBHOOK_HTTP_RESPONSE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return web.Response(text="Update processing timeout", status=503)
+        if not succeeded:
+            return web.Response(text="Update processing failed", status=503)
         return web.json_response({}, dumps=self.bot.session.json_dumps)
+
+    def _prune_dedup_state(self, *, now: float) -> None:
+        cutoff = now - _WEBHOOK_DEDUP_TTL_SECONDS
+        limit = max(1, int(_WEBHOOK_DEDUP_MAX_UPDATES))
+        for mapping in (self._completed_update_ids, self._seen_update_ids):
+            stale = [key for key, timestamp in mapping.items() if timestamp < cutoff]
+            for key in stale:
+                mapping.pop(key, None)
+            # Callers prune immediately before publishing one new key. Keep one
+            # slot free so the insertion cannot grow the map to limit + 1.
+            while len(mapping) >= limit:
+                mapping.pop(next(iter(mapping)), None)
+
+    async def _finish_queued_update(
+        self,
+        queued: _QueuedWebhookUpdate,
+        *,
+        succeeded: bool,
+    ) -> None:
+        async with self._dedup_lock:
+            self._prune_dedup_state(now=asyncio.get_running_loop().time())
+            current = self._inflight_updates.get(queued.update_id)
+            has_late_finalizer = queued.update_id in self._late_finalizers
+            if current is queued.result and not has_late_finalizer:
+                self._inflight_updates.pop(queued.update_id, None)
+            if succeeded and not has_late_finalizer:
+                self._completed_update_ids[queued.update_id] = (
+                    asyncio.get_running_loop().time()
+                )
+            if not queued.result.done():
+                queued.result.set_result(succeeded)
 
     async def _ensure_workers(self) -> None:
         if self._workers or self._stopped:
@@ -508,6 +1322,7 @@ class _WebhookUpdateQueue:
         async with self._start_lock:
             if self._workers or self._stopped:
                 return
+            self._workers_started = True
             self._workers = [
                 asyncio.create_task(
                     self._worker(),
@@ -515,37 +1330,643 @@ class _WebhookUpdateQueue:
                 )
                 for index in range(self.worker_count)
             ]
+            for worker in self._workers:
+                worker.add_done_callback(self._worker_finished)
+
+    def _worker_finished(self, task: asyncio.Task[None]) -> None:
+        if self._stopped:
+            return
+        if task.cancelled():
+            issue = "webhook worker 意外被取消"
+        else:
+            try:
+                error = task.exception()
+            except asyncio.CancelledError:
+                issue = "webhook worker 意外被取消"
+            else:
+                issue = (
+                    f"webhook worker 异常退出：{error}"
+                    if error is not None
+                    else "webhook worker 意外正常退出"
+                )
+        self._set_fatal(issue)
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _track_orphan(self, task: asyncio.Task[Any]) -> None:
+        self._processing_tasks.discard(task)
+        if task.done():
+            self._consume_task_result(task)
+            return
+        self._orphaned_tasks.add(task)
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._orphaned_tasks.discard(done)
+            self._consume_task_result(done)
+
+        task.add_done_callback(finished)
+
+    def _set_fatal(self, issue: str) -> None:
+        if self._fatal_error is None:
+            self._fatal_error = issue[:500]
+            log.error("Telegram webhook processor unhealthy: %s", self._fatal_error)
+
+    async def _await_stage(
+        self,
+        awaitable: Any,
+        *,
+        deadline: float,
+    ) -> Any:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise _WebhookUpdateDeadlineExceeded("update deadline exceeded")
+        task = asyncio.create_task(awaitable)
+        self._processing_tasks.add(task)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            task.cancel()
+            self._track_orphan(task)
+            raise
+        if task in done:
+            self._processing_tasks.discard(task)
+            if task.cancelled():
+                raise RuntimeError("webhook update stage was cancelled")
+            return task.result()
+
+        task.cancel()
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+        )
+        if task in done:
+            self._processing_tasks.discard(task)
+            if task.cancelled():
+                raise _WebhookUpdateDeadlineExceeded("update deadline exceeded")
+            # A handler may catch cancellation to finish an atomic DB/Telegram
+            # compensation and return during the grace period.  Its successful
+            # result is authoritative: discarding it and releasing the durable
+            # lease would replay already-applied side effects.
+            return task.result()
+        else:
+            self._track_orphan(task)
+            raise _WebhookUpdateDeadlineExceeded(
+                "update deadline exceeded",
+                unfinished_task=task,
+            )
+
+    def _track_deferred_task(self, task: asyncio.Task[Any]) -> None:
+        self._deferred_tasks.add(task)
+
+        def _finished(done: asyncio.Task[Any]) -> None:
+            self._deferred_tasks.discard(done)
+            self._consume_task_result(done)
+
+        task.add_done_callback(_finished)
+
+    async def _wait_task_with_lease(
+        self,
+        queued: _QueuedWebhookUpdate,
+        task: asyncio.Task[Any],
+    ) -> Any:
+        """Wait for a terminal task while keeping its durable lease exclusive."""
+
+        renew_interval = max(0.05, _WEBHOOK_INBOX_LEASE_SECONDS / 3.0)
+        lease_warning_reported = False
+        try:
+            while True:
+                done, _pending = await asyncio.wait({task}, timeout=renew_interval)
+                if task in done:
+                    if task.cancelled():
+                        raise RuntimeError("webhook update task was cancelled")
+                    return task.result()
+                try:
+                    renewed = await self._renew_durable_lease(queued)
+                except Exception:
+                    renewed = False
+                    if not lease_warning_reported:
+                        log.exception(
+                            "durable webhook lease renewal failed; retaining the "
+                            "in-memory ownership barrier | update=%s",
+                            queued.update_id,
+                        )
+                if not renewed and not lease_warning_reported:
+                    lease_warning_reported = True
+                    self._set_fatal(
+                        f"durable webhook lease renewal was lost for "
+                        f"update {queued.update_id}"
+                    )
+                # Never stop waiting merely because persistence is temporarily
+                # unavailable. The in-memory inflight entry remains the second
+                # ownership barrier, so recovery in this process cannot replay
+                # the update while the old task is still alive.
+        except asyncio.CancelledError:
+            task.cancel()
+            self._track_orphan(task)
+            raise
+
+    def _record_deferred_failure(self, update_id: int, error: str) -> None:
+        self._deferred_failed_updates += 1
+        self._failed_updates += 1
+        self._last_failure_at = time.time()
+        self._record_business_failure(update_id, error)
+
+    def _record_business_failure(self, update_id: int, error: str) -> None:
+        normalized_id = int(update_id)
+        self._last_business_error = f"update={normalized_id} error={error}"[:500]
+        if len(self._failed_update_ids_since_success) < _WEBHOOK_FAILURE_THRESHOLD:
+            self._failed_update_ids_since_success.add(normalized_id)
+        distinct_failures = len(self._failed_update_ids_since_success)
+        if distinct_failures >= _WEBHOOK_FAILURE_THRESHOLD:
+            self._business_failure_issue = (
+                "durable webhook processing failed for "
+                f"{distinct_failures} consecutive distinct updates"
+            )
+
+    def _record_durable_success(self) -> None:
+        self._consecutive_failures = 0
+        self._failed_update_ids_since_success.clear()
+        self._business_failure_issue = None
+        self._completed_updates += 1
+        self._last_success_at = time.time()
+
+    async def _finalize_deferred_update(
+        self,
+        queued: _QueuedWebhookUpdate,
+        receipt: UpdateCompletionReceipt,
+    ) -> None:
+        error = "deferred group reply failed"
+        durably_completed = False
+        failure_recorded = False
+        receipt_task = asyncio.create_task(
+            receipt.wait(),
+            name=f"webhook-receipt-wait:{queued.update_id}",
+        )
+        try:
+            succeeded = bool(await self._wait_task_with_lease(queued, receipt_task))
+            if succeeded:
+                persisted = await self._complete_durable_update(queued)
+                if persisted:
+                    durably_completed = True
+                    self._record_durable_success()
+                    return
+                error = "deferred completion lease was lost"
+            self._record_deferred_failure(queued.update_id, error)
+            failure_recorded = True
+            await self._release_durable_update(queued, error=error)
+        except asyncio.CancelledError:
+            # Process shutdown resets unfinished leases on the next start.
+            raise
+        except Exception:
+            if not failure_recorded:
+                self._record_deferred_failure(
+                    queued.update_id,
+                    "deferred finalizer persistence failure",
+                )
+            log.exception(
+                "failed to finalize durable deferred webhook update | update=%s",
+                queued.update_id,
+            )
+            try:
+                await self._release_durable_update(
+                    queued,
+                    error="deferred finalizer persistence failure",
+                )
+            except Exception:
+                log.exception(
+                    "failed to release durable deferred webhook lease | update=%s",
+                    queued.update_id,
+                )
+        finally:
+            if self._durable_inbox_enabled and not durably_completed:
+                async with self._dedup_lock:
+                    # Accepted-in-memory is not the same as durably completed.
+                    # Let the recovery loop execute a failed durable job.
+                    self._completed_update_ids.pop(queued.update_id, None)
+
+    async def _finalize_late_update(
+        self,
+        queued: _QueuedWebhookUpdate,
+        receipt: UpdateCompletionReceipt,
+        unfinished_task: asyncio.Task[Any],
+        *,
+        phase: str,
+    ) -> None:
+        """Finalize an update only after its cancellation-resistant work ends.
+
+        The lease is renewed throughout the wait. This is the critical barrier
+        preventing recovery from dispatching a concurrent second copy while an
+        old provider/handler coroutine is still performing side effects.
+        """
+
+        durably_completed = False
+        error = "late webhook update failed"
+        try:
+            result = await self._wait_task_with_lease(queued, unfinished_task)
+            if phase == "dispatch" and isinstance(result, TelegramMethod):
+                silent_task = asyncio.create_task(
+                    self.dispatcher.silent_call_request(bot=self.bot, result=result),
+                    name=f"webhook-late-silent:{queued.update_id}",
+                )
+                await self._wait_task_with_lease(queued, silent_task)
+            if receipt.deferred:
+                receipt_task = asyncio.create_task(
+                    receipt.wait(),
+                    name=f"webhook-late-receipt:{queued.update_id}",
+                )
+                if not bool(await self._wait_task_with_lease(queued, receipt_task)):
+                    raise RuntimeError("deferred group reply processing failed")
+            if not await self._complete_durable_update(queued):
+                raise RuntimeError("durable webhook completion lease was lost")
+            durably_completed = True
+            self._record_durable_success()
+        except asyncio.CancelledError:
+            # Only real server/process shutdown cancels late finalizers. Keep the
+            # lease intact; startup recovery will reclaim it after the old
+            # process (and therefore the old handler) no longer exists.
+            raise
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+            self._late_failed_updates += 1
+            self._failed_updates += 1
+            self._last_failure_at = time.time()
+            self._record_business_failure(queued.update_id, error)
+            try:
+                await self._release_durable_update(queued, error=error)
+            except Exception:
+                log.exception(
+                    "failed to release late durable webhook update | update=%s",
+                    queued.update_id,
+                )
+            log.exception(
+                "late durable webhook update failed | update=%s phase=%s",
+                queued.update_id,
+                phase,
+            )
+        finally:
+            async with self._dedup_lock:
+                current_late = self._late_finalizers.get(queued.update_id)
+                if current_late is asyncio.current_task():
+                    self._late_finalizers.pop(queued.update_id, None)
+                current = self._inflight_updates.get(queued.update_id)
+                if current is queued.result:
+                    self._inflight_updates.pop(queued.update_id, None)
+                if durably_completed:
+                    self._completed_update_ids[queued.update_id] = (
+                        asyncio.get_running_loop().time()
+                    )
+                else:
+                    self._completed_update_ids.pop(queued.update_id, None)
+
+    async def _process_update(self, queued: _QueuedWebhookUpdate) -> bool:
+        loop = asyncio.get_running_loop()
+        # The budget starts when the HTTP request is accepted into the queue,
+        # not when a worker eventually dequeues it. Queue pressure therefore
+        # cannot add another full execution budget before the HTTP response.
+        deadline = queued.enqueued_at + _WEBHOOK_UPDATE_TIMEOUT_SECONDS
+        key = id(queued)
+        self._active_started_at[key] = loop.time()
+        receipt = UpdateCompletionReceipt()
+        receipt_token = bind_update_completion(receipt)
+        durable_handed_off = False
+        terminal_error = "update processing did not complete"
+        phase = "dispatch"
+        try:
+            try:
+                result = await self._await_stage(
+                    self.dispatcher.feed_raw_update(
+                        bot=self.bot,
+                        update=queued.update,
+                    ),
+                    deadline=deadline,
+                )
+            finally:
+                reset_update_completion(receipt_token)
+            if isinstance(result, TelegramMethod):
+                phase = "silent"
+                await self._await_stage(
+                    self.dispatcher.silent_call_request(
+                        bot=self.bot,
+                        result=result,
+                    ),
+                    deadline=deadline,
+                )
+            if receipt.deferred:
+                if self._durable_inbox_enabled:
+                    finalizer = asyncio.create_task(
+                        self._finalize_deferred_update(queued, receipt),
+                        name=f"webhook-deferred:{queued.update_id}",
+                    )
+                    self._track_deferred_task(finalizer)
+                    durable_handed_off = True
+                else:
+                    deferred_succeeded = await self._await_stage(
+                        receipt.wait(),
+                        deadline=deadline,
+                    )
+                    if not deferred_succeeded:
+                        raise RuntimeError("deferred group reply processing failed")
+            elif self._durable_inbox_enabled:
+                if not await self._complete_durable_update(queued):
+                    raise RuntimeError("durable webhook completion lease was lost")
+                durable_handed_off = True
+        except asyncio.CancelledError:
+            terminal_error = "update processing cancelled"
+            raise
+        except _WebhookUpdateDeadlineExceeded as exc:
+            terminal_error = "update processing deadline exceeded"
+            self._timed_out_updates += 1
+            self._failed_updates += 1
+            self._last_failure_at = time.time()
+            if self._durable_inbox_enabled:
+                self._record_business_failure(
+                    queued.update_id,
+                    "processing exceeded "
+                    f"{_WEBHOOK_UPDATE_TIMEOUT_SECONDS:.1f}s",
+                )
+            else:
+                self._set_fatal(
+                    f"update processing exceeded "
+                    f"{_WEBHOOK_UPDATE_TIMEOUT_SECONDS:.1f}s"
+                )
+            log.exception("Telegram webhook update processing timed out")
+            if self._durable_inbox_enabled and exc.unfinished_task is not None:
+                late = asyncio.create_task(
+                    self._finalize_late_update(
+                        queued,
+                        receipt,
+                        exc.unfinished_task,
+                        phase=phase,
+                    ),
+                    name=f"webhook-late-finalizer:{queued.update_id}",
+                )
+                self._late_finalizers[queued.update_id] = late
+                self._track_deferred_task(late)
+                durable_handed_off = True
+            return False
+        except Exception as exc:
+            terminal_error = str(exc)
+            self._failed_updates += 1
+            self._last_failure_at = time.time()
+            if self._durable_inbox_enabled:
+                self._record_business_failure(
+                    queued.update_id,
+                    str(exc) or type(exc).__name__,
+                )
+            else:
+                self._consecutive_failures += 1
+            if (
+                not self._durable_inbox_enabled
+                and self._consecutive_failures >= _WEBHOOK_FAILURE_THRESHOLD
+            ):
+                self._set_fatal(
+                    "update processing failed "
+                    f"{self._consecutive_failures} consecutive times: {exc}"
+                )
+            log.exception("Telegram webhook update processing failed")
+            return False
+        else:
+            if not (self._durable_inbox_enabled and receipt.deferred):
+                self._record_durable_success()
+            return True
+        finally:
+            self._active_started_at.pop(key, None)
+            if self._durable_inbox_enabled and not durable_handed_off:
+                try:
+                    await self._release_durable_update(
+                        queued,
+                        error=terminal_error,
+                    )
+                except Exception:
+                    log.exception(
+                        "failed to release durable webhook update | update=%s",
+                        queued.update_id,
+                    )
 
     async def _worker(self) -> None:
         while True:
-            update = await self.queue.get()
+            queued = await self.queue.get()
+            succeeded = False
             try:
-                result = await self.dispatcher.feed_raw_update(
-                    bot=self.bot,
-                    update=update,
-                )
-                if isinstance(result, TelegramMethod):
-                    await self.dispatcher.silent_call_request(
-                        bot=self.bot,
-                        result=result,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Telegram webhook update processing failed")
+                succeeded = await self._process_update(queued)
             finally:
+                await asyncio.shield(
+                    self._finish_queued_update(queued, succeeded=succeeded)
+                )
                 self.queue.task_done()
 
-    async def stop(self) -> None:
+    def fatal_issue(self) -> str | None:
+        return self._fatal_error or self._business_failure_issue
+
+    def _oldest_queue_age(self) -> float:
+        try:
+            queued = self.queue._queue[0]  # type: ignore[attr-defined]
+        except (AttributeError, IndexError):
+            return 0.0
+        return max(0.0, time.monotonic() - queued.enqueued_at)
+
+    def _oldest_active_age(self) -> float:
+        if not self._active_started_at:
+            return 0.0
+        return max(0.0, time.monotonic() - min(self._active_started_at.values()))
+
+    def delivery_issue(self) -> str | None:
         if self._stopped:
-            return
+            return "webhook processor is stopped"
+        if self._fatal_error is not None:
+            return self._fatal_error
+        if self._business_failure_issue is not None:
+            return self._business_failure_issue
+        if self._workers_started:
+            alive = sum(not worker.done() for worker in self._workers)
+            if alive != self.worker_count:
+                return f"only {alive}/{self.worker_count} webhook workers are alive"
+        if self.queue.full():
+            return "webhook update queue is saturated"
+        oldest_queue_age = self._oldest_queue_age()
+        if oldest_queue_age > _WEBHOOK_UPDATE_TIMEOUT_SECONDS:
+            return f"oldest queued update is {oldest_queue_age:.1f}s old"
+        oldest_active_age = self._oldest_active_age()
+        if (
+            oldest_active_age
+            > _WEBHOOK_UPDATE_TIMEOUT_SECONDS + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+        ):
+            return f"oldest active update is {oldest_active_age:.1f}s old"
+        return None
+
+    def health_snapshot(self) -> dict[str, Any]:
+        issue = self.delivery_issue()
+        return {
+            "ok": issue is None,
+            "issue": issue,
+            "stopped": self._stopped,
+            "workers_configured": self.worker_count,
+            "workers_alive": sum(not worker.done() for worker in self._workers),
+            "queue_size": self.queue.qsize(),
+            "queue_capacity": self.queue.maxsize,
+            "oldest_queue_age_seconds": round(self._oldest_queue_age(), 3),
+            "active_updates": len(self._active_started_at),
+            "oldest_active_age_seconds": round(self._oldest_active_age(), 3),
+            "orphaned_update_tasks": len(self._orphaned_tasks),
+            "deferred_reply_jobs": len(self._deferred_tasks),
+            "late_finalizers": len(self._late_finalizers),
+            "accepted_updates": self._accepted_updates,
+            "completed_updates": self._completed_updates,
+            "failed_updates": self._failed_updates,
+            "timed_out_updates": self._timed_out_updates,
+            "retried_updates": self._retried_updates,
+            "dropped_updates": self._dropped_updates,
+            "deferred_failed_updates": self._deferred_failed_updates,
+            "late_failed_updates": self._late_failed_updates,
+            "dead_lettered_updates": self._dead_lettered_updates,
+            "retry_scheduled_updates": self._retry_scheduled_updates,
+            "cleaned_inbox_updates": self._cleaned_inbox_updates,
+            "recovery_failures": self._recovery_failures,
+            "last_business_error": self._last_business_error,
+            "consecutive_distinct_failures": len(
+                self._failed_update_ids_since_success
+            ),
+            "last_recovery_error": self._last_recovery_error,
+            "last_success_at": self._last_success_at,
+            "last_failure_at": self._last_failure_at,
+        }
+
+    async def _discard_queued_updates(self) -> int:
+        discarded = 0
+        while True:
+            try:
+                queued = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                discarded += 1
+                try:
+                    await self._release_durable_update(
+                        queued,
+                        error="webhook queue discarded during shutdown",
+                    )
+                except Exception:
+                    log.exception(
+                        "failed to release discarded durable webhook update | update=%s",
+                        queued.update_id,
+                    )
+                await self._finish_queued_update(queued, succeeded=False)
+                self.queue.task_done()
+        self._dropped_updates += discarded
+        return discarded
+
+    async def _stop_impl(self) -> None:
         self._stopped = True
+        if self._recovery_task is not None:
+            recovery_task = self._recovery_task
+            recovery_task.cancel()
+            done, pending = await asyncio.wait(
+                {recovery_task},
+                timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+            )
+            if recovery_task in done:
+                self._consume_task_result(recovery_task)
+            elif pending:
+                self._track_orphan(recovery_task)
+            self._recovery_task = None
         if self._workers:
-            await self.queue.join()
+            try:
+                await asyncio.wait_for(
+                    self.queue.join(),
+                    timeout=_WEBHOOK_DRAIN_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                discarded = await self._discard_queued_updates()
+                self._set_fatal(
+                    "webhook queue drain timed out; "
+                    f"rejected {discarded} queued updates"
+                )
+                log.error(
+                    "Webhook queue drain timed out after %.1fs; discarded=%d",
+                    _WEBHOOK_DRAIN_TIMEOUT_SECONDS,
+                    discarded,
+                )
             for worker in self._workers:
                 worker.cancel()
-            await asyncio.gather(*self._workers, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                self._workers,
+                timeout=_WEBHOOK_WORKER_STOP_TIMEOUT_SECONDS,
+            )
+            for task in done:
+                self._consume_task_result(task)
+            if pending:
+                log.error(
+                    "%d webhook workers ignored cancellation during shutdown",
+                    len(pending),
+                )
+                for task in pending:
+                    task.add_done_callback(self._consume_task_result)
             self._workers.clear()
+
+        outstanding = list(self._processing_tasks | self._orphaned_tasks)
+        for task in outstanding:
+            task.cancel()
+        if outstanding:
+            done, pending = await asyncio.wait(
+                outstanding,
+                timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+            )
+            for task in done:
+                self._consume_task_result(task)
+            if pending:
+                log.error(
+                    "%d webhook update tasks ignored cancellation during shutdown",
+                    len(pending),
+                )
+                for task in pending:
+                    task.add_done_callback(self._consume_task_result)
+
+        deferred = {task for task in self._deferred_tasks if not task.done()}
+        if deferred:
+            done, pending = await asyncio.wait(
+                deferred,
+                timeout=_WEBHOOK_WORKER_STOP_TIMEOUT_SECONDS,
+            )
+            for task in done:
+                self._consume_task_result(task)
+            for task in pending:
+                task.cancel()
+            if pending:
+                done_after_cancel, still_pending = await asyncio.wait(
+                    pending,
+                    timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+                )
+                for task in done_after_cancel:
+                    self._consume_task_result(task)
+                for task in still_pending:
+                    task.add_done_callback(self._consume_task_result)
+                if still_pending:
+                    log.error(
+                        "%d deferred webhook finalizers ignored cancellation",
+                        len(still_pending),
+                    )
+
+    async def stop(self) -> None:
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(
+                self._stop_impl(),
+                name="telegram-webhook-processor-stop",
+            )
+        try:
+            await asyncio.shield(self._stop_task)
+        except asyncio.CancelledError:
+            self._stop_task.cancel()
+            await asyncio.wait({self._stop_task}, timeout=1.0)
+            raise
 
 
 class VerifyWebServer:
@@ -571,9 +1992,11 @@ class VerifyWebServer:
         self.webhook_secret = webhook_secret
         self.webhook_route_error: str | None = None
         self._webhook_accepting_updates = False
+        self._delivery_mode = "starting"
         self._webhook_processor: _WebhookUpdateQueue | None = None
         self._webhook_request_tasks: set[asyncio.Task[Any]] = set()
         self._runner: web.AppRunner | None = None
+        self._stop_task: asyncio.Task[None] | None = None
         self._completed_verifications: dict[
             tuple[int, int], tuple[float, _VerificationFingerprint]
         ] = {}
@@ -583,6 +2006,65 @@ class VerifyWebServer:
         self._active_verifications: dict[
             tuple[int, int], _ActiveVerification
         ] = {}
+        self._verification_upstream_slots = asyncio.Semaphore(
+            _VERIFICATION_MAX_CONCURRENT_UPSTREAM
+        )
+        self._verification_upstream_admission_lock = asyncio.Lock()
+        self._verification_rate_events: OrderedDict[
+            tuple[str, str], deque[float]
+        ] = OrderedDict()
+
+    async def _try_acquire_verification_upstream(self) -> bool:
+        """Atomically claim an upstream slot without joining its wait queue."""
+
+        async with self._verification_upstream_admission_lock:
+            if self._verification_upstream_slots.locked():
+                return False
+            # The lock makes the capacity check and decrement one admission
+            # transaction. Since capacity is known to be available, acquire()
+            # completes immediately and never adds this request as a waiter.
+            await self._verification_upstream_slots.acquire()
+            return True
+
+    def _verification_rate_limited(
+        self,
+        *,
+        user_id: int | None,
+        remote_ip: str,
+    ) -> bool:
+        """Apply a bounded sliding-window limit before DB/provider work."""
+
+        now = time.monotonic()
+        cutoff = now - _VERIFICATION_RATE_WINDOW_SECONDS
+        keyed_limits: list[tuple[tuple[str, str], int]] = []
+        if user_id is not None and int(user_id) > 0:
+            keyed_limits.append(
+                (("user", str(int(user_id))), _VERIFICATION_USER_RATE_LIMIT)
+            )
+        if remote_ip:
+            keyed_limits.append((("ip", remote_ip), _VERIFICATION_IP_RATE_LIMIT))
+        if not keyed_limits:
+            return False
+
+        buckets: list[deque[float]] = []
+        for key, limit in keyed_limits:
+            bucket = self._verification_rate_events.get(key)
+            if bucket is None:
+                while len(self._verification_rate_events) >= _VERIFICATION_RATE_CACHE_MAX_ENTRIES:
+                    self._verification_rate_events.popitem(last=False)
+                bucket = deque()
+                self._verification_rate_events[key] = bucket
+            else:
+                self._verification_rate_events.move_to_end(key)
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= limit:
+                return True
+            buckets.append(bucket)
+
+        for bucket in buckets:
+            bucket.append(now)
+        return False
 
     @staticmethod
     def _verification_fingerprint(
@@ -775,7 +2257,7 @@ class VerifyWebServer:
             return False
 
     def build_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(client_max_size=_WEB_MAX_REQUEST_BYTES)
         app.router.add_get("/verify", self.handle_challenge_page)
         app.router.add_post("/verify", self.handle_challenge_submit)
         app.router.add_get("/healthz", self.handle_health)
@@ -795,15 +2277,27 @@ class VerifyWebServer:
                 session_factory=self.session_factory,
             )
         self.webhook_route_error = None
-        if self.webhook_dispatcher is not None and self.webhook_path:
-            try:
-                processor = _WebhookUpdateQueue(
-                    dispatcher=self.webhook_dispatcher,
-                    bot=self.bot,
-                    secret_token=self.webhook_secret,
-                    worker_count=WEBHOOK_MAX_CONCURRENT_UPDATES,
-                )
+        if self.webhook_dispatcher is not None:
+            processor = _WebhookUpdateQueue(
+                dispatcher=self.webhook_dispatcher,
+                bot=self.bot,
+                session_factory=(
+                    self.session_factory if callable(self.session_factory) else None
+                ),
+                secret_token=self.webhook_secret,
+                worker_count=WEBHOOK_MAX_CONCURRENT_UPDATES,
+            )
+            self._webhook_processor = processor
 
+            async def close_webhook_handler(_app: web.Application) -> None:
+                await self.disable_webhook_route()
+                await self._stop_webhook_processor()
+
+            app.on_shutdown.append(close_webhook_handler)
+
+        if self._webhook_processor is not None and self.webhook_path:
+            processor = self._webhook_processor
+            try:
                 async def handle_webhook(request: web.Request) -> web.Response:
                     if not processor.verify_secret(request):
                         return web.Response(text="Unauthorized", status=401)
@@ -818,13 +2312,7 @@ class VerifyWebServer:
                         if task is not None:
                             self._webhook_request_tasks.discard(task)
 
-                async def close_webhook_handler(_app: web.Application) -> None:
-                    await self.disable_webhook_route()
-                    await self.bot.session.close()
-
                 app.router.add_post(self.webhook_path, handle_webhook)
-                app.on_shutdown.append(close_webhook_handler)
-                self._webhook_processor = processor
             except Exception as exc:
                 self.webhook_route_error = f"Webhook HTTP 路由注册失败：{exc}"
                 log.error(
@@ -835,23 +2323,99 @@ class VerifyWebServer:
         return app
 
     def enable_webhook_route(self) -> None:
+        self._delivery_mode = "registering"
         self._webhook_accepting_updates = True
+
+    def mark_webhook_active(self) -> None:
+        if self._webhook_accepting_updates and self._delivery_mode != "stopping":
+            self._delivery_mode = "webhook"
 
     async def disable_webhook_route(self) -> None:
         self._webhook_accepting_updates = False
+        if self._delivery_mode != "stopping":
+            self._delivery_mode = "switching"
         request_tasks = [
             task
             for task in self._webhook_request_tasks
             if task is not asyncio.current_task() and not task.done()
         ]
         if request_tasks:
-            await asyncio.gather(*request_tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                request_tasks,
+                timeout=_WEBHOOK_REQUEST_DRAIN_TIMEOUT_SECONDS,
+            )
+            if pending:
+                log.error(
+                    "%d webhook HTTP requests exceeded %.1fs shutdown grace",
+                    len(pending),
+                    _WEBHOOK_REQUEST_DRAIN_TIMEOUT_SECONDS,
+                )
+                for task in pending:
+                    task.cancel()
+                    task.add_done_callback(_WebhookUpdateQueue._consume_task_result)
+            for task in done:
+                _WebhookUpdateQueue._consume_task_result(task)
+        if (
+            self._webhook_processor is not None
+            and not self._webhook_processor._durable_inbox_enabled
+        ):
+            await self._webhook_processor.stop()
+
+    async def _stop_webhook_processor(self) -> None:
         if self._webhook_processor is not None:
             await self._webhook_processor.stop()
 
+    async def stop_update_processor(self) -> None:
+        """Stop durable update consumption before reply/LLM shutdown flushes."""
+
+        await self._stop_webhook_processor()
+
+    async def start_update_processor(self) -> None:
+        """Start the transport-neutral durable Telegram inbox consumer.
+
+        The dispatcher startup hook must have completed before this method is
+        called. Keeping it separate from the HTTP listener prevents recovered
+        rows from reaching handlers while router startup is still in progress.
+        """
+
+        if self._webhook_processor is None:
+            raise RuntimeError("durable Telegram update processor is unavailable")
+        await self._webhook_processor.start_recovery()
+
+    async def accept_polling_update(self, update: Any) -> int:
+        """Durably accept one getUpdates item before polling advances offset."""
+
+        if self._webhook_processor is None:
+            raise RuntimeError("durable Telegram update processor is unavailable")
+        if isinstance(update, dict):
+            payload = dict(update)
+        else:
+            model_dump = getattr(update, "model_dump", None)
+            if not callable(model_dump):
+                raise TypeError("unsupported Telegram update object")
+            payload = model_dump(mode="json", exclude_none=True)
+        if not isinstance(payload, dict):
+            raise TypeError("Telegram update serialization did not return an object")
+        return await self._webhook_processor.accept_durable_update(payload)
+
+    def mark_polling_active(self) -> None:
+        if self._delivery_mode != "stopping":
+            self._delivery_mode = "polling"
+
+    def webhook_runtime_failure(self) -> str | None:
+        """Return only confirmed local failures suitable for transport fallback."""
+        if not self._webhook_accepting_updates:
+            return None
+        if self._webhook_processor is None:
+            return "webhook route is enabled without an update processor"
+        return self._webhook_processor.fatal_issue()
+
     async def start(self) -> None:
         app = self.build_app()
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(
+            app,
+            shutdown_timeout=_WEB_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
+        )
         await self._runner.setup()
         site = web.TCPSite(
             self._runner,
@@ -865,19 +2429,98 @@ class VerifyWebServer:
             self.settings.miniapp_listen_port,
         )
 
+    async def _stop_impl(self) -> None:
+        self._delivery_mode = "stopping"
+        # Stop accepting/drain Telegram updates explicitly before aiohttp starts
+        # its own shutdown sequence. This keeps the processor's bounded budget
+        # separate from AppRunner.shutdown_timeout and guarantees no update task
+        # survives into Bot-session/engine teardown.
+        await self.disable_webhook_route()
+        await self._stop_webhook_processor()
+        try:
+            if self._runner is not None:
+                runner = self._runner
+                self._runner = None
+                cleanup_task = asyncio.create_task(
+                    runner.cleanup(),
+                    name="miniapp-web-cleanup",
+                )
+                done, _pending = await asyncio.wait(
+                    {cleanup_task},
+                    timeout=_WEB_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                if cleanup_task not in done:
+                    log.error(
+                        "Mini App web server shutdown exceeded %.1fs",
+                        _WEB_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                    cleanup_task.cancel()
+                    done_after_cancel, pending_after_cancel = await asyncio.wait(
+                        {cleanup_task},
+                        timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+                    )
+                    for task in done_after_cancel:
+                        _WebhookUpdateQueue._consume_task_result(task)
+                    for task in pending_after_cancel:
+                        task.add_done_callback(_WebhookUpdateQueue._consume_task_result)
+                else:
+                    try:
+                        await cleanup_task
+                    except asyncio.CancelledError:
+                        log.error("Mini App web server cleanup was cancelled")
+                    except Exception:
+                        log.exception("Mini App web server cleanup failed")
+        finally:
+            await _flush_public_body_tasks()
+            await flush_member_identity_tasks()
+
     async def stop(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(
+                self._stop_impl(),
+                name="miniapp-web-server-stop",
+            )
+        try:
+            await asyncio.shield(self._stop_task)
+        except asyncio.CancelledError:
+            self._stop_task.cancel()
+            await asyncio.wait({self._stop_task}, timeout=1.0)
+            raise
 
     async def handle_health(self, _request: web.Request) -> web.Response:
+        processor = self._webhook_processor
+        webhook_health = processor.health_snapshot() if processor is not None else None
+        webhook_issue = (
+            processor.delivery_issue()
+            if processor is not None
+            and (
+                self._webhook_accepting_updates
+                or (
+                    processor._durable_inbox_enabled
+                    and not processor._stopped
+                )
+            )
+            else (
+                "webhook route is enabled without an update processor"
+                if self._webhook_accepting_updates
+                else None
+            )
+        )
+        ok = (
+            webhook_issue is None
+            and self._delivery_mode in {"webhook", "polling"}
+        )
         return web.json_response(
             {
-                "ok": True,
+                "ok": ok,
+                "delivery_mode": self._delivery_mode,
+                "webhook_accepting_updates": self._webhook_accepting_updates,
+                "webhook": webhook_health,
                 "config_revision": self.runtime_config.revision
                 if self.runtime_config is not None
                 else None,
-            }
+            },
+            status=200 if ok else 503,
         )
 
     async def handle_settings_page(self, _request: web.Request) -> web.StreamResponse:
@@ -1001,7 +2644,15 @@ class VerifyWebServer:
 
     async def handle_challenge_submit(self, request: web.Request) -> web.Response:
         try:
-            body = await request.json()
+            body = await _read_json_body_hard(
+                request,
+                timeout_seconds=_PUBLIC_JSON_BODY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return web.json_response(
+                {"ok": False, "error": "请求体读取超时"},
+                status=408,
+            )
         except Exception:
             body = {}
         if not isinstance(body, dict):
@@ -1025,11 +2676,38 @@ class VerifyWebServer:
                 else "turnstile": challenge_token
             }
         page_config_tag = str(body.get("config_tag") or "").strip()
+        raw_verification_id = body.get("verification_id") or 0
+        raw_verification_id_text = str(raw_verification_id).strip()
+        init_data = str(body.get("init_data") or "")
+        if (
+            len(page_provider) > _VERIFICATION_MAX_PROVIDER_CHARS
+            or len(page_config_tag) > _VERIFICATION_MAX_CONFIG_TAG_CHARS
+            or len(raw_verification_id_text) > _VERIFICATION_MAX_ID_CHARS
+            or len(init_data) > _VERIFICATION_MAX_INIT_DATA_CHARS
+            or any(
+                len(token) > _VERIFICATION_MAX_CHALLENGE_TOKEN_CHARS
+                for token in subprovider_tokens.values()
+            )
+        ):
+            return web.json_response(
+                {"ok": False, "error": "验证参数过长"},
+                status=413,
+            )
+        remote_ip = _client_public_ip(request)
+        if self._verification_rate_limited(user_id=None, remote_ip=remote_ip):
+            log.info(
+                "verification rejected | reason=ip_rate_limited ip=%s",
+                remote_ip,
+            )
+            return web.json_response(
+                {"ok": False, "error": "请求过于频繁，请稍后重试"},
+                status=429,
+                headers={"Retry-After": str(int(_VERIFICATION_RATE_WINDOW_SECONDS))},
+            )
         try:
-            verification_id = int(body.get("verification_id") or 0)
+            verification_id = int(raw_verification_id_text or 0)
         except (TypeError, ValueError):
             verification_id = -1
-        init_data = str(body.get("init_data") or "")
         if (
             not all(subprovider_tokens.values())
             or not init_data
@@ -1044,10 +2722,30 @@ class VerifyWebServer:
             web_app_data = safe_parse_webapp_init_data(
                 token=self.bot.token, init_data=init_data
             )
-        except ValueError:
+            auth_timestamp = _auth_timestamp(web_app_data.auth_date)
+        except (ValueError, AttributeError, TypeError, OverflowError, OSError):
             log.info("verification rejected | reason=bad_init_data_signature")
             return web.json_response(
                 {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
+            )
+        init_data_age = time.time() - auth_timestamp
+        if init_data_age > MAX_INIT_DATA_AGE_SECONDS:
+            log.info(
+                "verification rejected | reason=expired_init_data age=%.1f",
+                init_data_age,
+            )
+            return web.json_response(
+                {"ok": False, "error": "会话已过期，请从 Telegram 重新打开"},
+                status=403,
+            )
+        if init_data_age < -MAX_INIT_DATA_FUTURE_SECONDS:
+            log.info(
+                "verification rejected | reason=future_init_data age=%.1f",
+                init_data_age,
+            )
+            return web.json_response(
+                {"ok": False, "error": "会话时间异常，请从 Telegram 重新打开"},
+                status=403,
             )
         web_user = web_app_data.user
         if web_user is None:
@@ -1055,6 +2753,17 @@ class VerifyWebServer:
                 {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
             )
         user_id = int(web_user.id)
+        if self._verification_rate_limited(user_id=user_id, remote_ip=""):
+            log.info(
+                "verification rejected | reason=rate_limited user=%s ip=%s",
+                user_id,
+                remote_ip or "-",
+            )
+            return web.json_response(
+                {"ok": False, "error": "请求过于频繁，请稍后重试"},
+                status=429,
+                headers={"Retry-After": str(int(_VERIFICATION_RATE_WINDOW_SECONDS))},
+            )
 
         async with self.session_factory() as session:
             record = None
@@ -1167,32 +2876,64 @@ class VerifyWebServer:
         if request_task is not None:
             request_task.add_done_callback(lambda _task: release_active())
 
-        remote_ip = _client_public_ip(request)
+        if joined_existing_active:
+            # Widget tokens are single-use for both providers. A concurrent
+            # duplicate submit must join the first terminal future before any
+            # second siteverify call, otherwise Turnstile commonly reports
+            # timeout-or-duplicate and a genuine solve is returned as 403.
+            release_active()
+            if await self._wait_for_completed_verification(active):
+                async with self.session_factory() as session:
+                    still_pending = await get_pending_verification_by_id_for_user(
+                        session,
+                        verification_id,
+                        user_id,
+                    )
+                if still_pending is None:
+                    return web.json_response({"ok": True})
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "验证正在处理中或未完成，请稍后重试",
+                },
+                status=409,
+            )
+
+        if not await self._try_acquire_verification_upstream():
+            release_active()
+            return web.json_response(
+                {"ok": False, "error": "验证服务繁忙，请稍后重试"},
+                status=429,
+                headers={"Retry-After": "2"},
+            )
         # Combined verification checks each service in guided order and stops
         # at the first failure; the member must pass every one of them.
         passed = True
         verification_errors: list[str] = []
         failed_subprovider = required_subproviders[0]
-        for subprovider in required_subproviders:
-            site_key, secret_key = verification_keys_for_provider(
-                self.settings, subprovider
-            )
-            if subprovider == "hcaptcha":
-                passed, verification_errors = await verify_hcaptcha_token(
-                    secret_key=secret_key,
-                    hcaptcha_token=subprovider_tokens[subprovider],
-                    remote_ip=remote_ip,
-                    site_key=site_key,
+        try:
+            for subprovider in required_subproviders:
+                site_key, secret_key = verification_keys_for_provider(
+                    self.settings, subprovider
                 )
-            else:
-                passed, verification_errors = await verify_turnstile_token(
-                    secret_key=secret_key,
-                    turnstile_token=subprovider_tokens[subprovider],
-                    remote_ip=remote_ip,
-                )
-            if not passed:
-                failed_subprovider = subprovider
-                break
+                if subprovider == "hcaptcha":
+                    passed, verification_errors = await verify_hcaptcha_token(
+                        secret_key=secret_key,
+                        hcaptcha_token=subprovider_tokens[subprovider],
+                        remote_ip=remote_ip,
+                        site_key=site_key,
+                    )
+                else:
+                    passed, verification_errors = await verify_turnstile_token(
+                        secret_key=secret_key,
+                        turnstile_token=subprovider_tokens[subprovider],
+                        remote_ip=remote_ip,
+                    )
+                if not passed:
+                    failed_subprovider = subprovider
+                    break
+        finally:
+            self._verification_upstream_slots.release()
         if _verification_config_tag(self.settings, provider) != current_config_tag:
             release_active()
             return web.json_response(
@@ -1336,6 +3077,7 @@ class VerifyWebServer:
                     status=403,
                 )
 
+            lease_until = now + timedelta(seconds=TERMINAL_LEASE_SECONDS)
             claimed = await claim_join_verification(
                 session,
                 verification_id=current.id,
@@ -1343,6 +3085,8 @@ class VerifyWebServer:
                 kind=current.kind,
                 now=now,
                 expired=False,
+                lease_until=lease_until,
+                target_status=VERIFICATION_STATUS_RELEASING,
             )
             if not claimed:
                 await session.rollback()
@@ -1358,9 +3102,9 @@ class VerifyWebServer:
             prompt_message_id = int(current.prompt_message_id or 0)
             display_name = (current.display_name or "").strip()
             kind = current.kind
-            reason = current.reason or ""
-            # Commit before Telegram calls so a failed restore cannot roll the
-            # pass back and let the sweeper kick a verified member.
+            # Persist the releasing lease before Telegram calls. A crash after
+            # this commit is recovered by the sweeper as restore+CAS delete,
+            # never as a timeout kick/ban.
             await session.commit()
 
         terminal_task = asyncio.create_task(
@@ -1372,8 +3116,7 @@ class VerifyWebServer:
                 prompt_message_id=prompt_message_id,
                 display_name=display_name,
                 kind=kind,
-                reason=reason,
-                provider=provider,
+                lease_until=lease_until,
             )
         )
         try:
@@ -1391,8 +3134,7 @@ class VerifyWebServer:
                         prompt_message_id=prompt_message_id,
                         display_name=display_name,
                         kind=kind,
-                        reason=reason,
-                        provider=provider,
+                        lease_until=lease_until,
                     )
                 )
             raise
@@ -1406,8 +3148,7 @@ class VerifyWebServer:
                     prompt_message_id=prompt_message_id,
                     display_name=display_name,
                     kind=kind,
-                    reason=reason,
-                    provider=provider,
+                    lease_until=lease_until,
                 )
             )
             raise
@@ -1424,8 +3165,7 @@ class VerifyWebServer:
         prompt_message_id: int,
         display_name: str,
         kind: str,
-        reason: str,
-        provider: str,
+        lease_until: datetime,
     ) -> web.Response:
         restored = await restore_member_permissions(self.bot, group_id, user_id)
         log.info(
@@ -1436,29 +3176,21 @@ class VerifyWebServer:
             restored,
         )
         if not restored:
-            timeout_seconds = verification_timeout_seconds_for_kind(
-                self.settings, kind
+            retry_lease = now_shanghai_naive() + timedelta(
+                seconds=TERMINAL_LEASE_SECONDS
             )
             async with self.session_factory() as session:
-                await upsert_join_verification(
+                deferred = await renew_join_verification_lease(
                     session,
-                    group_id=group_id,
-                    user_id=user_id,
-                    deadline_at=now_shanghai_naive()
-                    + timedelta(seconds=max(60, int(timeout_seconds))),
-                    kind=kind,
-                    reason=reason,
-                    display_name=display_name,
-                    prompt_message_id=prompt_message_id,
-                    provider=provider,
+                    verification_id=verification_id,
+                    lease_until=lease_until,
+                    new_lease_until=retry_lease,
+                    status=VERIFICATION_STATUS_RELEASING,
                 )
-                await session.commit()
-                retry_record = await get_join_verification(
-                    session,
-                    group_id,
-                    user_id,
-                )
-                retry_verification_id = int(retry_record.id) if retry_record else 0
+                if deferred:
+                    await session.commit()
+                else:
+                    await session.rollback()
             await self._announce_pass(
                 group_id=group_id,
                 user_id=user_id,
@@ -1475,11 +3207,26 @@ class VerifyWebServer:
             return web.json_response(
                 {
                     "ok": False,
-                    "error": "验证已通过，但 Telegram 放行暂时失败；验证入口已保留，请稍后重试",
-                    "verification_id": retry_verification_id,
+                    "error": (
+                        "验证已通过，但 Telegram 放行暂时失败；后台将继续重试"
+                        if deferred
+                        else "验证已通过，但放行工单已由后台接管，请稍后重试"
+                    ),
+                    "verification_id": verification_id,
                 },
                 status=502,
             )
+        async with self.session_factory() as session:
+            completed = await complete_leased_join_verification(
+                session,
+                verification_id=verification_id,
+                lease_until=lease_until,
+                status=VERIFICATION_STATUS_RELEASING,
+            )
+            if completed:
+                await session.commit()
+            else:
+                await session.rollback()
         self._mark_verification_completed(
             verification_id,
             user_id,
@@ -1541,8 +3288,7 @@ class VerifyWebServer:
         prompt_message_id: int,
         display_name: str,
         kind: str,
-        reason: str,
-        provider: str,
+        lease_until: datetime,
     ) -> None:
         try:
             restored = await self._completed_member_is_unrestricted(
@@ -1550,6 +3296,17 @@ class VerifyWebServer:
                 user_id,
             ) or await restore_member_permissions(self.bot, group_id, user_id)
             if restored:
+                async with self.session_factory() as session:
+                    completed = await complete_leased_join_verification(
+                        session,
+                        verification_id=verification_id,
+                        lease_until=lease_until,
+                        status=VERIFICATION_STATUS_RELEASING,
+                    )
+                    if completed:
+                        await session.commit()
+                    else:
+                        await session.rollback()
                 self._mark_verification_completed(
                     verification_id,
                     user_id,
@@ -1557,23 +3314,21 @@ class VerifyWebServer:
                 )
                 return
 
-            timeout_seconds = verification_timeout_seconds_for_kind(
-                self.settings, kind
+            retry_lease = now_shanghai_naive() + timedelta(
+                seconds=TERMINAL_LEASE_SECONDS
             )
             async with self.session_factory() as session:
-                await upsert_join_verification(
+                deferred = await renew_join_verification_lease(
                     session,
-                    group_id=group_id,
-                    user_id=user_id,
-                    deadline_at=now_shanghai_naive()
-                    + timedelta(seconds=max(60, int(timeout_seconds))),
-                    kind=kind,
-                    reason=reason,
-                    display_name=display_name,
-                    prompt_message_id=prompt_message_id,
-                    provider=provider,
+                    verification_id=verification_id,
+                    lease_until=lease_until,
+                    new_lease_until=retry_lease,
+                    status=VERIFICATION_STATUS_RELEASING,
                 )
-                await session.commit()
+                if deferred:
+                    await session.commit()
+                else:
+                    await session.rollback()
         except Exception:
             log.exception(
                 "verification terminal recovery failed | kind=%s group=%s user=%s",
@@ -1623,7 +3378,7 @@ class VerifyWebServer:
                 )
                 # Repurposed challenge prompt is now a moderation outcome
                 # notice: honor the group's auto-delete retention.
-                schedule_message_auto_delete(
+                await schedule_message_auto_delete_durable(
                     edited if not isinstance(edited, bool) else None,
                     configured_auto_delete_seconds(self.settings, "moderation"),
                 )
@@ -1650,7 +3405,7 @@ class VerifyWebServer:
             # persisted challenge prompt and is left to persist like other
             # finalizations.
             sent = await self.bot.send_message(group_id, text, parse_mode="HTML")
-            schedule_message_auto_delete(
+            await schedule_message_auto_delete_durable(
                 sent, configured_auto_delete_seconds(self.settings, "moderation")
             )
         except Exception:

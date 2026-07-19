@@ -30,7 +30,10 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
-from bot.utils.telegram import configured_auto_delete_seconds, schedule_message_auto_delete
+from bot.utils.telegram import (
+    configured_auto_delete_seconds,
+    schedule_message_auto_delete_durable,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
@@ -46,6 +49,56 @@ VOTE_BAN_ENFORCEMENT_LEASE_SECONDS = 60
 _expiry_tasks: dict[int, asyncio.Task] = {}
 _enforcement_tasks: dict[int, asyncio.Task] = {}
 _start_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _consume_vote_task_result(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def flush_vote_ban_tasks(*, timeout_seconds: float = 15.0) -> None:
+    """Cancel and boundedly join every vote timer/recovery task.
+
+    These tasks outlive the update handler that created them and may access
+    both the database and Telegram hours later.  They therefore have to finish
+    before the shared engine and Bot session are closed during application
+    shutdown.
+    """
+
+    current = asyncio.current_task()
+    tasks = {
+        task
+        for task in (*_expiry_tasks.values(), *_enforcement_tasks.values())
+        if task is not current and not task.done()
+    }
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(0.0, float(timeout_seconds)),
+        )
+        for task in done:
+            _consume_vote_task_result(task)
+        if pending:
+            log.error(
+                "%d vote-ban task(s) ignored shutdown cancellation",
+                len(pending),
+            )
+            for task in pending:
+                task.add_done_callback(_consume_vote_task_result)
+
+    # A task's finally block normally retires itself.  Clean completed entries
+    # defensively, but never remove a newer replacement that reused the same
+    # session id while an older cancelled task was unwinding.
+    for registry in (_expiry_tasks, _enforcement_tasks):
+        for session_id, task in tuple(registry.items()):
+            if task.done() and registry.get(session_id) is task:
+                registry.pop(session_id, None)
 
 
 @dataclass(slots=True)
@@ -616,6 +669,11 @@ async def start_vote_ban(
     if is_super_admin_user_id(target_id, settings):
         return VoteBanStartResult(False, "owner_target", "不能对最高管理员发起投票。")
 
+    # All checks above are read-only. Release their transaction before the
+    # Telegram membership lookup, which may otherwise pin a pooled connection
+    # for the full network timeout. The session is safely reused below for the
+    # quota/session reservation transaction.
+    await session.commit()
     member_status = await _target_membership_status(request_message.bot, group_id, target_id)
     if member_status is None:
         return VoteBanStartResult(
@@ -809,6 +867,26 @@ async def apply_vote_ban(
     recovery worker can safely retry instead of a false local "banned" fact.
     """
     del session  # Kept in the signature for existing callers and tests.
+    # The target may have been promoted after the poll was created.  Re-check as
+    # close as possible to the irreversible action and fail closed when Telegram
+    # cannot provide a fresh answer.  Telegram performs its own final permission
+    # check too, but this avoids even attempting to ban a newly promoted admin.
+    member_status = await _target_membership_status(bot, group_id, target_user_id)
+    if member_status is None:
+        log.warning(
+            "vote ban skipped because target status is unknown | group=%s user=%s",
+            group_id,
+            target_user_id,
+        )
+        return False
+    if member_status in {"creator", "administrator"}:
+        log.warning(
+            "vote ban skipped because target is now admin | group=%s user=%s status=%s",
+            group_id,
+            target_user_id,
+            member_status,
+        )
+        return False
     try:
         banned = await bot.ban_chat_member(int(group_id), int(target_user_id))
         if banned is False:
@@ -895,6 +973,9 @@ async def record_vote_ban_outcome(
     )
     await session.commit()
     await session.refresh(record)
+    # The refresh is only for callers that render the final poll state. Do not
+    # leave its read transaction checked out across Telegram message editing.
+    await session.commit()
     return True
 
 
@@ -913,6 +994,7 @@ async def recover_stale_vote_enforcement(
     """
     current = now_shanghai_naive()
     if not enforcement_is_stale(record, now=current):
+        await session.commit()
         return None
     cutoff = current - timedelta(seconds=VOTE_BAN_ENFORCEMENT_LEASE_SECONDS)
     claimed = await session.execute(
@@ -934,8 +1016,15 @@ async def recover_stale_vote_enforcement(
 
     fresh = await session.get(VoteBanSession, int(record.id), populate_existing=True)
     if fresh is None or fresh.status != "enforcing":
+        await session.commit()
         return None
     approvals = await count_approvals(session, int(fresh.id))
+    # The lease and approval snapshot are now authoritative for this attempt.
+    # End the read transaction before the Bot API call so a slow/ambiguous ban
+    # cannot pin a pooled connection for its network timeout. ``expire_on_commit``
+    # is disabled for the application session factory, so the detached values
+    # below remain safe to use for the final CAS transaction.
+    await session.commit()
     banned = await apply_vote_ban(
         bot,
         session,
@@ -975,8 +1064,14 @@ async def recover_stale_vote_enforcement(
             int(fresh.id),
             populate_existing=True,
         )
-        if latest is not None and latest.status in {"passed", "failed"}:
-            return str(latest.status)
+        latest_status = (
+            str(latest.status)
+            if latest is not None and latest.status in {"passed", "failed"}
+            else None
+        )
+        await session.commit()
+        if latest_status is not None:
+            return latest_status
         return None
 
     cancel_vote_expiry(int(fresh.id))
@@ -1026,7 +1121,7 @@ async def finalize_vote_message(
             parse_mode="HTML",
             reply_markup=None,
         )
-        schedule_message_auto_delete(
+        await schedule_message_auto_delete_durable(
             edited if not isinstance(edited, bool) else None,
             configured_auto_delete_seconds(settings, "vote"),
         )
@@ -1074,7 +1169,9 @@ def schedule_vote_expiry(
         except Exception:
             log.exception("vote expiry failed | session=%s", session_id)
         finally:
-            _expiry_tasks.pop(int(session_id), None)
+            current = asyncio.current_task()
+            if _expiry_tasks.get(int(session_id)) is current:
+                _expiry_tasks.pop(int(session_id), None)
 
     try:
         _expiry_tasks[int(session_id)] = asyncio.create_task(

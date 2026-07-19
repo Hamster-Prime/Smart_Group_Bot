@@ -81,6 +81,21 @@ class SendStickerSkill:
                 error="no_sticker",
             )
 
+        # ``pick_sticker`` may have read/imported the library. Persist that
+        # snapshot and return its connection before Telegram I/O. The skill
+        # service owns a private tool session, so committing here cannot publish
+        # unrelated handler state.
+        try:
+            await session.commit()
+        except Exception as exc:
+            log.exception("[%s] sticker snapshot commit failed", group_id)
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="当前无法读取贴纸库",
+                error=str(exc),
+            )
+
         try:
             await send_sticker_with_auto_delete(
                 message,
@@ -88,7 +103,6 @@ class SendStickerSkill:
                 delivery_mode=delivery_mode,
                 auto_delete_seconds=context.auto_delete_media_seconds,
             )
-            await sticker_library.mark_sent(session, group_id, sticker_file_id)
         except Exception as exc:
             log.exception("[%s] send_sticker skill failed", group_id)
             return SkillRunResult(
@@ -96,6 +110,27 @@ class SendStickerSkill:
                 skill=self.name,
                 summary="贴纸发送失败",
                 error=str(exc),
+            )
+
+        # Delivery is already externally visible. Bookkeeping must use a fresh,
+        # short transaction and must never turn a successful send into a tool
+        # failure that could make the model retry the side effect.
+        try:
+            if context.session_factory is not None:
+                async with context.session_factory() as mark_session:
+                    await sticker_library.mark_sent(
+                        mark_session,
+                        group_id,
+                        sticker_file_id,
+                    )
+                    await mark_session.commit()
+            else:
+                await sticker_library.mark_sent(session, group_id, sticker_file_id)
+        except Exception:
+            log.exception(
+                "[%s] sent sticker bookkeeping failed | file_id=%s",
+                group_id,
+                sticker_file_id[:32],
             )
 
         context.handled = True

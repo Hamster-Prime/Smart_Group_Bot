@@ -8,7 +8,9 @@ dependencies = [
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
     "sqlalchemy[asyncio]>=2.0",
-    "litellm>=1.50",
+    # Async Responses API support is required so request timeouts can cancel
+    # the underlying operation instead of leaking blocking worker threads.
+    "litellm>=1.92",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",

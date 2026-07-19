@@ -17,7 +17,7 @@ from bot.services.message_templates import (
 )
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
-    schedule_message_auto_delete,
+    schedule_message_auto_delete_durable,
 )
 
 log = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ async def send_group_welcome(
     except Exception:
         log.warning("welcome send failed | group=%s user=%s", group_id, user_id)
         return False
-    schedule_message_auto_delete(
+    await schedule_message_auto_delete_durable(
         sent, configured_auto_delete_seconds(settings, "welcome")
     )
     return True

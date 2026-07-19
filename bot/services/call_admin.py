@@ -29,7 +29,7 @@ from bot.db.models import Admin, GroupMember
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     is_reply_target_missing_error,
-    schedule_message_auto_delete,
+    schedule_message_auto_delete_durable,
 )
 
 log = logging.getLogger(__name__)
@@ -236,9 +236,36 @@ async def handle_call_admin(
     # get_chat_administrators must not all pass the check above.
     claim_stamp = _claim_call(group_id)
 
+    # This helper is invoked from the main message handler after several local
+    # authorization/settings reads. Release that snapshot before Telegram's
+    # potentially slow administrator lookup.
+    try:
+        await session.commit()
+    except Exception:
+        _release_call(group_id, claim_stamp)
+        log.warning(
+            "[%s] call admin transaction release failed before lookup",
+            group_id,
+            exc_info=True,
+        )
+        return False
+
     mentions = await _resolve_admin_mentions(
         message.bot, session, group_id, call_admin_targets(group_settings)
     )
+    # The Telegram fallback path may have queried the local Admin/roster
+    # tables. End that fresh read transaction before sending notification
+    # batches so it cannot remain checked out across network retries.
+    try:
+        await session.commit()
+    except Exception:
+        _release_call(group_id, claim_stamp)
+        log.warning(
+            "[%s] call admin transaction release failed after lookup",
+            group_id,
+            exc_info=True,
+        )
+        return False
     if not mentions:
         _release_call(group_id, claim_stamp)
         log.info("[%s] call admin skipped: no admins to mention", group_id)
@@ -290,7 +317,7 @@ async def handle_call_admin(
             )
             return bool(sent_messages)
         sent_messages.append(sent)
-        schedule_message_auto_delete(
+        await schedule_message_auto_delete_durable(
             sent, configured_auto_delete_seconds(settings, "call_admin")
         )
     return bool(sent_messages)

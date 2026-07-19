@@ -79,8 +79,9 @@ class EmbedConfig(EmbedEndpointConfig):
 class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
-    drop_pending_updates: bool = True
+    drop_pending_updates: bool = False
     inbound_debounce_seconds: float = 5.0
+    reply_batch_timeout_seconds: float = 45.0
     enable_typing: bool = True
     enable_streaming: bool = True
     stream_chunk_size: int = 36
@@ -206,6 +207,7 @@ class Settings(BaseSettings):
     max_context_tokens: int = 256000
     max_output_tokens: int = 2048
     bot_inbound_debounce_seconds: float = 5.0
+    bot_reply_batch_timeout_seconds: float = 45.0
     bot_enable_typing: bool = True
     bot_enable_streaming: bool = True
     bot_stream_chunk_size: int = 36
@@ -728,6 +730,11 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             settings.bot.parse_mode = bot_data["parse_mode"]
         if "drop_pending_updates" in bot_data:
             settings.bot.drop_pending_updates = bot_data["drop_pending_updates"]
+        if "reply_batch_timeout_seconds" in bot_data:
+            settings.bot.reply_batch_timeout_seconds = min(
+                120.0,
+                max(5.0, float(bot_data["reply_batch_timeout_seconds"])),
+            )
 
     if "moderation" in toml_data:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
@@ -743,6 +750,11 @@ def load_settings(config_path: str = "config.toml") -> Settings:
 
     settings.bot.token = settings.bot_token
     settings.bot.inbound_debounce_seconds = max(0.0, float(settings.bot_inbound_debounce_seconds))
+    if "bot_reply_batch_timeout_seconds" in getattr(settings, "model_fields_set", set()):
+        settings.bot.reply_batch_timeout_seconds = min(
+            120.0,
+            max(5.0, float(settings.bot_reply_batch_timeout_seconds)),
+        )
     settings.bot.enable_typing = settings.bot_enable_typing
     settings.bot.enable_streaming = settings.bot_enable_streaming
     settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)
@@ -975,3 +987,23 @@ def load_bootstrap_settings() -> Settings:
     settings.join_verification_listen_host = listen_host
     settings.join_verification_listen_port = listen_port
     return settings
+
+
+def validate_bootstrap_settings(settings: Settings) -> None:
+    """Reject deployments that cannot be administered or decrypt runtime secrets.
+
+    ``start.py`` performs a friendly local preflight, but production containers
+    invoke ``python -m bot`` directly.  Keep the authoritative validation in the
+    application package so every entry point fails before opening the database or
+    listening on the public Mini App server.
+    """
+
+    token = str(getattr(settings.bot, "token", "") or settings.bot_token or "").strip()
+    if not token or token.lower() in {"your_bot_token_here", "replace_me", "changeme"}:
+        raise ValueError("BOT_TOKEN is required and must not use a template placeholder")
+    if int(settings.super_admin_id or 0) <= 0:
+        raise ValueError("SUPER_ADMIN_ID must be a positive Telegram user ID")
+    if not str(settings.config_master_key or "").strip():
+        raise ValueError("CONFIG_MASTER_KEY is required and must remain stable")
+
+    settings.bot.token = token

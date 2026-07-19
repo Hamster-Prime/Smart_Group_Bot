@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from bot.config import ModerationConfig
 from bot.db.models import ModerationRule
@@ -41,19 +42,19 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             no_autoflush=_NoAutoflush(),
             execute=AsyncMock(return_value=_RowsResult([self.rule])),
             get=AsyncMock(return_value=None),
+            commit=AsyncMock(),
         )
 
     def _service(
         self,
-        response: str | list[str],
+        response: str | list[str] | Exception,
         *,
         threshold: float = 0.8,
     ) -> ModerationService:
-        moderation = (
-            AsyncMock(side_effect=response)
-            if isinstance(response, list)
-            else AsyncMock(return_value=response)
-        )
+        if isinstance(response, (list, Exception)):
+            moderation = AsyncMock(side_effect=response)
+        else:
+            moderation = AsyncMock(return_value=response)
         llm = SimpleNamespace(moderation=moderation)
         config = ModerationConfig(high_confidence_threshold=threshold)
         return ModerationService(config, llm)
@@ -145,7 +146,7 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(verdict.violated)
         self.assertTrue(verdict.conclusive)
-        self.assertIs(verdict.rule, self.rule)
+        self.assertEqual(verdict.rule.id, self.rule.id)
         self.assertAlmostEqual(verdict.confidence, 0.1)
         self.assertFalse(service.is_high_confidence(verdict))
 
@@ -179,6 +180,164 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.llm.moderation.await_count, 2)
         for call in service.llm.moderation.await_args_list:
             self.assertIn("[\u6210\u5458\u8d44\u6599\u5ba1\u6838]", call.args[1])
+    async def test_keyword_rule_matches_locally_without_llm(self) -> None:
+        keyword = ModerationRule(
+            id=8,
+            group_id=-100,
+            rule_type="keyword",
+            pattern="SpamOffer",
+            action="delete",
+            enabled=True,
+        )
+        llm_rule = ModerationRule(
+            id=9,
+            group_id=-100,
+            rule_type="llm",
+            pattern="No semantic advertising",
+            action="ban",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([keyword, llm_rule])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(self.session, -100, "prefix spamoffer suffix")
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        self.assertEqual(verdict.confidence, 1.0)
+        self.assertEqual(verdict.rule.id, keyword.id)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_regex_rule_matches_locally_without_llm(self) -> None:
+        regex_rule = ModerationRule(
+            id=10,
+            group_id=-100,
+            rule_type="regex",
+            pattern=r"\b(?:buy|sell)-\d{4}\b",
+            action="warn",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([regex_rule])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(self.session, -100, "BUY-2026 now")
+
+        self.assertTrue(verdict.violated)
+        self.assertEqual(verdict.rule.id, regex_rule.id)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_invalid_regex_is_inconclusive_instead_of_crashing(self) -> None:
+        invalid = ModerationRule(
+            id=11,
+            group_id=-100,
+            rule_type="regex",
+            pattern="([",
+            action="warn",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([invalid])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(self.session, -100, "ordinary text")
+
+        self.assertFalse(verdict.violated)
+        self.assertFalse(verdict.conclusive)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_many_regex_rules_share_one_small_total_budget(self) -> None:
+        regex_rules = [
+            ModerationRule(
+                id=20 + index,
+                group_id=-100,
+                rule_type="regex",
+                pattern=f"never-{index}",
+                action="warn",
+                enabled=True,
+            )
+            for index in range(3)
+        ]
+        self.session.execute.return_value = _RowsResult(regex_rules)
+        service = self._service(RuntimeError("LLM must not run"))
+
+        with (
+            patch(
+                "bot.services.moderation.time.perf_counter",
+                side_effect=[0.0, 0.05, 0.11, 0.12],
+            ),
+            patch(
+                "bot.services.moderation.safe_regex.search",
+                return_value=None,
+            ) as search,
+        ):
+            verdict = await service.evaluate(self.session, -100, "ordinary text")
+
+        self.assertFalse(verdict.violated)
+        self.assertFalse(verdict.conclusive)
+        self.assertEqual(search.call_count, 1)
+
+    async def test_llm_failure_cannot_bypass_matching_deterministic_rule(self) -> None:
+        keyword = ModerationRule(
+            id=12,
+            group_id=-100,
+            rule_type="keyword",
+            pattern="blocked-token",
+            action="delete",
+            enabled=True,
+        )
+        llm_rule = ModerationRule(
+            id=13,
+            group_id=-100,
+            rule_type="llm",
+            pattern="No scams",
+            action="ban",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([keyword, llm_rule])
+        service = self._service(RuntimeError("provider down"))
+
+        verdict = await service.evaluate(self.session, -100, "contains BLOCKED-TOKEN")
+
+        self.assertTrue(verdict.violated)
+        self.assertEqual(verdict.rule.id, keyword.id)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_llm_exception_returns_inconclusive_after_local_clean(self) -> None:
+        self.session.execute.return_value = _RowsResult([self.rule])
+        service = self._service(RuntimeError("provider down"))
+
+        verdict = await service.evaluate(self.session, -100, "ordinary text")
+
+        self.assertFalse(verdict.violated)
+        self.assertFalse(verdict.conclusive)
+
+    async def test_read_transaction_is_released_before_llm_await(self) -> None:
+        transaction_open = True
+
+        async def release_transaction() -> None:
+            nonlocal transaction_open
+            transaction_open = False
+
+        self.session.commit.side_effect = release_transaction
+        self.session.in_transaction = lambda: transaction_open
+
+        async def assert_committed_first(_system: str, _user: str) -> str:
+            self.session.commit.assert_awaited_once()
+            self.assertFalse(self.session.in_transaction())
+            # Simulate a provider that yields control while the assertion
+            # remains true for the entire network wait.
+            await asyncio.sleep(0.01)
+            self.assertFalse(self.session.in_transaction())
+            return '{"violated": false, "rule_id": null, "confidence": 1.0}'
+
+        service = ModerationService(
+            ModerationConfig(),
+            SimpleNamespace(moderation=AsyncMock(side_effect=assert_committed_first)),
+        )
+
+        verdict = await service.evaluate(self.session, -100, "ordinary text")
+
+        self.assertFalse(verdict.violated)
+        self.assertTrue(verdict.conclusive)
 
 
 if __name__ == "__main__":

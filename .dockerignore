@@ -1,0 +1,48 @@
+.git/
+.github/
+.agents/
+.codex/
+
+# Local secrets must never become image-layer history.
+.env
+.env.*
+!.env.example
+config.toml
+
+# Runtime state and user data are mounted at runtime.
+data/
+memory/
+*.db
+*.sqlite
+*.sqlite3
+*.log*
+
+# Local tooling and build products.
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+node_modules/
+tests/
+README.md
+start.py
+pyproject.toml
+uv.lock
+docker-compose.yml
+
+# Editor/OS/assistant state.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.bak

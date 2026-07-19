@@ -181,8 +181,9 @@ class BotBehaviorConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
 
     parse_mode: str = Field(default="HTML", max_length=32)
-    drop_pending_updates: bool = True
+    drop_pending_updates: bool = False
     inbound_debounce_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
+    reply_batch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=120.0)
     enable_typing: bool = True
     enable_streaming: bool = True
     stream_chunk_size: int = Field(default=36, ge=8, le=4096)
@@ -436,7 +437,7 @@ class LoggingSettingsConfig(StrictModel):
     third_party_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "WARNING"
     color: Literal["on", "off", "auto"] = "on"
     to_file: bool = False
-    file_path: str = Field(default="bot.log", max_length=1000)
+    file_path: str = Field(default="data/bot.log", max_length=1000)
     file_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=10 * 1024 * 1024 * 1024)
     file_backup_count: int = Field(default=3, ge=1, le=100)
 
@@ -712,6 +713,7 @@ class RuntimeConfig(StrictModel):
         settings.bot.parse_mode = bot.parse_mode
         settings.bot.drop_pending_updates = bot.drop_pending_updates
         settings.bot.inbound_debounce_seconds = bot.inbound_debounce_seconds
+        settings.bot.reply_batch_timeout_seconds = bot.reply_batch_timeout_seconds
         settings.bot.enable_typing = bot.enable_typing
         settings.bot.enable_streaming = bot.enable_streaming
         settings.bot.stream_chunk_size = bot.stream_chunk_size
@@ -1199,6 +1201,11 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             settings.bot.parse_mode = str(bot_data["parse_mode"] or "HTML")
         if "drop_pending_updates" in bot_data:
             settings.bot.drop_pending_updates = bool(bot_data["drop_pending_updates"])
+        if "reply_batch_timeout_seconds" in bot_data:
+            settings.bot.reply_batch_timeout_seconds = min(
+                120.0,
+                max(5.0, float(bot_data["reply_batch_timeout_seconds"])),
+            )
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
     if isinstance(moderation_data, dict):
         settings.moderation = ModerationConfig(**moderation_data)
@@ -1306,6 +1313,12 @@ def build_legacy_runtime_config(
             parse_mode=settings.bot.parse_mode,
             drop_pending_updates=settings.bot.drop_pending_updates,
             inbound_debounce_seconds=settings.bot_inbound_debounce_seconds,
+            reply_batch_timeout_seconds=(
+                settings.bot_reply_batch_timeout_seconds
+                if "bot_reply_batch_timeout_seconds"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.reply_batch_timeout_seconds
+            ),
             enable_typing=settings.bot_enable_typing,
             enable_streaming=settings.bot_enable_streaming,
             stream_chunk_size=settings.bot_stream_chunk_size,
@@ -1445,7 +1458,10 @@ def build_legacy_runtime_config(
                 values=raw_env,
             ),
             to_file=_env_bool("LOG_TO_FILE", False, values=raw_env),
-            file_path=str(raw_env.get("LOG_FILE_PATH", "bot.log")).strip() or "bot.log",
+            file_path=(
+                str(raw_env.get("LOG_FILE_PATH", "data/bot.log")).strip()
+                or "data/bot.log"
+            ),
             file_max_bytes=max(
                 1024,
                 _env_int(

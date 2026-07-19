@@ -36,11 +36,12 @@ class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
         sent = SimpleNamespace(chat=SimpleNamespace(id=-1), message_id=5)
 
         with patch(
-            "bot.utils.telegram.schedule_message_auto_delete"
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(return_value=True),
         ) as schedule_mock:
-            authz._schedule_auto_delete(sent, settings)
+            await authz._schedule_auto_delete(sent, settings)
 
-        schedule_mock.assert_called_once_with(sent, 45)
+        schedule_mock.assert_awaited_once_with(sent, 45)
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(
@@ -49,6 +50,7 @@ class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
             text="/lm",
         )
         settings = _settings()
+        session = SimpleNamespace(commit=AsyncMock())
 
         fake_memory = SimpleNamespace(list_permanent_memories=AsyncMock(return_value=[]))
         with (
@@ -57,8 +59,14 @@ class CommandMessageRetentionTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.commands.memory_holder.get", return_value=fake_memory),
             patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
         ):
-            await commands.cmd_lm(message, session=object(), settings=settings)
+            await commands.cmd_lm(
+                message,
+                session=session,
+                settings=settings,
+                session_factory=object(),
+            )
 
+        session.commit.assert_awaited_once()
         self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
 
 

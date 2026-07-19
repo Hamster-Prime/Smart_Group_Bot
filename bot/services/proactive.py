@@ -17,6 +17,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig, Settings
+from bot.services.background_health import record_background_failure
 from bot.services.memory import MemoryService
 from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.runtime_context import build_current_time_context
@@ -324,20 +325,28 @@ class ProactiveTopicService:
         self.llm = llm
 
     async def run_forever(self) -> None:
+        consecutive_failures = 0
         while True:
             try:
-                await self.run_once()
+                await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log.exception("proactive topic loop failed")
+                consecutive_failures = record_background_failure(
+                    service="proactive topic loop",
+                    previous_failures=consecutive_failures,
+                    error=exc,
+                )
+            else:
+                consecutive_failures = 0
             interval = max(
                 15.0,
                 float(self.settings.bot.proactive_check_interval_seconds or 60.0),
             )
             await asyncio.sleep(interval)
 
-    async def run_once(self) -> None:
+    async def run_once(self, *, raise_on_total_failure: bool = False) -> None:
         if _is_quiet_hours(_now_local(), self.settings.bot):
             return
         from bot.services.authz import list_authorized_groups
@@ -345,32 +354,52 @@ class ProactiveTopicService:
         async with self.session_factory() as session:
             rows = await list_authorized_groups(session)
             group_ids = [int(row.group_id) for row in rows]
+        attempted = 0
+        succeeded = 0
+        failed = 0
         for group_id in group_ids:
-            async with self.session_factory() as session:
-                try:
-                    await self._run_group_cooldown_task(session, group_id, now=_now_local())
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await session.rollback()
-                    log.exception("[%s] proactive topic run failed", group_id)
+            try:
+                did_attempt = await self._run_group_cooldown_task(
+                    group_id,
+                    now=_now_local(),
+                )
+                if did_attempt:
+                    attempted += 1
+                    succeeded += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                attempted += 1
+                failed += 1
+                log.exception("[%s] proactive topic run failed", group_id)
+        if raise_on_total_failure and attempted and failed and succeeded == 0:
+            raise RuntimeError(
+                f"proactive topic failed for all {failed} attempted groups"
+            )
 
-    async def _run_group_cooldown_task(
-        self, session: AsyncSession, group_id: int, *, now: datetime
-    ) -> None:
+    async def _load_group_settings(self, group_id: int) -> dict[str, Any] | None:
+        """Snapshot one group without retaining its DB session during AI work."""
         from bot.db.models import Group
 
-        row = await session.get(Group, group_id)
-        if row is None:
-            return
-        group_settings = dict(row.settings or {})
+        async with self.session_factory() as session:
+            row = await session.get(Group, int(group_id))
+            if row is None:
+                return None
+            return dict(row.settings or {})
+
+    async def _run_group_cooldown_task(
+        self, group_id: int, *, now: datetime
+    ) -> bool:
+        group_settings = await self._load_group_settings(group_id)
+        if group_settings is None:
+            return False
         if bool(group_settings.get(_MUTE_ALL_REPLIES_KEY, False)):
-            return
+            return False
         if not is_cooldown_task_enabled(
             group_settings,
             default_enabled=self.settings.bot.proactive_default_enabled,
         ):
-            return
+            return False
 
         state = get_cooldown_task_state(group_settings)
         activity_revision = _activity_revision(state)
@@ -381,18 +410,18 @@ class ProactiveTopicService:
         last_sent_at = _parse_iso_datetime(state.get("last_sent_at"))
 
         if last_user_at is None or next_run_at is None or now < next_run_at:
-            return
+            return False
         if processed_activity_revision is not None:
             if processed_activity_revision >= activity_revision:
-                return
+                return False
         elif last_processed_user_at is not None and last_processed_user_at >= last_user_at:
             # Legacy state did not track revisions; keep the timestamp check
             # until the next processed marker upgrades the stored state.
-            return
+            return False
         if last_sent_at is not None:
             min_gap = timedelta(minutes=max(180, int(self.settings.bot.proactive_idle_minutes or 180)))
             if now < last_sent_at + min_gap:
-                return
+                return False
 
         task_brief = clean_text(str(state.get("task_brief") or _DEFAULT_TASK_BRIEF), max_len=240)
         local_activity_revision = _local_activity_revision(group_id)
@@ -410,7 +439,7 @@ class ProactiveTopicService:
 
         finished_at = _now_local()
         if not reply or reply.upper() in _SKIP_MARKERS:
-            await self._commit_fresh_settings(
+            committed = await self._commit_fresh_settings(
                 group_id,
                 lambda fresh: mark_cooldown_task_processed(
                     fresh,
@@ -418,7 +447,9 @@ class ProactiveTopicService:
                     activity_revision=activity_revision,
                 ),
             )
-            return
+            if not committed:
+                raise RuntimeError("failed to persist proactive skip marker")
+            return True
 
         # The LLM call takes seconds; re-check fresh state before sending so a
         # concurrent /proactive off, /mute all, or new user activity during
@@ -433,22 +464,16 @@ class ProactiveTopicService:
             now=_now_local(),
         ):
             log.info("[%s] proactive topic dropped | reason=state_changed_during_generation", group_id)
-            return
+            return True
 
         sent_ok = await self._deliver_topic(group_id, reply, fresh_settings)
         if not sent_ok:
-            await self._commit_fresh_settings(
-                group_id,
-                lambda fresh: postpone_cooldown_task(
-                    fresh,
-                    self.settings.bot,
-                    at=finished_at,
-                    expected_activity_revision=activity_revision,
-                ),
-            )
-            return
+            # Leave the due marker untouched so the next service pass retries.
+            # Advancing it here hid persistent Telegram/TTS failures from the
+            # supervisor because subsequent passes appeared healthy/no-op.
+            raise RuntimeError("proactive topic delivery failed")
 
-        await self._commit_fresh_settings(
+        committed = await self._commit_fresh_settings(
             group_id,
             lambda fresh: mark_cooldown_task_processed(
                 fresh,
@@ -457,17 +482,22 @@ class ProactiveTopicService:
                 sent_at=finished_at,
             ),
         )
+        if not committed:
+            # The message is already visible, so this is an infrastructure
+            # failure rather than a successful pass. Surface it immediately;
+            # otherwise the same due marker can silently resend forever.
+            raise RuntimeError("failed to persist proactive delivery outcome")
 
         await self.memory.add_message(group_id, "assistant", reply, message_type="assistant_proactive")
         await self.memory.compact_if_needed(group_id)
         log.info("[%s] proactive topic sent | %s", group_id, reply[:80])
+        return True
 
     async def _load_fresh_settings(self, group_id: int) -> dict[str, Any]:
         from bot.db.models import Group
 
-        # The task's original session performed its first SELECT before the
-        # LLM call. Use a new transaction here so SQLite WAL and other snapshot
-        # isolation modes cannot return that pre-generation view again.
+        # Use a new transaction here so the post-generation decision can never
+        # reuse the pre-generation settings snapshot.
         async with self.session_factory() as fresh_session:
             row = await fresh_session.get(Group, group_id)
             return dict(row.settings or {}) if row is not None else {}

@@ -1,12 +1,21 @@
 services:
   bot:
     build: .
+    # Match the bind-mounted ./data owner. Override these on hosts whose service
+    # account is not UID/GID 1000.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    init: true
     env_file: .env
     volumes:
       - ./data:/app/data
       # Legacy one-time import only; ignored after runtime_config is created.
       - ./config.toml:/app/config.toml:ro
     ports:
-      # Telegram webhook, settings and verification Mini App.
-      - "8480:8480"
+      # Safe default for a reverse proxy on this host. Set
+      # MINIAPP_BIND_ADDRESS=0.0.0.0 only when another container/host must reach
+      # the backend directly and a firewall protects the port.
+      - "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:8480:8480"
+    # The application drains durable updates, replies and cleanup jobs in a
+    # bounded sequence; Docker's 10-second default would SIGKILL it mid-drain.
+    stop_grace_period: 8m
     restart: unless-stopped

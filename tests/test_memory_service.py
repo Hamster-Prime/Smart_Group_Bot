@@ -4,13 +4,15 @@ import sqlite3
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from bot.config import BotConfig
 from bot.db.engine import init_db
-from bot.db.models import MessageVector
+from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVector
 from bot.services.memory import MemoryService
 from bot.utils.security import sanitize_history_for_llm
 
@@ -147,6 +149,41 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(memory.max_context, 10240)
 
+    async def test_sqlite_lock_exhaustion_is_not_recorded_as_memory_success(self) -> None:
+        class _LockedSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def add(self, _row) -> None:
+                return None
+
+            async def commit(self) -> None:
+                raise OperationalError(
+                    "INSERT",
+                    {},
+                    sqlite3.OperationalError("database is locked"),
+                )
+
+            async def rollback(self) -> None:
+                return None
+
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=2048),
+            _StubLLM(),
+            session_factory=lambda: _LockedSession(),  # type: ignore[arg-type]
+        )
+
+        with (
+            patch("bot.services.memory.asyncio.sleep", new=AsyncMock()),
+            self.assertRaises(OperationalError),
+        ):
+            await memory.add_message(12345, "user", "must-not-be-ram-only")
+
+        self.assertEqual(memory.get_history(12345), [])
+
     async def test_bootstrap_converts_legacy_utc_message_timestamps_to_shanghai(self) -> None:
         tmpdir = self._workspace_tmpdir()
         try:
@@ -239,6 +276,57 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    async def test_permanent_memory_replace_rolls_back_delete_when_insert_fails(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _StubLLM(),
+                session_factory=session_factory,
+            )
+            original, created = await memory.add_permanent_memory(
+                12345,
+                "must survive",
+                created_by=42,
+            )
+            self.assertTrue(created)
+            self.assertIsNotNone(original)
+            async with session_factory() as session:
+                await session.execute(
+                    text(
+                        "CREATE TRIGGER reject_replacement BEFORE INSERT "
+                        "ON group_permanent_memories "
+                        "WHEN NEW.content = 'reject me' "
+                        "BEGIN SELECT RAISE(ABORT, 'replacement rejected'); END"
+                    )
+                )
+                await session.commit()
+
+            with self.assertRaises(IntegrityError):
+                await memory.replace_permanent_memory(
+                    12345,
+                    target=f"#{original.id}",
+                    new_content="reject me",
+                    created_by=43,
+                )
+
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(GroupPermanentMemory).where(
+                                GroupPermanentMemory.group_id == 12345
+                            )
+                        )
+                    ).scalars()
+                )
+            self.assertEqual([(row.id, row.content) for row in rows], [(original.id, "must survive")])
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     async def test_history_compacts_when_final_prompt_is_near_limit(self) -> None:
         tmpdir = self._workspace_tmpdir()
         try:
@@ -322,6 +410,58 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].content, "must-survive-failed-compression")
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_compaction_summary_and_source_delete_roll_back_together(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=512),
+                _SummaryStubLLM(),
+                session_factory=session_factory,
+            )
+            memory._count_tokens = lambda _messages: memory.max_context  # type: ignore[method-assign]
+            group_id = 12345
+            await memory.add_message(
+                group_id,
+                "user",
+                "atomic-compaction-source",
+                message_id="atomic-source",
+            )
+            async with session_factory() as session:
+                await session.execute(
+                    text(
+                        "CREATE TRIGGER reject_history_delete BEFORE DELETE "
+                        "ON message_vectors "
+                        "BEGIN SELECT RAISE(ABORT, 'delete rejected'); END"
+                    )
+                )
+                await session.commit()
+
+            with self.assertRaises(IntegrityError):
+                await memory.compact_if_needed(group_id)
+
+            async with session_factory() as session:
+                summary = await session.get(GroupContextSummary, group_id)
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector).where(
+                                MessageVector.group_id == group_id
+                            )
+                        )
+                    ).scalars()
+                )
+            self.assertIsNone(summary)
+            self.assertEqual([row.content for row in rows], ["atomic-compaction-source"])
+            self.assertEqual(
+                [item["content"] for item in memory.get_history(group_id)],
+                ["atomic-compaction-source"],
+            )
             await engine.dispose()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

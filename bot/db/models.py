@@ -147,6 +147,53 @@ class ScheduledMessage(Base):
     )
 
 
+class ScheduledMessageOccurrence(Base):
+    """Durable delivery attempt for one computed schedule occurrence.
+
+    The unique occurrence key and live lease prevent concurrent workers from
+    normally publishing the same due event. Delivery is intentionally
+    at-least-once across process crashes or lease expiry: an old worker that
+    loses its lease cannot complete the row, while a later worker may replay it.
+    Failed attempts retain the row with exponential backoff until completion can
+    advance ``ScheduledMessage.last_run_at`` atomically.
+    """
+
+    __tablename__ = "scheduled_message_occurrences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheduled_message_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("scheduled_messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    occurrence_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_scheduled_message_occurrence_unique",
+            "scheduled_message_id",
+            "occurrence_at",
+            unique=True,
+        ),
+        Index(
+            "ix_scheduled_message_occurrence_recovery",
+            "next_attempt_at",
+            "lease_until",
+            "occurrence_at",
+        ),
+    )
+
+
 class VoteBanSession(Base):
     """Democratic vote-ban: one active poll per (group, target).
 
@@ -293,12 +340,39 @@ class Violation(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     group_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("groups.id"))
     user_id: Mapped[int] = mapped_column(BigInteger)
-    rule_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("moderation_rules.id"), nullable=True)
+    rule_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("moderation_rules.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     message_text: Mapped[str] = mapped_column(Text, default="")
     action_taken: Mapped[str] = mapped_column(String(32), default="warn")
+    # Telegram message ids are unique within a chat.  Durable webhook retries
+    # can dispatch the same update more than once, so the pair below is the
+    # stable idempotency key for every moderation side effect derived from one
+    # source message.  NULL keeps legacy/manual rows unrestricted.
+    source_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Count captured by the atomic warning transaction for this event.  It lets
+    # retries render the original warning state without incrementing again.
+    warning_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NULL means a threshold/sender-chat ban has not completed its Telegram +
+    # audit persistence stage.  False is an attempted but unconfirmed ban.
+    ban_enforced: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Notification delivery is a separate retryable stage.  The unavoidable
+    # send-success/process-crash-before-commit window is intentionally tiny.
+    notice_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     group: Mapped[Group] = relationship(back_populates="violations")
+
+    __table_args__ = (
+        Index(
+            "ix_violations_group_source_message",
+            "group_id",
+            "source_message_id",
+            unique=True,
+        ),
+    )
 
 
 class UserWarning(Base):
@@ -361,7 +435,10 @@ class Admin(Base):
     __tablename__ = "admins"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    group_id: Mapped[int] = mapped_column(BigInteger)
+    group_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("authorized_groups.group_id", ondelete="CASCADE"),
+    )
     user_id: Mapped[int] = mapped_column(BigInteger)
     role: Mapped[str] = mapped_column(String(32), default="admin")
 
@@ -460,6 +537,12 @@ class JoinVerification(Base):
         String(32), default="turnstile", server_default="turnstile"
     )
     reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default="pending",
+        server_default="pending",
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     display_name: Mapped[str] = mapped_column(String(255), default="")
     prompt_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
     deadline_at: Mapped[datetime] = mapped_column(DateTime)
@@ -471,6 +554,7 @@ class JoinVerification(Base):
 
     __table_args__ = (
         Index("ix_join_verification_group_user", "group_id", "user_id", unique=True),
+        Index("ix_join_verifications_status_lease", "status", "lease_until"),
         {"sqlite_autoincrement": True},
     )
 
@@ -509,16 +593,92 @@ class GroupMember(Base):
 
 
 class UserProfileScreen(Base):
-    """Last screened profile signature per user, for on-message re-screening."""
+    """Last screened profile signature per group/user pair.
+
+    The signature includes the group's moderation-rule fingerprint, so a
+    process-wide user-only key lets two groups continually overwrite each
+    other's cached verdict.  Keep the cache scoped to the policy owner.
+    """
 
     __tablename__ = "user_profile_screens"
 
+    group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     profile_hash: Mapped[str] = mapped_column(String(64), default="")
     checked_at: Mapped[datetime] = mapped_column(
         DateTime,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+
+class WebhookInboxUpdate(Base):
+    """Durable acceptance/dedup record for Telegram webhook updates."""
+
+    __tablename__ = "webhook_inbox_updates"
+
+    update_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_webhook_inbox_recovery",
+            "completed_at",
+            "dead_lettered_at",
+            "next_attempt_at",
+            "lease_until",
+        ),
+    )
+
+
+class TelegramDeleteJob(Base):
+    """Durable delayed deletion for an outgoing Telegram message.
+
+    A unique message key makes scheduling idempotent.  ``lease_until`` keeps a
+    claimed row recoverable after a process crash without holding a database
+    transaction across the Telegram API call.
+    """
+
+    __tablename__ = "telegram_delete_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_telegram_delete_jobs_message",
+            "chat_id",
+            "message_id",
+            unique=True,
+        ),
+        Index(
+            "ix_telegram_delete_jobs_recovery",
+            "due_at",
+            "lease_until",
+        ),
     )
 
 

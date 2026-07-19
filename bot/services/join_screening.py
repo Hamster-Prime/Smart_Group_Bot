@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -273,14 +273,19 @@ def profile_screen_signature(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-async def get_profile_screen_hash(session: AsyncSession, user_id: int) -> str:
+async def get_profile_screen_hash(
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+) -> str:
     with session.no_autoflush:
-        row = await session.get(UserProfileScreen, user_id)
+        row = await session.get(UserProfileScreen, (group_id, user_id))
     return str(row.profile_hash or "") if row else ""
 
 
 async def mark_profile_screened(
     session: AsyncSession,
+    group_id: int,
     user_id: int,
     *,
     profile_hash: str,
@@ -294,24 +299,31 @@ async def mark_profile_screened(
     dialect_name = getattr(dialect, "name", "")
     if dialect_name == "sqlite":
         stmt = sqlite_insert(UserProfileScreen).values(
+            group_id=group_id,
             user_id=user_id,
             profile_hash=profile_hash,
         )
         stmt = stmt.on_conflict_do_update(
-            index_elements=[UserProfileScreen.user_id],
-            set_={"profile_hash": profile_hash},
+            index_elements=[UserProfileScreen.group_id, UserProfileScreen.user_id],
+            set_={"profile_hash": profile_hash, "checked_at": func.now()},
         )
         await session.execute(stmt)
         return
 
-    row = await session.get(UserProfileScreen, user_id)
+    row = await session.get(UserProfileScreen, (group_id, user_id))
     if row is None:
         try:
             async with session.begin_nested():
-                session.add(UserProfileScreen(user_id=user_id, profile_hash=profile_hash))
+                session.add(
+                    UserProfileScreen(
+                        group_id=group_id,
+                        user_id=user_id,
+                        profile_hash=profile_hash,
+                    )
+                )
                 await session.flush()
         except IntegrityError:
-            row = await session.get(UserProfileScreen, user_id)
+            row = await session.get(UserProfileScreen, (group_id, user_id))
             if row is not None:
                 row.profile_hash = profile_hash
     else:

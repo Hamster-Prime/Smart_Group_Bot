@@ -11,7 +11,9 @@ class MessageEntrypointTests(unittest.TestCase):
         launcher = (ROOT / "start.py").read_text(encoding="utf-8")
         entrypoint = (ROOT / "bot" / "__main__.py").read_text(encoding="utf-8")
 
-        self.assertIn("from bot.__main__ import main", launcher)
+        self.assertIn("from bot.__main__ import run_bot", launcher)
+        self.assertIn("run_bot()", launcher)
+        self.assertIn("os.umask(0o077)", entrypoint)
         self.assertNotIn("ThrottleMiddleware", entrypoint)
         self.assertNotIn("bot.middlewares.throttle", entrypoint)
         self.assertIsNone(importlib.util.find_spec("bot.middlewares.throttle"))

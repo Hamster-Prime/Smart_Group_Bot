@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import Group, GroupMember, MessageVector, ModerationRule, PatrolRun
+from bot.services.background_health import record_background_failure
 from bot.services.authz import is_group_authorized, list_authorized_groups
 from bot.services.join_screening import (
     build_join_profile_text,
@@ -48,10 +49,14 @@ from bot.services.join_screening import (
 from bot.services.join_verification import (
     PATROL_VERIFY_CALLBACK_DATA,
     VERIFICATION_KIND_PATROL,
+    PreparedVerification,
+    activate_prepared_join_verification,
+    delete_verification_prompt,
     get_join_verification,
-    restore_member_permissions,
+    prepare_join_verification,
+    renew_prepared_join_verification,
     restrict_new_member,
-    upsert_join_verification,
+    shield_abort_prepared_join_verification,
     verification_provider,
     verification_service_ready,
     verification_timeout_seconds_for_kind,
@@ -330,6 +335,7 @@ async def acknowledge_patrol_pass(
         )
         await mark_profile_screened(
             session,
+            group_id,
             user_id,
             profile_hash=profile_screen_signature(
                 full_name=full_name,
@@ -498,24 +504,46 @@ class PatrolService:
         lock = self._group_locks.get(int(group_id))
         return bool(lock is not None and lock.locked())
 
-    async def shutdown(self) -> None:
-        """Cancel in-flight manual runs so they release their group locks."""
-        tasks = list(self._manual_tasks)
+    async def shutdown(self, *, timeout_seconds: float = 2.0) -> None:
+        """Cancel manual runs without waiting forever for a stuck dependency."""
+
+        tasks = {task for task in self._manual_tasks if not task.done()}
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+            for task in done:
+                try:
+                    task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if pending:
+                log.error(
+                    "%d manual patrol task(s) ignored bounded shutdown",
+                    len(pending),
+                )
 
     async def run_forever(self) -> None:
         log.info("profile patrol service started")
         await self._reset_stale_running_flags()
+        consecutive_failures = 0
         while True:
             try:
-                await self.run_once()
+                await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log.exception("profile patrol pass failed")
+                consecutive_failures = record_background_failure(
+                    service="profile patrol service",
+                    previous_failures=consecutive_failures,
+                    error=exc,
+                )
+            else:
+                consecutive_failures = 0
             await asyncio.sleep(
                 max(15.0, float(getattr(self.settings, "patrol_check_interval_seconds", 60.0)))
             )
@@ -532,7 +560,7 @@ class PatrolService:
         except Exception:
             log.exception("patrol running-flag cleanup failed")
 
-    async def run_once(self) -> None:
+    async def run_once(self, *, raise_on_total_failure: bool = False) -> None:
         """Fire the patrol for every enabled group whose schedule has passed."""
         async with self.session_factory() as session:
             groups = await list_authorized_groups(session)
@@ -547,6 +575,8 @@ class PatrolService:
 
         schedule_time = str(getattr(self.settings, "patrol_schedule_time", "") or "")
         now = now_shanghai_naive()
+        succeeded = 0
+        failed = 0
         for group_id in group_ids:
             if not patrol_policy(self.settings, group_settings.get(group_id)):
                 continue
@@ -558,11 +588,17 @@ class PatrolService:
                 continue
             try:
                 summary = await self.run_group_patrol(group_id)
+                succeeded += 1
                 log.info("[%s] scheduled patrol finished | %s", group_id, summary)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                failed += 1
                 log.exception("[%s] scheduled patrol failed", group_id)
+        if raise_on_total_failure and failed and succeeded == 0:
+            raise RuntimeError(
+                f"profile patrol failed for all {failed} attempted groups"
+            )
 
     def start_manual_patrol(self, group_id: int) -> dict[str, Any]:
         """Fire-and-forget manual trigger (Mini App); returns immediately."""
@@ -594,6 +630,8 @@ class PatrolService:
 
     async def _run_group_patrol_locked(self, group_id: int) -> dict[str, Any]:
         settings = self.settings
+        if not await self._group_authorized(group_id):
+            return {"status": "group_unauthorized"}
         if not settings.moderation.enabled:
             return {"status": "moderation_disabled"}
         provider = verification_provider(settings)
@@ -640,6 +678,12 @@ class PatrolService:
             fetch_bio = bool(getattr(settings, "patrol_fetch_bio", True))
             last_user_id = 0
             while True:
+                if not await self._group_authorized(group_id):
+                    return {
+                        "status": "group_unauthorized",
+                        "scanned": scanned,
+                        "violations": 0,
+                    }
                 async with self.session_factory() as session:
                     stmt = (
                         select(GroupMember)
@@ -704,6 +748,10 @@ class PatrolService:
                 "[%s] patrol could not list chat administrators", group_id, exc_info=True
             )
         return admin_ids
+
+    async def _group_authorized(self, group_id: int) -> bool:
+        async with self.session_factory() as session:
+            return await is_group_authorized(session, int(group_id))
 
     async def _fresh_profile(
         self, member: GroupMember, *, fetch_bio: bool
@@ -810,7 +858,7 @@ class PatrolService:
     async def _enforce_violators(
         self, group_id: int, violators: list[PatrolViolator]
     ) -> list[PatrolViolator]:
-        """Mute violators, post chunked warnings, persist patrol challenges."""
+        """Prepare durably, then mute, warn, and atomically activate challenges."""
         if not violators:
             return []
         timeout_seconds = verification_timeout_seconds_for_kind(
@@ -818,23 +866,141 @@ class PatrolService:
         )
         provider = verification_provider(self.settings)
 
+        async def abort_one(
+            prepared: PreparedVerification,
+            *,
+            restore_permissions: bool,
+        ) -> bool:
+            try:
+                async with self.session_factory() as session:
+                    return await shield_abort_prepared_join_verification(
+                        self.bot,
+                        session,
+                        prepared=prepared,
+                        restore_permissions=restore_permissions,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "[%s] patrol preparation compensation failed | user=%s",
+                    group_id,
+                    prepared.user_id,
+                )
+                return False
+
+        async def activate_chunk(
+            pairs: list[tuple[PatrolViolator, PreparedVerification]],
+            *,
+            prompt_message_id: int,
+            deadline: datetime,
+        ) -> set[int]:
+            activated: set[int] = set()
+            async with self.session_factory() as session:
+                for _violator, prepared in pairs:
+                    if not await is_group_authorized(session, group_id):
+                        break
+                    if await activate_prepared_join_verification(
+                        session,
+                        prepared=prepared,
+                        prompt_message_id=prompt_message_id,
+                        deadline_at=deadline,
+                    ):
+                        activated.add(prepared.verification_id)
+                await session.commit()
+            return activated
+
+        async def renew_chunk(
+            pairs: list[tuple[PatrolViolator, PreparedVerification]],
+        ) -> list[tuple[PatrolViolator, PreparedVerification]]:
+            renewed_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
+            async with self.session_factory() as session:
+                for violator, prepared in pairs:
+                    renewed = await renew_prepared_join_verification(
+                        session,
+                        prepared=prepared,
+                    )
+                    if renewed is not None:
+                        renewed_pairs.append((violator, renewed))
+                await session.commit()
+            return renewed_pairs
+
         enforced: list[PatrolViolator] = []
         for start in range(0, len(violators), PATROL_MENTIONS_PER_MESSAGE):
-            # Mute, warn, and persist one chunk at a time: a crash mid-run
-            # then strands at most one chunk muted without durable records.
-            chunk: list[PatrolViolator] = []
-            for violator in violators[start : start + PATROL_MENTIONS_PER_MESSAGE]:
-                if await restrict_new_member(self.bot, group_id, violator.user_id):
-                    chunk.append(violator)
-                else:
-                    log.warning(
-                        "[%s] patrol mute failed; skipping user %s",
-                        group_id,
-                        violator.user_id,
-                    )
-                await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
-            if not chunk:
+            if not await self._group_authorized(group_id):
+                return enforced
+            candidates = violators[start : start + PATROL_MENTIONS_PER_MESSAGE]
+            deadline = now_shanghai_naive() + timedelta(seconds=timeout_seconds)
+            prepared_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
+            try:
+                async with self.session_factory() as session:
+                    for violator in candidates:
+                        if not await is_group_authorized(session, group_id):
+                            await session.rollback()
+                            prepared_pairs.clear()
+                            break
+                        prepared = await prepare_join_verification(
+                            session,
+                            group_id=group_id,
+                            user_id=violator.user_id,
+                            deadline_at=deadline,
+                            kind=VERIFICATION_KIND_PATROL,
+                            reason=(violator.reason or "资料命中群规")[:500],
+                            display_name=violator.full_name
+                            or (f"@{violator.username}" if violator.username else ""),
+                            provider=provider,
+                        )
+                        if prepared is not None:
+                            prepared_pairs.append((violator, prepared))
+                    await session.commit()
+            except Exception:
+                log.exception("[%s] patrol preparation persistence failed", group_id)
                 continue
+            if not prepared_pairs:
+                continue
+
+            muted_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
+            try:
+                for violator, prepared in prepared_pairs:
+                    if not await self._group_authorized(group_id):
+                        muted_ids = {
+                            item.verification_id for _member, item in muted_pairs
+                        }
+                        for _member, item in prepared_pairs:
+                            await abort_one(
+                                item,
+                                restore_permissions=item.verification_id in muted_ids,
+                            )
+                        return enforced
+                    if await restrict_new_member(self.bot, group_id, violator.user_id):
+                        muted_pairs.append((violator, prepared))
+                    else:
+                        log.warning(
+                            "[%s] patrol mute failed; skipping user %s",
+                            group_id,
+                            violator.user_id,
+                        )
+                        await abort_one(prepared, restore_permissions=True)
+                    await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
+            except asyncio.CancelledError:
+                for _violator, prepared in prepared_pairs:
+                    # Cancellation may arrive after Telegram applied a mute but
+                    # before the response/append. Treat every attempted batch
+                    # member as ambiguous and recover permissions durably.
+                    await abort_one(prepared, restore_permissions=True)
+                raise
+            if not muted_pairs:
+                continue
+            muted_pairs = await renew_chunk(muted_pairs)
+            if not muted_pairs:
+                continue
+
+            if not await self._group_authorized(group_id):
+                for _violator, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                return enforced
+
+            chunk = [violator for violator, _prepared in muted_pairs]
             prompt_message_id = 0
             try:
                 sent = await _tg_call(
@@ -848,58 +1014,75 @@ class PatrolService:
                     )
                 )
                 prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
+            except asyncio.CancelledError:
+                for _violator, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                raise
             except Exception:
                 log.exception("[%s] patrol warning message failed", group_id)
-                for violator in chunk:
-                    await restore_member_permissions(
-                        self.bot, group_id, violator.user_id
+                for _violator, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                continue
+
+            activation_task = asyncio.create_task(
+                activate_chunk(
+                    muted_pairs,
+                    prompt_message_id=prompt_message_id,
+                    deadline=deadline,
+                ),
+                name=f"patrol-activate:{group_id}:{start}",
+            )
+            try:
+                activated_ids = await asyncio.shield(activation_task)
+            except asyncio.CancelledError:
+                try:
+                    activated_ids = await activation_task
+                except asyncio.CancelledError:
+                    activated_ids = set()
+                except Exception:
+                    activated_ids = set()
+                    log.exception(
+                        "[%s] patrol activation failed while cancellation was pending",
+                        group_id,
+                    )
+                for _violator, prepared in muted_pairs:
+                    if prepared.verification_id not in activated_ids:
+                        await abort_one(prepared, restore_permissions=True)
+                if not activated_ids and prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
+                    )
+                raise
+            except Exception:
+                log.exception("[%s] patrol challenge activation failed", group_id)
+                for _violator, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                if prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
                     )
                 continue
 
-            deadline = now_shanghai_naive() + timedelta(seconds=timeout_seconds)
-            try:
-                async with self.session_factory() as session:
-                    for violator in chunk:
-                        # A join/moderation challenge issued since the scan
-                        # governs this member; overwriting it would downgrade
-                        # a ban-on-timeout to a kick. The member stays muted
-                        # under that other challenge either way.
-                        existing = await get_join_verification(
-                            session, group_id, violator.user_id
-                        )
-                        if (
-                            existing is not None
-                            and existing.kind != VERIFICATION_KIND_PATROL
-                        ):
-                            continue
-                        await upsert_join_verification(
-                            session,
-                            group_id=group_id,
-                            user_id=violator.user_id,
-                            deadline_at=deadline,
-                            kind=VERIFICATION_KIND_PATROL,
-                            reason=(violator.reason or "资料命中群规")[:500],
-                            display_name=violator.full_name
-                            or (f"@{violator.username}" if violator.username else ""),
-                            prompt_message_id=prompt_message_id,
-                            provider=provider,
-                        )
-                    # The mute and warning are already visible; the durable
-                    # records must land before this run ends or the sweeper
-                    # could never lift/kick these members.
-                    await session.commit()
-            except Exception:
-                log.exception("[%s] patrol challenge persistence failed", group_id)
-                for violator in chunk:
-                    await restore_member_permissions(
-                        self.bot, group_id, violator.user_id
+            activated_pairs = [
+                (violator, prepared)
+                for violator, prepared in muted_pairs
+                if prepared.verification_id in activated_ids
+            ]
+            for _violator, prepared in muted_pairs:
+                if prepared.verification_id not in activated_ids:
+                    await abort_one(prepared, restore_permissions=True)
+            if not activated_pairs:
+                if prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
                     )
                 continue
-            enforced.extend(chunk)
+            active_chunk = [violator for violator, _prepared in activated_pairs]
+            enforced.extend(active_chunk)
             log.info(
                 "[%s] patrol challenge issued | users=%s timeout=%ss",
                 group_id,
-                ",".join(str(v.user_id) for v in chunk),
+                ",".join(str(v.user_id) for v in active_chunk),
                 timeout_seconds,
             )
         return enforced

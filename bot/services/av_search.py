@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 import aiohttp
 
 from bot.config import Settings
+from bot.services.skills.platform_common import fetch_text
 
 log = logging.getLogger(__name__)
 
@@ -378,23 +379,26 @@ class AVSearchService:
 
     async def _fetch_text(
         self,
-        session: aiohttp.ClientSession,
+        _session: aiohttp.ClientSession,
         url: str,
         *,
         referer: str = "",
         cookies: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         try:
-            async with session.get(
+            headers = self._headers(referer=referer)
+            if cookies:
+                headers["Cookie"] = "; ".join(
+                    f"{key}={value}" for key, value in cookies.items()
+                )
+            status, content, final_url, _content_type = await fetch_text(
                 url,
-                headers=self._headers(referer=referer),
-                allow_redirects=True,
-                cookies=dict(cookies or {}),
-            ) as response:
-                status = int(response.status)
-                final_url = str(response.url)
-                content = await response.text(errors="ignore")
-                return status, final_url, content
+                headers=headers,
+                timeout_sec=self.timeout_seconds,
+                max_response_bytes=4 * 1024 * 1024,
+                max_decoded_bytes=6 * 1024 * 1024,
+            )
+            return int(status), str(final_url), content
         except Exception:
             log.exception("av fetch failed: %s", url)
             return 599, url, ""

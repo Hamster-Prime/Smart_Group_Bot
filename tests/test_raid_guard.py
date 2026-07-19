@@ -16,6 +16,7 @@ from bot.services.join_verification import (
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_RAID,
     JoinVerificationSweeper,
+    claim_join_verification,
     get_join_verification,
     upsert_join_verification,
     verification_timeout_seconds_for_kind,
@@ -31,6 +32,7 @@ from bot.services.raid_guard import (
     build_raid_unlock_text,
     normalize_manual_lockdown_minutes,
     raid_guard_policy,
+    remove_raid_challenged_users,
     resolve_raid_guard_config,
 )
 from bot.utils.timezone import now_shanghai_naive
@@ -248,7 +250,384 @@ class MessageTests(unittest.TestCase):
                 normalize_manual_lockdown_minutes(invalid)
 
 
+class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_passive_unlock_notice_is_tracked_and_drained_on_shutdown(self) -> None:
+        bot = _bot_mock()
+        service = RaidGuardService(
+            bot=bot,
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        started = asyncio.Event()
+
+        async def slow_notice(*_args, **_kwargs):
+            started.set()
+            await asyncio.sleep(60)
+
+        bot.send_message.side_effect = slow_notice
+        service._lockdown_until[-100] = now_shanghai_naive() - timedelta(seconds=1)
+        service._lockdown_source[-100] = "automatic"
+
+        self.assertFalse(service.lockdown_active(-100))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        self.assertIn(-100, service._unlock_notice_tasks)
+        await service.shutdown()
+        self.assertEqual(service._unlock_notice_tasks, {})
+
+    async def test_notice_capacity_and_shutdown_remain_bounded_when_cancel_is_ignored(
+        self,
+    ) -> None:
+        import bot.services.raid_guard as raid_guard_module
+
+        bot = _bot_mock()
+        service = RaidGuardService(
+            bot=bot,
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        rejected_started = asyncio.Event()
+
+        async def stubborn_notice(*_args, **_kwargs):
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        async def rejected_notice() -> None:
+            rejected_started.set()
+
+        bot.send_message.side_effect = stubborn_notice
+        try:
+            with (
+                patch.object(raid_guard_module, "_NOTICE_CALL_CAPACITY", 1),
+                patch.object(
+                    raid_guard_module,
+                    "_NOTICE_CALL_BACKPRESSURE_SECONDS",
+                    0.01,
+                ),
+            ):
+                service._schedule_unlock_notice(-100, source="automatic")
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+
+                with self.assertRaises(raid_guard_module._NoticeCallCapacityError):
+                    await raid_guard_module._bounded_notice_call(
+                        rejected_notice(),
+                        timeout_seconds=1.0,
+                    )
+                self.assertFalse(rejected_started.is_set())
+
+                before = asyncio.get_running_loop().time()
+                await service.shutdown(timeout_seconds=0.02)
+                self.assertLess(
+                    asyncio.get_running_loop().time() - before,
+                    0.2,
+                )
+                self.assertEqual(service._unlock_notice_tasks, {})
+                self.assertEqual(
+                    len(raid_guard_module._active_notice_call_tasks()),
+                    1,
+                )
+        finally:
+            release.set()
+            await raid_guard_module.flush_raid_guard_telegram_tasks(
+                timeout_seconds=0.5
+            )
+
+        self.assertEqual(len(raid_guard_module._active_notice_call_tasks()), 0)
+
+    async def test_concurrent_notice_starts_never_exceed_reserved_capacity(self) -> None:
+        import bot.services.raid_guard as raid_guard_module
+
+        release = asyncio.Event()
+        capacity_reached = asyncio.Event()
+        active = 0
+        peak = 0
+        total_started = 0
+
+        async def stubborn_notice() -> None:
+            nonlocal active, peak, total_started
+            active += 1
+            total_started += 1
+            peak = max(peak, active)
+            if active == 2:
+                capacity_reached.set()
+            try:
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
+            finally:
+                active -= 1
+
+        owners: list[asyncio.Task] = []
+        try:
+            with (
+                patch.object(raid_guard_module, "_NOTICE_CALL_CAPACITY", 2),
+                patch.object(
+                    raid_guard_module,
+                    "_NOTICE_CALL_BACKPRESSURE_SECONDS",
+                    0.02,
+                ),
+            ):
+                owners = [
+                    asyncio.create_task(
+                        raid_guard_module._bounded_notice_call(
+                            stubborn_notice(),
+                            timeout_seconds=60.0,
+                        )
+                    )
+                    for _ in range(8)
+                ]
+                await asyncio.wait_for(capacity_reached.wait(), timeout=1.0)
+                await asyncio.sleep(0.05)
+                self.assertEqual(total_started, 2)
+                self.assertEqual(peak, 2)
+                self.assertEqual(
+                    len(raid_guard_module._active_notice_call_tasks()),
+                    2,
+                )
+        finally:
+            for owner in owners:
+                owner.cancel()
+            if owners:
+                await asyncio.gather(*owners, return_exceptions=True)
+            release.set()
+            await raid_guard_module.flush_raid_guard_telegram_tasks(
+                timeout_seconds=0.5
+            )
+
+    async def test_notice_acquire_cancel_same_tick_returns_won_permit(self) -> None:
+        import bot.services.raid_guard as raid_guard_module
+
+        class RacingSemaphore:
+            def __init__(self) -> None:
+                self.owner: asyncio.Task[object] | None = None
+                self.acquired = 0
+                self.released = 0
+
+            async def acquire(self) -> bool:
+                self.acquired += 1
+                assert self.owner is not None
+                asyncio.get_running_loop().call_soon(self.owner.cancel)
+                return True
+
+            def release(self) -> None:
+                self.released += 1
+
+        semaphore = RacingSemaphore()
+        state = SimpleNamespace(
+            semaphore=semaphore,
+            lock=asyncio.Lock(),
+            draining=False,
+            tasks=set(),
+            waiters=0,
+        )
+
+        async def never_started() -> None:
+            return None
+
+        with patch.object(
+            raid_guard_module,
+            "_notice_call_state",
+            return_value=state,
+        ):
+            owner = asyncio.create_task(
+                raid_guard_module._start_notice_call(never_started())
+            )
+            semaphore.owner = owner
+            result = await asyncio.gather(owner, return_exceptions=True)
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertEqual(semaphore.acquired, 1)
+        self.assertEqual(semaphore.released, 1)
+        self.assertEqual(state.waiters, 0)
+
+    async def test_bulk_remove_releases_read_transaction_before_telegram(self) -> None:
+        import bot.services.raid_guard as raid_guard_module
+
+        transaction_open = False
+        record = SimpleNamespace(
+            id=1,
+            group_id=-100,
+            user_id=79,
+            provider="turnstile",
+            reason="raid",
+            display_name="suspect",
+            prompt_message_id=777,
+            deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+            kind=VERIFICATION_KIND_RAID,
+            status="pending",
+            lease_until=None,
+        )
+
+        async def execute(_statement):
+            nonlocal transaction_open
+            transaction_open = True
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: [record])
+            )
+
+        async def commit() -> None:
+            nonlocal transaction_open
+            transaction_open = False
+
+        async def rollback() -> None:
+            nonlocal transaction_open
+            transaction_open = False
+
+        async def query_true(*_args, **_kwargs) -> bool:
+            nonlocal transaction_open
+            transaction_open = True
+            return True
+
+        async def query_false(*_args, **_kwargs) -> bool:
+            nonlocal transaction_open
+            transaction_open = True
+            return False
+
+        async def assert_no_open_transaction(*_args, **_kwargs) -> bool:
+            self.assertFalse(transaction_open)
+            return True
+
+        session = SimpleNamespace(
+            execute=AsyncMock(side_effect=execute),
+            commit=AsyncMock(side_effect=commit),
+            rollback=AsyncMock(side_effect=rollback),
+        )
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=assert_no_open_transaction),
+            unban_chat_member=AsyncMock(side_effect=assert_no_open_transaction),
+        )
+        with (
+            patch.object(
+                raid_guard_module,
+                "is_group_authorized",
+                new=AsyncMock(side_effect=query_true),
+            ),
+            patch.object(
+                raid_guard_module,
+                "is_globally_banned",
+                new=AsyncMock(side_effect=query_false),
+            ),
+            patch.object(
+                raid_guard_module,
+                "claim_join_verification",
+                new=AsyncMock(side_effect=query_true),
+            ),
+            patch.object(
+                raid_guard_module,
+                "renew_join_verification_lease",
+                new=AsyncMock(side_effect=query_true),
+            ),
+            patch.object(
+                raid_guard_module,
+                "verification_release_blocked_by_ban",
+                new=AsyncMock(side_effect=query_false),
+            ),
+            patch.object(
+                raid_guard_module,
+                "complete_leased_join_verification",
+                new=AsyncMock(side_effect=query_true),
+            ),
+        ):
+            result = await remove_raid_challenged_users(
+                bot=bot,
+                session=session,  # type: ignore[arg-type]
+                settings=_settings(),
+                group_id=-100,
+                prompt_message_id=777,
+            )
+
+        self.assertEqual(result.removed_user_ids, (79,))
+        bot.ban_chat_member.assert_awaited_once()
+        bot.unban_chat_member.assert_awaited_once()
+
+
 class DetectionTests(_DbTestCase):
+    async def test_raid_preparation_is_durable_before_mute(self) -> None:
+        service, bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+
+        async def assert_prepared(_chat_id: int, user_id: int, **_kwargs):
+            async with self.session_factory() as session:
+                record = await get_join_verification(session, -100, user_id)
+                self.assertIsNotNone(record)
+                self.assertEqual(record.status, "preparing")
+            return True
+
+        bot.restrict_chat_member.side_effect = assert_prepared
+        enforced = await service._challenge_suspects(
+            -100,
+            [RaidSuspect(90, "准备中用户", "preparing", now_shanghai_naive())],
+            config,
+            "turnstile",
+        )
+
+        self.assertEqual([item.user_id for item in enforced], [90])
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 90)
+            self.assertEqual(record.status, "pending")
+
+    async def test_deauthorization_mid_batch_stops_raid_and_restores_mute(self) -> None:
+        from bot.services.authz import deauthorize_group
+
+        service, bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+        calls = 0
+
+        async def deauthorize_after_first_mute(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                async with self.session_factory() as session:
+                    await deauthorize_group(session, -100)
+                    await session.commit()
+            return True
+
+        bot.restrict_chat_member.side_effect = deauthorize_after_first_mute
+        enforced = await service._challenge_suspects(
+            -100,
+            [
+                RaidSuspect(92, "首个用户", "first", now_shanghai_naive()),
+                RaidSuspect(93, "第二用户", "second", now_shanghai_naive()),
+            ],
+            config,
+            "turnstile",
+        )
+
+        self.assertEqual(enforced, [])
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        self.assertEqual(
+            [item.args[1] for item in bot.restrict_chat_member.await_args_list],
+            [92, 92],
+        )
+        bot.send_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 92))
+            self.assertIsNone(await get_join_verification(session, -100, 93))
+
+    async def test_cancelled_raid_prompt_restores_and_removes_preparation(self) -> None:
+        service, bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+        bot.send_message.side_effect = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await service._challenge_suspects(
+                -100,
+                [RaidSuspect(91, "取消用户", "cancelled", now_shanghai_naive())],
+                config,
+                "turnstile",
+            )
+
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 91))
+
     async def test_below_threshold_does_not_trigger(self) -> None:
         service, bot = self._service()
         self.assertFalse(await self._join(service, 1))
@@ -539,6 +918,61 @@ class DetectionTests(_DbTestCase):
         # Kick failed: the join must fall through to the normal pipeline.
         self.assertFalse(await self._join(service, 99))
 
+    async def test_lockdown_existing_non_raid_challenge_falls_through(self) -> None:
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100)
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=99,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                kind=VERIFICATION_KIND_MODERATION,
+            )
+            await session.commit()
+
+        # RaidGuard cannot borrow/overwrite another workflow's durable row.
+        # False lets membership re-enforce the existing pending challenge.
+        self.assertFalse(await self._join(service, 99))
+        bot.ban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            existing = await get_join_verification(session, -100, 99)
+            self.assertIsNotNone(existing)
+            self.assertEqual(existing.kind, VERIFICATION_KIND_MODERATION)
+
+    async def test_lockdown_insert_race_never_clobbers_new_moderation_challenge(self) -> None:
+        import bot.services.raid_guard as raid_guard_module
+
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100)
+        original_prepare = raid_guard_module.prepare_join_verification
+
+        async def concurrent_prepare(session, **kwargs):
+            # Simulate a moderation worker winning after RaidGuard's initial
+            # SELECT but before its insert-if-absent.
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=100,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                kind=VERIFICATION_KIND_MODERATION,
+            )
+            await session.commit()
+            return await original_prepare(session, **kwargs)
+
+        with patch.object(
+            raid_guard_module,
+            "prepare_join_verification",
+            side_effect=concurrent_prepare,
+        ):
+            self.assertFalse(await self._join(service, 100))
+
+        bot.ban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            existing = await get_join_verification(session, -100, 100)
+            self.assertIsNotNone(existing)
+            self.assertEqual(existing.kind, VERIFICATION_KIND_MODERATION)
+
     async def test_repelled_joins_do_not_extend_lockdown(self) -> None:
         service, _bot = self._service()
         for user_id in (1, 2, 3):
@@ -779,6 +1213,103 @@ class CallbackTests(_DbTestCase):
             self.assertIsNone(await get_join_verification(session, -100, 73))
             self.assertIsNone(await get_join_verification(session, -100, 74))
 
+    async def test_cancelled_bulk_remove_cleans_ambiguous_ban_and_keeps_lease(self) -> None:
+        await self._add_raid_record(76)
+        callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
+
+        async def cancelled_ban(*_args, **_kwargs):
+            async with self.session_factory() as check_session:
+                row = await get_join_verification(check_session, -100, 76)
+                self.assertIsNotNone(row)
+                self.assertEqual(row.status, "enforcing")
+                self.assertIsNotNone(row.lease_until)
+            raise asyncio.CancelledError()
+
+        callback.bot.ban_chat_member.side_effect = cancelled_ban
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=True),
+        ):
+            async with self.session_factory() as session:
+                with self.assertRaises(asyncio.CancelledError):
+                    await membership.on_raid_remove_callback(
+                        callback,
+                        session=session,
+                        settings=_settings(),
+                    )
+
+        # Cancellation does not prove that Telegram failed to apply the ban.
+        # The kick helper must therefore issue an idempotent unban while the
+        # durable enforcing lease remains available for a later retry.
+        callback.bot.unban_chat_member.assert_awaited_once_with(
+            -100, 76, only_if_banned=True
+        )
+        async with self.session_factory() as session:
+            row = await get_join_verification(session, -100, 76)
+            self.assertIsNotNone(row)
+            self.assertEqual(row.status, "enforcing")
+
+    async def test_deauthorization_before_bulk_kick_stops_telegram_enforcement(self) -> None:
+        await self._add_raid_record(78)
+        callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
+        authorization = AsyncMock(side_effect=[True, True, False])
+
+        with patch(
+            "bot.services.raid_guard.is_group_authorized",
+            new=authorization,
+        ):
+            async with self.session_factory() as session:
+                result = await remove_raid_challenged_users(
+                    bot=callback.bot,
+                    session=session,
+                    settings=_settings(),
+                    group_id=-100,
+                    prompt_message_id=777,
+                )
+
+        self.assertEqual(result.removed_user_ids, ())
+        self.assertEqual(result.failed_user_ids, (78,))
+        callback.bot.ban_chat_member.assert_not_awaited()
+        callback.bot.unban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            row = await get_join_verification(session, -100, 78)
+            self.assertIsNotNone(row)
+            self.assertEqual(row.status, "enforcing")
+
+    async def test_bulk_remove_keeps_keyboard_when_record_has_active_lease(self) -> None:
+        await self._add_raid_record(77)
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            row = await get_join_verification(session, -100, 77)
+            self.assertTrue(
+                await claim_join_verification(
+                    session,
+                    verification_id=row.id,
+                    deadline_at=row.deadline_at,
+                    kind=row.kind,
+                    now=now,
+                    expired=False,
+                    lease_until=now + timedelta(minutes=2),
+                )
+            )
+            await session.commit()
+
+        callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=True),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_raid_remove_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        callback.bot.ban_chat_member.assert_not_awaited()
+        callback.bot.edit_message_reply_markup.assert_not_awaited()
+        self.assertIn("移除失败", callback.answer.await_args.args[0])
+
     async def test_non_admin_cannot_bulk_remove_suspects(self) -> None:
         from unittest.mock import patch
 
@@ -899,12 +1430,13 @@ class TimeoutTests(_DbTestCase):
             settings=settings,
         )
         with patch(
-            "bot.services.join_verification.schedule_message_auto_delete"
+            "bot.services.join_verification.schedule_message_auto_delete_durable",
+            new=AsyncMock(return_value=True),
         ) as schedule_mock:
             self.assertEqual(await sweeper.sweep_once(), 1)
 
         bot.send_message.assert_awaited_once()
-        schedule_mock.assert_called_once()
+        schedule_mock.assert_awaited_once()
         sent_arg, seconds_arg = schedule_mock.call_args.args
         self.assertEqual(sent_arg.message_id, 777)
         self.assertEqual(seconds_arg, 45)

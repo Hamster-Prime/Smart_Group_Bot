@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.config import Settings
@@ -225,6 +226,45 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
         text = bot.send_message.await_args.args[1]
         self.assertIn("tg://user?id=21", text)
         self.assertIn("@backup", text)
+
+    async def test_database_transactions_are_released_before_telegram_calls(self) -> None:
+        bot = self._bot([])
+        bot.get_chat_administrators = AsyncMock(side_effect=RuntimeError("down"))
+        async with self.session_factory() as session:
+            session.add(Admin(group_id=-100, user_id=22, role="admin"))
+            session.add(
+                GroupMember(
+                    group_id=-100,
+                    user_id=22,
+                    full_name="事务管理",
+                    username="txadmin",
+                )
+            )
+            await session.commit()
+            # Reproduce the caller's already-open authorization snapshot.
+            await session.execute(select(Admin.id).limit(1))
+
+            async def me_after_release():
+                self.assertFalse(session.in_transaction())
+                return SimpleNamespace(id=999)
+
+            async def send_after_fallback_release(*_args, **_kwargs):
+                self.assertFalse(session.in_transaction())
+                return SimpleNamespace(chat=SimpleNamespace(id=-100), message_id=2)
+
+            bot.me = AsyncMock(side_effect=me_after_release)
+            bot.send_message = AsyncMock(side_effect=send_after_fallback_release)
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                _settings(),
+                group_settings={},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        bot.send_message.assert_awaited_once()
 
     async def test_reply_context_included_and_anchored(self) -> None:
         bot = self._bot([self._admin_member(7)])

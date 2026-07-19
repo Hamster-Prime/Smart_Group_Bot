@@ -6,8 +6,11 @@ from typing import Any
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.platform_common import (
     InvalidJsonResponseError,
+    ResponseTooLargeError,
+    UnsupportedContentTypeError,
     fetch_json,
     fetch_text,
+    host_matches,
     parse_html_summary,
     site_search,
     strip_html,
@@ -25,6 +28,7 @@ _WEIBO_MOBILE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "X-Requested-With": "XMLHttpRequest",
 }
+_WEIBO_ALLOWED_HOSTS = ("weibo.com", "weibo.cn")
 
 
 class WeiboSearchSkill:
@@ -73,7 +77,7 @@ class WeiboSearchSkill:
     @staticmethod
     def _is_weibo_post_url(url: str) -> bool:
         normalized = clean_text(url, max_len=320).lower()
-        if "weibo.com/" not in normalized and "m.weibo.cn/" not in normalized:
+        if not host_matches(normalized, _WEIBO_ALLOWED_HOSTS):
             return False
         if any(token in normalized for token in ("/status/", "/detail/", "/tv/show/")):
             return True
@@ -190,8 +194,13 @@ class WeiboSearchSkill:
                 "https://weibo.com/ajax/side/hotSearch",
                 headers=_WEIBO_HEADERS,
                 timeout_sec=18.0,
+                allowed_hosts=_WEIBO_ALLOWED_HOSTS,
             )
-        except InvalidJsonResponseError as exc:
+        except (
+            InvalidJsonResponseError,
+            UnsupportedContentTypeError,
+            ResponseTooLargeError,
+        ) as exc:
             log.warning("weibo hot_search api returned non-json, fallback to web search: %s", exc)
             return await self._hot_search_via_web(max_results=max_results)
 
@@ -239,8 +248,13 @@ class WeiboSearchSkill:
                 },
                 headers=_WEIBO_MOBILE_HEADERS,
                 timeout_sec=18.0,
+                allowed_hosts=_WEIBO_ALLOWED_HOSTS,
             )
-        except InvalidJsonResponseError as exc:
+        except (
+            InvalidJsonResponseError,
+            UnsupportedContentTypeError,
+            ResponseTooLargeError,
+        ) as exc:
             log.warning("weibo search_posts api returned non-json, fallback to web search: %s", exc)
             return await self._search_posts_via_web(keyword, max_results=max_results)
 
@@ -297,8 +311,13 @@ class WeiboSearchSkill:
                 },
                 headers=_WEIBO_HEADERS,
                 timeout_sec=18.0,
+                allowed_hosts=_WEIBO_ALLOWED_HOSTS,
             )
-        except InvalidJsonResponseError as exc:
+        except (
+            InvalidJsonResponseError,
+            UnsupportedContentTypeError,
+            ResponseTooLargeError,
+        ) as exc:
             log.warning("weibo hot_feed api returned non-json, fallback to web search: %s", exc)
             return await self._hot_feed_via_web(max_results=max_results)
 
@@ -339,7 +358,14 @@ class WeiboSearchSkill:
         )
 
     async def _fetch_url(self, url: str) -> SkillRunResult:
-        status, raw_html, final_url, _ = await fetch_text(url, headers=_WEIBO_HEADERS, timeout_sec=18.0)
+        status, raw_html, final_url, _ = await fetch_text(
+            url,
+            headers=_WEIBO_HEADERS,
+            timeout_sec=18.0,
+            allowed_hosts=_WEIBO_ALLOWED_HOSTS,
+            max_response_bytes=1024 * 1024,
+            max_decoded_bytes=2 * 1024 * 1024,
+        )
         if status >= 400:
             return SkillRunResult(ok=False, skill=self.name, summary=f"微博链接抓取失败: HTTP {status}", error=f"http_{status}")
 

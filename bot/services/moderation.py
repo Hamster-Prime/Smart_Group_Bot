@@ -4,9 +4,12 @@ import json
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 
+import regex as safe_regex
 from sqlalchemy import case, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -194,7 +197,7 @@ class ModerationService:
     async def evaluate(
         self, session: AsyncSession, group_id: int, text: str
     ) -> ModerationVerdict:
-        """使用 LLM 基于群规则判定，返回带置信度的完整判定。
+        """Evaluate deterministic rules locally and semantic rules with the LLM.
 
         审核模型输出不可解析时按不违规处理，但 conclusive=False，
         调用方不应据此写入"已审查通过"类缓存。"""
@@ -204,11 +207,118 @@ class ModerationService:
         ).order_by(ModerationRule.id)
         with session.no_autoflush:
             result = await session.execute(stmt)
-        rules = list(result.scalars().all())
+        loaded_rules = list(result.scalars().all())
+        # Keep a detached immutable-in-practice snapshot.  Ending the read
+        # transaction may expire ORM rows on session factories configured with
+        # expire_on_commit=True; accessing those rows during/after a slow LLM
+        # call would otherwise silently check a connection back out or raise
+        # MissingGreenlet.
+        rules = [
+            ModerationRule(
+                id=int(rule.id),
+                group_id=int(rule.group_id),
+                rule_type=str(rule.rule_type or ""),
+                pattern=str(rule.pattern or ""),
+                action=str(rule.action or "warn"),
+                enabled=bool(rule.enabled),
+            )
+            for rule in loaded_rules
+        ]
+
+        # A SELECT starts a SQLite transaction and keeps a pooled connection
+        # checked out.  End that read-only transaction before regex/LLM work so
+        # a slow provider cannot starve the database pool.
+        commit = getattr(session, "commit", None)
+        if callable(commit):
+            await commit()
 
         if not rules:
             log.info("审核通过 (无启用规则)")
             return ModerationVerdict(violated=False, reason="", rule=None, conclusive=True)
+
+        deterministic_inconclusive = False
+        llm_rules: list[ModerationRule] = []
+        normalized_text = text or ""
+        folded_text = normalized_text.casefold()
+        regex_deadline = time.perf_counter() + 0.1
+        for rule in rules:
+            rule_type = (rule.rule_type or "keyword").strip().lower()
+            pattern = (rule.pattern or "").strip()
+            if rule_type == "keyword":
+                if not pattern:
+                    deterministic_inconclusive = True
+                    log.warning(
+                        "empty keyword moderation rule ignored: group=%s rule=%s",
+                        group_id,
+                        rule.id,
+                    )
+                    continue
+                if pattern.casefold() in folded_text:
+                    log.info("审核命中本地关键词: group=%s rule_id=%s", group_id, rule.id)
+                    return ModerationVerdict(
+                        violated=True,
+                        reason="命中关键词规则",
+                        rule=rule,
+                        conclusive=True,
+                        confidence=1.0,
+                    )
+                continue
+            if rule_type == "regex":
+                if not pattern:
+                    deterministic_inconclusive = True
+                    log.warning(
+                        "empty regex moderation rule ignored: group=%s rule=%s",
+                        group_id,
+                        rule.id,
+                    )
+                    continue
+                remaining_regex_budget = regex_deadline - time.perf_counter()
+                if remaining_regex_budget <= 0:
+                    deterministic_inconclusive = True
+                    log.warning(
+                        "regex moderation total budget exhausted: group=%s rule=%s",
+                        group_id,
+                        rule.id,
+                    )
+                    continue
+                try:
+                    matched = safe_regex.search(
+                        pattern,
+                        normalized_text,
+                        flags=safe_regex.IGNORECASE,
+                        timeout=min(0.02, remaining_regex_budget),
+                    )
+                except (safe_regex.error, TimeoutError) as exc:
+                    deterministic_inconclusive = True
+                    log.warning(
+                        "regex moderation rule invalid or timed out: group=%s rule=%s error=%s",
+                        group_id,
+                        rule.id,
+                        exc,
+                    )
+                    continue
+                if matched is not None:
+                    log.info("审核命中本地正则: group=%s rule_id=%s", group_id, rule.id)
+                    return ModerationVerdict(
+                        violated=True,
+                        reason="命中正则规则",
+                        rule=rule,
+                        conclusive=True,
+                        confidence=1.0,
+                    )
+                continue
+            # Unknown legacy rule types are treated as semantic rules rather
+            # than silently ignored.
+            llm_rules.append(rule)
+
+        if not llm_rules:
+            log.info("审核通过 (检查了 %d 条本地规则)", len(rules))
+            return ModerationVerdict(
+                violated=False,
+                reason="",
+                rule=None,
+                conclusive=not deterministic_inconclusive,
+            )
 
         rules_payload = [
             {
@@ -217,7 +327,7 @@ class ModerationService:
                 "rule": r.pattern,
                 "action": r.action,
             }
-            for r in rules
+            for r in llm_rules
         ]
         rules_json = json.dumps(rules_payload, ensure_ascii=False, indent=2)
 
@@ -225,7 +335,16 @@ class ModerationService:
             get_prompt("moderation").format(rules_json=rules_json)
         )
         user_input = wrap_untrusted("待审核消息", clean_text(text, max_len=1200), max_len=1200)
-        llm_raw = await self.llm.moderation(system_prompt, user_input)
+        try:
+            llm_raw = await self.llm.moderation(system_prompt, user_input)
+        except Exception:
+            log.exception("审核模型调用失败；本地规则已完成检查")
+            return ModerationVerdict(
+                violated=False,
+                reason="",
+                rule=None,
+                conclusive=False,
+            )
         data = _parse_moderation_json(llm_raw)
 
         if not data:
@@ -260,14 +379,17 @@ class ModerationService:
         if rid is not None:
             try:
                 rid_int = int(rid)
-                hit_rule = next((r for r in rules if r.id == rid_int), None)
+                hit_rule = next((r for r in llm_rules if r.id == rid_int), None)
             except (TypeError, ValueError):
                 hit_rule = None
 
         if violated and not hit_rule:
             rule_text = str(data.get("rule", "")).strip()
             if rule_text:
-                hit_rule = next((r for r in rules if (r.pattern or "").strip() == rule_text), None)
+                hit_rule = next(
+                    (r for r in llm_rules if (r.pattern or "").strip() == rule_text),
+                    None,
+                )
 
         if violated:
             if not reason:
@@ -287,8 +409,13 @@ class ModerationService:
                 confidence=confidence,
             )
 
-        log.info("审核通过 (检查了 %d 条规则, AI判定)", len(rules))
-        return ModerationVerdict(violated=False, reason="", rule=None, conclusive=True)
+        log.info("审核通过 (检查了 %d 条语义规则, AI判定)", len(llm_rules))
+        return ModerationVerdict(
+            violated=False,
+            reason="",
+            rule=None,
+            conclusive=not deterministic_inconclusive,
+        )
 
     def is_high_confidence(self, verdict: ModerationVerdict) -> bool:
         return bool(
@@ -304,15 +431,47 @@ class ModerationService:
         text: str,
         action: str,
         rule: ModerationRule | None = None,
+        *,
+        source_message_id: int | None = None,
     ) -> Violation:
-        v = Violation(
-            group_id=group_id,
-            user_id=user_id,
-            rule_id=rule.id if rule else None,
-            message_text=text[:500],
-            action_taken=action,
+        values = {
+            "group_id": int(group_id),
+            "user_id": int(user_id),
+            "rule_id": int(rule.id) if rule is not None and rule.id is not None else None,
+            "message_text": str(text or "")[:500],
+            "action_taken": str(action or "warn")[:32],
+        }
+        normalized_source = int(source_message_id or 0)
+        if normalized_source <= 0:
+            v = Violation(**values)
+            session.add(v)
+            setattr(v, "_source_event_created", True)
+            return v
+
+        values["source_message_id"] = normalized_source
+        inserted_id = (
+            await session.execute(
+                sqlite_insert(Violation)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        Violation.group_id,
+                        Violation.source_message_id,
+                    ]
+                )
+                .returning(Violation.id)
+            )
+        ).scalar_one_or_none()
+        created = inserted_id is not None
+        v = await session.scalar(
+            select(Violation).where(
+                Violation.group_id == int(group_id),
+                Violation.source_message_id == normalized_source,
+            )
         )
-        session.add(v)
+        if v is None:
+            raise RuntimeError("failed to persist or reload idempotent violation event")
+        setattr(v, "_source_event_created", created)
         return v
 
     async def add_warning(

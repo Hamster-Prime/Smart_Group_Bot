@@ -4,8 +4,10 @@ import asyncio
 import logging
 import re
 from collections.abc import Iterable
+from functools import partial
 
 from bot.services.skills.base import SkillContext, SkillRunResult
+from bot.services.skills.platform_common import run_search_thread
 from bot.utils.security import clean_text
 
 log = logging.getLogger(__name__)
@@ -173,7 +175,7 @@ class WebSearchSkill:
     ) -> list[dict]:
         from ddgs import DDGS
 
-        with DDGS() as ddgs:
+        with DDGS(timeout=5) as ddgs:
             if kind == "news":
                 return list(
                     ddgs.news(
@@ -243,8 +245,15 @@ class WebSearchSkill:
             is_news=self._is_news_query(q),
         )
         last_error = "empty_result"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 18.0
 
         for idx, (kind, query, region, backend) in enumerate(attempts, start=1):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                last_error = "search_timeout"
+                log.warning("websearch total timeout: query=%s", q)
+                break
             log.info(
                 "websearch try=%d/%d kind=%s region=%s backend=%s query=%s",
                 idx,
@@ -255,13 +264,16 @@ class WebSearchSkill:
                 query,
             )
             try:
-                rows = await asyncio.to_thread(
-                    self._search_once,
-                    kind=kind,
-                    query=query,
-                    max_results=max_results,
-                    region=region,
-                    backend=backend,
+                rows = await run_search_thread(
+                    partial(
+                        self._search_once,
+                        kind=kind,
+                        query=query,
+                        max_results=max_results,
+                        region=region,
+                        backend=backend,
+                    ),
+                    timeout_sec=min(6.0, remaining),
                 )
             except ModuleNotFoundError:
                 log.exception("websearch failed: ddgs not installed")
@@ -271,6 +283,16 @@ class WebSearchSkill:
                     summary="未安装 ddgs 依赖",
                     error="ddgs_not_installed",
                 )
+            except TimeoutError:
+                last_error = "search_timeout"
+                log.warning(
+                    "websearch attempt timed out: kind=%s region=%s backend=%s query=%s",
+                    kind,
+                    region,
+                    backend,
+                    query,
+                )
+                continue
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 log.warning(

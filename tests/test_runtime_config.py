@@ -50,6 +50,7 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.main_model.max_tokens, 2048)
         self.assertEqual(self.settings.bot.max_context_tokens, 256000)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
+        self.assertEqual(self.settings.bot.reply_batch_timeout_seconds, 45.0)
         self.assertEqual(self.settings.vote_ban_trigger_limit, 3)
         self.assertEqual(self.settings.vote_ban_trigger_window_seconds, 3600)
         async with self.session_factory() as session:

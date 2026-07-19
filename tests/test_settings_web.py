@@ -128,6 +128,10 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Smart Group Bot", page_text)
         self.assertIn("/settings-assets/lucide.min.js", page_text)
         self.assertNotIn("unpkg.com", page_text)
+        self.assertIn(
+            "frame-ancestors https://web.telegram.org",
+            page.headers["Content-Security-Policy"],
+        )
 
         asset = await self.client.get("/settings-assets/app.js")
         self.assertEqual(asset.status, 200)
@@ -172,9 +176,10 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                     AuthorizedGroup(group_id=-402, authorized_by=42),
                     Group(id=-401, title="Own Group", settings={}),
                     Group(id=-402, title="Other Group", settings={}),
-                    Admin(group_id=-401, user_id=99, role="admin"),
                 ]
             )
+            await session.flush()
+            session.add(Admin(group_id=-401, user_id=99, role="admin"))
             await session.commit()
 
         session_response = await self.client.get(
@@ -208,6 +213,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-501, authorized_by=42))
             session.add(Group(id=-501, title="Managed Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-501, user_id=99, role="admin"))
             await session.commit()
 
@@ -234,6 +240,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-503, authorized_by=42))
             session.add(Group(id=-503, title="Keyword Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-503, user_id=99, role="admin"))
             await session.commit()
 
@@ -309,6 +316,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-504, authorized_by=42))
             session.add(Group(id=-504, title="Schedule Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-504, user_id=99, role="admin"))
             await session.commit()
 
@@ -383,6 +391,11 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                 [
                     AuthorizedGroup(group_id=-505, authorized_by=42),
                     Group(id=-505, title="Names Group", settings={}),
+                ]
+            )
+            await session.flush()
+            session.add_all(
+                [
                     Admin(group_id=-505, user_id=99, role="admin"),
                     Admin(group_id=-505, user_id=100, role="admin"),
                     Admin(group_id=-505, user_id=101, role="admin"),
@@ -417,6 +430,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-502, authorized_by=42))
             session.add(Group(id=-502, title="Ban Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-502, user_id=99, role="admin"))
             session.add(
                 GroupMember(
@@ -458,6 +472,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-503, authorized_by=42))
             session.add(Group(id=-503, title="Failure Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-503, user_id=99, role="admin"))
             await session.commit()
         self.bot.ban_chat_member.side_effect = RuntimeError("telegram unavailable")
@@ -1028,6 +1043,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             session.add(AuthorizedGroup(group_id=-272, authorized_by=42))
             session.add(Group(id=-272, title="Admins Group", settings={}))
+            await session.flush()
             session.add(Admin(group_id=-272, user_id=99, role="admin"))
             session.add(
                 GroupMember(

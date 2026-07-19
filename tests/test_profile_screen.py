@@ -64,6 +64,10 @@ def _event(**message_fields: object) -> SimpleNamespace:
         ),
         "sender_chat": None,
         "delete": AsyncMock(),
+        "bot": SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="kicked")),
+        ),
         "text": "hello",
     }
     values.update(message_fields)
@@ -325,7 +329,39 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         screen.assert_awaited_once()
         mark_screened.assert_awaited_once()
 
-    async def test_confirmed_violation_stays_blocked_when_persistence_fails(self) -> None:
+    async def test_deauthorization_during_llm_discards_global_ban_verdict(self) -> None:
+        patches = list(self._patch_screening(verdict=(True, "广告昵称", True)))
+        patches[0] = patch(
+            "bot.middlewares.profile_screen.is_group_authorized",
+            new=AsyncMock(side_effect=[True, True, False]),
+        )
+        add_ban = AsyncMock()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patch(
+                "bot.middlewares.profile_screen.add_global_ban",
+                new=add_ban,
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                _event(),
+                {"settings": _settings()},
+            )
+
+        self.assertEqual(result, "handled")
+        add_ban.assert_not_awaited()
+        self.handler.assert_awaited_once()
+
+    async def test_violation_never_bans_when_policy_persistence_fails(self) -> None:
         entered = asyncio.Event()
         release = asyncio.Event()
 
@@ -378,13 +414,13 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             results = await _gather_message_tasks(self, [first, second])
 
-        self.assertEqual(results, [None, None])
-        self.handler.assert_not_awaited()
-        screen.assert_awaited_once()
-        add_ban.assert_awaited_once()
+        self.assertEqual(results, ["handled", "handled"])
+        self.assertEqual(self.handler.await_count, 2)
+        self.assertEqual(screen.await_count, 2)
+        self.assertEqual(add_ban.await_count, 2)
         for event in events:
-            event.delete.assert_awaited_once()
-            event.chat.ban.assert_awaited_once_with(42)
+            event.delete.assert_not_awaited()
+            event.bot.ban_chat_member.assert_not_awaited()
 
     async def test_concurrent_different_profile_signature_is_reviewed_separately(self) -> None:
         entered = asyncio.Event()
@@ -453,7 +489,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(screen.await_count, 2)
         self.handler.assert_awaited_once_with(clean_event, {"settings": _settings()})
         changed_event.delete.assert_awaited_once()
-        changed_event.chat.ban.assert_awaited_once_with(42)
+        changed_event.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
 
 
 class ProfileScreenConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -536,7 +572,7 @@ class ProfileScreenConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         screen.assert_awaited_once()
         for event in events:
             event.delete.assert_awaited_once()
-            event.chat.ban.assert_awaited_once_with(42)
+            event.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
 
         async with self.session_factory() as session:
             row = await get_global_ban(session, 42)

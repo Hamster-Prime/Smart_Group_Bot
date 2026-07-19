@@ -5,15 +5,64 @@ import json
 import logging
 import os
 import re
+import weakref
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
+
+# Loading LiteLLM otherwise performs a blocking five-second GitHub fetch at
+# import time.  Model pricing metadata is not required for this bot; use the
+# bundled map so startup and test discovery never depend on external DNS.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
 
 log = logging.getLogger(__name__)
+
+# Keep slow/upstream-broken providers from consuming every Telegram update
+# worker at once.  The semaphore is process-wide because LLMService instances
+# are intentionally short lived (one is built for each pending reply batch).
+_LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(4)
+_LLM_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
+_LLM_CIRCUIT_FAILURE_THRESHOLD = 3
+_LLM_CIRCUIT_COOLDOWN_SECONDS = 30.0
+_LLM_CIRCUITS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[tuple[str, str, str, str], tuple[int, float]],
+] = weakref.WeakKeyDictionary()
+
+
+def _observe_llm_task(task: asyncio.Future[Any]) -> None:
+    _LLM_ORPHAN_TASKS.discard(task)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_llm_orphan(task: asyncio.Future[Any]) -> None:
+    if task.done():
+        _observe_llm_task(task)
+        return
+    _LLM_ORPHAN_TASKS.add(task)
+    task.add_done_callback(_observe_llm_task)
+
+
+async def flush_llm_request_tasks(*, timeout_seconds: float = 15.0) -> None:
+    """Cancel and join cancellation-resistant provider calls at shutdown."""
+
+    tasks = {task for task in _LLM_ORPHAN_TASKS if not task.done()}
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+    for task in done:
+        _observe_llm_task(task)
+    if pending:
+        log.error("%d LLM request task(s) ignored shutdown cancellation", len(pending))
 
 _PROVIDER_CREDENTIAL_ENV_KEYS = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
@@ -1208,8 +1257,133 @@ class LLMService:
         return base * (multiplier ** max(0, attempt - 1))
 
     @staticmethod
+    def _circuit_key(
+        cfg: ChatEndpointConfig | EmbedEndpointConfig,
+        *,
+        stage: str,
+    ) -> tuple[str, str, str, str]:
+        return (
+            "embed" if stage == "embed" else "chat",
+            str(getattr(cfg, "provider", "") or ""),
+            str(getattr(cfg, "model", "") or ""),
+            str(getattr(cfg, "api_base", "") or ""),
+        )
+
+    @classmethod
+    def _circuit_is_open(
+        cls,
+        cfg: ChatEndpointConfig | EmbedEndpointConfig,
+        *,
+        stage: str,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        states = _LLM_CIRCUITS.setdefault(loop, {})
+        key = cls._circuit_key(cfg, stage=stage)
+        failures, open_until = states.get(key, (0, 0.0))
+        now = loop.time()
+        if open_until > now:
+            return True
+        if open_until:
+            states[key] = (0, 0.0)
+        return False
+
+    @classmethod
+    def _record_circuit_success(
+        cls,
+        cfg: ChatEndpointConfig | EmbedEndpointConfig,
+        *,
+        stage: str,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        _LLM_CIRCUITS.setdefault(loop, {}).pop(
+            cls._circuit_key(cfg, stage=stage),
+            None,
+        )
+
+    @classmethod
+    def _record_circuit_failure(
+        cls,
+        cfg: ChatEndpointConfig | EmbedEndpointConfig,
+        *,
+        stage: str,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        states = _LLM_CIRCUITS.setdefault(loop, {})
+        key = cls._circuit_key(cfg, stage=stage)
+        failures, _ = states.get(key, (0, 0.0))
+        failures += 1
+        open_until = 0.0
+        if failures >= _LLM_CIRCUIT_FAILURE_THRESHOLD:
+            open_until = loop.time() + _LLM_CIRCUIT_COOLDOWN_SECONDS
+            log.error(
+                "LLM circuit opened | stage=%s model=%s cooldown=%.0fs",
+                stage,
+                getattr(cfg, "model", ""),
+                _LLM_CIRCUIT_COOLDOWN_SECONDS,
+            )
+        states[key] = (failures, open_until)
+
+    @staticmethod
     async def _await_with_timeout(awaitable: Any, *, timeout_sec: float) -> Any:
-        return await asyncio.wait_for(awaitable, timeout=max(1.0, timeout_sec))
+        """Wait for an operation without letting cancellation delay the deadline.
+
+        ``asyncio.wait_for`` waits until a cancelled child acknowledges
+        cancellation.  Several HTTP streaming implementations can delay or
+        swallow that cancellation, turning a nominal five second timeout into
+        an unbounded wait.  This helper returns at the deadline, while still
+        cancelling and observing the child in the background.
+        """
+
+        timeout = max(0.01, float(timeout_sec))
+        task = asyncio.ensure_future(awaitable)
+
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            _track_llm_orphan(task)
+            raise
+        if task in done:
+            return task.result()
+
+        task.cancel()
+        _track_llm_orphan(task)
+        raise asyncio.TimeoutError
+
+    @staticmethod
+    def _close_stream_best_effort(stream_resp: Any) -> None:
+        """Close an upstream stream without extending the request deadline."""
+
+        close = getattr(stream_resp, "aclose", None)
+        if callable(close):
+            try:
+                result = close()
+            except Exception:
+                log.debug("LLM stream aclose failed", exc_info=True)
+                return
+            if asyncio.iscoroutine(result):
+                try:
+                    task = asyncio.create_task(result, name="llm-stream-close")
+                except RuntimeError:
+                    result.close()
+                    return
+
+                def _observe_close(done_task: asyncio.Task[Any]) -> None:
+                    try:
+                        done_task.result()
+                    except (asyncio.CancelledError, Exception):
+                        log.debug("LLM stream async close failed", exc_info=True)
+
+                _track_llm_orphan(task)
+                task.add_done_callback(_observe_close)
+            return
+
+        close = getattr(stream_resp, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                log.debug("LLM stream close failed", exc_info=True)
 
     @staticmethod
     def _uses_responses_api(cfg: ChatEndpointConfig) -> bool:
@@ -1390,6 +1564,44 @@ class LLMService:
             return self._consume_chat_stream_sync(resp)
         return self._normalize_response_object(resp)
 
+    async def _responses_async_request(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        cfg: ChatEndpointConfig,
+        stream: bool = False,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        exclude_params: frozenset[str] | set[str] = frozenset(),
+        timeout_sec: float,
+    ) -> Any:
+        """Create a Responses API request using the cancellable async client."""
+
+        responses_fn = getattr(litellm, "aresponses", None)
+        if responses_fn is None:
+            raise RuntimeError(
+                "installed litellm does not support aresponses(); please upgrade litellm"
+            )
+
+        kwargs = self._build_responses_kwargs(
+            cfg,
+            stream=stream,
+            exclude_params=exclude_params,
+        )
+        kwargs["timeout"] = max(0.01, float(timeout_sec))
+        if tools:
+            kwargs["tools"] = self._tools_to_responses_format(tools)
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
+
+        input_items = self._messages_to_responses_input(messages)
+        try:
+            return await responses_fn(input=input_items, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'input'" not in str(exc):
+                raise
+            return await responses_fn(messages=messages, **kwargs)
+
     async def _chat_completion_response_with_retries(
         self,
         *,
@@ -1441,6 +1653,13 @@ class LLMService:
                 configuration_issue,
             )
             return None
+        if self._circuit_is_open(cfg, stage=label):
+            log.warning(
+                "LLM circuit open | stage=%s model=%s | skipping_model",
+                label_cn,
+                cfg.model,
+            )
+            return None
 
         excluded_params: set[str] = set()
         attempt = 0
@@ -1449,6 +1668,9 @@ class LLMService:
             stream = self._should_stream_upstream(label, cfg)
             kwargs = self._build_chat_kwargs(cfg, stream=stream, exclude_params=excluded_params)
             timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
+            # Keep the SDK/socket timeout aligned with the current retry attempt.
+            # Previously only the outer waiter used the multiplied timeout.
+            kwargs["timeout"] = timeout_sec
             prompt_usage = self.prompt_usage_text(
                 messages,
                 tools=tools,
@@ -1469,48 +1691,59 @@ class LLMService:
                 stream,
             )
             try:
-                if self._uses_responses_api(cfg):
-                    resp = await self._await_with_timeout(
-                        asyncio.to_thread(
-                            self._responses_sync_request,
-                            messages=messages,
-                            cfg=cfg,
-                            stream=stream,
-                            tools=tools,
-                            tool_choice=tool_choice,
-                            exclude_params=set(excluded_params),
-                        ),
-                        timeout_sec=timeout_sec,
-                    )
-                else:
-                    if tools:
-                        tool_kwargs: dict[str, Any] = {
-                            "tools": tools,
-                            "tool_choice": tool_choice,
-                        }
-                        if not any(
-                            isinstance(tool, dict)
-                            and str(tool.get("type", "")).strip().lower() == "mcp"
-                            for tool in tools
-                        ):
-                            # LiteLLM 1.92 imports its optional Proxy/MCP stack
-                            # before it checks that these are ordinary function tools.
-                            tool_kwargs["_skip_mcp_handler"] = True
-                        request = litellm.acompletion(
-                            messages=messages,
-                            **tool_kwargs,
-                            **kwargs,
-                        )
-                    else:
-                        request = litellm.acompletion(messages=messages, **kwargs)
-                    raw_resp = await self._await_with_timeout(request, timeout_sec=timeout_sec)
-                    if stream:
-                        resp = await self._await_with_timeout(
-                            self._consume_chat_stream(raw_resp),
-                            timeout_sec=timeout_sec,
-                        )
-                    else:
-                        resp = self._normalize_response_object(raw_resp)
+                async def _perform_attempt() -> Any:
+                    # Keep the permit owned by the actual request task. If an
+                    # upstream coroutine ignores cancellation, the permit is
+                    # released only when that orphan really exits; nominal
+                    # timeouts therefore cannot create unbounded real network
+                    # concurrency behind a semaphore that was released early.
+                    async with _LLM_REQUEST_SEMAPHORE:
+                        raw_resp: Any
+                        request: Any
+                        if self._uses_responses_api(cfg):
+                            request = self._responses_async_request(
+                                messages=messages,
+                                cfg=cfg,
+                                stream=stream,
+                                tools=tools,
+                                tool_choice=tool_choice,
+                                exclude_params=set(excluded_params),
+                                timeout_sec=timeout_sec,
+                            )
+                        else:
+                            if tools:
+                                tool_kwargs: dict[str, Any] = {
+                                    "tools": tools,
+                                    "tool_choice": tool_choice,
+                                }
+                                if not any(
+                                    isinstance(tool, dict)
+                                    and str(tool.get("type", "")).strip().lower() == "mcp"
+                                    for tool in tools
+                                ):
+                                    # LiteLLM 1.92 imports its optional Proxy/MCP stack
+                                    # before it checks that these are ordinary function tools.
+                                    tool_kwargs["_skip_mcp_handler"] = True
+                                request = litellm.acompletion(
+                                    messages=messages,
+                                    **tool_kwargs,
+                                    **kwargs,
+                                )
+                            else:
+                                request = litellm.acompletion(messages=messages, **kwargs)
+
+                        raw_resp = await request
+                        if stream:
+                            try:
+                                return await self._consume_chat_stream(raw_resp)
+                            finally:
+                                self._close_stream_best_effort(raw_resp)
+                        return self._normalize_response_object(raw_resp)
+
+                resp = await self._await_with_timeout(
+                    _perform_attempt(),
+                    timeout_sec=timeout_sec,
+                )
                 resp = self._normalize_response_object(resp)
                 message = resp.choices[0].message
                 content = self._normalize_content_text(message.content)
@@ -1528,6 +1761,7 @@ class LLMService:
                         if backoff > 0:
                             await asyncio.sleep(backoff)
                         continue
+                    self._record_circuit_failure(cfg, stage=label)
                     return None
 
                 usage = getattr(resp, "usage", None)
@@ -1549,6 +1783,7 @@ class LLMService:
                     truncated,
                     preview,
                 )
+                self._record_circuit_success(cfg, stage=label)
                 return resp
             except asyncio.TimeoutError:
                 if attempt < total_attempts:
@@ -1605,6 +1840,7 @@ class LLMService:
                     total_attempts,
                     exc,
                 )
+        self._record_circuit_failure(cfg, stage=label)
         return None
 
     async def _chat_with_fallbacks(
@@ -1758,10 +1994,17 @@ class LLMService:
         candidates = self._embed_candidates(self.embed_config)
         total = len(candidates)
         for idx, cfg in enumerate(candidates, start=1):
+            if self._circuit_is_open(cfg, stage="embed"):
+                log.warning(
+                    "LLM circuit open | stage=embed model=%s | skipping_model",
+                    cfg.model,
+                )
+                continue
             total_attempts = self._retry_attempts(cfg)
             for attempt in range(1, total_attempts + 1):
                 kwargs = self._build_embed_kwargs(cfg, texts)
                 timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
+                kwargs["timeout"] = timeout_sec
                 log.info(
                     "LLM request | stage=embed | model=%s | attempt=%d/%d | texts=%d | timeout=%.1fs",
                     cfg.model,
@@ -1771,8 +2014,12 @@ class LLMService:
                     timeout_sec,
                 )
                 try:
+                    async def _perform_embedding() -> Any:
+                        async with _LLM_REQUEST_SEMAPHORE:
+                            return await litellm.aembedding(**kwargs)
+
                     resp = await self._await_with_timeout(
-                        litellm.aembedding(**kwargs),
+                        _perform_embedding(),
                         timeout_sec=timeout_sec,
                     )
                     embeddings = [item["embedding"] for item in resp.data]
@@ -1796,6 +2043,7 @@ class LLMService:
                         total_attempts,
                         len(embeddings[0]),
                     )
+                    self._record_circuit_success(cfg, stage="embed")
                     return embeddings
                 except asyncio.TimeoutError:
                     if attempt < total_attempts:
@@ -1839,6 +2087,7 @@ class LLMService:
                         exc,
                     )
                     break
+            self._record_circuit_failure(cfg, stage="embed")
             if idx < total:
                 continue
             log.error("LLM exhausted | stage=embed | model=%s | no_fallback_left", cfg.model)

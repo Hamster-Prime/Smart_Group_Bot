@@ -52,6 +52,74 @@ def _settings(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+class VoteBanTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.5)
+
+    async def test_shutdown_flush_joins_vote_tasks(self) -> None:
+        release = asyncio.Event()
+
+        async def cancellation_resistant() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        vote_ban._expiry_tasks[999] = task
+        flush = asyncio.create_task(
+            vote_ban.flush_vote_ban_tasks(timeout_seconds=1.0)
+        )
+        await asyncio.sleep(0.01)
+        self.assertFalse(flush.done())
+        release.set()
+        await asyncio.wait_for(flush, timeout=0.5)
+        self.assertFalse(vote_ban._expiry_tasks)
+        self.assertFalse(vote_ban._enforcement_tasks)
+
+    async def test_shutdown_timeout_keeps_cancellation_resistant_task_registered(self) -> None:
+        release = asyncio.Event()
+
+        async def cancellation_resistant() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        vote_ban._enforcement_tasks[1000] = task
+
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.01)
+        self.assertIs(vote_ban._enforcement_tasks.get(1000), task)
+        self.assertFalse(task.done())
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.5)
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.1)
+        self.assertNotIn(1000, vote_ban._enforcement_tasks)
+
+    async def test_replaced_expiry_task_cannot_retire_new_owner(self) -> None:
+        kwargs = {
+            "session_factory": object(),
+            "bot": SimpleNamespace(),
+            "settings": _settings(),
+            "session_id": 321,
+            "delay_seconds": 3600,
+        }
+        vote_ban.schedule_vote_expiry(**kwargs)
+        await asyncio.sleep(0)
+        first = vote_ban._expiry_tasks[321]
+
+        vote_ban.schedule_vote_expiry(**kwargs)
+        second = vote_ban._expiry_tasks[321]
+        self.assertIsNot(first, second)
+        await asyncio.sleep(0)
+
+        self.assertIs(vote_ban._expiry_tasks.get(321), second)
+
+
 class VoteBanConfigTests(unittest.TestCase):
     def test_group_overrides_and_clamping(self) -> None:
         settings = _settings()
@@ -180,6 +248,13 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         session_id = await self._open_session(threshold=3)
         callback = self._callback(session_id, voter_id=11)
         async with self.session_factory() as session:
+            async def edit_without_db_lease(**_kwargs):
+                self.assertFalse(session.in_transaction())
+                self.assertEqual(self.engine.sync_engine.pool.checkedout(), 0)
+
+            callback.bot.edit_message_text = AsyncMock(
+                side_effect=edit_without_db_lease
+            )
             await group.on_vote_ban_action(callback, self.settings, session=session)
         callback.bot.ban_chat_member.assert_not_awaited()
         callback.bot.edit_message_text.assert_awaited()
@@ -190,10 +265,39 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "active")
 
+    async def test_membership_lookup_does_not_hold_database_transaction(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        callback = self._callback(session_id, voter_id=11)
+        async with self.session_factory() as session:
+            async def membership_lookup(*_args, **_kwargs):
+                self.assertFalse(session.in_transaction())
+                self.assertEqual(self.engine.sync_engine.pool.checkedout(), 0)
+                return SimpleNamespace(status="member")
+
+            callback.bot.get_chat_member = AsyncMock(side_effect=membership_lookup)
+            await group.on_vote_ban_action(callback, self.settings, session=session)
+
+        callback.bot.get_chat_member.assert_awaited_once()
+
     async def test_threshold_reached_bans_and_finalizes(self) -> None:
         session_id = await self._open_session(threshold=2)
         callback = self._callback(session_id, voter_id=11)
         async with self.session_factory() as session:
+            async def ban_without_db_lease(*_args, **_kwargs):
+                self.assertFalse(session.in_transaction())
+                self.assertEqual(self.engine.sync_engine.pool.checkedout(), 0)
+                return True
+
+            async def edit_without_db_lease(**_kwargs):
+                self.assertFalse(session.in_transaction())
+                self.assertEqual(self.engine.sync_engine.pool.checkedout(), 0)
+
+            callback.bot.ban_chat_member = AsyncMock(
+                side_effect=ban_without_db_lease
+            )
+            callback.bot.edit_message_text = AsyncMock(
+                side_effect=edit_without_db_lease
+            )
             await group.on_vote_ban_action(callback, self.settings, session=session)
         callback.bot.ban_chat_member.assert_awaited_once_with(-100, 555)
         kwargs = callback.bot.edit_message_text.await_args.kwargs
@@ -260,6 +364,9 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_ban_failure_rolls_back_warning_flag(self) -> None:
         async with self.session_factory() as session:
             bot = SimpleNamespace(
+                get_chat_member=AsyncMock(
+                    return_value=SimpleNamespace(status="member")
+                ),
                 ban_chat_member=AsyncMock(side_effect=RuntimeError("api down"))
             )
             banned = await apply_vote_ban(
@@ -277,6 +384,9 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_success_is_not_published_before_final_outcome(self) -> None:
         async with self.session_factory() as session:
             bot = SimpleNamespace(
+                get_chat_member=AsyncMock(
+                    return_value=SimpleNamespace(status="member")
+                ),
                 ban_chat_member=AsyncMock(return_value=True)
             )
             banned = await apply_vote_ban(
@@ -309,6 +419,9 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         bot = SimpleNamespace(
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(status="member")
+            ),
             ban_chat_member=AsyncMock(return_value=True),
             edit_message_text=AsyncMock(),
         )
@@ -432,6 +545,37 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(record.status, "failed")
             self.assertEqual(event.outcome, "failed")
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 555,
+                )
+            )
+            self.assertFalse(bool(warning.is_banned) if warning else False)
+
+    async def test_threshold_rechecks_target_and_refuses_new_admin(self) -> None:
+        session_id = await self._open_session(threshold=2)
+        bot = SimpleNamespace(
+            # First lookup validates the voter; the second fresh lookup protects
+            # a target promoted while the vote was in progress.
+            get_chat_member=AsyncMock(
+                side_effect=(
+                    SimpleNamespace(status="member"),
+                    SimpleNamespace(status="administrator"),
+                )
+            ),
+            ban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(),
+        )
+        callback = self._callback(session_id, voter_id=11, bot=bot)
+
+        async with self.session_factory() as session:
+            await group.on_vote_ban_action(callback, self.settings, session=session)
+
+        bot.ban_chat_member.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "failed")
             warning = await session.scalar(
                 select(UserWarning).where(
                     UserWarning.group_id == -100,
@@ -572,6 +716,23 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                 )
         message.bot.send_message.assert_not_awaited()
         self.assertIn("确认", answer_mock.await_args.args[2])
+
+    async def test_target_status_lookup_releases_database_transaction_first(self) -> None:
+        message = self._message(reply=self._reply())
+        async with self.session_factory() as session:
+            async def get_chat_member(_group_id: int, _user_id: int):
+                self.assertFalse(session.in_transaction())
+                return SimpleNamespace(status="administrator")
+
+            message.bot.get_chat_member = AsyncMock(side_effect=get_chat_member)
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "admin_target")
 
     async def test_persistent_trigger_quota_blocks_next_target(self) -> None:
         self.settings.vote_ban_trigger_limit = 1

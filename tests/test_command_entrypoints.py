@@ -15,7 +15,147 @@ def _settings() -> Settings:
     return settings
 
 
+class _AsyncContext:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
 class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
+    def test_av_command_is_registered_on_router(self) -> None:
+        callbacks = [handler.callback for handler in commands.router.message.handlers]
+
+        self.assertIn(commands.cmd_av, callbacks)
+
+    async def test_av_search_releases_db_transaction_before_external_lookup(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            from_user=SimpleNamespace(id=123),
+            text="/av test query",
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        async def assert_committed_before_search(_query: str):
+            session.commit.assert_awaited_once()
+            return []
+
+        service = SimpleNamespace(
+            enabled=True,
+            search=AsyncMock(side_effect=assert_committed_before_search),
+            lookup_by_code=AsyncMock(),
+        )
+        group_row = SimpleNamespace(settings={"av_enabled": True})
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands._ensure_group_row", new=AsyncMock(return_value=group_row)),
+            patch("bot.handlers.commands.AVSearchService", return_value=service),
+            patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
+            patch("bot.handlers.commands._answer", new=AsyncMock()),
+        ):
+            await commands.cmd_av(message, session=session, settings=_settings())
+
+        service.search.assert_awaited_once_with("test query")
+
+    async def test_av_private_search_is_rejected_for_non_owner(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123, type="private", title=""),
+            from_user=SimpleNamespace(id=123),
+            text="/av test query",
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        settings = _settings()
+        settings.super_admin_id = 999
+
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.AVSearchService") as service_cls,
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await commands.cmd_av(message, session=session, settings=settings)
+
+        session.commit.assert_awaited_once()
+        service_cls.assert_not_called()
+        self.assertIn("私聊仅最高管理员", answer_mock.await_args.args[2])
+
+    async def test_av_group_search_requires_group_feature_flag(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            from_user=SimpleNamespace(id=123),
+            text="/av test query",
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        group_row = SimpleNamespace(settings={"av_enabled": False})
+
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands._ensure_group_row", new=AsyncMock(return_value=group_row)),
+            patch("bot.handlers.commands.AVSearchService") as service_cls,
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
+        ):
+            await commands.cmd_av(message, session=session, settings=_settings())
+
+        session.commit.assert_awaited_once()
+        service_cls.assert_not_called()
+        self.assertIn("当前群组未启用", answer_mock.await_args.args[2])
+
+    async def test_av_private_search_allows_owner(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=999, type="private", title=""),
+            from_user=SimpleNamespace(id=999),
+            text="/av test query",
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        settings = _settings()
+        settings.super_admin_id = 999
+        service = SimpleNamespace(
+            enabled=True,
+            search=AsyncMock(return_value=[]),
+            lookup_by_code=AsyncMock(),
+        )
+
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.AVSearchService", return_value=service),
+            patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
+            patch("bot.handlers.commands._answer", new=AsyncMock()),
+        ):
+            await commands.cmd_av(message, session=session, settings=settings)
+
+        session.commit.assert_awaited_once()
+        service.search.assert_awaited_once_with("test query")
+
+    async def test_av_private_callback_rechecks_current_owner_policy(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=123, type="private", title=""),
+        )
+        callback = SimpleNamespace(
+            data="avs:legacy-token:0",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        settings = _settings()
+        settings.super_admin_id = 999
+
+        with patch(
+            "bot.handlers.commands.ensure_group_authorized",
+            new=AsyncMock(return_value=True),
+        ):
+            await commands.on_av_search_paging(
+                callback,
+                settings=settings,
+                session=session,
+            )
+
+        session.commit.assert_awaited_once()
+        callback.answer.assert_awaited_once_with(
+            "私聊仅最高管理员可使用 AV 查询",
+            show_alert=True,
+        )
+
     async def test_help_uses_shared_command_catalog_text(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),
@@ -90,7 +230,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             text="/clearwarnings 456",
             reply_to_message=None,
         )
-        session = object()
+        session = SimpleNamespace(commit=AsyncMock())
         settings = _settings()
 
         with (
@@ -109,8 +249,9 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         clear_mock.assert_awaited_once_with(session, -10001, 456)
         self.assertIn("原为 2 次", answer_mock.await_args.args[2])
+        session.commit.assert_awaited_once()
 
-    async def test_warning_reset_deletes_state_and_returns_previous_values(self) -> None:
+    async def test_warning_reset_preserves_banned_state_and_returns_previous_values(self) -> None:
         warning = SimpleNamespace(count=4, is_banned=True)
         session = SimpleNamespace(
             execute=AsyncMock(
@@ -120,6 +261,27 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         )
 
         cleared = await admin._clear_user_warning(session, -10001, 456)
+
+        self.assertEqual(cleared, (4, True))
+        self.assertEqual(warning.count, 0)
+        self.assertTrue(warning.is_banned)
+        session.delete.assert_not_awaited()
+
+    async def test_unban_warning_reset_removes_banned_state(self) -> None:
+        warning = SimpleNamespace(count=4, is_banned=True)
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(scalar_one_or_none=lambda: warning)
+            ),
+            delete=AsyncMock(),
+        )
+
+        cleared = await admin._clear_user_warning(
+            session,
+            -10001,
+            456,
+            preserve_ban=False,
+        )
 
         self.assertEqual(cleared, (4, True))
         session.delete.assert_awaited_once_with(warning)
@@ -164,6 +326,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("bot.handlers.admin._target_is_group_admin", new=AsyncMock(return_value=False)),
             patch("bot.handlers.admin.get_join_verification", new=AsyncMock(return_value=verification)),
+            patch(
+                "bot.handlers.admin.lease_join_verification_for_unban",
+                new=AsyncMock(),
+            ),
             patch("bot.handlers.admin.delete_join_verification", new=AsyncMock()) as delete_record,
             patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()) as delete_prompts,
             patch("bot.handlers.admin.record_ban_event", new=AsyncMock()),
@@ -176,9 +342,31 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
                 reason="test",
             )
 
-        self.assertIn("原警告和真人验证状态均已保留", text)
+        self.assertIn("崩溃恢复工单", text)
         delete_record.assert_not_awaited()
         delete_prompts.assert_not_awaited()
+
+    async def test_group_ban_fails_closed_when_admin_status_is_unavailable(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            reply_to_message=None,
+            bot=SimpleNamespace(ban_chat_member=AsyncMock()),
+        )
+        with patch(
+            "bot.handlers.admin._target_is_group_admin",
+            new=AsyncMock(return_value=None),
+        ):
+            text = await admin._perform_group_ban_locked(
+                message,
+                SimpleNamespace(),
+                _settings(),
+                target_id=456,
+                reason="test",
+            )
+
+        self.assertIn("避免误封", text)
+        message.bot.ban_chat_member.assert_not_awaited()
 
     async def test_group_ban_success_cleans_verification_prompt_after_commit(self) -> None:
         verification = SimpleNamespace(prompt_message_id=322)
@@ -195,6 +383,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "bot.handlers.admin.get_join_verification",
                 new=AsyncMock(side_effect=[verification, verification]),
+            ),
+            patch(
+                "bot.handlers.admin.lease_join_verification_for_unban",
+                new=AsyncMock(),
             ),
             patch("bot.handlers.admin._mark_group_banned_after_telegram", new=AsyncMock()) as mark_banned,
             patch("bot.handlers.admin.delete_join_verification", new=AsyncMock()) as delete_record,
@@ -222,6 +414,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         )
         settings = _settings()
         fake_memory = SimpleNamespace(list_permanent_memories=AsyncMock(return_value=[]))
+        session = SimpleNamespace(commit=AsyncMock())
 
         with (
             patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
@@ -229,10 +422,63 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.commands.memory_holder.get", return_value=fake_memory),
             patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
         ):
-            await commands.cmd_lm(message, session=object(), settings=settings)
+            await commands.cmd_lm(
+                message,
+                session=session,
+                settings=settings,
+                session_factory=object(),
+            )
 
+        session.commit.assert_awaited_once()
         self.assertEqual(answer_mock.await_args.kwargs["auto_delete_seconds"], 0)
         self.assertIn("永久记忆", answer_mock.await_args.args[2])
+
+    async def test_lm_skill_releases_auth_session_and_uses_factory(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin"),
+            text="/lm add 记住测试内容",
+        )
+        settings = _settings()
+        events: list[str] = []
+        session = SimpleNamespace(
+            commit=AsyncMock(side_effect=lambda: events.append("commit"))
+        )
+        session_factory = object()
+
+        async def run_after_commit(*_args: object, **_kwargs: object) -> SkillRunResult:
+            self.assertEqual(events, ["commit"])
+            events.append("skill")
+            return SkillRunResult(
+                ok=True,
+                skill="memory_manage",
+                summary="永久记忆已写入",
+            )
+
+        fake_skill = SimpleNamespace(run_skill=AsyncMock(side_effect=run_after_commit))
+        with (
+            patch("bot.handlers.commands.ensure_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.commands.ensure_group_admin_permission", new=AsyncMock(return_value=True)),
+            patch(
+                "bot.handlers.commands.memory_holder.get",
+                return_value=SimpleNamespace(),
+            ),
+            patch("bot.handlers.commands._build_skill_service", return_value=fake_skill),
+            patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
+            patch("bot.handlers.commands._answer", new=AsyncMock()),
+        ):
+            await commands.cmd_lm(
+                message,
+                session=session,
+                settings=settings,
+                session_factory=session_factory,
+            )
+
+        self.assertIsNone(fake_skill.run_skill.await_args.kwargs["session"])
+        self.assertIs(
+            fake_skill.run_skill.await_args.kwargs["session_factory"],
+            session_factory,
+        )
 
     async def test_addrule_uses_rule_manage_skill(self) -> None:
         message = SimpleNamespace(
@@ -241,10 +487,19 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             text="/addrule 新增群规 禁止发广告",
         )
         settings = _settings()
+        events: list[str] = []
+        session = SimpleNamespace(
+            commit=AsyncMock(side_effect=lambda: events.append("commit"))
+        )
+        session_factory = object()
+
+        async def run_after_commit(*_args: object, **_kwargs: object) -> SkillRunResult:
+            self.assertEqual(events, ["commit"])
+            events.append("skill")
+            return SkillRunResult(ok=True, skill="rule_manage", summary="规则添加成功")
+
         fake_skill = SimpleNamespace(
-            run_skill=AsyncMock(
-                return_value=SkillRunResult(ok=True, skill="rule_manage", summary="规则添加成功")
-            )
+            run_skill=AsyncMock(side_effect=run_after_commit)
         )
 
         with (
@@ -253,10 +508,20 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.admin._build_skill_service", return_value=fake_skill),
             patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock,
         ):
-            await admin.cmd_addrule(message, session=object(), settings=settings)
+            await admin.cmd_addrule(
+                message,
+                session=session,
+                settings=settings,
+                session_factory=session_factory,
+            )
 
         fake_skill.run_skill.assert_awaited()
         self.assertEqual(fake_skill.run_skill.await_args.args[0], "rule_manage")
+        self.assertIsNone(fake_skill.run_skill.await_args.kwargs["session"])
+        self.assertIs(
+            fake_skill.run_skill.await_args.kwargs["session_factory"],
+            session_factory,
+        )
         self.assertIn("规则添加成功", answer_mock.await_args.args[2])
 
 

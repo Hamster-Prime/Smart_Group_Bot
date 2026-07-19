@@ -169,7 +169,7 @@ Mini App 群组页可读取并完整编辑 Telegram 当前 `ChatPermissions` 全
 
 ### AV 查询
 
-支持按番号直查、按演员/关键词搜索，来源覆盖 JAVBUS / MADOUQU / DMM / FC2。每群独立开关（`/av enable|disable`），支持内联翻页浏览详情和种子。
+支持按番号直查、按演员/关键词搜索，来源覆盖 JAVBUS / MADOUQU / DMM / FC2。每群独立开关（`/av enable|disable`）；群内仅在已授权且已启用时可用，私聊仅最高管理员可用。支持内联翻页浏览详情和种子。
 
 ### 日志
 
@@ -258,7 +258,17 @@ python start.py
 ### Docker
 
 ```bash
-docker compose up -d
+APP_UID="$(id -u)" APP_GID="$(id -g)" docker compose up -d --build
+```
+
+Compose 默认只把后端端口绑定到 `127.0.0.1:8480`，适合同机 HTTPS 反向代理；如确需让其他主机或容器直接访问，请显式设置 `MINIAPP_BIND_ADDRESS` 并同时配置防火墙。`APP_UID` / `APP_GID` 应与宿主机 `./data` 目录所有者一致，容器进程不会以 root 运行。停止宽限期为 8 分钟，确保在途更新、LLM 回复及 Telegram 清理任务能完成有界落盘。
+
+`uv.lock` 与由其导出的 `requirements.lock` 均纳入版本控制；镜像只安装锁定版本。依赖变更后运行：
+
+```bash
+uv lock
+uv export --frozen --no-dev --no-emit-project --no-hashes \
+  --no-annotate --no-header --output-file requirements.lock
 ```
 
 ---

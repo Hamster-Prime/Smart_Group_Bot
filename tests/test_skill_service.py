@@ -1,7 +1,9 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 
-from bot.services.skills.base import SkillRunResult
+from bot.services.skills import service as skill_service_module
+from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.service import SkillService
 
 
@@ -48,6 +50,7 @@ class _PlannedSkillService(SkillService):
         super().__init__(llm=object(), settings=None)
         self._responses = list(responses)
         self.calls: list[list[dict]] = []
+        self.tool_runs: list[str] = []
 
     async def _completion_with_fallbacks(self, messages, tools):
         self.calls.append([dict(message) for message in messages])
@@ -56,6 +59,7 @@ class _PlannedSkillService(SkillService):
         return self._responses.pop(0)
 
     async def _run_tool(self, *, name, arguments, context, skills=None):
+        self.tool_runs.append(name)
         if name == "send_sticker":
             context.handled = True
             context.sticker_sent = True
@@ -101,6 +105,14 @@ class _PlannedSkillService(SkillService):
                 payload={"quota": {"limit": 1, "used": 1, "remaining": 0}},
             )
 
+        if name == "rule_manage":
+            return SkillRunResult(
+                ok=True,
+                skill=name,
+                summary="已添加规则 #7",
+                payload={"action": "add", "rule_id": 7},
+            )
+
         if name == "bilibili_search":
             return SkillRunResult(
                 ok=True,
@@ -143,6 +155,13 @@ class _PlannedSkillService(SkillService):
         return SkillRunResult(ok=False, skill=name, summary="", error="unknown_skill")
 
 
+class _AmbiguousPlannedSkillService(_PlannedSkillService):
+    async def _run_tool(self, *, name, arguments, context, skills=None):
+        del arguments, context, skills
+        self.tool_runs.append(name)
+        return self._ambiguous_side_effect_result(name)
+
+
 class SkillServiceTTSPromptTests(unittest.TestCase):
     def test_vote_ban_skill_is_registered_when_runtime_settings_exist(self) -> None:
         service = SkillService(_llm_stub(), settings=_tts_settings())
@@ -181,6 +200,38 @@ class SkillServiceTTSPromptTests(unittest.TestCase):
 
 
 class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ambiguous_side_effect_is_terminal_and_not_retried(self) -> None:
+        service = _AmbiguousPlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-sticker",
+                            "function": {
+                                "name": "send_sticker",
+                                "arguments": "{}",
+                            },
+                        },
+                        {
+                            "id": "call-tts",
+                            "function": {
+                                "name": "doubao_tts",
+                                "arguments": '{"text":"不要重复"}',
+                            },
+                        },
+                    ]
+                ),
+                _resp(content="错误地声称两个操作都成功"),
+            ]
+        )
+
+        result = await service.answer_with_skill("发贴纸并说一句", intent_type="casual")
+
+        self.assertEqual(service.tool_runs, ["send_sticker"])
+        self.assertEqual(len(service.calls), 1)
+        self.assertIn("可能已经完成", result.text)
+        self.assertIn("不会自动重试", result.text)
+
     async def test_send_sticker_does_not_return_followup_text(self) -> None:
         service = _PlannedSkillService(
             [
@@ -310,7 +361,7 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.sticker_sent)
         self.assertFalse(result.handled)
 
-    async def test_quota_refusal_forces_visible_text_after_earlier_tts(self) -> None:
+    async def test_successful_tts_skips_later_side_effect_tool(self) -> None:
         service = _PlannedSkillService(
             [
                 _resp(
@@ -335,9 +386,73 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         result = await service.answer_with_skill("语音说完再发起投票", intent_type="casual")
 
         self.assertTrue(result.tts_sent)
-        self.assertTrue(result.must_deliver_text)
-        self.assertIn("额度已用完", result.text)
-        self.assertNotIn("已经发起", result.text)
+        self.assertFalse(result.must_deliver_text)
+        self.assertEqual(result.text, "")
+        self.assertEqual(service.tool_runs, ["doubao_tts"])
+
+    async def test_successful_sticker_skips_second_delivered_action(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-sticker",
+                            "function": {"name": "send_sticker", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call-tts",
+                            "function": {
+                                "name": "doubao_tts",
+                                "arguments": '{"text":"重复回复"}',
+                            },
+                        },
+                    ]
+                )
+            ]
+        )
+
+        result = await service.answer_with_skill("发贴纸再说一句", intent_type="casual")
+
+        self.assertTrue(result.sticker_sent)
+        self.assertFalse(result.tts_sent)
+        self.assertEqual(service.tool_runs, ["send_sticker"])
+
+    async def test_successful_state_mutation_skips_remaining_tools_and_summarizes(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-rule-1",
+                            "function": {
+                                "name": "rule_manage",
+                                "arguments": '{"request_text":"添加规则一"}',
+                            },
+                        },
+                        {
+                            "id": "call-rule-2",
+                            "function": {
+                                "name": "rule_manage",
+                                "arguments": '{"request_text":"添加规则二"}',
+                            },
+                        },
+                    ]
+                ),
+                _resp(content="已添加第一条规则；第二次操作为避免重复已跳过。"),
+            ]
+        )
+
+        result = await service.answer_with_skill("添加两次规则", intent_type="casual")
+
+        self.assertEqual(service.tool_runs, ["rule_manage"])
+        self.assertIn("已添加第一条规则", result.text)
+        second_call = service.calls[1]
+        tool_messages = [item for item in second_call if item.get("role") == "tool"]
+        self.assertEqual(len(tool_messages), 2)
+        self.assertIn("skipped_after_side_effect", tool_messages[1]["content"])
+        self.assertTrue(
+            any("SIDE_EFFECT_COMMITTED" in item.get("content", "") for item in second_call)
+        )
 
     async def test_websearch_summary_only_reply_triggers_followup_generation(self) -> None:
         service = _PlannedSkillService(
@@ -548,6 +663,120 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("微博相关链接：", result)
         self.assertIn("https://example.com/1", result)
         self.assertIn("https://example.com/2", result)
+
+
+class SkillExecutionBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_exception_is_converted_to_result(self) -> None:
+        class BrokenSkill:
+            name = "broken"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                raise RuntimeError("boom")
+
+        service = SkillService(_llm_stub(), tool_timeout_seconds=0.1)
+        service.skills = {"broken": BrokenSkill()}
+
+        result = await service._run_tool(
+            name="broken",
+            arguments={},
+            context=SkillContext(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "tool_failed")
+
+    async def test_tool_timeout_returns_without_waiting_for_cancel_ack(self) -> None:
+        release = asyncio.Event()
+
+        class StuckSkill:
+            name = "stuck"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    await release.wait()
+                context.handled = True
+                return SkillRunResult(ok=True, skill="stuck", summary="late")
+
+        service = SkillService(_llm_stub(), tool_timeout_seconds=0.02)
+        service.skills = {"stuck": StuckSkill()}
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        context = SkillContext()
+        result = await service._run_tool(
+            name="stuck",
+            arguments={},
+            context=context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "tool_timeout")
+        self.assertLess(loop.time() - started, 0.2)
+        self.assertEqual(len(skill_service_module._SKILL_ORPHAN_TASKS), 1)
+        release.set()
+        for _ in range(10):
+            if not skill_service_module._SKILL_ORPHAN_TASKS:
+                break
+            await asyncio.sleep(0)
+        self.assertFalse(skill_service_module._SKILL_ORPHAN_TASKS)
+        self.assertFalse(context.handled)
+
+    async def test_side_effect_timeout_returns_terminal_ambiguous_result(self) -> None:
+        release = asyncio.Event()
+
+        class StuckStickerSkill:
+            name = "send_sticker"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    await release.wait()
+                return SkillRunResult(ok=True, skill=self.name, summary="late")
+
+        service = SkillService(_llm_stub(), tool_timeout_seconds=0.02)
+        service.skills = {"send_sticker": StuckStickerSkill()}
+        result = await service._run_tool(
+            name="send_sticker",
+            arguments={},
+            context=SkillContext(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "tool_outcome_ambiguous")
+        self.assertIn("不会自动重试", result.summary)
+        release.set()
+        for _ in range(10):
+            if not skill_service_module._SKILL_ORPHAN_TASKS:
+                break
+            await asyncio.sleep(0)
+        self.assertFalse(skill_service_module._SKILL_ORPHAN_TASKS)
+
+    async def test_shutdown_flush_joins_timed_out_tool_orphan(self) -> None:
+        release = asyncio.Event()
+
+        async def cancellation_resistant() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        skill_service_module._track_skill_orphan(task)
+        flush = asyncio.create_task(
+            skill_service_module.flush_skill_execution_tasks(timeout_seconds=1.0)
+        )
+        await asyncio.sleep(0.01)
+        self.assertFalse(flush.done())
+        release.set()
+        await asyncio.wait_for(flush, timeout=0.5)
+        self.assertFalse(skill_service_module._SKILL_ORPHAN_TASKS)
 
 
 if __name__ == "__main__":

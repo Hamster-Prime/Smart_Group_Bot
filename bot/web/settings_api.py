@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal
 
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,15 +41,20 @@ from bot.services.proactive import (
 from bot.services.join_screening import add_global_ban, list_global_bans, remove_global_ban
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
+    ban_member as enforce_ban_member,
     delete_join_verification,
     delete_join_verifications_for_user,
     delete_verification_prompts,
     get_join_verification,
     join_verification_prompts_for_user,
     join_verification_policy,
+    lease_join_verification_for_unban,
+    lease_join_verifications_for_user_unban,
     restore_member_permissions,
     turnstile_verification_configured,
+    unban_member as enforce_unban_member,
     verification_provider,
+    verification_release_blocked_by_ban,
     verification_service_ready,
 )
 from bot.services.group_permissions import (
@@ -129,11 +134,23 @@ _VOTE_BAN_GROUP_INT_FIELDS = {
 _SCHEDULED_TASKS_KEY = "scheduled_tasks"
 _COOLDOWN_TASK_KEY = "cooldown_topic"
 _GROUP_UPDATE_LOCKS: dict[int, asyncio.Lock] = {}
+_JSON_BODY_TIMEOUT_SECONDS = 5.0
+_JSON_BODY_CANCEL_GRACE_SECONDS = 0.1
+_JSON_BODY_ORPHAN_LIMIT = 32
+_JSON_BODY_ORPHANS: set[asyncio.Task[Any]] = set()
+_JSON_BODY_TASKS: set[asyncio.Task[Any]] = set()
 _MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS = 5.0
+_MEMBER_IDENTITY_CANCEL_GRACE_SECONDS = 0.2
+_MEMBER_IDENTITY_REQUEST_LOOKUP_LIMIT = 8
+_MEMBER_IDENTITY_REQUEST_BUDGET_SECONDS = 4.0
 _MEMBER_IDENTITY_CACHE_TTL_SECONDS = 300.0
 _MEMBER_IDENTITY_NEGATIVE_CACHE_TTL_SECONDS = 30.0
 _MEMBER_IDENTITY_CACHE_MAX_ENTRIES = 4096
 _MEMBER_IDENTITY_LOOKUP_CONCURRENCY = 8
+_MEMBER_IDENTITY_RPC_TASK_LIMIT = 32
+_MEMBER_IDENTITY_ORPHAN_LIMIT = 8
+_MEMBER_IDENTITY_CIRCUIT_COOLDOWN_SECONDS = 10.0
+_MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL = 0.0
 _MEMBER_IDENTITY_CACHE: dict[
     tuple[int, int, int],
     tuple[float, tuple[str, str, bool] | None],
@@ -142,6 +159,8 @@ _MEMBER_IDENTITY_INFLIGHT: dict[
     tuple[int, int, int],
     asyncio.Task[tuple[str, str, bool] | None],
 ] = {}
+_MEMBER_IDENTITY_ORPHANS: set[asyncio.Task[Any]] = set()
+_MEMBER_IDENTITY_RPC_TASKS: set[asyncio.Task[Any]] = set()
 _MEMBER_IDENTITY_LOOKUP_LOOP: asyncio.AbstractEventLoop | None = None
 _MEMBER_IDENTITY_LOOKUP_SEMAPHORE: asyncio.Semaphore | None = None
 
@@ -332,9 +351,84 @@ def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
     return json.loads(exc.json(include_url=False))
 
 
+def _consume_background_task(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_json_body_orphan(task: asyncio.Task[Any]) -> None:
+    if task.done():
+        _consume_background_task(task)
+        return
+    _JSON_BODY_ORPHANS.add(task)
+
+    def _finished(done: asyncio.Task[Any]) -> None:
+        _JSON_BODY_ORPHANS.discard(done)
+        _consume_background_task(done)
+
+    task.add_done_callback(_finished)
+
+
+async def _read_request_json(request: web.Request) -> Any:
+    """Read one JSON body with a hard caller-visible deadline.
+
+    ``asyncio.wait_for`` can wait indefinitely for a coroutine that suppresses
+    cancellation.  The request handler must still return 408 at the configured
+    deadline; a misbehaving body reader is retired separately and bounded.
+    """
+
+    if len(_JSON_BODY_TASKS) >= _JSON_BODY_ORPHAN_LIMIT:
+        raise _APIError(
+            503,
+            "request_body_overloaded",
+            "请求体读取任务暂时过载，请稍后重试。",
+        )
+    task = asyncio.create_task(request.json(), name="settings-json-body")
+    _JSON_BODY_TASKS.add(task)
+
+    def _retire(done: asyncio.Task[Any]) -> None:
+        _JSON_BODY_TASKS.discard(done)
+        _JSON_BODY_ORPHANS.discard(done)
+        _consume_background_task(done)
+
+    task.add_done_callback(_retire)
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=max(0.0, float(_JSON_BODY_TIMEOUT_SECONDS)),
+        )
+    except asyncio.CancelledError:
+        task.cancel()
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=max(0.0, float(_JSON_BODY_CANCEL_GRACE_SECONDS)),
+        )
+        if task not in done:
+            _track_json_body_orphan(task)
+        else:
+            _consume_background_task(task)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=max(0.0, float(_JSON_BODY_CANCEL_GRACE_SECONDS)),
+    )
+    if task not in done:
+        _track_json_body_orphan(task)
+    else:
+        _consume_background_task(task)
+    raise _APIError(408, "request_timeout", "请求体读取超时，请重试。")
+
+
 async def _json_object(request: web.Request) -> dict[str, Any]:
     try:
-        body = await request.json()
+        body = await _read_request_json(request)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise _APIError(400, "invalid_json", "请求体必须是有效的 JSON。") from exc
     if not isinstance(body, dict):
@@ -627,6 +721,155 @@ def _cache_member_identity(
         _MEMBER_IDENTITY_CACHE.pop(next(iter(_MEMBER_IDENTITY_CACHE)), None)
 
 
+def _track_member_identity_orphan(task: asyncio.Task[Any]) -> None:
+    global _MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL
+    if task.done():
+        _consume_background_task(task)
+        return
+    _MEMBER_IDENTITY_ORPHANS.add(task)
+    if len(_MEMBER_IDENTITY_ORPHANS) >= _MEMBER_IDENTITY_ORPHAN_LIMIT:
+        _MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL = max(
+            _MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL,
+            time.monotonic() + _MEMBER_IDENTITY_CIRCUIT_COOLDOWN_SECONDS,
+        )
+        log.error(
+            "settings Telegram lookup circuit opened | orphan_count=%d",
+            len(_MEMBER_IDENTITY_ORPHANS),
+        )
+
+    def _finished(done: asyncio.Task[Any]) -> None:
+        _MEMBER_IDENTITY_ORPHANS.discard(done)
+        _consume_background_task(done)
+
+    task.add_done_callback(_finished)
+
+
+class _TelegramLookupOverloaded(RuntimeError):
+    pass
+
+
+def _member_identity_lookup_capacity_available() -> bool:
+    for task in tuple(_MEMBER_IDENTITY_RPC_TASKS):
+        if task.done():
+            _MEMBER_IDENTITY_RPC_TASKS.discard(task)
+            _MEMBER_IDENTITY_ORPHANS.discard(task)
+            _consume_background_task(task)
+    if time.monotonic() < _MEMBER_IDENTITY_CIRCUIT_OPEN_UNTIL:
+        return False
+    if len(_MEMBER_IDENTITY_ORPHANS) >= _MEMBER_IDENTITY_ORPHAN_LIMIT:
+        return False
+    return len(_MEMBER_IDENTITY_RPC_TASKS) < _MEMBER_IDENTITY_RPC_TASK_LIMIT
+
+
+async def _await_member_identity_lookup(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    timeout_seconds: float | None = None,
+) -> Any:
+    """Run a Telegram lookup without releasing its permit before it stops."""
+
+    if not _member_identity_lookup_capacity_available():
+        raise _TelegramLookupOverloaded("settings Telegram lookup circuit is open")
+
+    async def _run_with_permit() -> Any:
+        # The permit belongs to the real Telegram operation.  If the SDK or a
+        # test double suppresses cancellation, it stays held until that child
+        # actually exits instead of admitting unbounded replacement calls.
+        async with _member_identity_lookup_semaphore():
+            return await operation()
+
+    task = asyncio.create_task(_run_with_permit(), name="settings-telegram-lookup")
+    _MEMBER_IDENTITY_RPC_TASKS.add(task)
+
+    def _retire_rpc(done: asyncio.Task[Any]) -> None:
+        _MEMBER_IDENTITY_RPC_TASKS.discard(done)
+        _MEMBER_IDENTITY_ORPHANS.discard(done)
+        _consume_background_task(done)
+
+    task.add_done_callback(_retire_rpc)
+    timeout = (
+        _MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(0.0, float(timeout_seconds))
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        task.cancel()
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_MEMBER_IDENTITY_CANCEL_GRACE_SECONDS,
+        )
+        if task not in done:
+            _track_member_identity_orphan(task)
+        else:
+            _consume_background_task(task)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=_MEMBER_IDENTITY_CANCEL_GRACE_SECONDS,
+    )
+    if task not in done:
+        _track_member_identity_orphan(task)
+    else:
+        _consume_background_task(task)
+    raise TimeoutError
+
+
+async def flush_member_identity_tasks(*, timeout_seconds: float = 2.0) -> None:
+    """Bound settings-page Telegram lookups before the Bot session closes."""
+
+    deadline = asyncio.get_running_loop().time() + max(
+        0.0, float(timeout_seconds)
+    )
+    pending: set[asyncio.Task[Any]] = set()
+    while True:
+        tasks = {
+            task
+            for task in (
+                *_MEMBER_IDENTITY_INFLIGHT.values(),
+                *_MEMBER_IDENTITY_RPC_TASKS,
+                *_MEMBER_IDENTITY_ORPHANS,
+                *_JSON_BODY_TASKS,
+                *_JSON_BODY_ORPHANS,
+            )
+            if not task.done()
+        }
+        if not tasks:
+            pending = set()
+            break
+        for task in tasks:
+            task.cancel()
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if remaining <= 0.0:
+            pending = tasks
+            break
+        done, pending = await asyncio.wait(tasks, timeout=remaining)
+        for task in done:
+            _consume_background_task(task)
+        if pending or asyncio.get_running_loop().time() >= deadline:
+            break
+        # Cancelling an outer identity task can expose its cancellation-
+        # resistant RPC child only after the first snapshot was taken.
+        await asyncio.sleep(0)
+    for task in pending:
+        if task in _MEMBER_IDENTITY_RPC_TASKS:
+            _track_member_identity_orphan(task)
+        elif task in _JSON_BODY_ORPHANS:
+            _track_json_body_orphan(task)
+    if pending:
+        log.error(
+            "%d settings API background tasks ignored shutdown cancellation",
+            len(pending),
+        )
+
+
 async def _lookup_member_identity(
     bot_obj: Any,
     group_id: int,
@@ -645,15 +888,23 @@ async def _lookup_member_identity(
         lookup = getattr(bot_obj, "get_chat_member", None)
         if not callable(lookup):
             return None
+        if (
+            len(_MEMBER_IDENTITY_INFLIGHT) >= _MEMBER_IDENTITY_RPC_TASK_LIMIT
+            or not _member_identity_lookup_capacity_available()
+        ):
+            log.warning(
+                "member identity lookup rejected by circuit | group=%s user=%s",
+                group_id,
+                user_id,
+            )
+            return None
 
         async def _fetch() -> tuple[str, str, bool] | None:
             profile_data: tuple[str, str, bool] | None = None
             try:
-                async with _member_identity_lookup_semaphore():
-                    chat_member = await asyncio.wait_for(
-                        lookup(int(group_id), int(user_id)),
-                        timeout=_MEMBER_IDENTITY_LOOKUP_TIMEOUT_SECONDS,
-                    )
+                chat_member = await _await_member_identity_lookup(
+                    lambda: lookup(int(group_id), int(user_id)),
+                )
                 profile = getattr(chat_member, "user", None)
                 if profile is not None:
                     full_name = str(getattr(profile, "full_name", "") or "")[:255]
@@ -670,6 +921,13 @@ async def _lookup_member_identity(
                     group_id,
                     user_id,
                 )
+            except _TelegramLookupOverloaded:
+                log.warning(
+                    "member identity lookup circuit open | group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return None
             except Exception:
                 log.debug(
                     "member identity lookup failed | group=%s user=%s",
@@ -695,7 +953,7 @@ async def _lookup_member_identity(
 
 
 async def _group_member_map(
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     group_id: int,
     user_ids: list[int],
     *,
@@ -704,14 +962,17 @@ async def _group_member_map(
     ids = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
     if not ids:
         return {}
-    rows = (
-        await session.scalars(
-            select(GroupMember).where(
-                GroupMember.group_id == int(group_id),
-                GroupMember.user_id.in_(ids),
+    # Take a short DB snapshot first.  Live Telegram lookups can take seconds
+    # and must never hold one of the application's scarce DB connections.
+    async with session_factory() as session:
+        rows = (
+            await session.scalars(
+                select(GroupMember).where(
+                    GroupMember.group_id == int(group_id),
+                    GroupMember.user_id.in_(ids),
+                )
             )
-        )
-    ).all()
+        ).all()
     members = {int(row.user_id): row for row in rows}
     if bot_obj is None or not callable(getattr(bot_obj, "get_chat_member", None)):
         return members
@@ -726,41 +987,87 @@ async def _group_member_map(
     ]
     if not missing_ids:
         return members
-    profiles = await asyncio.gather(
-        *(
-            _lookup_member_identity(bot_obj, int(group_id), user_id)
-            for user_id in missing_ids
+
+    # A policy table may contain thousands of historical users.  Only enrich a
+    # small page per request and keep one absolute budget for the whole batch.
+    lookup_ids = missing_ids[: max(0, int(_MEMBER_IDENTITY_REQUEST_LOOKUP_LIMIT))]
+    lookup_tasks = {
+        user_id: asyncio.create_task(
+            _lookup_member_identity(bot_obj, int(group_id), user_id),
+            name=f"settings-member-page:{int(group_id)}:{user_id}",
         )
-    )
-    changed = False
-    for user_id, profile_data in zip(missing_ids, profiles, strict=True):
-        if profile_data is None:
-            continue
-        full_name, username, is_bot = profile_data
-        row = members.get(user_id)
-        if row is None:
-            row = GroupMember(
-                group_id=int(group_id),
-                user_id=int(user_id),
-                full_name=full_name,
-                username=username,
-                is_bot=is_bot,
-                left=False,
+        for user_id in lookup_ids
+    }
+    done: set[asyncio.Task[tuple[str, str, bool] | None]] = set()
+    pending: set[asyncio.Task[tuple[str, str, bool] | None]] = set()
+    if lookup_tasks:
+        try:
+            done, pending = await asyncio.wait(
+                set(lookup_tasks.values()),
+                timeout=max(0.0, float(_MEMBER_IDENTITY_REQUEST_BUDGET_SECONDS)),
             )
-            session.add(row)
-            members[user_id] = row
-            changed = True
+        except asyncio.CancelledError:
+            for task in lookup_tasks.values():
+                task.cancel()
+            await asyncio.gather(*lookup_tasks.values(), return_exceptions=True)
+            raise
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    profiles_by_id: dict[int, tuple[str, str, bool]] = {}
+    for user_id, task in lookup_tasks.items():
+        if task not in done or task.cancelled():
             continue
-        if full_name and not str(row.full_name or "").strip():
-            row.full_name = full_name
-            changed = True
-        if username and not str(row.username or "").strip():
-            row.username = username
-            changed = True
-        if bool(row.is_bot) != is_bot:
-            row.is_bot = is_bot
-            changed = True
-    if changed:
+        try:
+            profile_data = task.result()
+        except Exception:
+            continue
+        if profile_data is not None:
+            profiles_by_id[user_id] = profile_data
+    if not profiles_by_id:
+        return members
+
+    # Open a fresh, short write transaction only after every network wait has
+    # ended.  Re-read rows to merge safely with the roster middleware.
+    async with session_factory() as session:
+        current_rows = (
+            await session.scalars(
+                select(GroupMember).where(
+                    GroupMember.group_id == int(group_id),
+                    GroupMember.user_id.in_(ids),
+                )
+            )
+        ).all()
+        members = {int(row.user_id): row for row in current_rows}
+        changed = False
+        for user_id, profile_data in profiles_by_id.items():
+            full_name, username, is_bot = profile_data
+            row = members.get(user_id)
+            if row is None:
+                row = GroupMember(
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    full_name=full_name,
+                    username=username,
+                    is_bot=is_bot,
+                    left=False,
+                )
+                session.add(row)
+                members[user_id] = row
+                changed = True
+                continue
+            if full_name and not str(row.full_name or "").strip():
+                row.full_name = full_name
+                changed = True
+            if username and not str(row.username or "").strip():
+                row.username = username
+                changed = True
+            if bool(row.is_bot) != is_bot:
+                row.is_bot = is_bot
+                changed = True
+        if not changed:
+            return members
         try:
             await session.commit()
         except Exception:
@@ -768,7 +1075,7 @@ async def _group_member_map(
             # the same member concurrently. Identity display is best-effort;
             # a conflict must not fail the whole policy-list response.
             await session.rollback()
-            rows = (
+            current_rows = (
                 await session.scalars(
                     select(GroupMember).where(
                         GroupMember.group_id == int(group_id),
@@ -776,8 +1083,8 @@ async def _group_member_map(
                     )
                 )
             ).all()
-            members = {int(row.user_id): row for row in rows}
-    return members
+            members = {int(row.user_id): row for row in current_rows}
+        return members
 
 
 def _user_policy_document(
@@ -1285,19 +1592,6 @@ def register_settings_routes(
             await session.commit()
         return _success_response({"deleted": row is not None})
 
-    async def _lookup_admin_display_name(group_id: int, user_id: int) -> str:
-        get_member = getattr(bot, "get_chat_member", None)
-        if not callable(get_member):
-            return ""
-        try:
-            member = await asyncio.wait_for(get_member(group_id, user_id), timeout=3.0)
-        except Exception:
-            return ""
-        member_user = getattr(member, "user", None)
-        full_name = str(getattr(member_user, "full_name", None) or "").strip()
-        username = str(getattr(member_user, "username", None) or "").strip()
-        return full_name or (f"@{username}" if username else "")
-
     @any_admin
     async def list_group_admins_api(request: web.Request, user: Any) -> web.Response:
         # Group admins may read this list too: the Mini App call-admin picker
@@ -1305,31 +1599,28 @@ def register_settings_routes(
         group_id = int(request.match_info["id"])
         await _require_group_access(group_id, int(user.id))
         async with session_factory() as session:
-            rows = (await session.execute(
-                select(Admin, GroupMember.full_name, GroupMember.username)
-                .outerjoin(
-                    GroupMember,
-                    (GroupMember.group_id == Admin.group_id)
-                    & (GroupMember.user_id == Admin.user_id),
-                )
+            rows = (await session.scalars(
+                select(Admin)
                 .where(Admin.group_id == group_id)
                 .order_by(Admin.id)
             )).all()
-        admins = []
-        for row, full_name, username in rows:
-            display_name = str(full_name or "").strip()
-            if not display_name:
-                clean_username = str(username or "").strip()
-                display_name = f"@{clean_username}" if clean_username else ""
-            if not display_name:
-                display_name = await _lookup_admin_display_name(
-                    group_id, int(row.user_id)
-                )
-            admins.append({
+        members = await _group_member_map(
+            session_factory,
+            group_id,
+            [int(row.user_id) for row in rows],
+            bot_obj=bot,
+        )
+        admins = [
+            {
                 "user_id": int(row.user_id),
                 "role": str(row.role or "admin"),
-                "display_name": display_name,
-            })
+                "display_name": _member_identity(
+                    members.get(int(row.user_id)),
+                    int(row.user_id),
+                )["display_name"],
+            }
+            for row in rows
+        ]
         return _success_response({"admins": admins})
 
     @any_admin
@@ -1345,18 +1636,15 @@ def register_settings_routes(
         get_admins = getattr(bot, "get_chat_administrators", None)
         if callable(get_admins):
             try:
-                me_id = 0
-                get_me = getattr(bot, "me", None)
-                if callable(get_me):
-                    me_id = int(getattr(await get_me(), "id", 0) or 0)
-                members = await asyncio.wait_for(get_admins(group_id), timeout=5.0)
+                members = await _await_member_identity_lookup(
+                    lambda: get_admins(group_id),
+                    timeout_seconds=5.0,
+                )
                 for member in members or []:
                     member_user = getattr(member, "user", None)
                     if member_user is None or getattr(member_user, "is_bot", False):
                         continue
                     user_id = int(member_user.id)
-                    if user_id == me_id:
-                        continue
                     full_name = str(getattr(member_user, "full_name", "") or "").strip()
                     username = str(getattr(member_user, "username", "") or "").strip()
                     admins.append({
@@ -1407,7 +1695,21 @@ def register_settings_routes(
                 session.add(row)
             else:
                 row.role = body.role
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if await session.get(AuthorizedGroup, group_id) is None:
+                    raise _APIError(
+                        404,
+                        "group_not_found",
+                        "该群授权状态刚刚发生变化。",
+                    ) from exc
+                raise _APIError(
+                    409,
+                    "admin_conflict",
+                    "管理员授权发生并发冲突，请重试。",
+                ) from exc
         return _success_response({"created": True})
 
     @authenticated
@@ -1449,8 +1751,8 @@ def register_settings_routes(
         body = _GlobalBanCreate.model_validate(await _json_object(request))
         if settings.super_admin_id and body.user_id == int(settings.super_admin_id):
             raise _APIError(400, "cannot_ban_owner", "不能封禁最高管理员。")
-        ban_member = getattr(bot, "ban_chat_member", None)
-        if not callable(ban_member):
+        telegram_ban_member = getattr(bot, "ban_chat_member", None)
+        if not callable(telegram_ban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 封禁接口。")
         previous_warning: tuple[int, bool] | None = None
         async with session_factory() as session:
@@ -1472,8 +1774,10 @@ def register_settings_routes(
         failures = 0
         for group_id in group_ids:
             try:
-                await ban_member(group_id, body.user_id)
-                succeeded += 1
+                if await enforce_ban_member(bot, group_id, body.user_id):
+                    succeeded += 1
+                else:
+                    failures += 1
             except Exception:
                 failures += 1
                 log.info("web ban failed | group=%s user=%s", group_id, body.user_id)
@@ -1492,13 +1796,61 @@ def register_settings_routes(
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
         async with session_factory() as session:
-            group_ids = [int(value) for value in (await session.scalars(select(AuthorizedGroup.group_id))).all()]
+            group_ids = sorted(
+                {
+                    *(
+                        int(value)
+                        for value in (await session.scalars(select(Group.id))).all()
+                    ),
+                    *(
+                        int(value)
+                        for value in (
+                            await session.scalars(select(AuthorizedGroup.group_id))
+                        ).all()
+                    ),
+                }
+            )
+            recoveries = await lease_join_verifications_for_user_unban(
+                session,
+                target_id,
+                group_ids=group_ids,
+            )
+            removed = await remove_global_ban(
+                session,
+                target_id,
+                operator_id=int(user.id),
+            )
+            await session.execute(
+                delete(UserWarning).where(UserWarning.user_id == target_id)
+            )
+            await session.commit()
+        prompts = tuple(
+            (item.group_id, item.prompt_message_id)
+            for item in recoveries
+            if item.prompt_message_id > 0
+        )
+        await delete_verification_prompts(bot, prompts)
         succeeded = 0
         restored = 0
         failures = 0
         for group_id in group_ids:
             try:
-                await unban_member(group_id, target_id, only_if_banned=True)
+                async def preserve_ban(group_id: int = group_id) -> bool:
+                    async with session_factory() as session:
+                        return await verification_release_blocked_by_ban(
+                            session,
+                            group_id=group_id,
+                            user_id=target_id,
+                        )
+
+                if not await enforce_unban_member(
+                    bot,
+                    group_id,
+                    target_id,
+                    preserve_ban=preserve_ban,
+                ):
+                    failures += 1
+                    continue
                 succeeded += 1
                 if await restore_member_permissions(bot, group_id, target_id):
                     restored += 1
@@ -1513,13 +1865,6 @@ def register_settings_routes(
                 "telegram_unban_partial",
                 f"已处理 {succeeded}/{len(group_ids)} 个群，但仍有群解封失败，请重试。",
             )
-        async with session_factory() as session:
-            removed = await remove_global_ban(session, target_id, operator_id=int(user.id))
-            prompts = await join_verification_prompts_for_user(session, target_id)
-            await delete_join_verifications_for_user(session, target_id)
-            await session.execute(delete(UserWarning).where(UserWarning.user_id == target_id))
-            await session.commit()
-        await delete_verification_prompts(bot, prompts)
         return _success_response({
             "removed": removed,
             "unbanned_groups": succeeded,
@@ -1588,7 +1933,10 @@ def register_settings_routes(
             config = None
         if config is None:
             try:
-                base = await fetch_telegram_default_permissions(bot, group_id)
+                base = await _await_member_identity_lookup(
+                    lambda: fetch_telegram_default_permissions(bot, group_id),
+                    timeout_seconds=5.0,
+                )
             except Exception as exc:
                 raise _APIError(
                     502,
@@ -2116,14 +2464,16 @@ def register_settings_routes(
         async with session_factory() as session:
             stmt = select(model).where(model.group_id == group_id).order_by(model.user_id)
             if model is UserWarning:
-                stmt = stmt.where(UserWarning.count > 0)
+                stmt = stmt.where(
+                    or_(UserWarning.count > 0, UserWarning.is_banned.is_(True))
+                )
             rows = (await session.scalars(stmt)).all()
-            members = await _group_member_map(
-                session,
-                group_id,
-                [int(row.user_id) for row in rows],
-                bot_obj=bot,
-            )
+        members = await _group_member_map(
+            session_factory,
+            group_id,
+            [int(row.user_id) for row in rows],
+            bot_obj=bot,
+        )
         return _success_response(
             {
                 key: [
@@ -2171,12 +2521,12 @@ def register_settings_routes(
                 )
                 .order_by(UserWarning.count.desc(), UserWarning.user_id.asc())
             )).all()
-            members = await _group_member_map(
-                session,
-                group_id,
-                [int(row.user_id) for row in rows],
-                bot_obj=bot,
-            )
+        members = await _group_member_map(
+            session_factory,
+            group_id,
+            [int(row.user_id) for row in rows],
+            bot_obj=bot,
+        )
         return _success_response(
             {
                 "bans": [
@@ -2209,9 +2559,15 @@ def register_settings_routes(
             )
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
+            await lease_join_verification_for_unban(
+                session,
+                group_id,
+                body.user_id,
+            )
+            await session.commit()
         try:
-            result = await ban_member(group_id, body.user_id)
-            if result is False:
+            result = await enforce_ban_member(bot, group_id, body.user_id)
+            if not result:
                 raise RuntimeError("Telegram returned false")
         except Exception as exc:
             try:
@@ -2293,12 +2649,14 @@ def register_settings_routes(
             verification = await get_join_verification(session, group_id, target_id)
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
+            await lease_join_verification_for_unban(session, group_id, target_id)
+            await session.commit()
         unban_member = getattr(bot, "unban_chat_member", None)
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
         try:
-            result = await unban_member(group_id, target_id, only_if_banned=True)
-            if result is False:
+            result = await enforce_unban_member(bot, group_id, target_id)
+            if not result:
                 raise RuntimeError("Telegram returned false")
         except Exception as exc:
             raise _APIError(502, "telegram_unban_failed", "Telegram 群内解封失败，请稍后重试。") from exc
@@ -2306,7 +2664,7 @@ def register_settings_routes(
             if await is_globally_banned(session, target_id):
                 await session.rollback()
                 try:
-                    await bot.ban_chat_member(group_id, target_id)
+                    await enforce_ban_member(bot, group_id, target_id)
                 except Exception:
                     log.exception(
                         "web group unban global-race reban failed | group=%s user=%s",
@@ -2340,7 +2698,7 @@ def register_settings_routes(
                 await session.rollback()
                 if current_banned:
                     try:
-                        await bot.ban_chat_member(group_id, target_id)
+                        await enforce_ban_member(bot, group_id, target_id)
                     except Exception:
                         log.exception(
                             "web group unban concurrent-state reban failed | group=%s user=%s",
@@ -2362,13 +2720,12 @@ def register_settings_routes(
                 prompts.add(
                     (group_id, int(current_verification.prompt_message_id))
                 )
-            await delete_join_verification(session, group_id, target_id)
             try:
                 await session.commit()
             except Exception as exc:
                 await session.rollback()
                 try:
-                    await bot.ban_chat_member(group_id, target_id)
+                    await enforce_ban_member(bot, group_id, target_id)
                 except Exception:
                     log.exception(
                         "web group unban database-failure reban failed | group=%s user=%s",

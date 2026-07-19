@@ -1,3 +1,6 @@
+import asyncio
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -5,8 +8,14 @@ from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendMessage
+from sqlalchemy import select, update
 from bot.config import Settings
-from bot.db.models import ScheduledMessage
+from bot.db.engine import init_db
+from bot.db.models import (
+    AuthorizedGroup,
+    ScheduledMessage,
+    ScheduledMessageOccurrence,
+)
 from bot.services.scheduled_messages import (
     ScheduledMessageService,
     scheduled_message_due,
@@ -114,7 +123,13 @@ class _FakeSession:
         return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
     async def get(self, _model, entry_id):
-        return self._updated.get(int(entry_id))
+        explicit = self._updated.get(int(entry_id))
+        if explicit is not None:
+            return explicit
+        return next(
+            (row for row in self._rows if int(row.id) == int(entry_id)),
+            None,
+        )
 
 
 class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -134,17 +149,56 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
             settings=_settings(),
             session_factory=lambda: session,
         )
+        # Delivery-format unit tests keep a tiny in-memory occurrence adapter;
+        # SQLite integration tests below exercise the real atomic claim/lease
+        # implementation.
+        pending: dict[tuple[int, datetime], object] = {}
+
+        async def persist_occurrences(occurrences):
+            for entry_id, occurrence_at in occurrences:
+                pending.setdefault((int(entry_id), occurrence_at), object())
+
+        async def claim_occurrence(*, authorized_groups, now):
+            if not pending:
+                return None
+            entry_id, occurrence_at = sorted(pending)[0]
+            pending.pop((entry_id, occurrence_at), None)
+            entry = next(row for row in rows if int(row.id) == int(entry_id))
+            return SimpleNamespace(
+                occurrence_id=entry_id,
+                occurrence_at=occurrence_at,
+                lease_until=now + timedelta(minutes=5),
+                attempts=1,
+                entry=entry,
+            )
+
+        async def complete_occurrence(claimed, *, completed_at):
+            claimed.entry.last_run_at = completed_at
+            await session.commit()
+            return True
+
+        service._persist_due_occurrences = persist_occurrences
+        service._claim_next_occurrence = claim_occurrence
+        service._complete_occurrence = complete_occurrence
+        service._retry_occurrence = AsyncMock()
         return service, bot, session
 
-    async def test_due_entry_is_sent_and_last_run_committed_first(self) -> None:
+    async def test_due_entry_is_marked_only_after_successful_send(self) -> None:
         entry = _entry()
         service, bot, session = self._service([entry], authorized=[-10001])
+        events: list[str] = []
+        bot.send_message.side_effect = lambda **_kwargs: (
+            events.append("send")
+            or SimpleNamespace(message_id=901, chat=SimpleNamespace(id=-10001))
+        )
+        session.commit.side_effect = lambda: events.append("commit")
 
         delivered = await service.run_once(now=NOW)
 
         self.assertEqual(delivered, 1)
         self.assertEqual(entry.last_run_at, NOW)
         session.commit.assert_awaited()
+        self.assertEqual(events, ["send", "commit"])
         bot.send_message.assert_awaited_once()
         self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], -10001)
         self.assertEqual(bot.send_message.await_args.kwargs["parse_mode"], "HTML")
@@ -233,11 +287,12 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
         service, bot, _session = self._service([entry], authorized=[-10001])
 
         with unittest.mock.patch(
-            "bot.services.scheduled_messages.schedule_message_auto_delete"
+            "bot.services.scheduled_messages.schedule_message_auto_delete_durable",
+            new=AsyncMock(return_value=True),
         ) as schedule_mock:
             await service.run_once(now=NOW)
 
-        schedule_mock.assert_called_once()
+        schedule_mock.assert_awaited_once()
         self.assertEqual(schedule_mock.call_args.args[1], 45)
 
     async def test_send_failure_does_not_crash_pass(self) -> None:
@@ -248,8 +303,50 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
         delivered = await service.run_once(now=NOW)
 
         self.assertEqual(delivered, 0)
-        # last_run_at was still advanced: one missed occurrence, no retry loop.
+        self.assertIsNone(entry.last_run_at)
+
+    async def test_send_failure_is_retried_on_next_pass(self) -> None:
+        entry = _entry()
+        service, bot, _session = self._service([entry], authorized=[-10001])
+        bot.send_message.side_effect = [
+            RuntimeError("temporary"),
+            SimpleNamespace(message_id=902, chat=SimpleNamespace(id=-10001)),
+        ]
+
+        self.assertEqual(await service.run_once(now=NOW), 0)
+        self.assertIsNone(entry.last_run_at)
+        self.assertEqual(await service.run_once(now=NOW), 1)
         self.assertEqual(entry.last_run_at, NOW)
+        self.assertEqual(bot.send_message.await_count, 2)
+
+    async def test_persistent_send_failure_surfaces_to_supervisor(self) -> None:
+        entry = _entry()
+        service, bot, _session = self._service([entry], authorized=[-10001])
+        bot.send_message.side_effect = RuntimeError("persistent")
+
+        with self.assertRaisesRegex(RuntimeError, "failed for all"):
+            await service.run_once(now=NOW, raise_on_total_failure=True)
+        self.assertIsNone(entry.last_run_at)
+
+    async def test_overlapping_passes_do_not_send_same_occurrence_twice(self) -> None:
+        entry = _entry()
+        service, bot, _session = self._service([entry], authorized=[-10001])
+        release = asyncio.Event()
+
+        async def slow_send(**_kwargs):
+            await release.wait()
+            return SimpleNamespace(message_id=903, chat=SimpleNamespace(id=-10001))
+
+        bot.send_message.side_effect = slow_send
+        first = asyncio.create_task(service.run_once(now=NOW))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(service.run_once(now=NOW))
+        await asyncio.sleep(0)
+        release.set()
+
+        self.assertEqual(await first, 1)
+        self.assertEqual(await second, 0)
+        self.assertEqual(bot.send_message.await_count, 1)
 
     async def test_pin_failure_keeps_delivery_success(self) -> None:
         entry = _entry(pin_message=True)
@@ -262,6 +359,235 @@ class ScheduledMessageServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(delivered, 1)
         self.assertEqual(entry.last_message_id, 0)
+
+
+class ScheduledMessageDurabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.engine, self.session_factory = await init_db(
+            f"sqlite+aiosqlite:///{self.path}"
+        )
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-10001, authorized_by=1))
+            session.add(_entry())
+            await session.commit()
+
+    async def asyncTearDown(self) -> None:
+        await self.engine.dispose()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(self.path + suffix)
+            except OSError:
+                pass
+
+    def _service(self, bot, **kwargs) -> ScheduledMessageService:
+        return ScheduledMessageService(
+            bot=bot,
+            settings=_settings(),
+            session_factory=self.session_factory,
+            retry_base_seconds=0.05,
+            retry_max_seconds=0.2,
+            claim_lease_seconds=1.0,
+            **kwargs,
+        )
+
+    async def _state(self):
+        async with self.session_factory() as session:
+            entry = await session.get(ScheduledMessage, 1)
+            occurrences = (
+                await session.scalars(select(ScheduledMessageOccurrence))
+            ).all()
+            return entry, occurrences
+
+    async def test_success_advances_last_run_and_completes_occurrence(self) -> None:
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(
+                    message_id=901,
+                    chat=SimpleNamespace(id=-10001),
+                )
+            ),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+        service = self._service(bot)
+
+        self.assertEqual(await service.run_once(now=NOW), 1)
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertEqual(entry.last_run_at, NOW)
+        self.assertEqual(occurrences, [])
+
+    async def test_failure_keeps_occurrence_with_exponential_backoff(self) -> None:
+        bot = SimpleNamespace(
+            send_message=AsyncMock(side_effect=RuntimeError("offline")),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+        service = self._service(bot)
+
+        self.assertEqual(await service.run_once(now=NOW), 0)
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertIsNone(entry.last_run_at)
+        self.assertEqual(len(occurrences), 1)
+        first = occurrences[0]
+        self.assertEqual(first.attempts, 1)
+        self.assertIsNone(first.lease_until)
+        self.assertGreater(first.next_attempt_at, NOW)
+
+        # Backoff prevents a hot-loop resend of the retained occurrence.
+        self.assertEqual(await service.run_once(now=NOW), 0)
+        self.assertEqual(bot.send_message.await_count, 1)
+
+        bot.send_message.side_effect = None
+        bot.send_message.return_value = SimpleNamespace(
+            message_id=902,
+            chat=SimpleNamespace(id=-10001),
+        )
+        self.assertEqual(
+            await service.run_once(now=NOW + timedelta(seconds=1)),
+            1,
+        )
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertEqual(entry.last_run_at, NOW + timedelta(seconds=1))
+        self.assertEqual(occurrences, [])
+
+    async def test_expired_lease_is_recovered(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                ScheduledMessageOccurrence(
+                    scheduled_message_id=1,
+                    occurrence_at=NOW.replace(hour=9, minute=0),
+                    attempts=1,
+                    lease_until=NOW - timedelta(seconds=1),
+                )
+            )
+            await session.commit()
+        bot = SimpleNamespace(
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(
+                    message_id=903,
+                    chat=SimpleNamespace(id=-10001),
+                )
+            ),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+
+        self.assertEqual(await self._service(bot).run_once(now=NOW), 1)
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertEqual(entry.last_run_at, NOW)
+        self.assertEqual(occurrences, [])
+
+    async def test_two_workers_atomically_claim_one_occurrence(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_send(**_kwargs):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(
+                message_id=904,
+                chat=SimpleNamespace(id=-10001),
+            )
+
+        bot = SimpleNamespace(
+            send_message=AsyncMock(side_effect=slow_send),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+        first = self._service(bot)
+        second = self._service(bot)
+        first_run = asyncio.create_task(first.run_once(now=NOW))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        second_result = await second.run_once(now=NOW)
+        release.set()
+
+        self.assertEqual(await first_run, 1)
+        self.assertEqual(second_result, 0)
+        self.assertEqual(bot.send_message.await_count, 1)
+
+    async def test_backoff_window_keeps_persistent_failure_unhealthy(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                ScheduledMessageOccurrence(
+                    scheduled_message_id=1,
+                    occurrence_at=NOW.replace(hour=9, minute=0),
+                    attempts=3,
+                    next_attempt_at=NOW + timedelta(hours=1),
+                    last_error="persistent Telegram failure",
+                )
+            )
+            await session.commit()
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "persistently failed"):
+            await self._service(bot).run_once(
+                now=NOW,
+                raise_on_total_failure=True,
+            )
+        bot.send_message.assert_not_awaited()
+
+    async def test_worker_that_loses_lease_cannot_complete_old_claim(self) -> None:
+        bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            pin_chat_message=AsyncMock(),
+            unpin_chat_message=AsyncMock(),
+        )
+        old_worker = self._service(bot)
+        new_worker = self._service(bot)
+        occurrence_at = NOW.replace(hour=9, minute=0)
+        await old_worker._persist_due_occurrences([(1, occurrence_at)])
+        old_claim = await old_worker._claim_next_occurrence(
+            authorized_groups={-10001},
+            now=NOW,
+        )
+        self.assertIsNotNone(old_claim)
+        assert old_claim is not None
+
+        async with self.session_factory() as session:
+            await session.execute(
+                update(ScheduledMessageOccurrence)
+                .where(ScheduledMessageOccurrence.id == old_claim.occurrence_id)
+                .values(lease_until=NOW - timedelta(seconds=1))
+            )
+            await session.commit()
+        new_claim = await new_worker._claim_next_occurrence(
+            authorized_groups={-10001},
+            now=NOW + timedelta(seconds=2),
+        )
+        self.assertIsNotNone(new_claim)
+        assert new_claim is not None
+
+        self.assertFalse(
+            await old_worker._complete_occurrence(
+                old_claim,
+                completed_at=NOW,
+            )
+        )
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertIsNone(entry.last_run_at)
+        self.assertEqual(len(occurrences), 1)
+
+        self.assertTrue(
+            await new_worker._complete_occurrence(
+                new_claim,
+                completed_at=NOW + timedelta(seconds=2),
+            )
+        )
+        entry, occurrences = await self._state()
+        assert entry is not None
+        self.assertEqual(entry.last_run_at, NOW + timedelta(seconds=2))
+        self.assertEqual(occurrences, [])
 
 
 if __name__ == "__main__":

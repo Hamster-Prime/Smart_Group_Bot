@@ -4,7 +4,6 @@ import html
 import logging
 import re
 
-import aiohttp
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
@@ -19,7 +18,7 @@ from aiogram.types import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import Admin, AuthorizedGroup, Group
@@ -44,7 +43,9 @@ from bot.services.join_verification import (
     parse_private_verify_group_id,
 )
 from bot.services.llm import LLMService
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.skills import SkillService
+from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
 from bot.utils.telegram import (
     answer_with_auto_delete,
@@ -84,6 +85,9 @@ async def _answer(
 
 
 async def _ensure_group_row(session: AsyncSession, group_id: int, title: str) -> Group:
+    if session.in_transaction():
+        await session.commit()
+    await acquire_group_settings_write_intent(session, group_id)
     row = await session.get(Group, group_id)
     if row:
         if title and row.title != title:
@@ -247,6 +251,33 @@ def _av_session_owner_ok(session: AVQuerySession, user_id: int) -> bool:
     if session.owner_user_id <= 0:
         return True
     return session.owner_user_id == user_id
+
+
+async def _ensure_av_callback_scope(
+    callback: CallbackQuery,
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> bool:
+    if message.chat and message.chat.type in ("group", "supergroup"):
+        group_row = await _ensure_group_row(
+            session,
+            message.chat.id,
+            message.chat.title or "",
+        )
+        group_av_enabled = _is_group_av_enabled(group_row.settings)
+        await session.commit()
+        if not group_av_enabled:
+            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
+            return False
+        return True
+
+    await session.commit()
+    user = callback.from_user
+    if user is None or not is_super_admin_user_id(user.id, settings):
+        await callback.answer("私聊仅最高管理员可使用 AV 查询", show_alert=True)
+        return False
+    return True
 
 
 def _build_av_search_page(
@@ -501,27 +532,22 @@ async def _download_cover_input_file(cover_url: str, referer: str = "") -> Buffe
     if referer:
         headers["Referer"] = referer
 
-    timeout = aiohttp.ClientTimeout(total=15)
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as client:
-            async with client.get(url, allow_redirects=True) as resp:
-                if resp.status >= 400:
-                    return None
-                ctype = (resp.headers.get("content-type") or "").lower()
-                if "image" not in ctype:
-                    return None
-                raw = await resp.read()
-                if not raw:
-                    return None
-                # Keep payload reasonable for Telegram photo upload.
-                if len(raw) > 15 * 1024 * 1024:
-                    return None
-                ext = ".jpg"
-                if "png" in ctype:
-                    ext = ".png"
-                elif "webp" in ctype:
-                    ext = ".webp"
-                return BufferedInputFile(raw, filename=f"av_cover{ext}")
+        status, raw, _final_url, ctype = await fetch_bytes(
+            url,
+            headers=headers,
+            timeout_sec=15.0,
+            allowed_content_types=("image/",),
+            max_response_bytes=15 * 1024 * 1024,
+        )
+        if status >= 400 or not raw:
+            return None
+        ext = ".jpg"
+        if "png" in ctype:
+            ext = ".png"
+        elif "webp" in ctype:
+            ext = ".webp"
+        return BufferedInputFile(raw, filename=f"av_cover{ext}")
     except Exception:
         log.exception("failed to download cover: %s", url)
         return None
@@ -819,11 +845,19 @@ async def cmd_settings(
 
 
 @router.message(Command("lm"))
-async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) -> None:
+async def cmd_lm(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
     if not await ensure_group_admin_permission(message, session, settings):
         return
+    # Authorization queries have completed. Release their connection before
+    # any memory lookup, LLM intent parsing, typing heartbeat or Telegram send.
+    await session.commit()
     if not message.chat or message.chat.type not in ("group", "supergroup"):
         await _answer(message, settings, "<b>永久记忆</b>\n请在群内使用 /lm。", auto_delete_seconds=0)
         return
@@ -892,7 +926,8 @@ async def cmd_lm(message: Message, session: AsyncSession, settings: Settings) ->
         result = await skill.run_skill(
             "memory_manage",
             {"request_text": request_text},
-            session=session,
+            session=None,
+            session_factory=session_factory,
             sender_user_id=user_id,
             sender_username=sender_username,
             sender_is_owner=sender_is_owner,
@@ -991,12 +1026,32 @@ async def on_memory_delete(
     await callback.answer(f"已删除记忆 #{memory_id}")
 
 
+@router.message(Command("av"))
 async def cmd_av(message: Message, session: AsyncSession, settings: Settings) -> None:
     if not await ensure_group_authorized(message, session, settings):
         return
 
+    is_group_chat = bool(
+        message.chat and message.chat.type in ("group", "supergroup")
+    )
+    if not is_group_chat:
+        # Private chats have no per-group feature flag or authorization scope.
+        # Keep the diagnostic entrypoint available to the configured owner only
+        # instead of turning it into a public, unmetered external-search proxy.
+        await session.commit()
+        user = message.from_user
+        if user is None or not is_super_admin_user_id(user.id, settings):
+            await _answer(
+                message,
+                settings,
+                "<b>AV 查询</b>\n私聊仅最高管理员可使用；普通用户请在已启用该功能的授权群内查询。",
+                auto_delete_seconds=0,
+            )
+            return
+
     args = (message.text or "").partition(" ")[2].strip()
     if not args:
+        await session.commit()
         await _answer(
             message,
             settings,
@@ -1008,6 +1063,7 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
             "支持 FC2 编号：/av FC2-PPV-4863846\n\n"
             "默认状态：<b>关闭</b>（每个群独立）\n"
             "需最高管理员在目标群发送 /av enable 后可使用\n\n"
+            "私聊仅最高管理员可查询。\n\n"
             "<b>最高管理员命令（群内）</b>\n"
             "4. /av enable（启用本群 AV 查询）\n"
             "5. /av disable（停用本群 AV 查询）",
@@ -1033,6 +1089,8 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         previous = _is_group_av_enabled(group_settings)
         group_settings[_AV_GROUP_ENABLE_KEY] = target_enabled
         group_row.settings = group_settings
+        # Persist and release the SQLite write lock before Telegram I/O.
+        await session.commit()
 
         if previous == target_enabled:
             status_line = "状态未变化"
@@ -1048,16 +1106,17 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         )
         return
 
-    if message.chat and message.chat.type in ("group", "supergroup"):
+    if is_group_chat:
         group_row = await _ensure_group_row(session, message.chat.id, message.chat.title or "")
-        if not _is_group_av_enabled(group_row.settings):
+        group_av_enabled = _is_group_av_enabled(group_row.settings)
+        await session.commit()
+        if not group_av_enabled:
             await _answer(
                 message,
                 settings,
                 "<b>AV 查询</b>\n当前群组未启用该功能，请最高管理员发送 /av enable。",
             )
             return
-
     svc = AVSearchService(settings)
     if not svc.enabled:
         await _answer(message, settings, "<b>AV 查询</b>\n当前已禁用。")
@@ -1140,11 +1199,8 @@ async def on_av_search_paging(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
-    if msg.chat and msg.chat.type in ("group", "supergroup"):
-        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
-        if not _is_group_av_enabled(group_row.settings):
-            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
-            return
+    if not await _ensure_av_callback_scope(callback, msg, session, settings):
+        return
 
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -1189,11 +1245,8 @@ async def on_av_detail_select(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
-    if msg.chat and msg.chat.type in ("group", "supergroup"):
-        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
-        if not _is_group_av_enabled(group_row.settings):
-            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
-            return
+    if not await _ensure_av_callback_scope(callback, msg, session, settings):
+        return
 
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -1258,11 +1311,8 @@ async def on_av_seed_paging(
     if not await ensure_group_authorized(msg, session, settings):
         await callback.answer()
         return
-    if msg.chat and msg.chat.type in ("group", "supergroup"):
-        group_row = await _ensure_group_row(session, msg.chat.id, msg.chat.title or "")
-        if not _is_group_av_enabled(group_row.settings):
-            await callback.answer("当前群组未启用 AV 查询", show_alert=True)
-            return
+    if not await _ensure_av_callback_scope(callback, msg, session, settings):
+        return
 
     parts = callback.data.split(":")
     if len(parts) != 4:

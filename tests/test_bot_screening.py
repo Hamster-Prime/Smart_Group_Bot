@@ -168,6 +168,8 @@ def _bot_message() -> SimpleNamespace:
         delete=AsyncMock(),
         bot=SimpleNamespace(
             me=AsyncMock(return_value=SimpleNamespace(username="selfbot", id=1)),
+            ban_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="kicked")),
         ),
     )
 
@@ -197,6 +199,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         record_pass: AsyncMock | None = None,
         reset: AsyncMock | None = None,
         msg_type: str = "text",
+        fresh_authorized: bool = True,
     ) -> SimpleNamespace:
         message = message or _bot_message()
         session = session if session is not None else _rules_lookup_session()
@@ -216,12 +219,12 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "bot.handlers.group._ensure_group_row",
-                new=AsyncMock(return_value=group_row),
+                "bot.handlers.group._fresh_group_authorized_for_moderation",
+                new=AsyncMock(return_value=fresh_authorized),
             ),
             patch(
-                "bot.handlers.group.record_group_activity",
-                return_value=group_row.settings,
+                "bot.handlers.group._record_group_activity_cas",
+                new=AsyncMock(return_value=group_row.settings),
             ),
             patch(
                 "bot.handlers.group.extract_message_text",
@@ -249,6 +252,10 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "bot.handlers.group.reset_bot_screening",
                 new=message._test_reset,
             ),
+            patch(
+                "bot.handlers.group.lease_join_verification_for_unban",
+                new=AsyncMock(),
+            ),
         ]
         with ExitStack() as stack:
             for patcher in patches:
@@ -273,6 +280,32 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[1:], (GROUP_ID, BOT_ID, 3))
         message._test_session.commit.assert_awaited()
         message.delete.assert_not_awaited()
+        message._test_reset.assert_not_awaited()
+
+    async def test_deauthorization_during_bot_verdict_suppresses_all_actions(self) -> None:
+        rule = SimpleNamespace(id=5, action="ban", rule_type="llm", pattern="禁止广告")
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.99,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            record_violation=AsyncMock(),
+        )
+        message = await self._run(
+            moderation_service=moderation,
+            fresh_authorized=False,
+        )
+
+        message.delete.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
+        moderation.record_violation.assert_not_awaited()
+        message._test_record_pass.assert_not_awaited()
         message._test_reset.assert_not_awaited()
 
     async def test_whitelisted_bot_skips_moderation(self) -> None:
@@ -321,7 +354,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         message.delete.assert_awaited_once()
         message._test_reset.assert_awaited_once()
         message._test_record_pass.assert_not_awaited()
-        message.chat.ban.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
         moderation.add_warning.assert_awaited_once()
         self.assertEqual(moderation.record_violation.await_args.args[4], "ban_warning")
         answer.assert_awaited_once()
@@ -345,7 +378,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.handlers.group.answer_with_auto_delete", new=answer):
             message = await self._run(moderation_service=moderation)
 
-        message.chat.ban.assert_awaited_once_with(BOT_ID)
+        message.bot.ban_chat_member.assert_awaited_once_with(GROUP_ID, BOT_ID)
         self.assertEqual(moderation.record_violation.await_args.args[4], "ban_applied")
 
     async def test_high_confidence_ban_rule_bans_bot(self) -> None:
@@ -365,7 +398,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             message = await self._run(moderation_service=moderation)
 
         message.delete.assert_awaited_once()
-        message.chat.ban.assert_awaited_once_with(BOT_ID)
+        message.bot.ban_chat_member.assert_awaited_once_with(GROUP_ID, BOT_ID)
         self.assertEqual(moderation.record_violation.await_args.args[4], "bot_ban")
 
     async def test_low_confidence_ban_rule_takes_counted_path(self) -> None:
@@ -386,7 +419,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             message = await self._run(moderation_service=moderation)
 
         message.delete.assert_awaited_once()
-        message.chat.ban.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
         message._test_reset.assert_awaited_once()
         self.assertEqual(moderation.record_violation.await_args.args[4], "ban_warning")
 
@@ -512,12 +545,12 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(return_value=True),
                 ),
                 patch(
-                    "bot.handlers.group._ensure_group_row",
-                    new=AsyncMock(return_value=group_row),
+                    "bot.handlers.group._fresh_group_authorized_for_moderation",
+                    new=AsyncMock(return_value=True),
                 ),
                 patch(
-                    "bot.handlers.group.record_group_activity",
-                    return_value=group_row.settings,
+                    "bot.handlers.group._record_group_activity_cas",
+                    new=AsyncMock(return_value=group_row.settings),
                 ),
                 patch(
                     "bot.handlers.group.extract_message_text",

@@ -119,6 +119,16 @@ class WeiboSearchSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.payload["effective_query"], "微博热门 site:weibo.com")
         self.assertEqual(result.payload["results"][0]["url"], "https://weibo.com/123/HotFeed")
 
+    def test_weibo_url_filter_rejects_host_suffix_confusion(self) -> None:
+        self.assertFalse(
+            WeiboSearchSkill._is_weibo_post_url(
+                "https://weibo.com.attacker.example/status/123"
+            )
+        )
+        self.assertTrue(
+            WeiboSearchSkill._is_weibo_post_url("https://m.weibo.cn/detail/123")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

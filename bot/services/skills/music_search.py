@@ -12,10 +12,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message
 
 from bot.services.skills.base import SkillContext, SkillRunResult
+from bot.services.skills.platform_common import (
+    ResponseTooLargeError,
+    fetch_json,
+)
 from bot.utils.telegram import (
     is_reply_target_missing_error,
     sanitize_outgoing_text,
-    schedule_message_auto_delete,
+    schedule_message_auto_delete_durable,
 )
 from bot.utils.security import clean_multiline_text, clean_text
 
@@ -263,19 +267,25 @@ class MusicSearchSkill:
             "User-Agent": "SmartGroupBot/1.0 (+https://example.local)",
             "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
         }
-        timeout = aiohttp.ClientTimeout(total=self.http_timeout_sec)
-
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(self.api_base_url, params=params, allow_redirects=True) as resp:
-                    if resp.status >= 400:
-                        raise _MusicAPIError(f"音乐接口请求失败: HTTP {resp.status}", f"http_{resp.status}")
-                    try:
-                        return await resp.json(content_type=None)
-                    except Exception:
-                        raw = await resp.text(errors="ignore")
-                        log.warning("music_search invalid json | params=%s body=%s", params, raw[:200])
-                        raise _MusicAPIError("音乐接口返回了无法解析的数据", "invalid_json") from None
+            status, data, _final_url = await fetch_json(
+                self.api_base_url,
+                params=params,
+                headers=headers,
+                timeout_sec=self.http_timeout_sec,
+                max_response_bytes=2 * 1024 * 1024,
+                max_decoded_bytes=2 * 1024 * 1024,
+            )
+            if status >= 400:
+                raise _MusicAPIError(
+                    f"音乐接口请求失败: HTTP {status}",
+                    f"http_{status}",
+                )
+            return data
+        except ResponseTooLargeError as exc:
+            raise _MusicAPIError("音乐接口响应过大", "response_too_large") from exc
+        except ValueError as exc:
+            raise _MusicAPIError("音乐接口返回了无法解析的数据", "invalid_json") from exc
         except asyncio.TimeoutError as exc:
             raise _MusicAPIError("音乐接口请求超时", "timeout") from exc
         except aiohttp.ClientError as exc:
@@ -549,7 +559,10 @@ class MusicSearchSkill:
                     sent = await message.reply_audio(**kwargs)
                 else:
                     sent = await message.answer_audio(**kwargs)
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                await schedule_message_auto_delete_durable(
+                    sent,
+                    auto_delete_seconds,
+                )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -600,7 +613,10 @@ class MusicSearchSkill:
                     caption=current_caption or None,
                     parse_mode=current_parse_mode,
                 )
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                await schedule_message_auto_delete_durable(
+                    sent,
+                    auto_delete_seconds,
+                )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2

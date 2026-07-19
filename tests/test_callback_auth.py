@@ -9,7 +9,11 @@ from bot.services.callback_auth import is_group_admin_or_higher
 
 def _session(local_admin_id: int | None = None) -> SimpleNamespace:
     result = SimpleNamespace(scalar_one_or_none=lambda: local_admin_id)
-    return SimpleNamespace(execute=AsyncMock(return_value=result))
+    return SimpleNamespace(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
 
 
 def _settings(super_admin_id: int = 1) -> SimpleNamespace:
@@ -47,6 +51,7 @@ class CallbackAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(allowed)
         session.execute.assert_awaited_once()
+        session.commit.assert_awaited_once()
         bot.get_chat_member.assert_not_awaited()
 
     async def test_telegram_creator_is_allowed(self) -> None:
@@ -66,6 +71,34 @@ class CallbackAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(allowed)
+        session.commit.assert_awaited_once()
+        bot.get_chat_member.assert_awaited_once_with(-100, 42)
+
+    async def test_database_transaction_is_released_before_telegram_lookup(self) -> None:
+        transaction_open = True
+        session = _session()
+
+        async def commit() -> None:
+            nonlocal transaction_open
+            transaction_open = False
+
+        async def get_chat_member(_group_id: int, _user_id: int):
+            self.assertFalse(transaction_open)
+            return SimpleNamespace(status=ChatMemberStatus.MEMBER)
+
+        session.commit.side_effect = commit
+        bot = SimpleNamespace(get_chat_member=AsyncMock(side_effect=get_chat_member))
+
+        allowed = await is_group_admin_or_higher(
+            bot=bot,
+            session=session,
+            settings=_settings(),
+            group_id=-100,
+            user_id=42,
+        )
+
+        self.assertFalse(allowed)
+        session.commit.assert_awaited_once()
         bot.get_chat_member.assert_awaited_once_with(-100, 42)
 
     async def test_telegram_admin_requires_restrict_members_permission(self) -> None:
@@ -126,7 +159,11 @@ class CallbackAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.get_chat_member.await_count, 2)
 
     async def test_lookup_failures_fail_closed(self) -> None:
-        session = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("db unavailable")))
+        session = SimpleNamespace(
+            execute=AsyncMock(side_effect=RuntimeError("db unavailable")),
+            commit=AsyncMock(),
+            rollback=AsyncMock(),
+        )
         bot = SimpleNamespace(
             get_chat_member=AsyncMock(side_effect=RuntimeError("telegram unavailable"))
         )
@@ -140,6 +177,7 @@ class CallbackAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(allowed)
+        session.rollback.assert_awaited_once()
         bot.get_chat_member.assert_awaited_once_with(-100, 42)
 
     async def test_invalid_identity_fails_closed_without_lookups(self) -> None:

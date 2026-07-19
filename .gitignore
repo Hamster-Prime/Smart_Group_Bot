@@ -36,7 +36,7 @@ memory/
 *.db
 *.sqlite
 *.sqlite3
-*.log
+*.log*
 
 # OS files
 .DS_Store
@@ -69,5 +69,6 @@ pnpm-debug.log*
 *.bak
 *-implement-the-following-plan.txt
 
-# uv lockfile (not committed for this project)
-uv.lock
+# Reproducible dependency graphs are release artifacts and must be committed.
+!uv.lock
+!requirements.lock

@@ -89,7 +89,10 @@ class WelcomeSendTests(unittest.IsolatedAsyncioTestCase):
         settings.bot.auto_delete_categories = ["welcome"]
         settings.bot.auto_delete_category_seconds = {"welcome": 45}
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace()))
-        with patch("bot.services.welcome.schedule_message_auto_delete") as schedule:
+        with patch(
+            "bot.services.welcome.schedule_message_auto_delete_durable",
+            new=AsyncMock(return_value=True),
+        ) as schedule:
             async with self.session_factory() as session:
                 sent = await send_group_welcome(
                     bot,
@@ -100,6 +103,7 @@ class WelcomeSendTests(unittest.IsolatedAsyncioTestCase):
                     display_name="Ada",
                 )
         self.assertTrue(sent)
+        schedule.assert_awaited_once()
         self.assertIn("欢迎 Ada", bot.send_message.await_args.args[1])
         keyboard = bot.send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(keyboard.inline_keyboard[0][0].text, "群规")

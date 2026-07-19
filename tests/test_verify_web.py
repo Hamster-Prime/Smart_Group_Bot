@@ -21,6 +21,7 @@ from bot.services.join_verification import (
     VERIFICATION_KIND_JOIN,
     VERIFICATION_KIND_MODERATION,
     VERIFICATION_KIND_RAID,
+    VERIFICATION_STATUS_RELEASING,
     clear_turnstile_configuration_unavailable,
     delete_join_verification,
     get_join_verification,
@@ -30,6 +31,7 @@ from bot.services.join_verification import (
 from bot.services.verify_web import (
     VerifyWebServer,
     _client_public_ip,
+    _flush_public_body_tasks,
     verify_hcaptcha_token,
     verify_turnstile_token,
 )
@@ -38,10 +40,15 @@ from bot.utils.timezone import now_shanghai_naive
 BOT_TOKEN = "42:TEST_TOKEN"
 
 
-def _signed_init_data(user_id: int, *, bot_token: str = BOT_TOKEN) -> str:
+def _signed_init_data(
+    user_id: int,
+    *,
+    bot_token: str = BOT_TOKEN,
+    auth_date: int | None = None,
+) -> str:
     """Build initData signed the way Telegram signs Mini App payloads."""
     pairs = {
-        "auth_date": str(int(time.time())),
+        "auth_date": str(int(time.time()) if auth_date is None else auth_date),
         "query_id": "AAF-test",
         "user": json.dumps(
             {"id": user_id, "first_name": "新人"}, separators=(",", ":")
@@ -77,6 +84,12 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         fd, self._db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         self.engine, self.session_factory = await init_db(f"sqlite+aiosqlite:///{self._db_path}")
+        from bot.services.authz import authorize_group
+
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await authorize_group(session, -200, 1)
+            await session.commit()
         self.bot = SimpleNamespace(
             token=BOT_TOKEN,
             restrict_chat_member=AsyncMock(),
@@ -178,12 +191,51 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def test_health_endpoint(self) -> None:
+        self.server.mark_polling_active()
         resp = await self.client.get("/healthz")
         self.assertEqual(resp.status, 200)
 
     async def test_non_object_submit_body_gets_400(self) -> None:
         resp = await self.client.post("/verify", json=["invalid"])
         self.assertEqual(resp.status, 400)
+
+    async def test_expired_signed_init_data_is_rejected_before_siteverify(self) -> None:
+        verification_id = await self._seed(user_id=91)
+        expired = _signed_init_data(
+            91,
+            auth_date=int(time.time()) - 11 * 60,
+        )
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            response = await self._submit(
+                91,
+                init_data=expired,
+                verification_id=verification_id,
+            )
+
+        self.assertEqual(response.status, 403)
+        verify_mock.assert_not_awaited()
+
+    async def test_future_signed_init_data_is_rejected_before_siteverify(self) -> None:
+        verification_id = await self._seed(user_id=92)
+        future = _signed_init_data(
+            92,
+            auth_date=int(time.time()) + 2 * 60,
+        )
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            response = await self._submit(
+                92,
+                init_data=future,
+                verification_id=verification_id,
+            )
+
+        self.assertEqual(response.status, 403)
+        verify_mock.assert_not_awaited()
 
     async def test_challenge_page_renders_turnstile_and_webapp_sdk(self) -> None:
         resp = await self.client.get("/verify")
@@ -198,6 +250,10 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("resetChallenge", body)
         self.assertIn('script-src', resp.headers["Content-Security-Policy"])
         self.assertIn("'nonce-", resp.headers["Content-Security-Policy"])
+        self.assertIn(
+            "frame-ancestors https://web.telegram.org",
+            resp.headers["Content-Security-Policy"],
+        )
         self.assertIn('<script nonce="', body)
 
     async def test_siteverify_error_codes_are_preserved(self) -> None:
@@ -428,6 +484,33 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 102))
 
+    async def test_submit_persists_releasing_lease_before_permission_restore(self) -> None:
+        verification_id = await self._seed(user_id=132)
+
+        async def inspect_durable_release(*_args, **_kwargs) -> bool:
+            async with self.session_factory() as session:
+                row = await get_join_verification(session, -100, 132)
+                self.assertIsNotNone(row)
+                self.assertEqual(row.status, VERIFICATION_STATUS_RELEASING)
+                self.assertIsNotNone(row.lease_until)
+            return True
+
+        with (
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(True, [])),
+            ),
+            patch(
+                "bot.services.verify_web.restore_member_permissions",
+                new=AsyncMock(side_effect=inspect_durable_release),
+            ),
+        ):
+            response = await self._submit(132, verification_id=verification_id)
+
+        self.assertEqual(response.status, 200)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 132))
+
     async def test_join_pass_sends_group_welcome_after_restore(self) -> None:
         from bot.db.models import Group
 
@@ -505,7 +588,8 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=(True, [])),
             ),
             patch(
-                "bot.services.verify_web.schedule_message_auto_delete"
+                "bot.services.verify_web.schedule_message_auto_delete_durable",
+                new=AsyncMock(return_value=True),
             ) as schedule_mock,
         ):
             resp = await self._submit(111)
@@ -517,7 +601,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             self.bot.edit_message_text.await_args.kwargs["reply_markup"]
         )
         self.bot.send_message.assert_not_awaited()
-        schedule_mock.assert_called_once_with(edited, 20)
+        schedule_mock.assert_awaited_once_with(edited, 20)
 
     async def test_pass_edit_failure_deletes_stale_prompt_before_fallback(self) -> None:
         self.bot.edit_message_text = AsyncMock(side_effect=RuntimeError("edit failed"))
@@ -545,7 +629,8 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=(True, [])),
             ),
             patch(
-                "bot.services.verify_web.schedule_message_auto_delete"
+                "bot.services.verify_web.schedule_message_auto_delete_durable",
+                new=AsyncMock(return_value=True),
             ) as schedule_mock,
         ):
             resp = await self._submit(110)
@@ -555,7 +640,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.bot.edit_message_text.assert_not_awaited()
         self.bot.send_message.assert_awaited_once()
         self.assertIn("已通过爆破防护质询", self.bot.send_message.await_args.args[1])
-        schedule_mock.assert_called_once()
+        schedule_mock.assert_awaited_once()
         self.assertEqual(schedule_mock.call_args.args[1], 25)
 
     async def test_forged_init_data_is_rejected(self) -> None:
@@ -781,30 +866,34 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
     async def test_verification_single_use(self) -> None:
         verification_id = await self._seed(user_id=107)
 
-        both_verifying = asyncio.Event()
-        verification_count = 0
+        first_verifying = asyncio.Event()
+        allow_verification = asyncio.Event()
 
         async def verify_concurrently(**_kwargs) -> tuple[bool, list[str]]:
-            nonlocal verification_count
-            verification_count += 1
-            if verification_count == 2:
-                both_verifying.set()
-            await both_verifying.wait()
+            first_verifying.set()
+            await allow_verification.wait()
             return True, []
 
         with patch(
             "bot.services.verify_web.verify_turnstile_token",
             new=AsyncMock(side_effect=verify_concurrently),
         ) as verify_mock:
-            first, second = await asyncio.gather(
-                self._submit(107, verification_id=verification_id),
-                self._submit(107, verification_id=verification_id),
+            first_task = asyncio.create_task(
+                self._submit(107, verification_id=verification_id)
             )
+            await first_verifying.wait()
+            second_task = asyncio.create_task(
+                self._submit(107, verification_id=verification_id)
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(second_task.done())
+            allow_verification.set()
+            first, second = await asyncio.gather(first_task, second_task)
             repeated = await self._submit(107, verification_id=verification_id)
 
         self.assertEqual((first.status, second.status), (200, 200))
         self.assertEqual(repeated.status, 200)
-        self.assertEqual(verify_mock.await_count, 2)
+        self.assertEqual(verify_mock.await_count, 1)
         self.assertEqual(self.bot.restrict_chat_member.await_count, 1)
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 107))
@@ -813,29 +902,32 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.settings.join_verification_hcaptcha_site_key = "h-site"
         self.settings.join_verification_hcaptcha_secret_key = "h-secret"
         verification_id = await self._seed(user_id=127, provider="hcaptcha")
-        second_started = asyncio.Event()
-        verification_count = 0
+        first_started = asyncio.Event()
+        allow_first = asyncio.Event()
 
         async def verify_concurrently(**_kwargs) -> tuple[bool, list[str]]:
-            nonlocal verification_count
-            verification_count += 1
-            if verification_count == 1:
-                await second_started.wait()
-                return True, []
-            second_started.set()
-            return False, ["invalid-or-already-seen-response"]
+            first_started.set()
+            await allow_first.wait()
+            return True, []
 
         with patch(
             "bot.services.verify_web.verify_hcaptcha_token",
             new=AsyncMock(side_effect=verify_concurrently),
         ) as verify_mock:
-            first, second = await asyncio.gather(
-                self._submit_hcaptcha(127, verification_id=verification_id),
-                self._submit_hcaptcha(127, verification_id=verification_id),
+            first_task = asyncio.create_task(
+                self._submit_hcaptcha(127, verification_id=verification_id)
             )
+            await first_started.wait()
+            second_task = asyncio.create_task(
+                self._submit_hcaptcha(127, verification_id=verification_id)
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(second_task.done())
+            allow_first.set()
+            first, second = await asyncio.gather(first_task, second_task)
 
         self.assertEqual((first.status, second.status), (200, 200))
-        self.assertEqual(verify_mock.await_count, 2)
+        self.assertEqual(verify_mock.await_count, 1)
         self.bot.restrict_chat_member.assert_awaited_once()
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 127))
@@ -1045,7 +1137,7 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 123))
 
-    async def test_restore_failure_requeues_verification_for_retry(self) -> None:
+    async def test_restore_failure_keeps_releasing_lease_for_retry(self) -> None:
         verification_id = await self._seed(user_id=124)
         self.bot.restrict_chat_member.side_effect = RuntimeError("telegram unavailable")
         self.bot.get_chat_member = AsyncMock(side_effect=RuntimeError("lookup failed"))
@@ -1072,6 +1164,8 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
             record = await get_join_verification(session, -100, 124)
             self.assertIsNotNone(record)
             self.assertEqual(record.id, payload["verification_id"])
+            self.assertEqual(record.status, VERIFICATION_STATUS_RELEASING)
+            self.assertIsNotNone(record.lease_until)
 
     async def test_identity_comes_from_init_data_not_body(self) -> None:
         # A pending user B cannot be verified by user A's signed session.
@@ -1115,6 +1209,205 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             self.assertIsNotNone(await get_join_verification(session, -100, 113))
 
+    async def test_oversized_verification_fields_are_rejected_before_siteverify(self) -> None:
+        verification_id = await self._seed(user_id=160)
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            response = await self._submit(
+                160,
+                verification_id=verification_id,
+                turnstile="x" * (8 * 1024 + 1),
+            )
+
+        self.assertEqual(response.status, 413)
+        verify_mock.assert_not_awaited()
+
+    async def test_verification_user_rate_limit_returns_429(self) -> None:
+        verification_id = await self._seed(user_id=161)
+        with (
+            patch("bot.services.verify_web._VERIFICATION_USER_RATE_LIMIT", 2),
+            patch(
+                "bot.services.verify_web.verify_turnstile_token",
+                new=AsyncMock(return_value=(False, ["invalid-input-response"])),
+            ) as verify_mock,
+        ):
+            first = await self._submit(161, verification_id=verification_id)
+            second = await self._submit(161, verification_id=verification_id)
+            limited = await self._submit(161, verification_id=verification_id)
+
+        self.assertEqual(first.status, 403)
+        self.assertEqual(second.status, 403)
+        self.assertEqual(limited.status, 429)
+        self.assertEqual(limited.headers.get("Retry-After"), "60")
+        self.assertEqual(verify_mock.await_count, 2)
+
+    async def test_verification_upstream_concurrency_saturation_returns_429(self) -> None:
+        first_id = await self._seed(user_id=162)
+        second_id = await self._seed(user_id=163)
+        self.server._verification_upstream_slots = asyncio.Semaphore(1)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_verify(**_kwargs):
+            started.set()
+            await release.wait()
+            return False, ["invalid-input-response"]
+
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(side_effect=slow_verify),
+        ) as verify_mock:
+            first_task = asyncio.create_task(
+                self._submit(162, verification_id=first_id)
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            limited = await self._submit(163, verification_id=second_id)
+            release.set()
+            first = await asyncio.wait_for(first_task, timeout=1.0)
+
+        self.assertEqual(first.status, 403)
+        self.assertEqual(limited.status, 429)
+        self.assertEqual(limited.headers.get("Retry-After"), "2")
+        self.assertEqual(verify_mock.await_count, 1)
+
+class InitDataFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    async def _submit_with_auth_date(self, auth_date: int):
+        server = VerifyWebServer(
+            bot=SimpleNamespace(token=BOT_TOKEN),
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+        )
+        request = SimpleNamespace(
+            json=AsyncMock(
+                return_value={
+                    "challenge_token": "cf-token",
+                    "provider": "turnstile",
+                    "verification_id": 1,
+                    "init_data": _signed_init_data(300, auth_date=auth_date),
+                }
+            )
+        )
+        with patch(
+            "bot.services.verify_web.verify_turnstile_token",
+            new=AsyncMock(),
+        ) as verify_mock:
+            response = await server.handle_challenge_submit(request)
+        return response, verify_mock
+
+    async def test_expired_init_data_is_rejected_without_database_or_siteverify(self) -> None:
+        response, verify_mock = await self._submit_with_auth_date(
+            int(time.time()) - 11 * 60
+        )
+
+        self.assertEqual(response.status, 403)
+        verify_mock.assert_not_awaited()
+
+    async def test_future_init_data_is_rejected_without_database_or_siteverify(self) -> None:
+        response, verify_mock = await self._submit_with_auth_date(
+            int(time.time()) + 2 * 60
+        )
+
+        self.assertEqual(response.status, 403)
+        verify_mock.assert_not_awaited()
+
+
+class PublicJsonBodyDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_resistant_body_reader_returns_408_at_hard_deadline(self) -> None:
+        release = asyncio.Event()
+
+        async def stubborn_json() -> dict:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+            return {}
+
+        server = VerifyWebServer(
+            bot=SimpleNamespace(token=BOT_TOKEN),
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+        )
+        request = SimpleNamespace(json=stubborn_json)
+        try:
+            with patch(
+                "bot.services.verify_web._PUBLIC_JSON_BODY_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                response = await asyncio.wait_for(
+                    server.handle_challenge_submit(request),
+                    timeout=0.2,
+                )
+            self.assertEqual(response.status, 408)
+        finally:
+            release.set()
+            await _flush_public_body_tasks(timeout_seconds=0.2)
+
+
+class VerificationAdmissionUnitTests(unittest.IsolatedAsyncioTestCase):
+    def _server(self) -> VerifyWebServer:
+        return VerifyWebServer(
+            bot=SimpleNamespace(token=BOT_TOKEN),
+            settings=_settings(),
+            session_factory=SimpleNamespace(),
+        )
+
+    async def test_verification_upstream_admission_is_atomic(self) -> None:
+        server = self._server()
+        server._verification_upstream_slots = asyncio.Semaphore(1)
+
+        admitted = await asyncio.gather(
+            server._try_acquire_verification_upstream(),
+            server._try_acquire_verification_upstream(),
+        )
+
+        self.assertEqual(sorted(admitted), [False, True])
+        self.assertFalse(await server._try_acquire_verification_upstream())
+        server._verification_upstream_slots.release()
+        self.assertTrue(await server._try_acquire_verification_upstream())
+        server._verification_upstream_slots.release()
+
+    async def test_oversized_token_is_rejected_before_auth_or_database(self) -> None:
+        server = self._server()
+        request = SimpleNamespace(
+            json=AsyncMock(
+                return_value={
+                    "challenge_token": "x" * (8 * 1024 + 1),
+                    "provider": "turnstile",
+                    "verification_id": 1,
+                    "init_data": "not-even-parsed",
+                }
+            )
+        )
+
+        response = await server.handle_challenge_submit(request)
+
+        self.assertEqual(response.status, 413)
+
+    async def test_verification_user_rate_limit_is_non_blocking(self) -> None:
+        server = self._server()
+        with patch("bot.services.verify_web._VERIFICATION_USER_RATE_LIMIT", 2):
+            self.assertFalse(server._verification_rate_limited(user_id=7, remote_ip=""))
+            self.assertFalse(server._verification_rate_limited(user_id=7, remote_ip=""))
+            self.assertTrue(server._verification_rate_limited(user_id=7, remote_ip=""))
+
+    async def test_verification_ip_rate_limit_applies_before_auth(self) -> None:
+        server = self._server()
+        with patch("bot.services.verify_web._VERIFICATION_IP_RATE_LIMIT", 1):
+            self.assertFalse(
+                server._verification_rate_limited(
+                    user_id=None,
+                    remote_ip="8.8.8.8",
+                )
+            )
+            self.assertTrue(
+                server._verification_rate_limited(
+                    user_id=None,
+                    remote_ip="8.8.8.8",
+                )
+            )
+
 
 class CombinedVerifyWebTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -1123,6 +1416,11 @@ class CombinedVerifyWebTests(unittest.IsolatedAsyncioTestCase):
         self.engine, self.session_factory = await init_db(
             f"sqlite+aiosqlite:///{self._db_path}"
         )
+        from bot.services.authz import authorize_group
+
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await session.commit()
         self.bot = SimpleNamespace(
             token=BOT_TOKEN,
             restrict_chat_member=AsyncMock(),

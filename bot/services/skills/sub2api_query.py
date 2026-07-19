@@ -7,6 +7,10 @@ from typing import Any
 import aiohttp
 
 from bot.services.skills.base import SkillContext, SkillRunResult
+from bot.services.skills.platform_common import (
+    ResponseTooLargeError,
+    _read_limited_raw_body,
+)
 from bot.utils.security import clean_text
 
 log = logging.getLogger(__name__)
@@ -79,9 +83,20 @@ class Sub2ApiQuerySkill:
         timeout = aiohttp.ClientTimeout(total=timeout_sec)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
-                method, url, headers=headers, json=json_body, allow_redirects=True
+                # Never forward the bearer token to a redirect destination.
+                # A gateway migration must be configured explicitly instead of
+                # trusting a possibly compromised 3xx Location header.
+                method,
+                url,
+                headers=headers,
+                json=json_body,
+                allow_redirects=False,
             ) as resp:
-                raw = await resp.text(errors="ignore")
+                try:
+                    raw_bytes = await _read_limited_raw_body(resp, 2 * 1024 * 1024)
+                except ResponseTooLargeError:
+                    return resp.status, None, "response_too_large"
+                raw = raw_bytes.decode(resp.charset or "utf-8", errors="ignore")
                 try:
                     import json as _json
 

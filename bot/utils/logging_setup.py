@@ -47,6 +47,20 @@ _TAG_COLORS = {
 }
 
 
+class _SecureRotatingFileHandler(RotatingFileHandler):
+    """Keep current and post-rollover log files owner-readable only."""
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            # Logging must remain available on filesystems that do not expose
+            # POSIX modes (for example some Windows/container mounts).
+            pass
+        return stream
+
+
 class LogContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.req_id = _REQ_ID.get()
@@ -159,13 +173,18 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
     if config is not None:
         color_mode = str(getattr(config, "color", "on") or "on").strip().lower()
         log_to_file = bool(getattr(config, "to_file", False))
-        log_file_path_raw = str(getattr(config, "file_path", "bot.log") or "bot.log").strip()
+        log_file_path_raw = str(
+            getattr(config, "file_path", "data/bot.log") or "data/bot.log"
+        ).strip()
         log_file_max_bytes = max(1024, int(getattr(config, "file_max_bytes", 5 * 1024 * 1024)))
         log_file_backup_count = max(1, int(getattr(config, "file_backup_count", 3)))
     else:
         color_mode = os.getenv("LOG_COLOR", "on").strip().lower()
         log_to_file = _parse_bool(os.getenv("LOG_TO_FILE"), default=False)
-        log_file_path_raw = (os.getenv("LOG_FILE_PATH") or "bot.log").strip() or "bot.log"
+        log_file_path_raw = (
+            (os.getenv("LOG_FILE_PATH") or "data/bot.log").strip()
+            or "data/bot.log"
+        )
         log_file_max_bytes = _parse_int(
             os.getenv("LOG_FILE_MAX_BYTES"),
             default=5 * 1024 * 1024,
@@ -207,7 +226,7 @@ def configure_logging(*, force: bool = False, config: Any | None = None) -> None
             file_path = Path.cwd() / file_path
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
+            file_handler = _SecureRotatingFileHandler(
                 file_path,
                 maxBytes=log_file_max_bytes,
                 backupCount=log_file_backup_count,

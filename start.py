@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import logging
 import os
@@ -65,27 +64,31 @@ def preflight() -> None:
         example = Path(".env.example")
         if example.exists():
             shutil.copy(example, env_path)
+            env_path.chmod(0o600)
             log.warning("Created .env from .env.example; fill the bootstrap settings first")
             print("\nPlease edit .env and set BOT_TOKEN, SUPER_ADMIN_ID, CONFIG_MASTER_KEY and MINIAPP_PUBLIC_BASE_URL.\n")
             sys.exit(1)
         log.error("Missing .env and .env.example")
         sys.exit(1)
 
+    try:
+        env_path.chmod(0o600)
+    except OSError as exc:
+        log.warning("Could not restrict .env permissions: %s", exc)
+
     from dotenv import load_dotenv
 
     load_dotenv()
     configure_logging(force=True)
-    token = os.getenv("BOT_TOKEN", "").strip()
-    if not token or token == "your_bot_token_here":
-        print("\nPlease set a valid BOT_TOKEN in .env and retry.\n")
+    from bot.config import load_bootstrap_settings, validate_bootstrap_settings
+
+    try:
+        bootstrap_settings = load_bootstrap_settings()
+        validate_bootstrap_settings(bootstrap_settings)
+    except ValueError as exc:
+        print(f"\n{exc}\n")
         sys.exit(1)
-    if not os.getenv("SUPER_ADMIN_ID", "").strip():
-        print("\nPlease set SUPER_ADMIN_ID so the settings Mini App can authenticate you.\n")
-        sys.exit(1)
-    if not os.getenv("CONFIG_MASTER_KEY", "").strip():
-        print("\nPlease set a stable CONFIG_MASTER_KEY before storing secrets.\n")
-        sys.exit(1)
-    if not os.getenv("MINIAPP_PUBLIC_BASE_URL", "").strip():
+    if not bootstrap_settings.miniapp_public_base_url:
         log.warning("MINIAPP_PUBLIC_BASE_URL is empty; /settings and verification buttons will be unavailable")
 
     Path("data").mkdir(exist_ok=True)
@@ -106,9 +109,9 @@ if __name__ == "__main__":
         print("=" * 50)
         print()
 
-        from bot.__main__ import main
+        from bot.__main__ import run_bot
 
-        asyncio.run(main())
+        run_bot()
     except KeyboardInterrupt:
         print("\nExited.")
     except Exception as exc:

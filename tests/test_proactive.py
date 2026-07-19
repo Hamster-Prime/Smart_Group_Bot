@@ -140,6 +140,122 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             llm=llm or SimpleNamespace(chat=AsyncMock(return_value="新话题")),
         )
 
+    async def test_group_session_is_released_before_history_and_llm(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        initial_settings = _due_settings(now)
+        exited = False
+
+        class SnapshotSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                nonlocal exited
+                exited = True
+
+            async def get(self, _model: object, _group_id: int) -> object:
+                return SimpleNamespace(settings=initial_settings)
+
+        async def history_after_close(*_args: object, **_kwargs: object) -> list:
+            self.assertTrue(exited)
+            return []
+
+        async def llm_after_close(_messages: object) -> str:
+            self.assertTrue(exited)
+            return ""
+
+        service = self._service(
+            llm=SimpleNamespace(chat=AsyncMock(side_effect=llm_after_close))
+        )
+        service.session_factory = SnapshotSession
+        service.memory.get_history_for_llm = AsyncMock(side_effect=history_after_close)
+
+        with patch.object(
+            service,
+            "_commit_fresh_settings",
+            new=AsyncMock(return_value=True),
+        ):
+            await service._run_group_cooldown_task(-100123, now=now)
+
+        self.assertTrue(exited)
+
+    async def test_disabled_group_does_not_mask_another_group_failure(self) -> None:
+        service = self._service()
+        service._run_group_cooldown_task = AsyncMock(
+            side_effect=[False, RuntimeError("broken group")]
+        )
+
+        with (
+            patch(
+                "bot.services.authz.list_authorized_groups",
+                new=AsyncMock(
+                    return_value=[
+                        SimpleNamespace(group_id=-1001),
+                        SimpleNamespace(group_id=-1002),
+                    ]
+                ),
+            ),
+            patch("bot.services.proactive._is_quiet_hours", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed for all"):
+                await service.run_once(raise_on_total_failure=True)
+
+    async def test_delivery_failure_remains_due_and_is_surfaced(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        initial_settings = _due_settings(now)
+        service = self._service(fresh_settings=initial_settings)
+
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(
+                service,
+                "_deliver_topic",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(
+                service,
+                "_commit_fresh_settings",
+                new=AsyncMock(),
+            ) as commit,
+            patch("bot.services.proactive._now_local", return_value=now),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "delivery failed"):
+                await service._run_group_cooldown_task(-100123, now=now)
+
+        commit.assert_not_awaited()
+
+    async def test_sent_topic_requires_persisted_outcome(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        initial_settings = _due_settings(now)
+        service = self._service(fresh_settings=initial_settings)
+
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(
+                service,
+                "_deliver_topic",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                service,
+                "_commit_fresh_settings",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("bot.services.proactive._now_local", return_value=now),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "persist"):
+                await service._run_group_cooldown_task(-100123, now=now)
+
+        service.memory.add_message.assert_not_awaited()
+
     async def test_new_activity_during_generation_suppresses_topic(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         initial_settings = _due_settings(now)
@@ -148,23 +264,23 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             BotConfig(),
             at=now - timedelta(hours=4),
         )
-        session = SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(settings=initial_settings))
-        )
         service = self._service(fresh_settings=fresh_settings)
 
-        with patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver:
-            await service._run_group_cooldown_task(session, -100123, now=now)
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver,
+        ):
+            await service._run_group_cooldown_task(-100123, now=now)
 
         deliver.assert_not_awaited()
 
     async def test_uncommitted_local_activity_during_generation_suppresses_topic(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         initial_settings = _due_settings(now)
-        session = SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(settings=initial_settings))
-        )
-
         async def generate_after_message(_messages: object) -> str:
             note_group_activity(-100123)
             return "新话题"
@@ -174,8 +290,15 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             fresh_settings=initial_settings,
         )
 
-        with patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver:
-            await service._run_group_cooldown_task(session, -100123, now=now)
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver,
+        ):
+            await service._run_group_cooldown_task(-100123, now=now)
 
         deliver.assert_not_awaited()
 
@@ -195,12 +318,16 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             with self.subTest(fresh_settings=fresh_settings):
-                session = SimpleNamespace(
-                    get=AsyncMock(return_value=SimpleNamespace(settings=initial_settings))
-                )
                 service = self._service(fresh_settings=fresh_settings)
-                with patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver:
-                    await service._run_group_cooldown_task(session, -100123, now=now)
+                with (
+                    patch.object(
+                        service,
+                        "_load_group_settings",
+                        new=AsyncMock(return_value=initial_settings),
+                    ),
+                    patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver,
+                ):
+                    await service._run_group_cooldown_task(-100123, now=now)
                 deliver.assert_not_awaited()
 
     async def test_older_processed_revision_does_not_block_same_second_activity(self) -> None:
@@ -210,12 +337,14 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         state["activity_revision"] = 2
         state["processed_activity_revision"] = 1
         state["last_processed_user_at"] = state["last_user_at"]
-        session = SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(settings=group_settings))
-        )
         service = self._service(fresh_settings=group_settings)
 
         with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=group_settings),
+            ),
             patch.object(
                 service,
                 "_deliver_topic",
@@ -225,7 +354,7 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             # pin it to the test's `now` so runs between 0-9 点 don't flake.
             patch("bot.services.proactive._now_local", return_value=now),
         ):
-            await service._run_group_cooldown_task(session, -100123, now=now)
+            await service._run_group_cooldown_task(-100123, now=now)
 
         deliver.assert_awaited_once()
 

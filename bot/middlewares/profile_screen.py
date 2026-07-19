@@ -23,6 +23,7 @@ from bot.services.join_screening import (
     profile_screen_signature,
     screen_member_profile_verbose,
 )
+from bot.services.join_verification import ban_member
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.utils.telegram import answer_with_auto_delete, configured_auto_delete_seconds
@@ -83,6 +84,34 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             if gate.users == 0 and self._screening_gates.get(key) is gate:
                 self._screening_gates.pop(key, None)
 
+    async def _read_screening_state(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        full_name: str,
+        username: str,
+    ) -> tuple[bool, str, bool, str | None]:
+        """Read all fast-path state without leaking a session downstream."""
+        async with self.session_factory() as session:
+            if not await is_group_authorized(session, group_id):
+                return False, "", False, None
+            rules_fp = await moderation_rules_fingerprint(session, group_id)
+            signature = profile_screen_signature(
+                full_name=full_name,
+                username=username,
+                rules_fingerprint=rules_fp,
+            )
+            signature_matches = (
+                await get_profile_screen_hash(session, group_id, user_id)
+                == signature
+            )
+            ban = await get_global_ban(session, user_id)
+            ban_reason = (
+                str(ban.reason or "资料命中群规") if ban is not None else None
+            )
+            return True, signature, signature_matches, ban_reason
+
     async def __call__(
         self,
         handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
@@ -115,24 +144,21 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             # query the ban after the signature read: a concurrent message may
             # already have passed the outer global-ban middleware before
             # another message committed both the signature and ban.
-            async with self.session_factory() as session:
-                if not await is_group_authorized(session, chat.id):
-                    return await handler(event, data)
-                rules_fp = await moderation_rules_fingerprint(session, chat.id)
-                signature = profile_screen_signature(
+            authorized, signature, signature_matches, ban_reason = (
+                await self._read_screening_state(
+                    group_id=chat.id,
+                    user_id=user.id,
                     full_name=full_name,
                     username=username,
-                    rules_fingerprint=rules_fp,
                 )
-                signature_matches = (
-                    await get_profile_screen_hash(session, user.id) == signature
-                )
-                ban = await get_global_ban(session, user.id)
-                if ban is not None:
-                    violation_confirmed = True
-                    reason = str(ban.reason or "资料命中群规")
-                elif signature_matches:
-                    return await handler(event, data)
+            )
+            if not authorized:
+                return await handler(event, data)
+            if ban_reason is not None:
+                violation_confirmed = True
+                reason = ban_reason
+            elif signature_matches:
+                return await handler(event, data)
 
             if not violation_confirmed:
                 async with self._screening_gate(chat.id, user.id) as gate:
@@ -143,46 +169,50 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                         # Double-check in a fresh session after acquiring the
                         # gate. The preceding task may have committed either a
                         # passed signature or a global ban while we waited.
-                        async with self.session_factory() as session:
-                            rules_fp = await moderation_rules_fingerprint(session, chat.id)
-                            signature = profile_screen_signature(
+                        authorized, signature, signature_matches, ban_reason = (
+                            await self._read_screening_state(
+                                group_id=chat.id,
+                                user_id=user.id,
                                 full_name=full_name,
                                 username=username,
-                                rules_fingerprint=rules_fp,
                             )
-                            ban = await get_global_ban(session, user.id)
-                            if ban is not None:
-                                violation_confirmed = True
-                                reason = str(ban.reason or "资料命中群规")
-                                gate.violation_confirmed = True
-                                gate.reason = reason
-                            elif gate.reviewed_signature == signature:
-                                pass
-                            elif await get_profile_screen_hash(session, user.id) == signature:
+                        )
+                        if not authorized:
+                            return await handler(event, data)
+                        if ban_reason is not None:
+                            violation_confirmed = True
+                            reason = ban_reason
+                            gate.violation_confirmed = True
+                            gate.reason = reason
+                        elif gate.reviewed_signature == signature:
+                            pass
+                        elif signature_matches:
+                            gate.reviewed_signature = signature
+                        else:
+                            # Telegram admins are exempt from screening; do not
+                            # persist a pass so a later demotion re-screens.
+                            if await is_user_admin_cached(event):
                                 gate.reviewed_signature = signature
                             else:
-                                # Telegram admins are exempt from screening; do
-                                # not mark them screened so a later demotion
-                                # re-screens on the next message.
-                                if await is_user_admin_cached(event):
-                                    gate.reviewed_signature = signature
-                                else:
-                                    moderation = ModerationService(
-                                        settings.moderation,
-                                        _build_llm(settings),
-                                    )
-                                    if await moderation.is_user_exempt(
+                                moderation = ModerationService(
+                                    settings.moderation,
+                                    _build_llm(settings),
+                                )
+                                async with self.session_factory() as session:
+                                    exempt = await moderation.is_user_exempt(
                                         session,
                                         chat.id,
                                         user.id,
-                                    ):
-                                        gate.reviewed_signature = signature
-                                    else:
-                                        profile_text = build_join_profile_text(
-                                            full_name=full_name,
-                                            username=username,
-                                            bio="",
-                                        )
+                                    )
+                                if exempt:
+                                    gate.reviewed_signature = signature
+                                else:
+                                    profile_text = build_join_profile_text(
+                                        full_name=full_name,
+                                        username=username,
+                                        bio="",
+                                    )
+                                    async with self.session_factory() as session:
                                         violated, reason, conclusive = (
                                             await screen_member_profile_verbose(
                                                 session,
@@ -191,15 +221,22 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                                 user_id=user.id,
                                                 profile_text=profile_text,
                                             )
-                                        )
-                                        if violated:
-                                            # Publish the verdict to all current
-                                            # waiters before database I/O. If a
-                                            # commit fails, an already-confirmed
-                                            # violation still cannot fail open.
-                                            violation_confirmed = True
-                                            gate.violation_confirmed = True
-                                            gate.reason = reason
+                                    )
+                                    if violated:
+                                        async with self.session_factory() as session:
+                                            if not await is_group_authorized(
+                                                session,
+                                                chat.id,
+                                            ):
+                                                # Authorization was revoked while
+                                                # the LLM was running. Discard the
+                                                # verdict; a removed group's rules
+                                                # must never create a cross-group
+                                                # global ban.
+                                                violation_confirmed = False
+                                                gate.violation_confirmed = False
+                                                gate.reason = ""
+                                                return await handler(event, data)
                                             await add_global_ban(
                                                 session,
                                                 user.id,
@@ -209,29 +246,34 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                             )
                                             await mark_profile_screened(
                                                 session,
+                                                chat.id,
                                                 user.id,
                                                 profile_hash=signature,
                                             )
-                                            # Persist the ban row before Telegram
-                                            # calls so a failed notice/delete
-                                            # cannot roll the registry entry back.
                                             await session.commit()
-                                        elif conclusive:
+                                        # Telegram enforcement is authorized only
+                                        # after the global policy commit succeeds.
+                                        # A DB outage retries screening next message
+                                        # instead of creating an untracked ban.
+                                        violation_confirmed = True
+                                        gate.violation_confirmed = True
+                                        gate.reason = reason
+                                    elif conclusive:
+                                        async with self.session_factory() as session:
                                             await mark_profile_screened(
                                                 session,
+                                                chat.id,
                                                 user.id,
                                                 profile_hash=signature,
                                             )
                                             await session.commit()
-                                            gate.reviewed_signature = signature
-                                        else:
-                                            # Share this fail-open result only
-                                            # with messages already queued on
-                                            # the gate. A later message creates
-                                            # a fresh gate and retries screening.
-                                            gate.reviewed_signature = signature
-                                        # Inconclusive verdicts are not cached:
-                                        # re-screen the next message.
+                                        gate.reviewed_signature = signature
+                                    else:
+                                        # Share an inconclusive fail-open only
+                                        # with tasks already queued on this gate.
+                                        gate.reviewed_signature = signature
+                                    # Inconclusive verdicts are not persisted;
+                                    # the next message creates a fresh gate.
         except Exception:
             log.exception("profile re-screening failed | chat=%s user=%s", chat.id, user.id)
             if not violation_confirmed:
@@ -245,10 +287,13 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             await event.delete()
         except Exception:
             pass
-        try:
-            await event.chat.ban(user.id)
-        except Exception:
-            log.exception("[%s] profile screening ban failed | user=%s", chat.id, user.id)
+        if not await ban_member(event.bot, int(chat.id), int(user.id)):
+            log.error(
+                "[%s] profile screening ban unconfirmed; durable global policy retained | "
+                "user=%s",
+                chat.id,
+                user.id,
+            )
 
         shown = html.escape(full_name or (f"@{username}" if username else str(user.id)))
         notice = (

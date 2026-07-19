@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -48,18 +49,30 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import AuthorizedGroup, Group, JoinVerification
+from bot.services.authz import is_group_authorized
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
+    TERMINAL_LEASE_SECONDS,
     VERIFICATION_KIND_RAID,
+    VERIFICATION_STATUS_ENFORCING,
+    VERIFICATION_STATUS_PENDING,
+    PreparedVerification,
+    activate_prepared_join_verification,
     claim_join_verification,
+    complete_leased_join_verification,
+    delete_verification_prompt,
     get_join_verification,
     kick_member,
-    restore_member_permissions,
+    lease_expired_join_verification,
     restrict_new_member,
-    upsert_join_verification,
+    prepare_join_verification,
+    renew_prepared_join_verification,
+    renew_join_verification_lease,
+    shield_abort_prepared_join_verification,
     verification_deadline_passed,
     verification_provider,
+    verification_release_blocked_by_ban,
     verification_service_ready,
     verification_timeout_seconds_for_kind,
 )
@@ -96,7 +109,207 @@ _PERSISTENCE_ANY = object()
 _PERSISTENCE_DELETE = object()
 _INVALID_PERSISTED_STATE = object()
 
+# Notices are intentionally short, but a cancelled Telegram HTTP request can
+# ignore cancellation. Slots remain occupied until the real child exits so a
+# broken transport cannot accumulate an unbounded number of detached tasks.
+_NOTICE_CALL_CAPACITY = 8
+_NOTICE_CALL_BACKPRESSURE_SECONDS = 0.5
+_NOTICE_CALL_TASKS: set[asyncio.Future[object]] = set()
+
+
+@dataclass(slots=True)
+class _NoticeCallState:
+    capacity: int
+    semaphore: asyncio.BoundedSemaphore
+    lock: asyncio.Lock
+    tasks: set[asyncio.Future[object]]
+    draining: bool = False
+    waiters: int = 0
+
+
+_NOTICE_CALL_STATES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, _NoticeCallState
+] = weakref.WeakKeyDictionary()
+
 _service: "RaidGuardService | None" = None
+
+
+class _NoticeCallCapacityError(RuntimeError):
+    pass
+
+
+def _notice_call_state() -> _NoticeCallState:
+    loop = asyncio.get_running_loop()
+    state = _NOTICE_CALL_STATES.get(loop)
+    if state is None:
+        capacity = max(1, int(_NOTICE_CALL_CAPACITY))
+        state = _NoticeCallState(
+            capacity=capacity,
+            semaphore=asyncio.BoundedSemaphore(capacity),
+            lock=asyncio.Lock(),
+            tasks=set(),
+        )
+        _NOTICE_CALL_STATES[loop] = state
+    return state
+
+
+def _active_notice_call_tasks() -> set[asyncio.Future[object]]:
+    loop = asyncio.get_running_loop()
+    return {
+        task
+        for task in _NOTICE_CALL_TASKS
+        if not task.done() and task.get_loop() is loop
+    }
+
+
+def _discard_notice_call_state_if_idle(
+    loop: asyncio.AbstractEventLoop,
+    state: _NoticeCallState,
+) -> None:
+    if state.draining or state.tasks or state.waiters or state.lock.locked():
+        return
+    if _NOTICE_CALL_STATES.get(loop) is state:
+        _NOTICE_CALL_STATES.pop(loop, None)
+
+
+def _observe_notice_call_task(
+    task: asyncio.Future[object],
+    state: _NoticeCallState,
+) -> None:
+    if task in state.tasks:
+        state.tasks.discard(task)
+        _NOTICE_CALL_TASKS.discard(task)
+        state.semaphore.release()
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+    _discard_notice_call_state_if_idle(task.get_loop(), state)
+
+
+def _discard_unstarted_notice(awaitable: object) -> None:
+    if asyncio.isfuture(awaitable):
+        awaitable.cancel()
+        return
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _cancel_notice_acquire_and_return_late_permit(
+    acquire_task: asyncio.Task[bool],
+    state: _NoticeCallState,
+) -> None:
+    """Return a notice permit won concurrently with owner cancellation."""
+
+    def _finished(done: asyncio.Task[bool]) -> None:
+        if done.cancelled():
+            return
+        try:
+            done.result()
+        except (asyncio.CancelledError, Exception):
+            return
+        state.semaphore.release()
+        _discard_notice_call_state_if_idle(done.get_loop(), state)
+
+    acquire_task.cancel()
+    if acquire_task.done():
+        _finished(acquire_task)
+    else:
+        acquire_task.add_done_callback(_finished)
+
+
+async def _start_notice_call(awaitable: object) -> asyncio.Future[object]:
+    loop = asyncio.get_running_loop()
+    state = _notice_call_state()
+    acquired = False
+    state.waiters += 1
+    acquire_task = asyncio.create_task(state.semaphore.acquire())
+    try:
+        wait_seconds = max(0.0, float(_NOTICE_CALL_BACKPRESSURE_SECONDS))
+        done, _pending = await asyncio.wait(
+            {acquire_task},
+            timeout=wait_seconds,
+        )
+        if acquire_task not in done:
+            _cancel_notice_acquire_and_return_late_permit(acquire_task, state)
+            raise asyncio.TimeoutError
+        await acquire_task
+        acquired = True
+    except asyncio.TimeoutError as exc:
+        _discard_unstarted_notice(awaitable)
+        raise _NoticeCallCapacityError(
+            "raid guard Telegram notice capacity is saturated"
+        ) from exc
+    except BaseException:
+        if not acquired:
+            _cancel_notice_acquire_and_return_late_permit(acquire_task, state)
+        _discard_unstarted_notice(awaitable)
+        raise
+    finally:
+        state.waiters -= 1
+        if not acquired:
+            _discard_notice_call_state_if_idle(loop, state)
+
+    try:
+        async with state.lock:
+            if state.draining:
+                raise _NoticeCallCapacityError(
+                    "raid guard Telegram notices are shutting down"
+                )
+            task = asyncio.ensure_future(awaitable)
+            state.tasks.add(task)
+            _NOTICE_CALL_TASKS.add(task)
+            task.add_done_callback(
+                lambda done, owned_state=state: _observe_notice_call_task(
+                    done, owned_state
+                )
+            )
+            return task
+    except BaseException:
+        state.semaphore.release()
+        _discard_unstarted_notice(awaitable)
+        _discard_notice_call_state_if_idle(loop, state)
+        raise
+
+
+async def flush_raid_guard_telegram_tasks(*, timeout_seconds: float = 2.0) -> None:
+    """Cancel and boundedly drain cancellation-resistant notice children."""
+
+    state = _notice_call_state()
+    async with state.lock:
+        state.draining = True
+        tasks = {task for task in state.tasks if not task.done()}
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    _done, pending = await asyncio.wait(
+        tasks,
+        timeout=max(0.0, float(timeout_seconds)),
+    )
+    if pending:
+        log.error(
+            "%d raid-guard Telegram notice call(s) ignored bounded shutdown",
+            len(pending),
+        )
+
+
+async def _bounded_notice_call(awaitable: object, *, timeout_seconds: float) -> object:
+    task = await _start_notice_call(awaitable)
+
+    try:
+        done, _ = await asyncio.wait({task}, timeout=max(0.1, timeout_seconds))
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    raise asyncio.TimeoutError
 
 
 def init_raid_guard_service(service: "RaidGuardService | None") -> None:
@@ -380,39 +593,69 @@ async def remove_raid_challenged_users(
     prompt_message_id: int,
     group_settings: dict | None = None,
 ) -> RaidRemovalResult:
-    """Atomically claim and kick pending raid suspects from one prompt.
+    """Lease and kick pending raid suspects from one prompt crash-safely.
 
     The prompt message id scopes the bulk action to exactly the displayed
-    chunk. Each record is claimed with the same compare-and-delete primitive
-    used by Mini App passes and the timeout sweeper, preventing double actions.
-    Failed Telegram kicks are requeued with a fresh raid deadline so an
-    administrator can retry instead of silently losing enforcement state.
+    chunk. Each record is moved to ``enforcing`` with a durable lease before
+    Telegram is called. A process crash leaves a sweeper-recoverable work item;
+    failed kicks CAS-release the exact generation back to pending.
     """
     group_id = int(group_id)
     prompt_message_id = int(prompt_message_id)
+    del settings, group_settings
     now = now_shanghai_naive()
+    if not await is_group_authorized(session, group_id):
+        await session.rollback()
+        return RaidRemovalResult(0, (), ())
     result = await session.execute(
         select(JoinVerification)
         .where(
             JoinVerification.group_id == group_id,
             JoinVerification.kind == VERIFICATION_KIND_RAID,
             JoinVerification.prompt_message_id == prompt_message_id,
+            JoinVerification.status.in_(
+                (VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_ENFORCING)
+            ),
         )
         .order_by(JoinVerification.id)
     )
     records = list(result.scalars().all())
     claimed: list[tuple[dict[str, object], bool]] = []
+    unclaimed_user_ids: list[int] = []
     for record in records:
+        if not await is_group_authorized(session, group_id):
+            await session.rollback()
+            return RaidRemovalResult(
+                pending_count=len(records),
+                removed_user_ids=(),
+                failed_user_ids=tuple(int(item.user_id) for item in records),
+            )
         globally_banned = await is_globally_banned(session, int(record.user_id))
-        won = await claim_join_verification(
-            session,
-            verification_id=int(record.id),
-            deadline_at=record.deadline_at,
-            kind=record.kind,
-            now=now,
-            expired=verification_deadline_passed(record.deadline_at, now=now),
-        )
+        lease_until = now + timedelta(seconds=TERMINAL_LEASE_SECONDS)
+        status = str(record.status or VERIFICATION_STATUS_PENDING)
+        if status == VERIFICATION_STATUS_PENDING:
+            won = await claim_join_verification(
+                session,
+                verification_id=int(record.id),
+                deadline_at=record.deadline_at,
+                kind=record.kind,
+                now=now,
+                expired=verification_deadline_passed(record.deadline_at, now=now),
+                lease_until=lease_until,
+                target_status=VERIFICATION_STATUS_ENFORCING,
+            )
+        elif record.lease_until is not None and record.lease_until <= now:
+            won = await lease_expired_join_verification(
+                session,
+                record=record,
+                now=now,
+                lease_until=lease_until,
+                target_status=VERIFICATION_STATUS_ENFORCING,
+            )
+        else:
+            won = False
         if not won:
+            unclaimed_user_ids.append(int(record.user_id))
             continue
         claimed.append(
             (
@@ -423,6 +666,8 @@ async def remove_raid_challenged_users(
                     "reason": str(record.reason or ""),
                     "display_name": str(record.display_name or ""),
                     "prompt_message_id": int(record.prompt_message_id or 0),
+                    "verification_id": int(record.id),
+                    "lease_until": lease_until,
                 },
                 globally_banned,
             )
@@ -430,35 +675,76 @@ async def remove_raid_challenged_users(
     await session.commit()
 
     removed: list[int] = []
-    failed: list[int] = []
-    retry_deadline = now_shanghai_naive() + timedelta(
-        seconds=verification_timeout_seconds_for_kind(
-            settings,
-            VERIFICATION_KIND_RAID,
-            group_settings,
-        )
-    )
+    failed: list[int] = list(unclaimed_user_ids)
     for snapshot, globally_banned in claimed:
         user_id = int(snapshot["user_id"])
+        if not await is_group_authorized(session, group_id):
+            await session.rollback()
+            failed.extend(
+                int(item[0]["user_id"])
+                for item in claimed
+                if int(item[0]["user_id"]) not in removed
+                and int(item[0]["user_id"]) not in failed
+            )
+            break
+        renewed_lease = now_shanghai_naive() + timedelta(
+            seconds=TERMINAL_LEASE_SECONDS
+        )
+        renewed = await renew_join_verification_lease(
+            session,
+            verification_id=int(snapshot["verification_id"]),
+            lease_until=snapshot["lease_until"],
+            new_lease_until=renewed_lease,
+            status=VERIFICATION_STATUS_ENFORCING,
+        )
+        if not renewed:
+            await session.rollback()
+            failed.append(user_id)
+            continue
+        await session.commit()
+        snapshot["lease_until"] = renewed_lease
         # A global ban already keeps this account out. kick_member would ban
         # and immediately unban it, accidentally lifting Telegram enforcement.
-        if globally_banned or await kick_member(bot, group_id, user_id):
+        async def preserve_ban() -> bool:
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+            )
+            await session.commit()
+            return blocked
+
+        authorized = await is_group_authorized(session, group_id)
+        # End the read transaction before ban/unban HTTP calls. A slow
+        # Telegram response must not pin a pooled DB connection or SQLite
+        # snapshot for the full network timeout.
+        await session.commit()
+        if not authorized:
+            failed.append(user_id)
+            continue
+        if globally_banned or await kick_member(
+            bot,
+            group_id,
+            user_id,
+            preserve_ban=preserve_ban,
+        ):
             removed.append(user_id)
+            completed = await complete_leased_join_verification(
+                session,
+                verification_id=int(snapshot["verification_id"]),
+                lease_until=snapshot["lease_until"],
+                status=VERIFICATION_STATUS_ENFORCING,
+            )
+            if completed:
+                await session.commit()
+            else:
+                await session.rollback()
             continue
         failed.append(user_id)
-        await upsert_join_verification(
-            session,
-            group_id=group_id,
-            user_id=user_id,
-            deadline_at=retry_deadline,
-            kind=VERIFICATION_KIND_RAID,
-            provider=str(snapshot["provider"]),
-            reason=str(snapshot["reason"]),
-            display_name=str(snapshot["display_name"]),
-            prompt_message_id=int(snapshot["prompt_message_id"]),
-        )
-    if failed:
-        await session.commit()
+        # Keep the punitive intent durable. kick_member has attempted its
+        # idempotent unban cleanup; if that still failed, the sweeper must retry
+        # the full kick cleanup rather than exposing this as a passable pending
+        # challenge.
     return RaidRemovalResult(
         pending_count=len(records),
         removed_user_ids=tuple(removed),
@@ -503,6 +789,7 @@ class RaidGuardService:
         self._lockdown_source: dict[int, str] = {}
         self._lockdown_timers: dict[int, asyncio.TimerHandle] = {}
         self._lockdown_expiry_tasks: dict[int, asyncio.Task[bool]] = {}
+        self._unlock_notice_tasks: dict[int, asyncio.Task[None]] = {}
         # Exact raw JSON values are retained so expiry/disable can use an
         # optimistic compare-and-delete. Only the process that removes the
         # matching record emits the recovery notice.
@@ -785,15 +1072,45 @@ class RaidGuardService:
         try:
             # Protection state notices are intentionally persistent and do
             # not participate in any general moderation auto-delete policy.
-            await self.bot.send_message(
-                int(group_id),
-                build_raid_unlock_text(),
-                parse_mode="HTML",
+            await _bounded_notice_call(
+                self.bot.send_message(
+                    int(group_id),
+                    build_raid_unlock_text(),
+                    parse_mode="HTML",
+                ),
+                timeout_seconds=10.0,
             )
         except Exception:
             log.exception(
                 "[%s] raid unlock notice failed | source=%s", group_id, source
             )
+
+    def _schedule_unlock_notice(self, group_id: int, *, source: str) -> None:
+        group_id = int(group_id)
+        existing = self._unlock_notice_tasks.get(group_id)
+        if existing is not None and not existing.done():
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._send_unlock_notice(group_id, source=source),
+                name=f"raid-unlock-notice:{group_id}",
+            )
+        except RuntimeError:
+            log.debug("[%s] raid unlock notification could not be scheduled", group_id)
+            return
+        self._unlock_notice_tasks[group_id] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._unlock_notice_tasks.get(group_id) is done:
+                self._unlock_notice_tasks.pop(group_id, None)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                log.exception("[%s] raid unlock notice task failed", group_id)
+
+        task.add_done_callback(finished)
 
     async def _expire_lockdown(
         self,
@@ -896,16 +1213,7 @@ class RaidGuardService:
             return False
         source = self._clear_lockdown(group_id)
         if source is not None:
-            try:
-                asyncio.create_task(
-                    self._send_unlock_notice(group_id, source=source),
-                    name=f"raid-unlock:{group_id}",
-                )
-            except RuntimeError:
-                log.debug(
-                    "[%s] raid unlock notification could not be scheduled",
-                    group_id,
-                )
+            self._schedule_unlock_notice(group_id, source=source)
         return False
 
     async def enable_manual_lockdown(
@@ -940,10 +1248,13 @@ class RaidGuardService:
         try:
             # Manual state notices, like automatic trigger/unlock notices, are
             # persistent by design.
-            await self.bot.send_message(
-                group_id,
-                build_manual_raid_lockdown_text(duration_minutes=minutes),
-                parse_mode="HTML",
+            await _bounded_notice_call(
+                self.bot.send_message(
+                    group_id,
+                    build_manual_raid_lockdown_text(duration_minutes=minutes),
+                    parse_mode="HTML",
+                ),
+                timeout_seconds=10.0,
             )
         except Exception:
             log.exception("[%s] manual raid lockdown notice failed", group_id)
@@ -1003,6 +1314,9 @@ class RaidGuardService:
             for task in tuple(self._lockdown_expiry_tasks.values()):
                 task.cancel()
             self._lockdown_expiry_tasks.clear()
+            for task in tuple(self._unlock_notice_tasks.values()):
+                task.cancel()
+            self._unlock_notice_tasks.clear()
             self._recent_joins.clear()
             self._lockdown_until.clear()
             self._lockdown_source.clear()
@@ -1013,11 +1327,43 @@ class RaidGuardService:
         task = self._lockdown_expiry_tasks.pop(int(group_id), None)
         if task is not None:
             task.cancel()
+        notice_task = self._unlock_notice_tasks.pop(int(group_id), None)
+        if notice_task is not None:
+            notice_task.cancel()
         self._recent_joins.pop(int(group_id), None)
         self._lockdown_until.pop(int(group_id), None)
         self._lockdown_source.pop(int(group_id), None)
         self._manual_persisted_state.pop(int(group_id), None)
         self._manual_state_locks.pop(int(group_id), None)
+
+    async def shutdown(self, *, timeout_seconds: float = 2.0) -> None:
+        """Cancel service-owned tasks without trusting them to cooperate."""
+
+        tasks = {
+            *self._lockdown_expiry_tasks.values(),
+            *self._unlock_notice_tasks.values(),
+        }
+        self.reset()
+
+        async def drain_service_tasks() -> None:
+            if not tasks:
+                return
+            _done, pending = await asyncio.wait(
+                tasks,
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+            if pending:
+                log.error(
+                    "%d raid-guard service task(s) ignored bounded shutdown",
+                    len(pending),
+                )
+
+        # Both branches are individually bounded and run in parallel, so the
+        # method's own deadline is not multiplied by the number of registries.
+        await asyncio.gather(
+            drain_service_tasks(),
+            flush_raid_guard_telegram_tasks(timeout_seconds=timeout_seconds),
+        )
 
     async def handle_join(
         self,
@@ -1039,6 +1385,8 @@ class RaidGuardService:
         """
         group_id = int(group_id)
         user_id = int(user_id)
+        if not await self._group_authorized(group_id):
+            return False
         config = resolve_raid_guard_config(self.settings, group_settings)
         now = now_shanghai_naive()
 
@@ -1061,7 +1409,12 @@ class RaidGuardService:
         # A manual lockdown must continue to repel joins even when automatic
         # detection is disabled in this group's persisted policy.
         if self.lockdown_active(group_id, now=now):
-            kicked = await kick_member(self.bot, group_id, user_id)
+            kicked = await self._kick_lockdown_join_durably(
+                group_id=group_id,
+                user_id=user_id,
+                full_name=full_name,
+                now=now,
+            )
             log.info(
                 "raid lockdown join repelled | group=%s user=%s kicked=%s",
                 group_id,
@@ -1105,6 +1458,143 @@ class RaidGuardService:
         # their challenge was not actually persisted (filtered, mute/message
         # failure, provider unavailable), the normal pipeline must run.
         return any(item.user_id == user_id for item in enforced)
+
+    async def _kick_lockdown_join_durably(
+        self,
+        *,
+        group_id: int,
+        user_id: int,
+        full_name: str,
+        now: datetime,
+    ) -> bool:
+        """Persist/lease lockdown kick cleanup before Telegram ban+unban."""
+        if not await self._group_authorized(group_id):
+            return False
+        lease_until = now + timedelta(seconds=TERMINAL_LEASE_SECONDS)
+        verification_id: int | None = None
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, group_id, user_id)
+            if record is None:
+                kick_deadline = now - timedelta(minutes=2)
+                prepared = await prepare_join_verification(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                    deadline_at=kick_deadline,
+                    kind=VERIFICATION_KIND_RAID,
+                    reason="爆破防护：封锁期间加入",
+                    display_name=full_name,
+                    prompt_message_id=0,
+                    provider=verification_provider(self.settings),
+                    lease_until=lease_until,
+                )
+                if prepared is not None:
+                    activated = await activate_prepared_join_verification(
+                        session,
+                        prepared=prepared,
+                        prompt_message_id=0,
+                        deadline_at=kick_deadline,
+                        now=now,
+                    )
+                    won = bool(activated) and await claim_join_verification(
+                        session,
+                        verification_id=prepared.verification_id,
+                        deadline_at=kick_deadline,
+                        kind=VERIFICATION_KIND_RAID,
+                        now=now,
+                        expired=True,
+                        lease_until=lease_until,
+                        target_status=VERIFICATION_STATUS_ENFORCING,
+                    )
+                    if not won:
+                        await session.rollback()
+                        return False
+                    await session.commit()
+                    verification_id = prepared.verification_id
+                    record = None
+                else:
+                    # The insert-if-absent lost to a concurrent challenge. Read
+                    # that committed generation and never overwrite it.
+                    record = await get_join_verification(session, group_id, user_id)
+            if record is None and verification_id is None:
+                return False
+            if record is not None and record.kind != VERIFICATION_KIND_RAID:
+                # The single durable verification row belongs to another
+                # workflow.  Do not report the lockdown kick as consumed: the
+                # membership handler must continue into its normal pending
+                # challenge path so a rejoin is restricted again.
+                return False
+            if record is not None:
+                status = str(record.status or VERIFICATION_STATUS_PENDING)
+                if status == VERIFICATION_STATUS_PENDING:
+                    won = await claim_join_verification(
+                        session,
+                        verification_id=int(record.id),
+                        deadline_at=record.deadline_at,
+                        kind=record.kind,
+                        now=now,
+                        expired=verification_deadline_passed(record.deadline_at, now=now),
+                        lease_until=lease_until,
+                        target_status=VERIFICATION_STATUS_ENFORCING,
+                    )
+                elif (
+                    status == VERIFICATION_STATUS_ENFORCING
+                    and record.lease_until is not None
+                    and record.lease_until <= now
+                ):
+                    won = await lease_expired_join_verification(
+                        session,
+                        record=record,
+                        now=now,
+                        lease_until=lease_until,
+                        target_status=VERIFICATION_STATUS_ENFORCING,
+                    )
+                else:
+                    # Another durable preparation/terminal worker owns this member.
+                    return True
+                if not won:
+                    await session.rollback()
+                    return True
+                await session.commit()
+                verification_id = int(record.id)
+
+        if verification_id is None:
+            return False
+
+        async def preserve_ban() -> bool:
+            async with self.session_factory() as session:
+                return await verification_release_blocked_by_ban(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+
+        if not await self._group_authorized(group_id):
+            return False
+        kicked = await kick_member(
+            self.bot,
+            group_id,
+            user_id,
+            preserve_ban=preserve_ban,
+        )
+        if not kicked:
+            return False
+        async with self.session_factory() as session:
+            completed = await complete_leased_join_verification(
+                session,
+                verification_id=verification_id,
+                lease_until=lease_until,
+                status=VERIFICATION_STATUS_ENFORCING,
+            )
+            if completed:
+                await session.commit()
+            else:
+                await session.rollback()
+        return True
+
+    async def _group_authorized(self, group_id: int) -> bool:
+        async with self.session_factory() as session:
+            return await is_group_authorized(session, int(group_id))
 
     def _observe(
         self,
@@ -1154,15 +1644,20 @@ class RaidGuardService:
         suspects: list[RaidSuspect],
         config: RaidGuardConfig,
     ) -> list[RaidSuspect]:
+        if not await self._group_authorized(group_id):
+            return []
         try:
-            await self.bot.send_message(
-                group_id,
-                build_raid_lockdown_text(
-                    joined_count=config.join_threshold,
-                    window_seconds=config.window_seconds,
-                    lockdown_seconds=config.lockdown_seconds,
+            await _bounded_notice_call(
+                self.bot.send_message(
+                    group_id,
+                    build_raid_lockdown_text(
+                        joined_count=config.join_threshold,
+                        window_seconds=config.window_seconds,
+                        lockdown_seconds=config.lockdown_seconds,
+                    ),
+                    parse_mode="HTML",
                 ),
-                parse_mode="HTML",
+                timeout_seconds=10.0,
             )
         except Exception:
             # The lockdown itself still protects the group.
@@ -1225,56 +1720,83 @@ class RaidGuardService:
         config: RaidGuardConfig,
         provider: str,
     ) -> list[RaidSuspect]:
-        """Mute suspects, post chunked challenges, persist raid records."""
+        """Prepare durably, then mute, prompt, and activate raid challenges."""
         timeout_seconds = config.challenge_timeout_seconds
-        enforced: list[RaidSuspect] = []
-        for start in range(0, len(suspects), RAID_MENTIONS_PER_MESSAGE):
-            # Mute, warn, and persist one chunk at a time: a crash mid-run
-            # then strands at most one chunk muted without durable records.
-            chunk: list[RaidSuspect] = []
-            for suspect in suspects[start : start + RAID_MENTIONS_PER_MESSAGE]:
-                if await restrict_new_member(self.bot, group_id, suspect.user_id):
-                    chunk.append(suspect)
-                else:
-                    log.warning(
-                        "[%s] raid mute failed; skipping user %s",
-                        group_id,
-                        suspect.user_id,
-                    )
-                await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
-            if not chunk:
-                continue
-            prompt_message_id = 0
-            try:
-                sent = await self.bot.send_message(
-                    group_id,
-                    build_raid_challenge_text(chunk, timeout_seconds=timeout_seconds),
-                    parse_mode="HTML",
-                    reply_markup=build_raid_challenge_keyboard(),
-                )
-                prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
-            except Exception:
-                log.exception("[%s] raid challenge message failed", group_id)
-                await self._restore_unowned(group_id, chunk)
-                continue
 
-            deadline = now_shanghai_naive() + timedelta(seconds=timeout_seconds)
-            persisted: list[RaidSuspect] = []
+        async def abort_one(
+            prepared: PreparedVerification,
+            *,
+            restore_permissions: bool,
+        ) -> bool:
             try:
                 async with self.session_factory() as session:
-                    for suspect in chunk:
-                        # A challenge issued since the filter pass governs
-                        # this member; overwriting a moderation record would
-                        # downgrade its ban-on-timeout to a kick.
-                        existing = await get_join_verification(
-                            session, group_id, suspect.user_id
-                        )
-                        if (
-                            existing is not None
-                            and existing.kind != VERIFICATION_KIND_RAID
-                        ):
-                            continue
-                        await upsert_join_verification(
+                    return await shield_abort_prepared_join_verification(
+                        self.bot,
+                        session,
+                        prepared=prepared,
+                        restore_permissions=restore_permissions,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "[%s] raid preparation compensation failed | user=%s",
+                    group_id,
+                    prepared.user_id,
+                )
+                return False
+
+        async def activate_chunk(
+            pairs: list[tuple[RaidSuspect, PreparedVerification]],
+            *,
+            prompt_message_id: int,
+            deadline: datetime,
+        ) -> set[int]:
+            activated: set[int] = set()
+            async with self.session_factory() as session:
+                for _suspect, prepared in pairs:
+                    if not await is_group_authorized(session, group_id):
+                        break
+                    if await activate_prepared_join_verification(
+                        session,
+                        prepared=prepared,
+                        prompt_message_id=prompt_message_id,
+                        deadline_at=deadline,
+                    ):
+                        activated.add(prepared.verification_id)
+                await session.commit()
+            return activated
+
+        async def renew_chunk(
+            pairs: list[tuple[RaidSuspect, PreparedVerification]],
+        ) -> list[tuple[RaidSuspect, PreparedVerification]]:
+            renewed_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
+            async with self.session_factory() as session:
+                for suspect, prepared in pairs:
+                    renewed = await renew_prepared_join_verification(
+                        session,
+                        prepared=prepared,
+                    )
+                    if renewed is not None:
+                        renewed_pairs.append((suspect, renewed))
+                await session.commit()
+            return renewed_pairs
+
+        enforced: list[RaidSuspect] = []
+        for start in range(0, len(suspects), RAID_MENTIONS_PER_MESSAGE):
+            if not await self._group_authorized(group_id):
+                return enforced
+            candidates = suspects[start : start + RAID_MENTIONS_PER_MESSAGE]
+            deadline = now_shanghai_naive() + timedelta(seconds=timeout_seconds)
+            prepared_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
+            try:
+                async with self.session_factory() as session:
+                    for suspect in candidates:
+                        if not await is_group_authorized(session, group_id):
+                            await session.rollback()
+                            prepared_pairs.clear()
+                            break
+                        prepared = await prepare_join_verification(
                             session,
                             group_id=group_id,
                             user_id=suspect.user_id,
@@ -1283,46 +1805,143 @@ class RaidGuardService:
                             reason="爆破防护：短时间内批量加入",
                             display_name=suspect.full_name
                             or (f"@{suspect.username}" if suspect.username else ""),
-                            prompt_message_id=prompt_message_id,
                             provider=provider,
                         )
-                        persisted.append(suspect)
-                    # The mute and challenge are already visible; the durable
-                    # records must land before this pass ends or the sweeper
-                    # could never lift/kick these members.
+                        if prepared is not None:
+                            prepared_pairs.append((suspect, prepared))
                     await session.commit()
             except Exception:
-                log.exception("[%s] raid challenge persistence failed", group_id)
-                await self._restore_unowned(group_id, chunk)
+                log.exception("[%s] raid preparation persistence failed", group_id)
                 continue
-            enforced.extend(persisted)
-            if persisted:
-                log.info(
-                    "[%s] raid challenge issued | users=%s timeout=%ss",
-                    group_id,
-                    ",".join(str(item.user_id) for item in persisted),
-                    timeout_seconds,
-                )
-        return enforced
+            if not prepared_pairs:
+                continue
 
-    async def _restore_unowned(
-        self, group_id: int, chunk: list[RaidSuspect]
-    ) -> None:
-        """Compensation unmute for a failed chunk, but only for members not
-        governed by another active challenge (whose mute must survive)."""
-        for suspect in chunk:
+            muted_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
             try:
-                async with self.session_factory() as session:
-                    existing = await get_join_verification(
-                        session, group_id, suspect.user_id
-                    )
-                if existing is not None and existing.kind != VERIFICATION_KIND_RAID:
-                    continue
-            except Exception:
-                log.debug(
-                    "[%s] raid compensation record check failed | user=%s",
-                    group_id,
-                    suspect.user_id,
-                    exc_info=True,
+                for suspect, prepared in prepared_pairs:
+                    if not await self._group_authorized(group_id):
+                        muted_ids = {
+                            item.verification_id for _member, item in muted_pairs
+                        }
+                        for _member, item in prepared_pairs:
+                            await abort_one(
+                                item,
+                                restore_permissions=item.verification_id in muted_ids,
+                            )
+                        return enforced
+                    if await restrict_new_member(self.bot, group_id, suspect.user_id):
+                        muted_pairs.append((suspect, prepared))
+                    else:
+                        log.warning(
+                            "[%s] raid mute failed; skipping user %s",
+                            group_id,
+                            suspect.user_id,
+                        )
+                        await abort_one(prepared, restore_permissions=True)
+                    await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
+            except asyncio.CancelledError:
+                for _suspect, prepared in prepared_pairs:
+                    # The mute may have reached Telegram before cancellation was
+                    # delivered locally. Recover every prepared member instead
+                    # of deleting an ambiguously applied side effect.
+                    await abort_one(prepared, restore_permissions=True)
+                raise
+            if not muted_pairs:
+                continue
+            muted_pairs = await renew_chunk(muted_pairs)
+            if not muted_pairs:
+                continue
+
+            if not await self._group_authorized(group_id):
+                for _suspect, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                return enforced
+
+            chunk = [suspect for suspect, _prepared in muted_pairs]
+            prompt_message_id = 0
+            try:
+                sent = await _bounded_notice_call(
+                    self.bot.send_message(
+                        group_id,
+                        build_raid_challenge_text(
+                            chunk,
+                            timeout_seconds=timeout_seconds,
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=build_raid_challenge_keyboard(),
+                    ),
+                    timeout_seconds=10.0,
                 )
-            await restore_member_permissions(self.bot, group_id, suspect.user_id)
+                prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
+            except asyncio.CancelledError:
+                for _suspect, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                raise
+            except Exception:
+                log.exception("[%s] raid challenge message failed", group_id)
+                for _suspect, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                continue
+
+            activation_task = asyncio.create_task(
+                activate_chunk(
+                    muted_pairs,
+                    prompt_message_id=prompt_message_id,
+                    deadline=deadline,
+                ),
+                name=f"raid-activate:{group_id}:{start}",
+            )
+            try:
+                activated_ids = await asyncio.shield(activation_task)
+            except asyncio.CancelledError:
+                try:
+                    activated_ids = await activation_task
+                except asyncio.CancelledError:
+                    activated_ids = set()
+                except Exception:
+                    activated_ids = set()
+                    log.exception(
+                        "[%s] raid activation failed while cancellation was pending",
+                        group_id,
+                    )
+                for _suspect, prepared in muted_pairs:
+                    if prepared.verification_id not in activated_ids:
+                        await abort_one(prepared, restore_permissions=True)
+                if not activated_ids and prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
+                    )
+                raise
+            except Exception:
+                log.exception("[%s] raid challenge activation failed", group_id)
+                for _suspect, prepared in muted_pairs:
+                    await abort_one(prepared, restore_permissions=True)
+                if prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
+                    )
+                continue
+
+            activated_pairs = [
+                (suspect, prepared)
+                for suspect, prepared in muted_pairs
+                if prepared.verification_id in activated_ids
+            ]
+            for _suspect, prepared in muted_pairs:
+                if prepared.verification_id not in activated_ids:
+                    await abort_one(prepared, restore_permissions=True)
+            if not activated_pairs:
+                if prompt_message_id:
+                    await delete_verification_prompt(
+                        self.bot, group_id, prompt_message_id
+                    )
+                continue
+            active_chunk = [suspect for suspect, _prepared in activated_pairs]
+            enforced.extend(active_chunk)
+            log.info(
+                "[%s] raid challenge issued | users=%s timeout=%ss",
+                group_id,
+                ",".join(str(item.user_id) for item in active_chunk),
+                timeout_seconds,
+            )
+        return enforced

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -202,6 +203,52 @@ class SpeechStyleServiceTests(unittest.IsolatedAsyncioTestCase):
             state = get_style_state((await session.get(Group, -200)).settings)
 
         self.assertEqual(state["profile_text"], "旧画像")
+
+    async def test_distill_fresh_merge_preserves_concurrent_private_settings(self) -> None:
+        await self._make_group()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def compress(*_args: object) -> str:
+            started.set()
+            await release.wait()
+            return "新画像"
+
+        service = SpeechStyleService(
+            SimpleNamespace(compress=AsyncMock(side_effect=compress)),
+            distill_every=1,
+            max_samples=100,
+        )
+
+        async def collect() -> None:
+            async with self.session_factory() as session:
+                await service.collect_sample(
+                    session,
+                    group_id=-200,
+                    user_id=555,
+                    text="触发提炼",
+                )
+                await session.commit()
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -200)
+            group.settings = {
+                **dict(group.settings or {}),
+                "raid_guard_manual_lockdown": {"enabled": True},
+            }
+            await session.commit()
+        release.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        async with self.session_factory() as session:
+            group = await session.get(Group, -200)
+            self.assertEqual(
+                group.settings["raid_guard_manual_lockdown"],
+                {"enabled": True},
+            )
+            self.assertEqual(get_style_state(group.settings)["profile_text"], "新画像")
 
 
 class StylePromptInjectionTests(unittest.TestCase):

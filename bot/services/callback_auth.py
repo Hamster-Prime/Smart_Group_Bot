@@ -32,9 +32,13 @@ async def is_group_admin_or_higher(
     if is_super_admin_user_id(user_id, settings):
         return True
 
+    local_authorized = False
     try:
-        if await is_group_admin_authorized(session, group_id, user_id):
-            return True
+        local_authorized = await is_group_admin_authorized(
+            session,
+            group_id,
+            user_id,
+        )
     except Exception:
         log.warning(
             "local callback admin lookup failed | group=%s user=%s",
@@ -42,6 +46,37 @@ async def is_group_admin_or_higher(
             user_id,
             exc_info=True,
         )
+        try:
+            await session.rollback()
+        except Exception:
+            log.debug(
+                "callback authorization rollback failed | group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+    else:
+        # The fallback below calls Telegram over the network. End the local
+        # authorization snapshot first so a slow Bot API request cannot pin a
+        # pooled connection (or a SQLite read transaction) for its duration.
+        try:
+            await session.commit()
+        except Exception:
+            log.warning(
+                "callback authorization transaction release failed | "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            return False
+
+    if local_authorized:
+        return True
 
     try:
         member = await bot.get_chat_member(group_id, user_id)

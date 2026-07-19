@@ -10,12 +10,13 @@ from uuid import uuid4
 
 import litellm
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import BotConfig
 from bot.db.sqlite_session import is_database_locked_error
-from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVector
+from bot.db.models import Group, GroupContextSummary, GroupPermanentMemory, MessageVector
 from bot.services.ban_audit import build_ban_knowledge_blocks
 from bot.services.llm import LLMService
 from bot.utils.prompts import get_prompt
@@ -179,6 +180,28 @@ class MemoryService:
     def session_factory(self) -> async_sessionmaker[AsyncSession]:
         return self._session_factory
 
+    @staticmethod
+    async def _ensure_group_row(session: AsyncSession, group_id: int) -> None:
+        """Ensure FK-backed memory rows always have a parent group."""
+        dialect = getattr(getattr(session, "bind", None), "dialect", None)
+        if getattr(dialect, "name", "") == "sqlite":
+            await session.execute(
+                sqlite_insert(Group)
+                .values(id=group_id, title="", settings={})
+                .on_conflict_do_nothing(index_elements=[Group.id])
+            )
+            return
+        row = await session.get(Group, group_id)
+        if row is None:
+            try:
+                async with session.begin_nested():
+                    session.add(Group(id=group_id, title="", settings={}))
+                    await session.flush()
+            except IntegrityError:
+                # Another writer created the parent while this transaction was
+                # waiting. The child insert can safely continue.
+                pass
+
     async def add_message(
         self,
         group_id: int,
@@ -212,7 +235,7 @@ class MemoryService:
             scoped_message_id=scoped_id,
             created_at=normalized_created_at,
         )
-        if inserted is not False:
+        if inserted:
             self._working(group_id).append(
                 self._history_item(
                     role=role,
@@ -244,7 +267,7 @@ class MemoryService:
         message_type: str,
         scoped_message_id: str,
         created_at: datetime,
-    ) -> bool | None:
+    ) -> bool:
         scoped_id = scoped_message_id
         normalized_role = (role or "user")[:16]
         normalized_sender_name = self._default_sender_name(normalized_role, sender_name)
@@ -278,14 +301,20 @@ class MemoryService:
                     if not is_database_locked_error(exc):
                         raise
                     if attempt >= 5:
-                        log.warning(
-                            "memory persist skipped due sqlite lock: group=%s message_id=%s",
+                        log.error(
+                            "memory persist failed after sqlite lock retries: "
+                            "group=%s message_id=%s",
                             group_id,
                             scoped_id,
                         )
-                        return None
+                        # Never turn a durable-write failure into an in-memory
+                        # success.  For inbound webhook updates this propagates
+                        # to a 503 so Telegram can redeliver; detached reply and
+                        # proactive workers surface their normal failure path
+                        # instead of silently losing history on restart.
+                        raise
                     await asyncio.sleep(0.2 * (attempt + 1))
-        return None
+        raise RuntimeError("memory persistence retry loop exited unexpectedly")
 
     def _count_tokens(self, messages: list[dict[str, Any]]) -> int:
         normalized = [
@@ -366,9 +395,9 @@ class MemoryService:
 
     async def _save_summary(self, group_id: int, summary: str) -> None:
         normalized = (summary or "").strip()
-        self._summary_cache[group_id] = normalized
 
         async with self._session_factory() as session:
+            await self._ensure_group_row(session, group_id)
             row = await session.get(GroupContextSummary, group_id)
             if row is None:
                 row = GroupContextSummary(group_id=group_id, summary=normalized)
@@ -376,6 +405,9 @@ class MemoryService:
             else:
                 row.summary = normalized
             await session.commit()
+        # Cache publication follows the durable commit.  A failed write must
+        # not make the process believe a summary exists only in memory.
+        self._summary_cache[group_id] = normalized
 
     async def list_permanent_memories(
         self,
@@ -414,6 +446,7 @@ class MemoryService:
             if existing:
                 return existing, False
 
+            await self._ensure_group_row(session, group_id)
             row = GroupPermanentMemory(
                 group_id=group_id,
                 content=text,
@@ -478,13 +511,62 @@ class MemoryService:
         new_content: str,
         created_by: int = 0,
     ) -> tuple[list[GroupPermanentMemory], GroupPermanentMemory | None, bool]:
-        deleted = await self.delete_permanent_memory(group_id, target)
-        created, created_new = await self.add_permanent_memory(
-            group_id,
-            new_content,
-            created_by=created_by,
-        )
-        return deleted, created, created_new
+        query = (target or "").strip()
+        text_value = (new_content or "").strip()
+        if not query:
+            return [], None, False
+
+        async with self._session_factory() as session:
+            match = re.fullmatch(r"#?(\d+)", query)
+            if match:
+                row = await session.get(GroupPermanentMemory, int(match.group(1)))
+                targets = [row] if row is not None and row.group_id == group_id else []
+            else:
+                stmt = (
+                    select(GroupPermanentMemory)
+                    .where(
+                        GroupPermanentMemory.group_id == group_id,
+                        GroupPermanentMemory.content.contains(query),
+                    )
+                    .order_by(GroupPermanentMemory.id.asc())
+                )
+                targets = list((await session.execute(stmt)).scalars().all())
+
+            if not targets:
+                return [], None, False
+
+            deleted = list(targets)
+            for row in targets:
+                await session.delete(row)
+            # Flush the deletes inside this transaction.  If creating the
+            # replacement fails, rollback restores every original row.
+            await session.flush()
+
+            created: GroupPermanentMemory | None = None
+            created_new = False
+            if text_value:
+                existing = (
+                    await session.execute(
+                        select(GroupPermanentMemory).where(
+                            GroupPermanentMemory.group_id == group_id,
+                            GroupPermanentMemory.content == text_value,
+                        )
+                    )
+                ).scalars().first()
+                if existing is not None:
+                    created = existing
+                else:
+                    await self._ensure_group_row(session, group_id)
+                    created = GroupPermanentMemory(
+                        group_id=group_id,
+                        content=text_value,
+                        created_by=created_by,
+                    )
+                    session.add(created)
+                    created_new = True
+
+            await session.commit()
+            return deleted, created, created_new
 
     async def _format_system_memory_blocks(self, group_id: int) -> list[dict[str, str]]:
         blocks: list[dict[str, str]] = [
@@ -544,17 +626,25 @@ class MemoryService:
             )
         return blocks
 
-    async def _clear_group_history_records(
+    async def _save_summary_and_clear_history(
         self,
         group_id: int,
+        summary: str,
         *,
         message_ids: list[str],
     ) -> None:
-        """Delete only the snapshotted rows: messages that arrived while the
-        compression LLM call was in flight are not in the summary and must
-        survive."""
+        """Atomically publish a summary and delete exactly its source rows."""
+        normalized = (summary or "").strip()
         ids = [mid for mid in message_ids if mid]
         async with self._session_factory() as session:
+            await self._ensure_group_row(session, group_id)
+            row = await session.get(GroupContextSummary, group_id)
+            if row is None:
+                session.add(
+                    GroupContextSummary(group_id=group_id, summary=normalized)
+                )
+            else:
+                row.summary = normalized
             for start in range(0, len(ids), 500):
                 chunk = ids[start : start + 500]
                 await session.execute(
@@ -564,6 +654,7 @@ class MemoryService:
                     )
                 )
             await session.commit()
+        self._summary_cache[group_id] = normalized
 
     @staticmethod
     def _render_compact_history(history: list[dict[str, Any]]) -> list[str]:
@@ -638,9 +729,9 @@ class MemoryService:
                 return False
 
             try:
-                await self._save_summary(group_id, compressed)
-                await self._clear_group_history_records(
+                await self._save_summary_and_clear_history(
                     group_id,
+                    compressed,
                     message_ids=[str(item.get("message_id") or "") for item in history],
                 )
             except OperationalError as exc:

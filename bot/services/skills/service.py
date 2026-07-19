@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from bot.config import Settings
@@ -40,6 +42,40 @@ from bot.utils.telegram import configured_auto_delete_seconds
 
 log = logging.getLogger(__name__)
 
+_SKILL_EXECUTION_SEMAPHORE = asyncio.Semaphore(8)
+_SKILL_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _observe_skill_task(task: asyncio.Task[Any]) -> None:
+    _SKILL_ORPHAN_TASKS.discard(task)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_skill_orphan(task: asyncio.Task[Any]) -> None:
+    if task.done():
+        _observe_skill_task(task)
+        return
+    _SKILL_ORPHAN_TASKS.add(task)
+    task.add_done_callback(_observe_skill_task)
+
+
+async def flush_skill_execution_tasks(*, timeout_seconds: float = 15.0) -> None:
+    """Cancel and join timed-out tool tasks before shared resources close."""
+
+    tasks = {task for task in _SKILL_ORPHAN_TASKS if not task.done()}
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+    for task in done:
+        _observe_skill_task(task)
+    if pending:
+        log.error("%d skill execution task(s) ignored shutdown cancellation", len(pending))
+
 _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "websearch": re.compile(r"^找到\s*\d+\s*[条个]\s*搜索结果[。！？!?\. ]*$"),
     "webfetch": re.compile(r"^(?:网页)?抓取成功[。！？!?\. ]*$"),
@@ -62,6 +98,11 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
 )
 _PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
 _MANDATORY_REFUSAL_ERRORS = frozenset({"starter_quota_exhausted"})
+_AMBIGUOUS_SIDE_EFFECT_ERROR = "tool_outcome_ambiguous"
+_STATE_MUTATING_TOOL_ACTIONS: dict[str, frozenset[str]] = {
+    "memory_manage": frozenset({"add", "replace"}),
+    "rule_manage": frozenset({"add"}),
+}
 _NUMBERED_LIST_ITEM_RE = re.compile(r"^(\s*)(\d{1,2})([.)、]\s*)")
 _URL_RE = re.compile(r"https?://\S+")
 _RESULT_LIST_RE = re.compile(r"(?m)^\s*\d{1,2}[.)、]\s+")
@@ -81,10 +122,16 @@ class SkillService:
         settings: Settings | None = None,
         default_sticker_file_ids: list[str] | None = None,
         max_tool_rounds: int = 6,
+        tool_timeout_seconds: float = 15.0,
+        max_tool_calls_per_round: int = 4,
+        max_total_tool_calls: int = 8,
     ) -> None:
         self.llm = llm
         self.settings = settings
         self.max_tool_rounds = max(1, max_tool_rounds)
+        self.tool_timeout_seconds = max(0.1, float(tool_timeout_seconds))
+        self.max_tool_calls_per_round = max(1, int(max_tool_calls_per_round))
+        self.max_total_tool_calls = max(1, int(max_total_tool_calls))
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
         self._register(MemoryManageSkill())
@@ -406,7 +453,123 @@ class SkillService:
         skill = skill_map.get(name)
         if not skill:
             return SkillRunResult(ok=False, skill=name, summary="未知技能", error="unknown_skill")
-        return await skill.run(arguments, context)
+
+        may_have_side_effect = self._tool_may_have_side_effect(name, arguments)
+
+        # A timed-out coroutine may ignore cancellation. Give it a private
+        # context so a late completion cannot race the next model round by
+        # overwriting ``context.session`` or falsely marking media as delivered.
+        tool_context = replace(
+            context,
+            history=list(context.history),
+            default_sticker_file_ids=list(context.default_sticker_file_ids),
+        )
+
+        async def _invoke() -> SkillRunResult:
+            async with _SKILL_EXECUTION_SEMAPHORE:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError
+                if tool_context.session is not None or tool_context.session_factory is None:
+                    return await skill.run(arguments, tool_context)
+
+                # A reply batch must not retain one database connection throughout
+                # all model rounds.  Give a DB-backed tool a short-lived session
+                # only for the duration of that tool call.
+                async with tool_context.session_factory() as tool_session:
+                    tool_context.session = tool_session
+                    try:
+                        result = await skill.run(arguments, tool_context)
+                        current_task = asyncio.current_task()
+                        if current_task is not None and current_task.cancelling():
+                            raise asyncio.CancelledError
+                        if result.ok:
+                            await tool_session.commit()
+                        else:
+                            await tool_session.rollback()
+                        return result
+                    except BaseException:
+                        await tool_session.rollback()
+                        raise
+                    finally:
+                        tool_context.session = None
+
+        task = asyncio.create_task(_invoke(), name=f"skill:{name}")
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self.tool_timeout_seconds)
+            if task not in done:
+                task.cancel()
+                _track_skill_orphan(task)
+                log.warning(
+                    "skill timed out | name=%s timeout=%.1fs",
+                    name,
+                    self.tool_timeout_seconds,
+                )
+                if may_have_side_effect:
+                    return self._ambiguous_side_effect_result(name)
+                return SkillRunResult(
+                    ok=False,
+                    skill=name,
+                    summary="技能执行超时，请稍后重试。",
+                    error="tool_timeout",
+                )
+            result = task.result()
+            for attribute in (
+                "handled",
+                "sticker_sent",
+                "sticker_file_id",
+                "tts_sent",
+                "tts_text",
+                "embedded_reply_sent",
+                "embedded_reply_text",
+                "suppress_followup_text",
+            ):
+                setattr(context, attribute, getattr(tool_context, attribute))
+            return result
+        except asyncio.CancelledError:
+            task.cancel()
+            _track_skill_orphan(task)
+            raise
+        except Exception:
+            log.exception("skill execution failed | name=%s", name)
+            if may_have_side_effect:
+                return self._ambiguous_side_effect_result(name)
+            return SkillRunResult(
+                ok=False,
+                skill=name,
+                summary="技能执行失败，请稍后重试。",
+                error="tool_failed",
+            )
+
+    @staticmethod
+    def _tool_may_have_side_effect(name: str, arguments: dict[str, Any]) -> bool:
+        if name in {
+            "send_sticker",
+            "doubao_tts",
+            "vote_ban",
+            "memory_manage",
+            "rule_manage",
+        }:
+            return True
+        if name == "music_search":
+            action = clean_text(
+                str(arguments.get("action") or "search"),
+                max_len=24,
+            ).lower()
+            return action == "send_audio"
+        return False
+
+    @staticmethod
+    def _ambiguous_side_effect_result(name: str) -> SkillRunResult:
+        return SkillRunResult(
+            ok=False,
+            skill=name,
+            summary=(
+                "操作可能已经完成，但系统未能确认最终结果。为避免重复发送或重复写入，"
+                "本轮不会自动重试；请先检查群内状态，确认未执行后再发起新请求。"
+            ),
+            error=_AMBIGUOUS_SIDE_EFFECT_ERROR,
+        )
 
     @staticmethod
     def _tool_result_to_payload(result: SkillRunResult) -> dict[str, Any]:
@@ -417,6 +580,16 @@ class SkillService:
             "error": result.error,
             "payload": result.payload,
         }
+
+    @staticmethod
+    def _committed_state_mutation(result: SkillRunResult) -> bool:
+        if not result.ok:
+            return False
+        allowed_actions = _STATE_MUTATING_TOOL_ACTIONS.get(result.skill)
+        if not allowed_actions:
+            return False
+        action = clean_text(str(result.payload.get("action") or ""), max_len=24).lower()
+        return action in allowed_actions
 
     @staticmethod
     def _latest_successful_tool_result(
@@ -1002,6 +1175,9 @@ class SkillService:
         recent_tool_results: list[dict[str, Any]] = []
         followup_retry_used = False
         mandatory_refusal_summary = ""
+        total_tool_calls = 0
+        side_effect_committed = ""
+        side_effect_notice_added = False
 
         def _build_answer_result(text: str = "") -> SkillAnswerResult:
             return SkillAnswerResult(
@@ -1018,6 +1194,9 @@ class SkillService:
             return context.handled and (context.embedded_reply_sent or context.suppress_followup_text)
 
         for step in range(1, self.max_tool_rounds + 1):
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise asyncio.CancelledError
             resp = await self._completion_with_fallbacks(messages=messages, tools=tools)
             if not resp:
                 return _build_answer_result(
@@ -1030,6 +1209,29 @@ class SkillService:
             msg = resp.choices[0].message
             content = self._normalize_content_text(getattr(msg, "content", "")).strip()
             tool_calls = self._parse_tool_calls(msg)
+
+            remaining_calls = self.max_total_tool_calls - total_tool_calls
+            if remaining_calls <= 0:
+                log.warning(
+                    "skill tool loop stopped at total call limit | limit=%d",
+                    self.max_total_tool_calls,
+                )
+                return _build_answer_result(
+                    self._build_tool_fallback_text(
+                        recent_tool_results=recent_tool_results,
+                        default_text=last_tool_summary or last_success_summary,
+                    )
+                )
+            allowed_calls = min(self.max_tool_calls_per_round, remaining_calls)
+            if len(tool_calls) > allowed_calls:
+                log.warning(
+                    "skill tool calls truncated | requested=%d allowed=%d step=%d",
+                    len(tool_calls),
+                    allowed_calls,
+                    step,
+                )
+                tool_calls = tool_calls[:allowed_calls]
+            total_tool_calls += len(tool_calls)
 
             # The model has now received the structured tool error and the
             # mandatory-refusal system block.  Its prose is advisory only:
@@ -1097,7 +1299,10 @@ class SkillService:
                 )
 
             log.info("skill tool loop: step=%d tool_calls=%d", step, len(tool_calls))
-            for tool_call in tool_calls:
+            for tool_index, tool_call in enumerate(tool_calls):
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError
                 args = self._parse_tool_arguments(tool_call["arguments"])
                 if mandatory_refusal_summary:
                     result = SkillRunResult(
@@ -1105,6 +1310,16 @@ class SkillService:
                         skill=tool_call["name"],
                         summary=mandatory_refusal_summary,
                         error="skipped_due_to_mandatory_refusal",
+                    )
+                elif side_effect_committed:
+                    result = SkillRunResult(
+                        ok=False,
+                        skill=tool_call["name"],
+                        summary=(
+                            f"已完成有副作用的工具 {side_effect_committed}；"
+                            "为避免重复操作，本轮其余工具调用已跳过。"
+                        ),
+                        error="skipped_after_side_effect",
                     )
                 else:
                     result = await self._run_tool(
@@ -1115,7 +1330,7 @@ class SkillService:
                     )
                 if result.ok and result.summary:
                     last_success_summary = result.summary
-                if result.summary:
+                if result.summary and result.error != "skipped_after_side_effect":
                     last_tool_summary = result.summary
                 recent_tool_results.append(
                     {
@@ -1152,10 +1367,49 @@ class SkillService:
                         }
                     )
 
+                if result.error == _AMBIGUOUS_SIDE_EFFECT_ERROR:
+                    log.warning(
+                        "skill tool loop stopped at ambiguous side effect | skill=%s",
+                        result.skill,
+                    )
+                    return _build_answer_result(result.summary)
+
+                # A delivered action (sticker, voice, media, vote prompt, ...)
+                # is the terminal reply for this turn.  Do not execute any
+                # remaining tool calls emitted in the same model response: they
+                # may be duplicate non-idempotent actions and the model is not a
+                # trusted transaction coordinator for Telegram side effects.
+                if result.ok and _action_reply_completed():
+                    skipped = len(tool_calls) - tool_index - 1
+                    log.info(
+                        "skill tool loop finished after delivered action | "
+                        "step=%d skill=%s skipped_calls=%d",
+                        step,
+                        tool_call["name"],
+                        max(0, skipped),
+                    )
+                    return _build_answer_result()
+                if self._committed_state_mutation(result):
+                    side_effect_committed = result.skill
+
             if mandatory_refusal_summary:
                 if step < self.max_tool_rounds:
                     continue
                 return _build_answer_result(mandatory_refusal_summary)
+            if side_effect_committed and not side_effect_notice_added:
+                side_effect_notice_added = True
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "[SIDE_EFFECT_COMMITTED]\n"
+                            f"tool: {side_effect_committed}\n"
+                            "Exactly one state-changing tool has succeeded in this turn. "
+                            "Do not call any more tools. Briefly report the confirmed result "
+                            "without claiming any skipped action succeeded."
+                        ),
+                    }
+                )
             if _action_reply_completed():
                 log.info("skill tool loop finished: step=%d action_handled_without_followup", step)
                 return _build_answer_result()

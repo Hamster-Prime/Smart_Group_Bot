@@ -5,11 +5,9 @@ import base64
 import html
 import json
 import logging
-import os
 import re
-import subprocess
-import tempfile
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +21,7 @@ from bot.db.models import Group
 from bot.utils.telegram import (
     is_reply_target_missing_error,
     sanitize_outgoing_text,
-    schedule_message_auto_delete,
+    schedule_message_auto_delete_durable,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +57,11 @@ _COMFORT_KEYWORDS = ("没事", "别怕", "慢慢来", "辛苦了", "抱抱", "�
 _HAPPY_KEYWORDS = ("太好了", "开心", "高兴", "好耶", "太棒了", "绝了", "哈哈", "成功了", "喜欢", "赢了")
 _ANGER_KEYWORDS = ("气死", "离谱", "无语", "烦死", "警告", "严禁", "禁止", "立刻", "马上", "闭嘴", "住手")
 _SUSPENSE_KEYWORDS = ("等等", "不对劲", "奇怪", "悬疑", "诡异", "突然", "怎么回事", "别回头")
+_TTS_MAX_WIRE_BYTES = 32 * 1024 * 1024
+_TTS_MAX_JSON_FRAME_CHARS = 8 * 1024 * 1024
+_TTS_MAX_ERROR_BYTES = 64 * 1024
+_TTS_MAX_AUDIO_BYTES = 20 * 1024 * 1024
+_TTS_TRANSCODE_TIMEOUT_SECONDS = 30.0
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
@@ -541,15 +544,22 @@ class DoubaoTTSService:
         }
 
     @staticmethod
-    async def _iter_json_objects(resp: aiohttp.ClientResponse) -> list[dict[str, Any]]:
+    async def _iter_json_objects(
+        resp: aiohttp.ClientResponse,
+    ) -> AsyncIterator[dict[str, Any]]:
         decoder = json.JSONDecoder()
         buffer = ""
-        items: list[dict[str, Any]] = []
+        total_wire_bytes = 0
 
         async for raw in resp.content.iter_any():
             if not raw:
                 continue
+            total_wire_bytes += len(raw)
+            if total_wire_bytes > _TTS_MAX_WIRE_BYTES:
+                raise ValueError("tts response too large")
             buffer += raw.decode("utf-8", errors="ignore")
+            if len(buffer) > _TTS_MAX_JSON_FRAME_CHARS:
+                raise ValueError("tts json frame too large")
             while True:
                 stripped = buffer.lstrip()
                 if not stripped:
@@ -562,7 +572,7 @@ class DoubaoTTSService:
                 except json.JSONDecodeError:
                     break
                 if isinstance(parsed, dict):
-                    items.append(parsed)
+                    yield parsed
                 buffer = buffer[end_idx:]
 
         stripped = buffer.lstrip()
@@ -573,8 +583,7 @@ class DoubaoTTSService:
                 log.debug("tts stream tail ignored: %s", stripped[:160])
             else:
                 if isinstance(parsed, dict):
-                    items.append(parsed)
-        return items
+                    yield parsed
 
     async def synthesize(
         self,
@@ -636,7 +645,11 @@ class DoubaoTTSService:
                 ) as resp:
                     logid = str(resp.headers.get("X-Tt-Logid", "") or "")
                     if resp.status >= 400:
-                        body = (await resp.text()).strip()
+                        raw_error = await resp.content.read(_TTS_MAX_ERROR_BYTES + 1)
+                        body = raw_error[:_TTS_MAX_ERROR_BYTES].decode(
+                            resp.charset or "utf-8",
+                            errors="ignore",
+                        ).strip()
                         log.warning("doubao tts http error status=%s body=%s", resp.status, body[:200])
                         return TTSSynthesisResult(
                             ok=False,
@@ -648,16 +661,27 @@ class DoubaoTTSService:
                     audio_parts: list[bytes] = []
                     usage: dict[str, Any] = {}
                     finished = False
-                    for item in await self._iter_json_objects(resp):
+                    audio_bytes_total = 0
+                    async for item in self._iter_json_objects(resp):
                         code = int(item.get("code", 0) or 0)
                         message = str(item.get("message", "") or "").strip()
                         if code == 0:
                             data = item.get("data")
                             if isinstance(data, str) and data:
                                 try:
-                                    audio_parts.append(base64.b64decode(data))
+                                    audio_chunk = base64.b64decode(data)
                                 except Exception:
                                     log.warning("doubao tts audio chunk decode failed | logid=%s", logid)
+                                else:
+                                    audio_bytes_total += len(audio_chunk)
+                                    if audio_bytes_total > _TTS_MAX_AUDIO_BYTES:
+                                        return TTSSynthesisResult(
+                                            ok=False,
+                                            text=normalized,
+                                            error="audio_too_large",
+                                            logid=logid,
+                                        )
+                                    audio_parts.append(audio_chunk)
                             continue
                         if code == 20000000:
                             raw_usage = item.get("usage")
@@ -721,48 +745,43 @@ class DoubaoTTSService:
             return TTSSynthesisResult(ok=False, text=normalized, error=str(exc))
 
     @staticmethod
-    def _convert_mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes:
-        src_fd, src_path = tempfile.mkstemp(suffix=".mp3")
-        dst_fd, dst_path = tempfile.mkstemp(suffix=".ogg")
-        os.close(src_fd)
-        os.close(dst_fd)
+    async def _convert_mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96k",
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+            "-f",
+            "ogg",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            with open(src_path, "wb") as f:
-                f.write(mp3_bytes)
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                src_path,
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "96k",
-                "-vbr",
-                "on",
-                "-application",
-                "voip",
-                dst_path,
-            ]
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                err = proc.stderr.decode("utf-8", errors="ignore")
-                raise RuntimeError(f"ffmpeg_failed:{proc.returncode}:{err[:200]}")
-            with open(dst_path, "rb") as f:
-                return f.read()
-        finally:
-            for path in (src_path, dst_path):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
+            async with asyncio.timeout(_TTS_TRANSCODE_TIMEOUT_SECONDS):
+                output, stderr = await proc.communicate(input=mp3_bytes)
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="ignore")
+            raise RuntimeError(f"ffmpeg_failed:{proc.returncode}:{err[:200]}")
+        if len(output) > _TTS_MAX_AUDIO_BYTES:
+            raise RuntimeError("ffmpeg_output_too_large")
+        return output
 
     async def synthesize_voice_payload(
         self,
@@ -803,7 +822,7 @@ class DoubaoTTSService:
             return mp3_result
 
         try:
-            ogg_bytes = await asyncio.to_thread(self._convert_mp3_to_ogg_opus, mp3_result.audio_bytes)
+            ogg_bytes = await self._convert_mp3_to_ogg_opus(mp3_result.audio_bytes)
         except Exception as exc:
             log.exception("tts ffmpeg transcode failed")
             return TTSSynthesisResult(
@@ -901,7 +920,10 @@ class DoubaoTTSService:
                             parse_mode=parse_mode,
                             title="Doubao TTS",
                         )
-                schedule_message_auto_delete(sent, auto_delete_seconds)
+                await schedule_message_auto_delete_durable(
+                    sent,
+                    auto_delete_seconds,
+                )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -1060,7 +1082,10 @@ class DoubaoTTSService:
                             parse_mode=current_parse_mode,
                             title="Doubao TTS",
                         )
-                    schedule_message_auto_delete(sent, auto_delete_seconds)
+                    await schedule_message_auto_delete_durable(
+                        sent,
+                        auto_delete_seconds,
+                    )
                     break
                 except TelegramRetryAfter as exc:
                     wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2

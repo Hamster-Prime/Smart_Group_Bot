@@ -20,6 +20,11 @@ from bot.handlers import group
 from bot.services.authz import authorize_group
 from bot.services.join_screening import add_global_ban
 from bot.services.moderation import ModerationService
+from bot.services.update_completion import (
+    UpdateCompletionReceipt,
+    bind_update_completion,
+    reset_update_completion,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 
@@ -240,7 +245,35 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(pending)
 
-    async def test_failed_direct_ban_restores_previous_database_state(self) -> None:
+    async def test_direct_ban_response_loss_confirms_remote_ban(self) -> None:
+        violation_id = await self._seed_violation("warn", pending_verification=True)
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=RuntimeError("response lost")),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="kicked")),
+            unban_chat_member=AsyncMock(),
+        )
+        callback = self._callback("ban", violation_id, bot=bot)
+
+        await self._invoke(callback)
+
+        bot.get_chat_member.assert_awaited_once_with(-100, 42)
+        async with self.session_factory() as session:
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 42,
+                )
+            )
+            pending = await session.scalar(
+                select(JoinVerification).where(
+                    JoinVerification.group_id == -100,
+                    JoinVerification.user_id == 42,
+                )
+            )
+            self.assertTrue(warning.is_banned)
+            self.assertIsNone(pending)
+
+    async def test_unconfirmed_direct_ban_keeps_durable_local_policy(self) -> None:
         violation_id = await self._seed_violation("ban_warning", warning=(2, False))
         bot = SimpleNamespace(
             ban_chat_member=AsyncMock(return_value=False),
@@ -252,15 +285,60 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
-            self.assertEqual(violation.action_taken, "ban_warning")
+            self.assertEqual(violation.action_taken, "ban_warning_direct")
             warning = await session.scalar(
                 select(UserWarning).where(
                     UserWarning.group_id == -100,
                     UserWarning.user_id == 42,
                 )
             )
-            self.assertEqual((warning.count, warning.is_banned), (2, False))
-        self.assertIn("数据库状态已恢复", callback.answer.await_args.args[0])
+            self.assertEqual((warning.count, warning.is_banned), (2, True))
+            self.assertFalse(violation.ban_enforced)
+        self.assertIn("保留本群封禁状态", callback.answer.await_args.args[0])
+
+    async def test_unconfirmed_direct_ban_retries_then_becomes_idempotent(self) -> None:
+        violation_id = await self._seed_violation("ban_warning", warning=(2, False))
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=[False, True]),
+            unban_chat_member=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        first = self._callback("ban", violation_id, bot=bot)
+        failed_receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(failed_receipt)
+        try:
+            await self._invoke(first)
+        finally:
+            reset_update_completion(token)
+        self.assertTrue(failed_receipt.deferred)
+        self.assertFalse(await failed_receipt.wait())
+
+        second = self._callback("ban", violation_id, bot=bot)
+        successful_receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(successful_receipt)
+        try:
+            await self._invoke(second)
+        finally:
+            reset_update_completion(token)
+        self.assertFalse(successful_receipt.deferred)
+
+        third = self._callback("ban", violation_id, bot=bot)
+        await self._invoke(third)
+
+        self.assertEqual(bot.ban_chat_member.await_count, 2)
+        self.assertIn("执行过", third.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            violation = await session.get(Violation, violation_id)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 42,
+                )
+            )
+        self.assertEqual(violation.action_taken, "ban_warning_direct")
+        self.assertTrue(violation.ban_enforced)
+        self.assertTrue(warning.is_banned)
 
     async def test_failed_direct_ban_does_not_overwrite_concurrent_warning_update(self) -> None:
         violation_id = await self._seed_violation("ban_warning", warning=(2, False))
@@ -295,7 +373,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(violation.action_taken, "ban_warning_direct")
             self.assertEqual((warning.count, warning.is_banned), (3, True))
-        self.assertIn("并发变化", callback.answer.await_args.args[0])
+        self.assertIn("保留本群封禁状态", callback.answer.await_args.args[0])
 
     async def test_atomic_warning_increment_handles_insert_race_and_threshold(self) -> None:
         service = ModerationService(
@@ -552,7 +630,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(warning)
 
-    async def test_undo_commit_failure_rebans_after_permissions_were_restored(self) -> None:
+    async def test_undo_policy_check_failure_keeps_durable_unban_journal(self) -> None:
         violation_id = await self._seed_violation(
             "ban_applied",
             warning=(3, True),
@@ -566,7 +644,11 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             async def fail_final_commit() -> None:
                 nonlocal commit_calls
                 commit_calls += 1
-                if commit_calls == 1:
+                # 1) release the callback lookup snapshot; 2) durably commit
+                # the warning rollback + unban journal. Fail the subsequent
+                # fresh policy-check commit so the recovery semantics, rather
+                # than the preparatory transaction, are exercised.
+                if commit_calls < 3:
                     await original_commit()
                     return
                 raise RuntimeError("commit failed")
@@ -592,8 +674,24 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
                     settings=self.settings,
                 )
 
-        callback.bot.ban_chat_member.assert_awaited_once_with(-100, 42)
-        self.assertIn("已重新封禁", callback.answer.await_args.args[0])
+        callback.bot.unban_chat_member.assert_not_awaited()
+        callback.bot.ban_chat_member.assert_not_awaited()
+        self.assertIn("后台继续重试", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 42,
+                )
+            )
+            recovery = await session.scalar(
+                select(JoinVerification).where(
+                    JoinVerification.group_id == -100,
+                    JoinVerification.user_id == 42,
+                )
+            )
+            self.assertEqual((warning.count, warning.is_banned), (2, False))
+            self.assertEqual(recovery.status, "unbanning")
 
     async def test_standalone_warning_undo_only_marks_event_reverted(self) -> None:
         violation_id = await self._seed_violation("warn")

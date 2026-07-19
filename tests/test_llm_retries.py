@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from bot.config import ChatEndpointConfig, EmbedConfig, ModelConfig
+from bot.services import llm as llm_module
 from bot.services.llm import LLMService
 
 
@@ -176,6 +177,137 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_completion.await_args_list[0].kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_completion.await_args_list[1].kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_completion.await_args_list[2].kwargs["model"], "openai/gpt-4.1-mini")
+
+    async def test_retry_multiplier_is_forwarded_to_sdk_timeout(self) -> None:
+        llm = self._make_llm()
+        llm.main.retry_timeout_multiplier = 2.0
+        mock_completion = AsyncMock(
+            side_effect=[asyncio.TimeoutError(), _chat_resp(content="ok")]
+        )
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(mock_completion.await_args_list[0].kwargs["timeout"], 1.0)
+        self.assertEqual(mock_completion.await_args_list[1].kwargs["timeout"], 2.0)
+
+    async def test_stream_timeout_is_hard_and_closes_stream(self) -> None:
+        llm = self._make_llm()
+        llm.main.retry_attempts = 1
+        llm.main.fallbacks = []
+        llm.main.stream = True
+        closed = asyncio.Event()
+
+        class HangingStream:
+            def __aiter__(self) -> "HangingStream":
+                return self
+
+            async def __anext__(self) -> Any:
+                await asyncio.sleep(60)
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                closed.set()
+
+        mock_completion = AsyncMock(return_value=HangingStream())
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch.object(llm, "_attempt_timeout_seconds", return_value=0.02),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "")
+        self.assertLess(loop.time() - started, 0.2)
+        await asyncio.wait_for(closed.wait(), timeout=0.2)
+
+    async def test_cancel_resistant_request_keeps_real_concurrency_slot(self) -> None:
+        llm = self._make_llm()
+        llm.main.retry_attempts = 1
+        llm.main.fallbacks = []
+        release = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def resistant_request(**_kwargs: Any) -> Any:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+                return _chat_resp(content="late")
+
+        mock_completion = AsyncMock(side_effect=resistant_request)
+        semaphore = asyncio.Semaphore(1)
+        try:
+            with (
+                patch("bot.services.llm._LLM_REQUEST_SEMAPHORE", semaphore),
+                patch("bot.services.llm.litellm.acompletion", mock_completion),
+                patch.object(llm, "_attempt_timeout_seconds", return_value=0.02),
+                patch("bot.services.llm.litellm.token_counter", return_value=128),
+                patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+            ):
+                self.assertEqual(await llm.generate("sys", "first"), "")
+                await asyncio.wait_for(cancelled.wait(), timeout=0.2)
+                self.assertTrue(llm_module._LLM_ORPHAN_TASKS)
+                self.assertEqual(await llm.generate("sys", "second"), "")
+
+            # The second attempt timed out waiting for the occupied permit and
+            # never created another upstream request.
+            self.assertEqual(mock_completion.await_count, 1)
+        finally:
+            release.set()
+            for _ in range(20):
+                if not semaphore.locked() and not llm_module._LLM_ORPHAN_TASKS:
+                    break
+                await asyncio.sleep(0)
+            self.assertFalse(llm_module._LLM_ORPHAN_TASKS)
+
+    async def test_shutdown_flush_joins_llm_orphan(self) -> None:
+        release = asyncio.Event()
+
+        async def cancellation_resistant() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        llm_module._track_llm_orphan(task)
+        flush = asyncio.create_task(
+            llm_module.flush_llm_request_tasks(timeout_seconds=1.0)
+        )
+        await asyncio.sleep(0.01)
+        self.assertFalse(flush.done())
+        release.set()
+        await asyncio.wait_for(flush, timeout=0.5)
+        self.assertFalse(llm_module._LLM_ORPHAN_TASKS)
+
+    async def test_repeated_endpoint_failures_open_circuit(self) -> None:
+        llm = self._make_llm()
+        llm.main.retry_attempts = 1
+        llm.main.fallbacks = []
+        mock_completion = AsyncMock(side_effect=RuntimeError("gateway down"))
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            self.assertEqual(await llm.generate("sys", "one"), "")
+            self.assertEqual(await llm.generate("sys", "two"), "")
+            self.assertEqual(await llm.generate("sys", "three"), "")
+            self.assertEqual(await llm.generate("sys", "four"), "")
+
+        self.assertEqual(mock_completion.await_count, 3)
 
     async def test_missing_native_provider_key_skips_retries_and_uses_fallback(self) -> None:
         main = ModelConfig(
@@ -454,11 +586,11 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         llm.main.provider = "openai"
         llm.main.chat_endpoint = "responses"
         llm.main.endpoint_path = "/responses"
-        mock_responses = Mock(return_value=_responses_resp(content="ok"))
+        mock_responses = AsyncMock(return_value=_responses_resp(content="ok"))
         mock_completion = AsyncMock()
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.acompletion", mock_completion),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
@@ -466,7 +598,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
             result = await llm.generate("sys", "hi")
 
         self.assertEqual(result, "ok")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertEqual(mock_responses.call_args.kwargs["model"], "gpt-4.1")
         self.assertEqual(mock_responses.call_args.kwargs["input"][0]["role"], "system")
         self.assertEqual(mock_completion.await_count, 0)
@@ -500,7 +632,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         llm.main.provider = "openai_compatible"
         llm.main.chat_endpoint = "responses"
         llm.main.api_base = "https://gateway.example/v1"
-        mock_responses = Mock(
+        mock_responses = AsyncMock(
             return_value=_responses_resp(
                 tool_calls=[
                     {
@@ -515,7 +647,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
@@ -534,7 +666,7 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(resp)
         self.assertEqual(resp.choices[0].message.tool_calls[0]["function"]["name"], "websearch")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertEqual(mock_responses.call_args.kwargs["model"], "gpt-4.1")
         self.assertEqual(mock_responses.call_args.kwargs["api_base"], "https://gateway.example/v1")
         self.assertEqual(len(mock_responses.call_args.kwargs["tools"]), 1)
@@ -548,8 +680,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
             content="hello world",
             usage={"input_tokens": 42, "output_tokens": 2, "total_tokens": 44},
         )
-        mock_responses = Mock(
-            return_value=_SyncStream(
+        mock_responses = AsyncMock(
+            return_value=_AsyncStream(
                 [
                     SimpleNamespace(
                         type="response.output_text.delta",
@@ -568,14 +700,14 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
             result = await llm.generate("sys", "hi")
 
         self.assertEqual(result, "hello world")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertTrue(mock_responses.call_args.kwargs["stream"])
 
     async def test_vision_responses_requests_honor_streaming_gateways(self) -> None:
@@ -584,8 +716,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         llm.vision_config.chat_endpoint = "responses"
         llm.vision_config.stream = True
         completed = _responses_resp(content="a cute cat sticker")
-        mock_responses = Mock(
-            return_value=_SyncStream(
+        mock_responses = AsyncMock(
+            return_value=_AsyncStream(
                 [
                     SimpleNamespace(type="response.output_text.delta", delta="a cute "),
                     SimpleNamespace(type="response.output_text.delta", delta="cat sticker"),
@@ -595,14 +727,14 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
             result = await llm.vision_describe("https://example.com/cat.jpg", "describe")
 
         self.assertEqual(result, "a cute cat sticker")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertTrue(bool(mock_responses.call_args.kwargs.get("stream")))
 
     async def test_generate_supports_streaming_responses_refusal_events(self) -> None:
@@ -614,8 +746,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
             refusal="抱歉，我不能帮助处理这个请求。",
             usage={"input_tokens": 42, "output_tokens": 9, "total_tokens": 51},
         )
-        mock_responses = Mock(
-            return_value=_SyncStream(
+        mock_responses = AsyncMock(
+            return_value=_AsyncStream(
                 [
                     SimpleNamespace(
                         type="response.refusal.delta",
@@ -638,14 +770,14 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
             result = await llm.generate("sys", "hi")
 
         self.assertEqual(result, "抱歉，我不能帮助处理这个请求。")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertTrue(mock_responses.call_args.kwargs["stream"])
 
     async def test_generate_supports_streaming_responses_done_events_without_completed_event(self) -> None:
@@ -653,8 +785,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         llm.main.provider = "openai"
         llm.main.chat_endpoint = "responses"
         llm.main.stream = True
-        mock_responses = Mock(
-            return_value=_SyncStream(
+        mock_responses = AsyncMock(
+            return_value=_AsyncStream(
                 [
                     SimpleNamespace(
                         type="response.output_text.done",
@@ -676,14 +808,14 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
             result = await llm.generate("sys", "hi")
 
         self.assertEqual(result, "hello world")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertTrue(mock_responses.call_args.kwargs["stream"])
 
     async def test_generate_supports_streaming_responses_enum_event_types_with_empty_completed_output(self) -> None:
@@ -695,8 +827,8 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
             output=[],
             usage={"input_tokens": 42, "output_tokens": 2, "total_tokens": 44},
         )
-        mock_responses = Mock(
-            return_value=_SyncStream(
+        mock_responses = AsyncMock(
+            return_value=_AsyncStream(
                 [
                     SimpleNamespace(
                         type=_EventType.OUTPUT_TEXT_DELTA,
@@ -713,14 +845,14 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("bot.services.llm.litellm.responses", mock_responses, create=True),
+            patch("bot.services.llm.litellm.aresponses", mock_responses, create=True),
             patch("bot.services.llm.litellm.token_counter", return_value=128),
             patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
         ):
             result = await llm.generate("sys", "hi")
 
         self.assertEqual(result, "hello world")
-        mock_responses.assert_called_once()
+        mock_responses.assert_awaited_once()
         self.assertTrue(mock_responses.call_args.kwargs["stream"])
 
     async def test_decision_requests_honor_streaming_gateways(self) -> None:

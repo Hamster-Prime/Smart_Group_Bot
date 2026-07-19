@@ -18,6 +18,8 @@ _BILI_HEADERS = {
     "Origin": "https://www.bilibili.com",
     "Accept": "application/json, text/plain, */*",
 }
+_BILI_API_HOSTS = ("api.bilibili.com",)
+_BILI_SUBTITLE_HOSTS = ("bilibili.com", "hdslb.com")
 
 
 class BilibiliSearchSkill:
@@ -98,6 +100,7 @@ class BilibiliSearchSkill:
             params=params,
             headers=_BILI_HEADERS,
             timeout_sec=18.0,
+            allowed_hosts=_BILI_API_HOSTS,
         )
         if status >= 400:
             raise ValueError(f"http_{status}")
@@ -329,7 +332,14 @@ class BilibiliSearchSkill:
         if subtitle_url.startswith("//"):
             subtitle_url = f"https:{subtitle_url}"
         try:
-            status, payload, _ = await fetch_json(subtitle_url, headers=_BILI_HEADERS, timeout_sec=18.0)
+            status, payload, _ = await fetch_json(
+                subtitle_url,
+                headers=_BILI_HEADERS,
+                timeout_sec=18.0,
+                allowed_hosts=_BILI_SUBTITLE_HOSTS,
+                max_response_bytes=512 * 1024,
+                max_decoded_bytes=1024 * 1024,
+            )
         except Exception as exc:
             log.warning("bilibili subtitle fetch failed: bvid=%s error=%s", bvid, exc)
             return ""

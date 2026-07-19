@@ -22,6 +22,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Group, SpeechStyleSample
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.utils.prompts import get_prompt
 from bot.utils.security import clean_multiline_text, clean_text
 
@@ -126,7 +127,23 @@ class SpeechStyleService:
         target_id = int(state.get("target_user_id") or 0)
         if not target_id or int(user_id) != target_id:
             return False
+
+        # Serialize the authoritative read/modify/write snapshot.  Two target
+        # messages arriving together used to read the same sample_count and one
+        # whole-JSON assignment erased the other's increment.
+        await session.commit()
+        await acquire_group_settings_write_intent(session, group_id)
+        group = await session.get(Group, group_id, populate_existing=True)
+        if group is None:
+            await session.commit()
+            return False
+        state = get_style_state(group.settings)
+        target_id = int(state.get("target_user_id") or 0)
+        if not target_id or int(user_id) != target_id:
+            await session.commit()
+            return False
         if int(state.get("sample_count") or 0) >= self.total_cap:
+            await session.commit()
             return False
 
         session.add(
@@ -167,7 +184,13 @@ class SpeechStyleService:
         if lock.locked():
             return
         async with lock:
-            state = get_style_state(group.settings)
+            # Reload under the distill lock; the caller committed before
+            # entering and the ORM object may already be stale.
+            fresh_group = await session.get(Group, group_id, populate_existing=True)
+            if fresh_group is None:
+                return
+            state = get_style_state(fresh_group.settings)
+            target_id = int(state.get("target_user_id") or 0)
             rows = (
                 await session.execute(
                     select(SpeechStyleSample.content)
@@ -177,6 +200,10 @@ class SpeechStyleService:
                 )
             ).scalars().all()
             corpus_lines = [line for line in reversed(list(rows)) if line]
+            # A SELECT checks out a pooled connection. Release it before the
+            # potentially slow LLM call; the write phase below uses a fresh
+            # snapshot and merges only the style namespace.
+            await session.commit()
             if not corpus_lines:
                 return
 
@@ -194,22 +221,43 @@ class SpeechStyleService:
                 profile = ""
 
             profile = clean_multiline_text(profile or "", max_len=1200).strip()
+            await acquire_group_settings_write_intent(session, group_id)
+            fresh_group = await session.get(Group, group_id, populate_existing=True)
+            if fresh_group is None:
+                await session.commit()
+                return
+            latest_state = get_style_state(fresh_group.settings)
+            if int(latest_state.get("target_user_id") or 0) != target_id:
+                # The administrator changed/disabled the mimic target while the
+                # model was running. Never publish a profile for the old target.
+                await session.commit()
+                log.info(
+                    "speech style distill discarded after target change | group=%s",
+                    group_id,
+                )
+                return
+            latest_count = max(
+                sample_count,
+                int(latest_state.get("sample_count") or 0),
+            )
             if not profile:
                 # Keep the previous profile; retry at the next threshold.
-                group.settings = _merge_style_state(
-                    group.settings,
-                    sample_count=sample_count,
+                fresh_group.settings = _merge_style_state(
+                    fresh_group.settings,
+                    sample_count=latest_count,
                     distilled_at_count=sample_count,
                 )
+                await session.commit()
                 log.warning("speech style distill empty | group=%s", group_id)
                 return
 
-            group.settings = _merge_style_state(
-                group.settings,
+            fresh_group.settings = _merge_style_state(
+                fresh_group.settings,
                 profile_text=profile,
-                sample_count=sample_count,
+                sample_count=latest_count,
                 distilled_at_count=sample_count,
             )
+            await session.commit()
             log.info(
                 "speech style distilled | group=%s samples=%d profile_len=%d",
                 group_id,
