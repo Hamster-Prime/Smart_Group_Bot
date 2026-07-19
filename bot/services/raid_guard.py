@@ -60,6 +60,7 @@ from bot.services.join_verification import (
     VERIFICATION_STATUS_PENDING,
     PreparedVerification,
     activate_prepared_join_verification,
+    ban_member,
     claim_join_verification,
     complete_leased_join_verification,
     delete_verification_prompt,
@@ -704,8 +705,9 @@ async def remove_raid_challenged_users(
             continue
         await session.commit()
         snapshot["lease_until"] = renewed_lease
-        # A global ban already keeps this account out. Direct removal uses
-        # unban_chat_member and would accidentally lift Telegram enforcement.
+        # A global-ban registry row is policy, not proof that the per-group
+        # Telegram ban succeeded. It also decides whether this action is a
+        # permanent ban or a rejoinable removal.
         async def preserve_ban() -> bool:
             blocked = await verification_release_blocked_by_ban(
                 session,
@@ -723,12 +725,16 @@ async def remove_raid_challenged_users(
         if not authorized:
             failed.append(user_id)
             continue
-        if globally_banned or await kick_member(
-            bot,
-            group_id,
-            user_id,
-            preserve_ban=preserve_ban,
-        ):
+        if globally_banned:
+            enforced = await ban_member(bot, group_id, user_id)
+        else:
+            enforced = await kick_member(
+                bot,
+                group_id,
+                user_id,
+                preserve_ban=preserve_ban,
+            )
+        if enforced:
             removed.append(user_id)
             completed = await complete_leased_join_verification(
                 session,

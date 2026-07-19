@@ -13,8 +13,9 @@ Join flow (per-group policy):
   the verified user identity cannot be forged; no secret link tokens needed.
 - Passing lifts the restriction (all-True permissions returns the user to a
   plain member governed by the chat's default permissions).
-- Missing the deadline directly removes the user without banning or deleting
-  their historical messages, so they may rejoin and retry later.
+- Missing the deadline removes the user with a temporary
+  ``banChatMember(revoke_messages=True)`` followed by ``unbanChatMember``, so
+  they may rejoin and retry later while the Bot API revokes their old view.
 
 Moderation-challenge flow (kind="moderation"):
 - A message judged violating with LOW confidence is deleted, the sender is
@@ -2139,6 +2140,21 @@ async def _ensure_kick_unbanned(
                 timeout_seconds=4.0,
             )
             if unbanned is not False:
+                if preserve_ban is not None:
+                    try:
+                        if await preserve_ban():
+                            # A durable ban created while the temporary kick
+                            # was being released wins the race.
+                            return await ban_member(bot, chat_id, user_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception(
+                            "kick unban post-check failed | chat=%s user=%s",
+                            chat_id,
+                            user_id,
+                        )
+                        return False
                 return True
         except asyncio.CancelledError:
             raise
@@ -2169,81 +2185,6 @@ async def _wait_for_kick_cleanup(task: asyncio.Task[bool]) -> bool:
     return False
 
 
-async def _remove_member_without_ban(
-    bot: Bot,
-    chat_id: int,
-    user_id: int,
-    preserve_ban: Callable[[], Awaitable[bool]] | None = None,
-) -> bool:
-    """Remove a member without using Telegram's history-revoking ban path."""
-
-    for attempt in range(1, 4):
-        if preserve_ban is not None:
-            try:
-                if await preserve_ban():
-                    log.info(
-                        "member removal replaced by current ban policy | "
-                        "chat=%s user=%s",
-                        chat_id,
-                        user_id,
-                    )
-                    return await ban_member(bot, chat_id, user_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception(
-                    "member removal ban-policy check failed | chat=%s user=%s",
-                    chat_id,
-                    user_id,
-                )
-                return False
-        try:
-            removed = await _bounded_telegram_call(
-                # Telegram documents only_if_banned=False as guaranteeing the
-                # user is no longer a member while still allowing them to
-                # rejoin. Unlike ban_chat_member, this does not revoke all of
-                # the member's historical messages in a supergroup.
-                bot.unban_chat_member(
-                    chat_id,
-                    user_id,
-                    only_if_banned=False,
-                ),
-                timeout_seconds=10.0,
-            )
-            if removed is False:
-                raise RuntimeError("Telegram returned false")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning(
-                "member removal failed | chat=%s user=%s attempt=%s/3 error=%s",
-                chat_id,
-                user_id,
-                attempt,
-                exc,
-            )
-        else:
-            if preserve_ban is not None:
-                try:
-                    if await preserve_ban():
-                        # A durable ban created while the removal request was
-                        # in flight wins and must be reflected back to Telegram.
-                        return await ban_member(bot, chat_id, user_id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception(
-                        "member removal post-check failed | chat=%s user=%s",
-                        chat_id,
-                        user_id,
-                    )
-                    return False
-            return True
-        if attempt < 3:
-            await asyncio.sleep(0.25 * attempt)
-    return False
-
-
 async def kick_member(
     bot: Bot,
     chat_id: int,
@@ -2251,18 +2192,56 @@ async def kick_member(
     *,
     preserve_ban: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
-    """Remove a member while preserving their historical group messages."""
+    """Remove a member through Bot API ban+unban, leaving them rejoinable.
 
-    removal = asyncio.create_task(
-        _remove_member_without_ban(bot, chat_id, user_id, preserve_ban),
-        name=f"kick-remove:{chat_id}:{user_id}",
-    )
-    _KICK_CLEANUP_TASKS.add(removal)
-    removal.add_done_callback(_KICK_CLEANUP_TASKS.discard)
+    ``revoke_messages=True`` is intentionally explicit on the temporary ban.
+    Telegram documents this as revoking the removed account's access to prior
+    chat history; it does not delete messages authored by that account.
+    """
+
     try:
-        return await asyncio.shield(removal)
+        banned = await _bounded_telegram_call(
+            bot.ban_chat_member(
+                chat_id,
+                user_id,
+                revoke_messages=True,
+            ),
+            timeout_seconds=10.0,
+        )
     except asyncio.CancelledError:
-        await _wait_for_kick_cleanup(removal)
+        # The response can be lost after Telegram applies the temporary ban.
+        cleanup = asyncio.create_task(
+            _ensure_kick_unbanned(bot, chat_id, user_id, preserve_ban),
+            name=f"kick-unban:{chat_id}:{user_id}",
+        )
+        _KICK_CLEANUP_TASKS.add(cleanup)
+        cleanup.add_done_callback(_KICK_CLEANUP_TASKS.discard)
+        await _wait_for_kick_cleanup(cleanup)
+        raise
+    except Exception:
+        log.exception("member kick ban failed | chat=%s user=%s", chat_id, user_id)
+        cleanup = asyncio.create_task(
+            _ensure_kick_unbanned(bot, chat_id, user_id, preserve_ban),
+            name=f"kick-unban:{chat_id}:{user_id}",
+        )
+        _KICK_CLEANUP_TASKS.add(cleanup)
+        cleanup.add_done_callback(_KICK_CLEANUP_TASKS.discard)
+        await _wait_for_kick_cleanup(cleanup)
+        return False
+
+    if banned is False:
+        return False
+
+    cleanup = asyncio.create_task(
+        _ensure_kick_unbanned(bot, chat_id, user_id, preserve_ban),
+        name=f"kick-unban:{chat_id}:{user_id}",
+    )
+    _KICK_CLEANUP_TASKS.add(cleanup)
+    cleanup.add_done_callback(_KICK_CLEANUP_TASKS.discard)
+    try:
+        return await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        await _wait_for_kick_cleanup(cleanup)
         raise
 
 
@@ -2312,7 +2291,7 @@ async def unban_member(
 
 
 async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Permanently ban a member and revoke all of their historical messages."""
+    """Permanently ban a member and revoke their view of prior chat history."""
     try:
         banned = await _bounded_telegram_call(
             bot.ban_chat_member(chat_id, user_id, revoke_messages=True),
@@ -3003,8 +2982,23 @@ class JoinVerificationSweeper:
                 (record.display_name or "").strip() or str(record.user_id)
             )
             if globally_banned:
-                # Direct removal uses unban_chat_member and would lift the
-                # independent global ban. Consume only this obsolete challenge.
+                # The registry is policy, not proof that Telegram enforcement
+                # succeeded in this group. Re-apply the idempotent ban so the
+                # remote state and mandatory revoke_messages flag are confirmed.
+                enforced = await ban_member(
+                    self.bot,
+                    record.group_id,
+                    record.user_id,
+                )
+                if not enforced:
+                    await self._release_enforcement(record)
+                    log.warning(
+                        "global-ban verification enforcement failed; requeued | "
+                        "group=%s user=%s",
+                        record.group_id,
+                        record.user_id,
+                    )
+                    continue
                 await self._complete_enforcement(record)
                 continue
             if protected_owner:

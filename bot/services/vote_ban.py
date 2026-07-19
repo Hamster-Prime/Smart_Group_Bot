@@ -30,6 +30,7 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
+from bot.services.join_verification import ban_member
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -943,18 +944,10 @@ async def apply_vote_ban(
             member_status,
         )
         return False
-    try:
-        banned = await bot.ban_chat_member(
-            int(group_id),
-            int(target_user_id),
-            revoke_messages=True,
-        )
-        if banned is False:
-            raise RuntimeError("Telegram returned false")
-    except Exception:
-        log.exception("vote ban failed | group=%s user=%s", group_id, target_user_id)
-        return False
-    return True
+    # Reuse the central enforcement path so an ambiguous Telegram response is
+    # confirmed from remote membership state and revoke_messages=True remains
+    # mandatory for every confirmed ban.
+    return await ban_member(bot, int(group_id), int(target_user_id))
 
 
 async def record_vote_ban_outcome(
