@@ -27,7 +27,7 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/addrule", "/addrule <自然语言>", "新增群规", "用户想显式通过命令新增群规", "核心入口"),
     CommandEntry("/rules", "/rules", "查看群规列表，支持翻页和删除", "用户想查看或删除群规", "核心入口"),
     CommandEntry("/av", "/av <番号/演员/关键词>", "搜索 AV 资源", "用户想搜片或查询 AV 详情", "核心入口"),
-    CommandEntry("/voteban", "回复目标用户消息后发送 /voteban [举报理由]", "发起民主投票封禁，票数达标即封禁被回复用户；与 AI 技能共用用户额度", "用户想集体投票封禁骚扰者", "核心入口"),
+    CommandEntry("/voteban", "回复目标用户消息后发送 /voteban [举报理由]", "发起民主投票封禁，票数达标即封禁被回复用户；管理员可在投票消息上取消投票或直接封禁；与 AI 技能共用用户额度", "用户想集体投票封禁骚扰者", "核心入口"),
     CommandEntry("/warnings", "/warnings", "查看当前群警告/封禁名单", "管理员想查看审核处罚情况", "群审核管理"),
     CommandEntry("/clearwarnings", "回复用户后 /clearwarnings，或 /clearwarnings <用户ID>", "清空某用户的累计违规次数", "管理员要重置某用户的违规次数", "群审核管理"),
     CommandEntry("/ban", "回复用户后 /ban [原因]，或 /ban <用户ID> [原因]", "在当前群手动封禁；最高管理员可选择全局", "管理员要封禁某个用户", "群审核管理"),

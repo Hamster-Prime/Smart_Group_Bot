@@ -15,7 +15,7 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,12 +39,18 @@ from bot.utils.timezone import now_shanghai_naive
 log = logging.getLogger(__name__)
 
 VOTE_BAN_CALLBACK_PREFIX = "vban"
+VOTE_BAN_ADMIN_RESOLUTION_BAN = "admin_ban"
+VOTE_BAN_ADMIN_RESOLUTION_CANCEL = "admin_cancel"
 VOTE_BAN_ENABLED_KEY = "vote_ban_enabled"
 VOTE_BAN_THRESHOLD_KEY = "vote_ban_threshold"
 VOTE_BAN_DURATION_KEY = "vote_ban_duration_seconds"
 VOTE_BAN_TRIGGER_LIMIT_KEY = "vote_ban_trigger_limit"
 VOTE_BAN_TRIGGER_WINDOW_KEY = "vote_ban_trigger_window_seconds"
-VOTE_BAN_ENFORCEMENT_LEASE_SECONDS = 60
+# One enforcement attempt performs two sequential Bot API calls. Aiogram's
+# default request timeout is 60 seconds, so the lease must exceed their
+# combined worst-case duration; otherwise a recovery worker can take over and
+# publish a competing failure while the original ban is still completing.
+VOTE_BAN_ENFORCEMENT_LEASE_SECONDS = 180
 
 _expiry_tasks: dict[int, asyncio.Task] = {}
 _enforcement_tasks: dict[int, asyncio.Task] = {}
@@ -246,6 +252,7 @@ def build_vote_text(record: VoteBanSession, *, approvals: int) -> str:
         f"达到 {record.threshold} 票后立即封禁；"
         f"投票 {_format_duration(_remaining_seconds(record))} 后自动失效。"
     )
+    lines.append("管理员可使用下方按钮取消投票或直接封禁。")
     return "\n".join(lines)
 
 
@@ -257,7 +264,17 @@ def build_vote_keyboard(session_id: int, approvals: int, threshold: int) -> Inli
                     text=f"🗳 投票封禁（{approvals}/{threshold}）",
                     callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:vote:{int(session_id)}",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ 取消投票",
+                    callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:cancel:{int(session_id)}",
+                ),
+                InlineKeyboardButton(
+                    text="🔨 直接封禁",
+                    callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:ban:{int(session_id)}",
+                ),
+            ],
         ]
     )
 
@@ -340,14 +357,42 @@ async def record_vote(
     session_id: int,
     voter_id: int,
 ) -> bool:
-    """Register one approval; False when the voter already voted."""
+    """Register one approval while the poll is still active.
+
+    The conditional ``INSERT .. SELECT .. FOR UPDATE`` makes the session row
+    and ballot insertion one database ordering point.  That matters in
+    multi-process deployments where an administrator can cancel the poll
+    between the handler's last read and this write.  SQLite ignores
+    ``FOR UPDATE`` but serializes the conditional write statement itself.
+
+    Returns ``False`` when the voter already voted or the poll is no longer
+    active; callers that need distinct user-facing text can refresh the poll.
+    """
+    current = now_shanghai_naive()
+    source = (
+        select(
+            literal(int(session_id)).label("session_id"),
+            literal(int(voter_id)).label("user_id"),
+        )
+        .select_from(VoteBanSession)
+        .where(
+            VoteBanSession.id == int(session_id),
+            VoteBanSession.status == "active",
+            VoteBanSession.deadline_at > current,
+        )
+        .with_for_update()
+    )
     try:
         async with session.begin_nested():
-            session.add(VoteBanVote(session_id=int(session_id), user_id=int(voter_id)))
-            await session.flush()
+            result = await session.execute(
+                insert(VoteBanVote).from_select(
+                    ("session_id", "user_id"),
+                    source,
+                )
+            )
     except IntegrityError:
         return False
-    return True
+    return int(result.rowcount or 0) == 1
 
 
 async def claim_session_status(
@@ -356,8 +401,19 @@ async def claim_session_status(
     *,
     expected: str,
     new_status: str,
+    resolution: str = "",
+    resolver_user_id: int = 0,
+    resolver_display: str = "",
 ) -> bool:
     values: dict[str, Any] = {"status": new_status}
+    if resolution:
+        values.update(
+            {
+                "resolution": str(resolution)[:16],
+                "resolver_user_id": int(resolver_user_id or 0),
+                "resolver_display": str(resolver_display or "")[:255],
+            }
+        )
     if new_status == "enforcing":
         values["enforcing_started_at"] = now_shanghai_naive()
     elif expected == "enforcing":
@@ -952,7 +1008,21 @@ async def record_vote_ban_outcome(
             )
         else:
             warning.is_banned = True
-    source = "democratic_vote_skill" if record.source == "skill" else "democratic_vote_command"
+    resolution = str(getattr(record, "resolution", "") or "")
+    if resolution == VOTE_BAN_ADMIN_RESOLUTION_BAN:
+        source = "democratic_vote_admin_ban"
+        actor_user_id = int(getattr(record, "resolver_user_id", 0) or 0)
+        actor_display = str(getattr(record, "resolver_display", "") or "")
+        reason = record.reason or "管理员在民主投票中直接封禁"
+    else:
+        source = (
+            "democratic_vote_skill"
+            if record.source == "skill"
+            else "democratic_vote_command"
+        )
+        actor_user_id = int(record.starter_user_id)
+        actor_display = record.starter_display
+        reason = record.reason or "民主投票达到封禁阈值"
     await record_ban_event(
         session,
         group_id=int(record.group_id),
@@ -962,16 +1032,17 @@ async def record_vote_ban_outcome(
         action="ban",
         source=source,
         outcome="succeeded" if banned else "failed",
-        reason=record.reason or "民主投票达到封禁阈值",
+        reason=reason,
         evidence=record.evidence,
-        actor_user_id=int(record.starter_user_id),
-        actor_display=record.starter_display,
+        actor_user_id=actor_user_id,
+        actor_display=actor_display,
         reference_type="vote_session",
         reference_id=int(record.id),
         details={
             "approvals": int(approvals),
             "threshold": int(record.threshold),
             "trigger_source": str(record.source or "command"),
+            "resolution": resolution,
             "deadline_at": record.deadline_at.isoformat(),
         },
     )
@@ -981,6 +1052,30 @@ async def record_vote_ban_outcome(
     # leave its read transaction checked out across Telegram message editing.
     await session.commit()
     return True
+
+
+def admin_cancel_outcome_line(record: VoteBanSession) -> str:
+    """User-visible result line for a poll cancelled by a group admin."""
+    resolver = _mention(
+        int(getattr(record, "resolver_user_id", 0) or 0),
+        str(getattr(record, "resolver_display", "") or "管理员"),
+    )
+    return f"管理员 {resolver} 已取消本次投票"
+
+
+def enforcement_outcome_line(record: VoteBanSession, *, banned: bool) -> str:
+    """User-visible result line for a finished enforcement attempt."""
+    if str(getattr(record, "resolution", "") or "") == VOTE_BAN_ADMIN_RESOLUTION_BAN:
+        resolver = _mention(
+            int(getattr(record, "resolver_user_id", 0) or 0),
+            str(getattr(record, "resolver_display", "") or "管理员"),
+        )
+        if banned:
+            return f"管理员 {resolver} 直接封禁了该用户"
+        return f"管理员 {resolver} 尝试直接封禁，但 Telegram 封禁失败，请手动处理"
+    if banned:
+        return "票数达标，已封禁该用户"
+    return "票数达标，但 Telegram 封禁失败，请管理员手动处理"
 
 
 async def recover_stale_vote_enforcement(
@@ -1079,16 +1174,11 @@ async def recover_stale_vote_enforcement(
         return None
 
     cancel_vote_expiry(int(fresh.id))
-    outcome_line = (
-        "票数达标，已封禁该用户"
-        if banned
-        else "票数达标，但 Telegram 封禁失败，请管理员手动处理"
-    )
     await finalize_vote_message(
         bot,
         settings,
         fresh,
-        outcome_line=outcome_line,
+        outcome_line=enforcement_outcome_line(fresh, banned=banned),
         approvals=approvals,
     )
     log.info(

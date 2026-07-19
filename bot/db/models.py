@@ -203,7 +203,9 @@ class VoteBanSession(Base):
     auto-delete timer is scheduled while status is "active"; the finalized
     (edited) outcome notice joins the "vote" retention category. Expiry timers
     are in-memory (raid-guard convention): a restart drops them, but the next
-    button press lazily finalizes an overdue session.
+    button press lazily finalizes an overdue session. Group admins may resolve
+    a poll early through dedicated buttons; the resolution columns record who
+    cancelled or banned so recovery and audit stay truthful after a crash.
     """
 
     __tablename__ = "vote_ban_sessions"
@@ -223,6 +225,17 @@ class VoteBanSession(Base):
     message_id: Mapped[int] = mapped_column(BigInteger, default=0)
     # active / enforcing / passed / failed / expired / cancelled
     status: Mapped[str] = mapped_column(String(16), default="active")
+    # "" = resolved by vote threshold / timeout; "admin_ban" / "admin_cancel"
+    # = a group admin resolved the poll early via its admin buttons.
+    resolution: Mapped[str] = mapped_column(
+        String(16), default="", server_default=""
+    )
+    resolver_user_id: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
+    resolver_display: Mapped[str] = mapped_column(
+        String(255), default="", server_default=""
+    )
     # Lease timestamp for the Telegram ban side effect.  If a worker dies
     # while status is ``enforcing``, another worker may safely retry the
     # idempotent ban after the lease becomes stale.

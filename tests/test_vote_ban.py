@@ -198,15 +198,18 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         *,
         voter_id: int,
         bot: SimpleNamespace | None = None,
+        action: str = "vote",
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            data=f"vban:vote:{session_id}",
+            data=f"vban:{action}:{session_id}",
             message=SimpleNamespace(
                 chat=SimpleNamespace(id=-100, type="supergroup"),
                 message_id=777,
                 reply_markup=None,
             ),
-            from_user=SimpleNamespace(id=voter_id),
+            from_user=SimpleNamespace(
+                id=voter_id, full_name="操作者", username=""
+            ),
             bot=bot
             or SimpleNamespace(
                 ban_chat_member=AsyncMock(return_value=True),
@@ -226,6 +229,26 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await record_vote(session, session_id, 11))
             await session.commit()
             self.assertEqual(await count_approvals(session, session_id), 2)
+
+    async def test_closed_session_rejects_late_ballot(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="cancelled",
+                    resolution="admin_cancel",
+                    resolver_user_id=42,
+                    resolver_display="管理员",
+                )
+            )
+            await session.commit()
+        async with self.session_factory() as session:
+            self.assertFalse(await record_vote(session, session_id, 11))
+            await session.commit()
+            self.assertEqual(await count_approvals(session, session_id), 1)
 
     async def test_one_active_session_per_target(self) -> None:
         await self._open_session()
@@ -346,6 +369,232 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("成员", callback.answer.await_args.args[0])
         async with self.session_factory() as session:
             self.assertEqual(await count_approvals(session, session_id), 1)
+
+    async def test_admin_action_rejected_for_non_admin(self) -> None:
+        session_id = await self._open_session()
+        for action in ("cancel", "ban"):
+            callback = self._callback(session_id, voter_id=11, action=action)
+            with patch.object(
+                group, "is_group_admin_or_higher", new=AsyncMock(return_value=False)
+            ):
+                async with self.session_factory() as session:
+                    await group.on_vote_ban_action(
+                        callback, self.settings, session=session
+                    )
+            callback.bot.ban_chat_member.assert_not_awaited()
+            self.assertIn("仅群管理员", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "active")
+
+    async def test_admin_cancel_finalizes_without_ban(self) -> None:
+        session_id = await self._open_session()
+        callback = self._callback(session_id, voter_id=42, action="cancel")
+        with patch.object(
+            group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
+        ):
+            async with self.session_factory() as session:
+                await group.on_vote_ban_action(callback, self.settings, session=session)
+        callback.bot.ban_chat_member.assert_not_awaited()
+        self.assertIn("已取消", callback.answer.await_args.args[0])
+        kwargs = callback.bot.edit_message_text.await_args.kwargs
+        self.assertIn("取消本次投票", kwargs["text"])
+        self.assertIsNone(kwargs["reply_markup"])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "cancelled")
+            self.assertEqual(record.resolution, "admin_cancel")
+            self.assertEqual(record.resolver_user_id, 42)
+            event = await session.scalar(
+                select(BanAuditEvent).where(
+                    BanAuditEvent.reference_type == "vote_session",
+                    BanAuditEvent.reference_id == session_id,
+                )
+            )
+            self.assertEqual(event.action, "vote_cancel")
+            self.assertEqual(event.source, "democratic_vote_admin_cancel")
+            self.assertEqual(event.outcome, "cancelled")
+            self.assertEqual(event.actor_user_id, 42)
+            self.assertEqual(event.details.get("resolution"), "admin_cancel")
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100, UserWarning.user_id == 555
+                )
+            )
+            self.assertFalse(bool(warning.is_banned) if warning else False)
+
+    async def test_concurrent_cancel_cannot_be_overwritten_by_live_vote_edit(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        callback = self._callback(session_id, voter_id=11)
+        edits: list[dict] = []
+
+        async def edit_then_cancel(**kwargs):
+            edits.append(kwargs)
+            if len(edits) == 1:
+                async with self.session_factory() as cancel_session:
+                    self.assertTrue(
+                        await claim_session_status(
+                            cancel_session,
+                            session_id,
+                            expected="active",
+                            new_status="cancelled",
+                            resolution="admin_cancel",
+                            resolver_user_id=42,
+                            resolver_display="管理员",
+                        )
+                    )
+                    await cancel_session.commit()
+            return True
+
+        callback.bot.edit_message_text = AsyncMock(side_effect=edit_then_cancel)
+        async with self.session_factory() as session:
+            await group.on_vote_ban_action(callback, self.settings, session=session)
+
+        self.assertEqual(len(edits), 2)
+        self.assertIsNotNone(edits[0]["reply_markup"])
+        self.assertIsNone(edits[-1]["reply_markup"])
+        self.assertIn("取消本次投票", edits[-1]["text"])
+        self.assertIn("其他操作结束", callback.answer.await_args.args[0])
+
+    async def test_admin_direct_ban_finalizes_with_audit(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        callback = self._callback(session_id, voter_id=42, action="ban")
+        with patch.object(
+            group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
+        ):
+            async with self.session_factory() as session:
+                await group.on_vote_ban_action(callback, self.settings, session=session)
+        callback.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            555,
+            revoke_messages=True,
+        )
+        self.assertIn("已直接封禁", callback.answer.await_args.args[0])
+        kwargs = callback.bot.edit_message_text.await_args.kwargs
+        self.assertIn("直接封禁", kwargs["text"])
+        self.assertIsNone(kwargs["reply_markup"])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "passed")
+            self.assertEqual(record.resolution, "admin_ban")
+            self.assertEqual(record.resolver_user_id, 42)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100, UserWarning.user_id == 555
+                )
+            )
+            self.assertTrue(warning.is_banned)
+            event = await session.scalar(
+                select(BanAuditEvent).where(
+                    BanAuditEvent.reference_type == "vote_session",
+                    BanAuditEvent.reference_id == session_id,
+                )
+            )
+            self.assertEqual(event.outcome, "succeeded")
+            self.assertEqual(event.source, "democratic_vote_admin_ban")
+            self.assertEqual(event.actor_user_id, 42)
+            self.assertEqual(event.details.get("resolution"), "admin_ban")
+
+    async def test_admin_direct_ban_failure_is_persisted_as_failed(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=RuntimeError("api down")),
+            edit_message_text=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+        callback = self._callback(session_id, voter_id=42, action="ban", bot=bot)
+        with patch.object(
+            group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
+        ):
+            async with self.session_factory() as session:
+                await group.on_vote_ban_action(callback, self.settings, session=session)
+        self.assertIn("失败", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "failed")
+            self.assertEqual(record.resolution, "admin_ban")
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100, UserWarning.user_id == 555
+                )
+            )
+            self.assertFalse(bool(warning.is_banned) if warning else False)
+
+    async def test_admin_action_on_overdue_session_expires_first(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.deadline_at = now_shanghai_naive() - timedelta(seconds=5)
+            await session.commit()
+        callback = self._callback(session_id, voter_id=42, action="ban")
+        with patch.object(
+            group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
+        ):
+            async with self.session_factory() as session:
+                await group.on_vote_ban_action(callback, self.settings, session=session)
+        callback.bot.ban_chat_member.assert_not_awaited()
+        self.assertIn("超时", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "expired")
+
+    async def test_admin_ban_recovery_keeps_admin_resolution_audit(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="enforcing",
+                    resolution="admin_ban",
+                    resolver_user_id=42,
+                    resolver_display="管理员",
+                )
+            )
+            record = await session.get(VoteBanSession, session_id)
+            record.enforcing_started_at = now_shanghai_naive() - timedelta(minutes=5)
+            await session.commit()
+
+        bot = SimpleNamespace(
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(status="member")
+            ),
+            ban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(),
+        )
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            status = await recover_stale_vote_enforcement(
+                bot=bot,
+                session=session,
+                settings=self.settings,
+                record=record,
+            )
+        self.assertEqual(status, "passed")
+        kwargs = bot.edit_message_text.await_args.kwargs
+        self.assertIn("直接封禁", kwargs["text"])
+        async with self.session_factory() as session:
+            event = await session.scalar(
+                select(BanAuditEvent).where(
+                    BanAuditEvent.reference_type == "vote_session",
+                    BanAuditEvent.reference_id == session_id,
+                )
+            )
+            self.assertEqual(event.source, "democratic_vote_admin_ban")
+            self.assertEqual(event.actor_user_id, 42)
+
+    async def test_keyboard_carries_vote_and_admin_buttons(self) -> None:
+        markup = vote_ban.build_vote_keyboard(9, 1, 3)
+        callback_data = [
+            button.callback_data
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            callback_data,
+            ["vban:vote:9", "vban:cancel:9", "vban:ban:9"],
+        )
 
     async def test_overdue_session_lazily_expires(self) -> None:
         session_id = await self._open_session()

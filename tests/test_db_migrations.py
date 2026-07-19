@@ -4,6 +4,7 @@ import sqlite3
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 
 from sqlalchemy import text
 
@@ -12,6 +13,8 @@ from bot.db.engine import (
     _SQLITE_VOTE_BAN_INDEX_SQL,
     init_db,
 )
+from bot.db.models import VoteBanSession
+from bot.utils.timezone import now_shanghai_naive
 
 
 class VoteBanMigrationTests(unittest.TestCase):
@@ -51,6 +54,83 @@ class VoteBanMigrationTests(unittest.TestCase):
 
 
 class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vote_ban_admin_resolution_columns_upgrade_existing_rows(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            async with session_factory() as session:
+                session.add(
+                    VoteBanSession(
+                        group_id=-100,
+                        target_user_id=7,
+                        target_display="target",
+                        target_username="",
+                        starter_user_id=1,
+                        starter_display="starter",
+                        reason="",
+                        evidence="",
+                        source="command",
+                        target_message_id=0,
+                        threshold=3,
+                        message_id=0,
+                        status="active",
+                        deadline_at=now_shanghai_naive() + timedelta(hours=1),
+                    )
+                )
+                await session.commit()
+            await engine.dispose()
+            engine = None
+
+            connection = sqlite3.connect(path)
+            for column in (
+                "resolution",
+                "resolver_user_id",
+                "resolver_display",
+            ):
+                connection.execute(
+                    f"ALTER TABLE vote_ban_sessions DROP COLUMN {column}"
+                )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            async with session_factory() as session:
+                columns = {
+                    row[1]
+                    for row in (
+                        await session.execute(
+                            text("PRAGMA table_info(vote_ban_sessions)")
+                        )
+                    ).all()
+                }
+                values = (
+                    await session.execute(
+                        text(
+                            "SELECT resolution, resolver_user_id, resolver_display "
+                            "FROM vote_ban_sessions WHERE target_user_id=7"
+                        )
+                    )
+                ).one()
+            self.assertTrue(
+                {"resolution", "resolver_user_id", "resolver_display"}
+                <= columns
+            )
+            self.assertEqual(tuple(values), ("", 0, ""))
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
     async def test_duplicate_violation_source_keys_are_preserved_but_detached(self) -> None:
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)

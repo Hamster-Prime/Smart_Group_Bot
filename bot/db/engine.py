@@ -1265,6 +1265,24 @@ async def init_db(
                 "enforcing_started_at",
                 "enforcing_started_at DATETIME",
             )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "resolution",
+                "resolution VARCHAR(16) NOT NULL DEFAULT ''",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "resolver_user_id",
+                "resolver_user_id BIGINT NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
+                "resolver_display",
+                "resolver_display VARCHAR(255) NOT NULL DEFAULT ''",
+            )
             await _sqlite_ensure_vote_ban_open_index(conn)
             await _sqlite_ensure_column(
                 conn,

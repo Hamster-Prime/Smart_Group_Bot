@@ -42,7 +42,10 @@ from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.ban_audit import record_ban_event
 from bot.services.call_admin import handle_call_admin, is_call_admin_trigger
 from bot.services.vote_ban import (
+    VOTE_BAN_ADMIN_RESOLUTION_BAN,
+    VOTE_BAN_ADMIN_RESOLUTION_CANCEL,
     VOTE_BAN_CALLBACK_PREFIX,
+    admin_cancel_outcome_line,
     apply_vote_ban,
     build_vote_keyboard,
     build_vote_text,
@@ -50,6 +53,7 @@ from bot.services.vote_ban import (
     cancel_vote_expiry,
     claim_session_status,
     count_approvals,
+    enforcement_outcome_line,
     expire_overdue,
     finalize_vote_message,
     recover_stale_vote_enforcement,
@@ -88,6 +92,7 @@ from bot.services.bot_screening import (
     reset_bot_screening,
 )
 from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
+from bot.services.member_identity import member_display_name
 from bot.services.moderation import ModerationService
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
@@ -1704,6 +1709,136 @@ async def on_delete_button(
     await callback.answer("已删除")
 
 
+async def _finalize_vote_enforcement(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession,
+    session_factory: Any | None,
+    *,
+    record: VoteBanSession,
+    session_id: int,
+    approvals: int,
+) -> tuple[bool, bool]:
+    """Run the Telegram ban and persist the outcome after a successful
+    active→enforcing claim (threshold or admin resolution).
+
+    Returns ``(banned, outcome_persisted)``.  When persistence fails the
+    enforcement lease is retained for the recovery worker.
+    """
+    await session.refresh(record)
+    lease_token = record.enforcing_started_at
+    group_id = int(record.group_id)
+    target_id = int(record.target_user_id)
+    # ``refresh`` opened a new read transaction. Snapshot all values needed
+    # by the idempotent Telegram side effect, then return the connection to
+    # the pool before the Bot API timeout can elapse.
+    await session.commit()
+    cancel_vote_expiry(session_id)
+    if session_factory is not None:
+        schedule_vote_enforcement_recovery(
+            session_factory=session_factory,
+            bot=callback.bot,
+            settings=settings,
+            session_id=session_id,
+        )
+
+    banned = await apply_vote_ban(
+        callback.bot,
+        session,
+        group_id=group_id,
+        target_user_id=target_id,
+    )
+    outcome_persisted = False
+    try:
+        if banned:
+            await delete_join_verification(session, group_id, target_id)
+        outcome_persisted = await record_vote_ban_outcome(
+            session,
+            record,
+            approvals=approvals,
+            banned=banned,
+            lease_token=lease_token,
+        )
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "vote-ban outcome persistence failed; enforcement lease retained | group=%s session=%s",
+            group_id,
+            session_id,
+        )
+
+    if outcome_persisted:
+        cancel_vote_enforcement_recovery(session_id)
+        await finalize_vote_message(
+            callback.bot,
+            settings,
+            record,
+            outcome_line=enforcement_outcome_line(record, banned=banned),
+            approvals=approvals,
+        )
+    return banned, outcome_persisted
+
+
+async def _refresh_closed_vote_message(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession,
+    *,
+    session_id: int,
+) -> str | None:
+    """Refresh a poll after a possible cross-process terminal transition.
+
+    Returns ``None`` while the poll remains active, otherwise its current
+    status. Terminal states are rendered again so a slower live-vote edit
+    cannot overwrite an administrator's cancellation/final result.
+    """
+    record = await session.get(
+        VoteBanSession,
+        int(session_id),
+        populate_existing=True,
+    )
+    if record is None:
+        await session.commit()
+        return "missing"
+    status = str(record.status or "")
+    if status == "active":
+        await session.commit()
+        return None
+    if status == "enforcing":
+        await session.commit()
+        return status
+
+    approvals = await count_approvals(session, int(session_id))
+    await session.commit()
+    if status == "cancelled":
+        outcome_line = (
+            admin_cancel_outcome_line(record)
+            if str(record.resolution or "") == VOTE_BAN_ADMIN_RESOLUTION_CANCEL
+            else "投票已取消"
+        )
+    elif status == "expired":
+        outcome_line = "投票超时，未达到封禁票数"
+    elif status in {"passed", "failed"}:
+        outcome_line = enforcement_outcome_line(
+            record,
+            banned=status == "passed",
+        )
+    else:
+        return status
+
+    cancel_vote_expiry(int(session_id))
+    if status in {"passed", "failed"}:
+        cancel_vote_enforcement_recovery(int(session_id))
+    await finalize_vote_message(
+        callback.bot,
+        settings,
+        record,
+        outcome_line=outcome_line,
+        approvals=approvals,
+    )
+    return status
+
+
 @router.callback_query(F.data.startswith(f"{VOTE_BAN_CALLBACK_PREFIX}:"))
 async def on_vote_ban_action(
     callback: CallbackQuery,
@@ -1715,9 +1850,14 @@ async def on_vote_ban_action(
         await callback.answer("会话未就绪，请稍后重试", show_alert=True)
         return
     parts = (callback.data or "").split(":")
-    if len(parts) != 3 or parts[0] != VOTE_BAN_CALLBACK_PREFIX or parts[1] != "vote":
+    if (
+        len(parts) != 3
+        or parts[0] != VOTE_BAN_CALLBACK_PREFIX
+        or parts[1] not in {"vote", "cancel", "ban"}
+    ):
         await callback.answer("操作参数无效", show_alert=True)
         return
+    action = parts[1]
     try:
         session_id = int(parts[2])
     except (TypeError, ValueError):
@@ -1763,6 +1903,26 @@ async def on_vote_ban_action(
         if carries_button:
             trusted_live_message_id = live_message_id
 
+    # Admin-only resolutions are authorized before taking the per-target lock:
+    # the check may call Telegram and must not extend the critical section.
+    if action in {"cancel", "ban"}:
+        admin_authorized = await is_group_admin_or_higher(
+            bot=callback.bot,
+            session=session,
+            settings=settings,
+            group_id=group_id,
+            user_id=int(voter.id),
+        )
+        # The super-admin fast path does not need a database lookup, so the
+        # callback authorization helper may legitimately return while the
+        # poll read transaction is still open. Release that snapshot before
+        # entering the compare-and-swap state transition below.
+        if session.in_transaction():
+            await session.commit()
+        if not admin_authorized:
+            await callback.answer("仅群管理员可执行该操作", show_alert=True)
+            return
+
     async with _moderation_user_lock(group_id, target_id):
         record = await session.get(VoteBanSession, session_id, populate_existing=True)
         if record is None or record.status not in {"active", "enforcing"}:
@@ -1804,10 +1964,128 @@ async def on_vote_ban_action(
                     outcome_line="投票超时，未达到封禁票数",
                     approvals=approvals,
                 )
+            else:
+                await session.rollback()
             await callback.answer("该投票已超时结束", show_alert=True)
             return
 
         voter_id = int(voter.id)
+
+        if action == "cancel":
+            resolver_display = member_display_name(
+                voter_id,
+                full_name=getattr(voter, "full_name", ""),
+                username=getattr(voter, "username", ""),
+            )
+            if not await claim_session_status(
+                session,
+                session_id,
+                expected="active",
+                new_status="cancelled",
+                resolution=VOTE_BAN_ADMIN_RESOLUTION_CANCEL,
+                resolver_user_id=voter_id,
+                resolver_display=resolver_display,
+            ):
+                await session.rollback()
+                await callback.answer("投票已由其他操作结束", show_alert=True)
+                return
+            approvals = await count_approvals(session, session_id)
+            await record_ban_event(
+                session,
+                group_id=group_id,
+                target_user_id=target_id,
+                target_display=record.target_display,
+                target_username=record.target_username,
+                action="vote_cancel",
+                source="democratic_vote_admin_cancel",
+                outcome="cancelled",
+                reason="管理员取消民主投票",
+                evidence=record.evidence,
+                actor_user_id=voter_id,
+                actor_display=resolver_display,
+                reference_type="vote_session",
+                reference_id=session_id,
+                details={
+                    "approvals": int(approvals),
+                    "threshold": int(record.threshold),
+                    "trigger_source": str(record.source or "command"),
+                    "resolution": VOTE_BAN_ADMIN_RESOLUTION_CANCEL,
+                    "deadline_at": record.deadline_at.isoformat(),
+                },
+            )
+            await session.commit()
+            record = await session.get(
+                VoteBanSession, session_id, populate_existing=True
+            )
+            await session.commit()
+            cancel_vote_expiry(session_id)
+            if record is not None:
+                await finalize_vote_message(
+                    callback.bot,
+                    settings,
+                    record,
+                    outcome_line=admin_cancel_outcome_line(record),
+                    approvals=approvals,
+                )
+            await callback.answer("已取消本次投票", show_alert=True)
+            log.info(
+                "[%s]【取消】民主投票封禁 | target=%s admin=%s approvals=%s",
+                group_id,
+                target_id,
+                voter_id,
+                approvals,
+            )
+            return
+
+        if action == "ban":
+            resolver_display = member_display_name(
+                voter_id,
+                full_name=getattr(voter, "full_name", ""),
+                username=getattr(voter, "username", ""),
+            )
+            if not await claim_session_status(
+                session,
+                session_id,
+                expected="active",
+                new_status="enforcing",
+                resolution=VOTE_BAN_ADMIN_RESOLUTION_BAN,
+                resolver_user_id=voter_id,
+                resolver_display=resolver_display,
+            ):
+                await session.rollback()
+                await callback.answer("投票已由其他操作结束", show_alert=True)
+                return
+            approvals = await count_approvals(session, session_id)
+            await session.commit()
+            banned, outcome_persisted = await _finalize_vote_enforcement(
+                callback,
+                settings,
+                session,
+                session_factory,
+                record=record,
+                session_id=session_id,
+                approvals=approvals,
+            )
+            if not outcome_persisted:
+                answer_text = (
+                    "封禁已执行，状态正在自动同步"
+                    if banned
+                    else "封禁失败，状态正在自动同步"
+                )
+            elif banned:
+                answer_text = "已直接封禁该用户"
+            else:
+                answer_text = "直接封禁失败，请手动处理"
+            await callback.answer(answer_text, show_alert=True)
+            log.info(
+                "[%s]【结束】民主投票封禁（管理员直接封禁）| target=%s admin=%s banned=%s",
+                group_id,
+                target_id,
+                voter_id,
+                banned,
+            )
+            return
+
         if voter_id == target_id:
             await session.commit()
             await callback.answer("不能给自己投票", show_alert=True)
@@ -1850,9 +2128,65 @@ async def on_vote_ban_action(
                 await session.rollback()
             await callback.answer("该投票已超时结束", show_alert=True)
             return
+        # End the poll refresh snapshot before the conditional ballot write.
+        # The INSERT itself re-checks both active status and deadline, so an
+        # administrator/expiry worker that won meanwhile remains authoritative.
+        await session.commit()
         if not await record_vote(session, session_id, voter_id):
             await session.commit()
-            await callback.answer("你已投过票", show_alert=True)
+            latest = await session.get(
+                VoteBanSession,
+                session_id,
+                populate_existing=True,
+            )
+            latest_status = str(latest.status or "") if latest is not None else ""
+            if (
+                latest is not None
+                and latest_status == "active"
+                and expire_overdue(latest)
+            ):
+                expired = await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="expired",
+                )
+                if expired:
+                    approvals = await count_approvals(session, session_id)
+                    await session.commit()
+                    cancel_vote_expiry(session_id)
+                    await finalize_vote_message(
+                        callback.bot,
+                        settings,
+                        latest,
+                        outcome_line="投票超时，未达到封禁票数",
+                        approvals=approvals,
+                    )
+                    await callback.answer("该投票已超时结束", show_alert=True)
+                    return
+
+                await session.rollback()
+                winner = await session.get(
+                    VoteBanSession,
+                    session_id,
+                    populate_existing=True,
+                )
+                winner_status = (
+                    str(winner.status or "") if winner is not None else ""
+                )
+                await session.commit()
+                answer_text = (
+                    "投票结果正在执行，请稍后"
+                    if winner_status == "enforcing"
+                    else "该投票已由其他操作结束"
+                )
+                await callback.answer(answer_text, show_alert=True)
+                return
+            await session.commit()
+            if latest_status == "active":
+                await callback.answer("你已投过票", show_alert=True)
+            else:
+                await callback.answer("该投票已由其他操作结束", show_alert=True)
             return
         # Publish this ballot before counting. In multi-process deployments a
         # concurrent voter can then observe it and exactly one side will claim
@@ -1867,6 +2201,20 @@ async def on_vote_ban_action(
         await session.commit()
 
         if approvals < threshold:
+            changed_status = await _refresh_closed_vote_message(
+                callback,
+                settings,
+                session,
+                session_id=session_id,
+            )
+            if changed_status is not None:
+                answer_text = (
+                    "投票结果正在执行，请稍后"
+                    if changed_status == "enforcing"
+                    else "该投票已由其他操作结束"
+                )
+                await callback.answer(answer_text, show_alert=True)
+                return
             try:
                 await callback.bot.edit_message_text(
                     chat_id=group_id,
@@ -1884,7 +2232,18 @@ async def on_vote_ban_action(
                     session_id,
                     exc_info=True,
                 )
-            await callback.answer(f"已投票（{approvals}/{threshold}）")
+            changed_status = await _refresh_closed_vote_message(
+                callback,
+                settings,
+                session,
+                session_id=session_id,
+            )
+            if changed_status is None:
+                await callback.answer(f"已投票（{approvals}/{threshold}）")
+            elif changed_status == "enforcing":
+                await callback.answer("投票结果正在执行，请稍后", show_alert=True)
+            else:
+                await callback.answer("该投票已由其他操作结束", show_alert=True)
             return
 
         # Threshold reached: keep the target in an explicit enforcing state
@@ -1896,65 +2255,19 @@ async def on_vote_ban_action(
             await callback.answer("投票已由其他操作结束", show_alert=True)
             return
         await session.commit()
-        await session.refresh(record)
-        lease_token = record.enforcing_started_at
-        enforcing_group_id = int(record.group_id)
-        enforcing_target_id = int(record.target_user_id)
-        # ``refresh`` opened a new read transaction. Snapshot all values needed
-        # by the idempotent Telegram side effect, then return the connection to
-        # the pool before the Bot API timeout can elapse.
-        await session.commit()
-        cancel_vote_expiry(session_id)
-        if session_factory is not None:
-            schedule_vote_enforcement_recovery(
-                session_factory=session_factory,
-                bot=callback.bot,
-                settings=settings,
-                session_id=session_id,
-            )
-
-        banned = await apply_vote_ban(
-            callback.bot,
+        banned, outcome_persisted = await _finalize_vote_enforcement(
+            callback,
+            settings,
             session,
-            group_id=enforcing_group_id,
-            target_user_id=enforcing_target_id,
+            session_factory,
+            record=record,
+            session_id=session_id,
+            approvals=approvals,
         )
-        outcome_persisted = False
-        try:
-            if banned:
-                await delete_join_verification(session, group_id, target_id)
-            outcome_persisted = await record_vote_ban_outcome(
-                session,
-                record,
-                approvals=approvals,
-                banned=banned,
-                lease_token=lease_token,
-            )
-        except Exception:
-            await session.rollback()
-            log.exception(
-                "vote-ban outcome persistence failed; enforcement lease retained | group=%s session=%s",
-                group_id,
-                session_id,
-            )
-
-        if outcome_persisted:
-            cancel_vote_enforcement_recovery(session_id)
-        if banned:
-            outcome_line = "票数达标，已封禁该用户"
-        else:
-            outcome_line = "票数达标，但 Telegram 封禁失败，请管理员手动处理"
-        if outcome_persisted:
-            await finalize_vote_message(
-                callback.bot,
-                settings,
-                record,
-                outcome_line=outcome_line,
-                approvals=approvals,
-            )
-            answer_text = "投票通过，已封禁" if banned else "投票通过，但封禁失败"
-        else:
+        if not outcome_persisted:
             answer_text = "投票结果已执行，状态正在自动同步"
+        else:
+            answer_text = "投票通过，已封禁" if banned else "投票通过，但封禁失败"
         await callback.answer(answer_text, show_alert=True)
         log.info(
             "[%s]【结束】民主投票封禁 | target=%s approvals=%s/%s banned=%s",
