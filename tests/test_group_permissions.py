@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ChatPermissions
 
 from bot.db.models import AuthorizedGroup, Group
@@ -318,6 +319,7 @@ class GroupPermissionServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.group_rows: dict[int, dict] = {}
         self.authorized_group_ids: set[int] = set()
+        self.inactive_group_ids: set[int] = set()
 
         class _Result:
             def __init__(inner_self, rows: list[tuple[int]]) -> None:
@@ -335,13 +337,20 @@ class GroupPermissionServiceTests(unittest.IsolatedAsyncioTestCase):
 
             async def execute(inner_self, _statement):
                 return _Result(
-                    [(group_id,) for group_id in sorted(self.authorized_group_ids)]
+                    [
+                        (group_id,)
+                        for group_id in sorted(self.authorized_group_ids)
+                        if group_id not in self.inactive_group_ids
+                    ]
                 )
 
             async def get(inner_self, model, group_id: int):
                 if model is AuthorizedGroup:
                     return (
-                        SimpleNamespace(group_id=group_id)
+                        SimpleNamespace(
+                            group_id=group_id,
+                            bot_present=group_id not in self.inactive_group_ids,
+                        )
                         if group_id in self.authorized_group_ids
                         else None
                     )
@@ -361,12 +370,15 @@ class GroupPermissionServiceTests(unittest.IsolatedAsyncioTestCase):
         config: dict,
         *,
         authorized: bool = True,
+        bot_present: bool = True,
     ) -> None:
         self.group_rows[group_id] = {
             GROUP_PERMISSIONS_SETTINGS_KEY: config,
         }
         if authorized:
             self.authorized_group_ids.add(group_id)
+            if not bot_present:
+                self.inactive_group_ids.add(group_id)
 
     async def test_per_group_scan_sends_complete_independent_permissions(self) -> None:
         await self._add_group(-1001, _config())
@@ -392,6 +404,21 @@ class GroupPermissionServiceTests(unittest.IsolatedAsyncioTestCase):
         for group_call in calls.values():
             dumped = group_call["permissions"].model_dump()
             self.assertTrue(all(dumped[field] is not None for field in PERMISSION_FIELDS))
+
+    async def test_inactive_authorized_group_is_not_reconciled(self) -> None:
+        await self._add_group(-1004, _config(), bot_present=False)
+        service = GroupPermissionService(
+            bot=self.bot,
+            session_factory=self.session_factory,
+        )
+
+        self.assertEqual(
+            await service.run_once(at=datetime(2026, 7, 17, 23, 30)),
+            0,
+        )
+        self.bot.set_chat_permissions.assert_not_awaited()
+        self.assertFalse(await service.apply_group(-1004))
+        self.assertFalse(service.status(-1004)["applied"])
 
     async def test_transition_applies_once_and_new_process_reconciles_on_restart(self) -> None:
         await self._add_group(-1101, _config())
@@ -446,6 +473,60 @@ class GroupPermissionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(service.status(-1201)["applied"])
         self.assertEqual(service.status(-1201)["last_error"], "")
+
+    async def test_chat_not_modified_is_an_idempotent_success(self) -> None:
+        await self._add_group(-1221, _config())
+        self.bot.set_chat_permissions.side_effect = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: CHAT_NOT_MODIFIED",
+        )
+        service = GroupPermissionService(
+            bot=self.bot,
+            session_factory=self.session_factory,
+            reconcile_interval_seconds=3600,
+        )
+
+        self.assertEqual(
+            await service.run_once(
+                at=datetime(2026, 7, 17, 23, 30),
+                raise_on_total_failure=True,
+            ),
+            1,
+        )
+        self.assertTrue(service.status(-1221)["applied"])
+        self.assertEqual(service.status(-1221)["last_error"], "")
+
+        # Recording the fingerprint prevents another API call before the
+        # periodic reconciliation interval expires.
+        self.assertEqual(
+            await service.run_once(at=datetime(2026, 7, 17, 23, 31)),
+            0,
+        )
+        self.bot.set_chat_permissions.assert_awaited_once()
+
+    async def test_other_telegram_bad_request_still_fails(self) -> None:
+        await self._add_group(-1231, _config())
+        self.bot.set_chat_permissions.side_effect = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: CHAT_NOT_MODIFIED_ELSE",
+        )
+        service = GroupPermissionService(
+            bot=self.bot,
+            session_factory=self.session_factory,
+            reconcile_interval_seconds=3600,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "group permission apply failed for all 1 attempted groups",
+        ):
+            await service.run_once(
+                at=datetime(2026, 7, 17, 23, 30),
+                raise_on_total_failure=True,
+            )
+        self.assertFalse(service.status(-1231)["applied"])
+        self.assertIn("CHAT_NOT_MODIFIED_ELSE", service.status(-1231)["last_error"])
+        self.bot.set_chat_permissions.assert_awaited_once()
 
     async def test_new_failure_does_not_report_an_older_state_as_applied(self) -> None:
         service = GroupPermissionService(

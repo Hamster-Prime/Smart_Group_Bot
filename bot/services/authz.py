@@ -45,12 +45,40 @@ async def ensure_super_admin(message: Message, settings: Settings) -> bool:
 
 async def is_group_authorized(session: AsyncSession, group_id: int) -> bool:
     row = await session.get(AuthorizedGroup, group_id)
-    return row is not None
+    return row is not None and bool(row.bot_present)
+
+
+async def set_group_bot_present(
+    session: AsyncSession,
+    group_id: int,
+    *,
+    present: bool,
+) -> bool:
+    """Update Telegram reachability without deleting authorization intent.
+
+    Returns ``True`` only when an existing authorized row changed.  A bot being
+    added to an unknown group must never implicitly authorize that group.
+    """
+
+    row = await session.get(AuthorizedGroup, int(group_id))
+    if row is None or bool(row.bot_present) == bool(present):
+        return False
+    row.bot_present = bool(present)
+    await session.flush()
+    return True
 
 
 async def authorize_group(session: AsyncSession, group_id: int, operator_id: int = 0) -> bool:
     row = await session.get(AuthorizedGroup, group_id)
     if row:
+        if not bool(row.bot_present):
+            # Explicit authorization is also the manual recovery path when a
+            # rejoin my_chat_member update was missed.
+            row.bot_present = True
+            if operator_id:
+                row.authorized_by = int(operator_id)
+            await session.flush()
+            return True
         return False
     session.add(AuthorizedGroup(group_id=group_id, authorized_by=operator_id or None))
     # Make the grant visible to subsequent authorization helpers in the same
@@ -72,8 +100,15 @@ async def deauthorize_group(session: AsyncSession, group_id: int) -> bool:
     return row is not None
 
 
-async def list_authorized_groups(session: AsyncSession) -> list[AuthorizedGroup]:
-    stmt = select(AuthorizedGroup).order_by(AuthorizedGroup.created_at.desc())
+async def list_authorized_groups(
+    session: AsyncSession,
+    *,
+    include_inactive: bool = False,
+) -> list[AuthorizedGroup]:
+    stmt = select(AuthorizedGroup)
+    if not include_inactive:
+        stmt = stmt.where(AuthorizedGroup.bot_present.is_(True))
+    stmt = stmt.order_by(AuthorizedGroup.created_at.desc())
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -88,6 +123,7 @@ async def is_group_admin_authorized(session: AsyncSession, group_id: int, user_i
         .where(
             Admin.group_id == group_id,
             Admin.user_id == user_id,
+            AuthorizedGroup.bot_present.is_(True),
         )
     )
     result = await session.execute(stmt)
@@ -97,7 +133,8 @@ async def is_group_admin_authorized(session: AsyncSession, group_id: int, user_i
 async def authorize_group_admin(
     session: AsyncSession, group_id: int, user_id: int, role: str = "admin"
 ) -> bool:
-    if await session.get(AuthorizedGroup, group_id) is None:
+    authorized = await session.get(AuthorizedGroup, group_id)
+    if authorized is None or not bool(authorized.bot_present):
         return False
     stmt = select(Admin).where(
         Admin.group_id == group_id,
@@ -135,6 +172,7 @@ async def list_group_admins(session: AsyncSession, group_id: int) -> list[Admin]
             AuthorizedGroup.group_id == Admin.group_id,
         )
         .where(Admin.group_id == group_id)
+        .where(AuthorizedGroup.bot_present.is_(True))
         .order_by(Admin.id.desc())
     )
     result = await session.execute(stmt)
@@ -152,7 +190,7 @@ async def warm_privileged_operator_cache(
                 select(Admin.group_id, Admin.user_id).join(
                     AuthorizedGroup,
                     AuthorizedGroup.group_id == Admin.group_id,
-                )
+                ).where(AuthorizedGroup.bot_present.is_(True))
             )
         ).all()
         await session.commit()

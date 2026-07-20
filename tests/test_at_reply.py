@@ -153,6 +153,40 @@ class AdminAtReplyCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PendingReplyActionResolutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_expected_at_reply_skip_is_debug_only(self) -> None:
+        with (
+            patch.object(group.log, "debug") as debug_log,
+            patch.object(group.log, "info") as info_log,
+        ):
+            group._log_pending_reply_action(
+                group_id=-10001,
+                action="skip",
+                action_forced=True,
+                explicit_mention=False,
+                reply_to_bot=False,
+                elapsed_ms=3,
+            )
+
+        debug_log.assert_called_once()
+        info_log.assert_not_called()
+
+    def test_forced_mention_reply_remains_info(self) -> None:
+        with (
+            patch.object(group.log, "debug") as debug_log,
+            patch.object(group.log, "info") as info_log,
+        ):
+            group._log_pending_reply_action(
+                group_id=-10001,
+                action="casual",
+                action_forced=True,
+                explicit_mention=True,
+                reply_to_bot=False,
+                elapsed_ms=4,
+            )
+
+        debug_log.assert_not_called()
+        info_log.assert_called_once()
+
     async def test_at_reply_enabled_skips_unmentioned_without_decision(self) -> None:
         decision_svc = SimpleNamespace(decide=AsyncMock(return_value="casual"))
 

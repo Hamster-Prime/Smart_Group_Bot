@@ -3856,6 +3856,46 @@ async def _resolve_pending_reply_action(
     return action, False
 
 
+def _log_pending_reply_action(
+    *,
+    group_id: int,
+    action: str,
+    action_forced: bool,
+    explicit_mention: bool,
+    reply_to_bot: bool,
+    elapsed_ms: int,
+) -> None:
+    if action_forced and action == "skip":
+        # In @-reply mode this is the expected path for almost every ordinary
+        # group message. Keep it available for diagnosis without flooding the
+        # normal service log.
+        log.debug(
+            "[%s] pending batch skipped by at-reply mode | "
+            "explicit_mention=%s reply_to_bot=%s elapsed=%dms",
+            group_id,
+            explicit_mention,
+            reply_to_bot,
+            elapsed_ms,
+        )
+    elif action_forced:
+        log.info(
+            "[%s] pending batch action forced | action=%s explicit_mention=%s "
+            "reply_to_bot=%s elapsed=%dms",
+            group_id,
+            action,
+            explicit_mention,
+            reply_to_bot,
+            elapsed_ms,
+        )
+    else:
+        log.info(
+            "[%s] pending batch decision done | action=%s elapsed=%dms",
+            group_id,
+            action,
+            elapsed_ms,
+        )
+
+
 async def _process_pending_reply_batch(
     items: list[_PendingReplyItem],
     settings: Settings,
@@ -3961,22 +4001,14 @@ async def _process_pending_reply_batch(
                 merged_count=merged_count,
                 merged_context=merged_context,
             )
-            if action_forced:
-                log.info(
-                    "[%s] pending batch action forced | action=%s explicit_mention=%s reply_to_bot=%s elapsed=%dms",
-                    group_id,
-                    action,
-                    explicit_mention,
-                    reply_to_bot,
-                    int((time.perf_counter() - decision_started) * 1000),
-                )
-            else:
-                log.info(
-                    "[%s] pending batch decision done | action=%s elapsed=%dms",
-                    group_id,
-                    action,
-                    int((time.perf_counter() - decision_started) * 1000),
-                )
+            _log_pending_reply_action(
+                group_id=group_id,
+                action=action,
+                action_forced=action_forced,
+                explicit_mention=explicit_mention,
+                reply_to_bot=reply_to_bot,
+                elapsed_ms=int((time.perf_counter() - decision_started) * 1000),
+            )
 
             reply = ""
             reply_specs: list[ReplyMessageSpec] = []

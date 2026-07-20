@@ -1518,7 +1518,10 @@ def register_settings_routes(
         stmt = (
             select(Admin.group_id)
             .join(AuthorizedGroup, AuthorizedGroup.group_id == Admin.group_id)
-            .where(Admin.user_id == int(user_id))
+            .where(
+                Admin.user_id == int(user_id),
+                AuthorizedGroup.bot_present.is_(True),
+            )
         )
         async with session_factory() as session:
             return {int(value) for value in (await session.scalars(stmt)).all()}
@@ -1596,6 +1599,7 @@ def register_settings_routes(
                     "group_id": int(row.group_id),
                     "title": str(title or ""),
                     "authorized_by": int(row.authorized_by or 0),
+                    "bot_present": bool(row.bot_present),
                     "created_at": row.created_at.isoformat() if row.created_at else "",
                 }
                 for row, title in rows
@@ -1610,6 +1614,9 @@ def register_settings_routes(
             if row is None:
                 row = AuthorizedGroup(group_id=body.group_id, authorized_by=int(user.id))
                 session.add(row)
+            elif not bool(row.bot_present):
+                row.bot_present = True
+                row.authorized_by = int(user.id)
             group = await session.get(Group, body.group_id)
             if group is None:
                 session.add(Group(id=body.group_id, title=clean_text(body.title, max_len=255), settings={}))
@@ -1722,7 +1729,8 @@ def register_settings_routes(
         group_id = int(request.match_info["id"])
         body = _AdminCreate.model_validate(await _json_object(request))
         async with session_factory() as session:
-            if await session.get(AuthorizedGroup, group_id) is None:
+            authorized = await session.get(AuthorizedGroup, group_id)
+            if authorized is None or not bool(authorized.bot_present):
                 raise _APIError(404, "group_not_found", "该群尚未授权。")
             row = await session.scalar(select(Admin).where(
                 Admin.group_id == group_id,
@@ -1737,7 +1745,8 @@ def register_settings_routes(
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                if await session.get(AuthorizedGroup, group_id) is None:
+                authorized = await session.get(AuthorizedGroup, group_id)
+                if authorized is None or not bool(authorized.bot_present):
                     raise _APIError(
                         404,
                         "group_not_found",
@@ -1796,16 +1805,25 @@ def register_settings_routes(
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 封禁接口。")
         previous_warning: tuple[int, bool] | None = None
         async with session_factory() as session:
+            authorization_rows = (
+                await session.execute(
+                    select(
+                        AuthorizedGroup.group_id,
+                        AuthorizedGroup.bot_present,
+                    )
+                )
+            ).all()
+            journal_group_ids = [int(group_id) for group_id, _ in authorization_rows]
             group_ids = [
-                int(value)
-                for value in (
-                    await session.scalars(select(AuthorizedGroup.group_id))
-                ).all()
+                int(group_id)
+                for group_id, bot_present in authorization_rows
+                if bool(bot_present)
             ]
+            active_group_set = set(group_ids)
             recoveries = await lease_join_verifications_for_user_unban(
                 session,
                 body.user_id,
-                group_ids=group_ids,
+                group_ids=journal_group_ids,
                 manual_unban=False,
             )
             await add_global_ban(
@@ -1819,6 +1837,7 @@ def register_settings_routes(
                 (item.group_id, item.prompt_message_id)
                 for item in recoveries
                 if item.prompt_message_id > 0
+                and int(item.group_id) in active_group_set
             )
             await session.commit()
         recovery_by_group = {int(item.group_id): item for item in recoveries}
@@ -1873,7 +1892,11 @@ def register_settings_routes(
                 "telegram_ban_partial",
                 f"已处理 {succeeded}/{len(group_ids)} 个群，但仍有群封禁失败，请重试。",
             )
-        return _success_response({"banned_groups": succeeded, "total_groups": len(group_ids)})
+        return _success_response({
+            "banned_groups": succeeded,
+            "total_groups": len(group_ids),
+            "deferred_groups": max(0, len(journal_group_ids) - len(group_ids)),
+        })
 
     @authenticated
     async def delete_global_ban_api(request: web.Request, user: Any) -> web.Response:
@@ -1882,16 +1905,25 @@ def register_settings_routes(
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
         async with session_factory() as session:
+            authorization_rows = (
+                await session.execute(
+                    select(
+                        AuthorizedGroup.group_id,
+                        AuthorizedGroup.bot_present,
+                    )
+                )
+            ).all()
+            journal_group_ids = [int(group_id) for group_id, _ in authorization_rows]
             group_ids = [
-                int(value)
-                for value in (
-                    await session.scalars(select(AuthorizedGroup.group_id))
-                ).all()
+                int(group_id)
+                for group_id, bot_present in authorization_rows
+                if bool(bot_present)
             ]
+            active_group_set = set(group_ids)
             recoveries = await lease_join_verifications_for_user_unban(
                 session,
                 target_id,
-                group_ids=group_ids,
+                group_ids=journal_group_ids,
             )
             removed = await remove_global_ban(
                 session,
@@ -1901,7 +1933,7 @@ def register_settings_routes(
             await session.execute(
                 delete(UserWarning).where(
                     UserWarning.user_id == target_id,
-                    UserWarning.group_id.in_(group_ids),
+                    UserWarning.group_id.in_(journal_group_ids),
                 )
             )
             await session.commit()
@@ -1910,6 +1942,7 @@ def register_settings_routes(
             (item.group_id, item.prompt_message_id)
             for item in recoveries
             if item.prompt_message_id > 0
+            and int(item.group_id) in active_group_set
         )
         recovery_by_group = {int(item.group_id): item for item in recoveries}
         restored_group_ids: set[int] = set()
@@ -1965,6 +1998,7 @@ def register_settings_routes(
             "unbanned_groups": succeeded,
             "restored_groups": restored,
             "total_groups": len(group_ids),
+            "deferred_groups": max(0, len(journal_group_ids) - len(group_ids)),
         })
 
     @any_admin
@@ -1978,6 +2012,7 @@ def register_settings_routes(
             )
             .select_from(AuthorizedGroup)
             .outerjoin(Group, Group.id == AuthorizedGroup.group_id)
+            .where(AuthorizedGroup.bot_present.is_(True))
             .order_by(AuthorizedGroup.created_at.desc())
         )
         if allowed is not None:
@@ -2093,7 +2128,7 @@ def register_settings_routes(
         async with lock:
             async with session_factory() as session:
                 authorized = await session.get(AuthorizedGroup, group_id)
-                if authorized is None:
+                if authorized is None or not bool(authorized.bot_present):
                     raise _APIError(404, "group_not_found", "该群未授权或不存在。")
                 group = await session.get(Group, group_id)
                 created_group = group is None

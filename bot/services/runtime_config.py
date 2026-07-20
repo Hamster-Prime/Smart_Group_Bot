@@ -181,6 +181,9 @@ class BotBehaviorConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
 
     parse_mode: str = Field(default="HTML", max_length=32)
+    # Deprecated compatibility field. Automatic lifecycle operations must
+    # never discard Telegram's backlog; keep accepting old payloads while
+    # normalizing every read/write to the safe value.
     drop_pending_updates: bool = False
     inbound_debounce_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
     reply_batch_timeout_seconds: float = Field(default=45.0, ge=5.0, le=120.0)
@@ -250,6 +253,11 @@ class BotBehaviorConfig(StrictModel):
     proactive_quiet_hours_start: int = Field(default=0, ge=0, le=23)
     proactive_quiet_hours_end: int = Field(default=9, ge=0, le=23)
     proactive_retry_minutes: int = Field(default=30, ge=5, le=1440)
+
+    @field_validator("drop_pending_updates", mode="before")
+    @classmethod
+    def _preserve_pending_updates(cls, _value: object) -> bool:
+        return False
 
     @model_validator(mode="after")
     def _migrate_auto_delete_minutes(self) -> BotBehaviorConfig:
@@ -857,6 +865,26 @@ class SecretCipher:
 ConfigAppliedCallback = Callable[[RuntimeConfig], Awaitable[None] | None]
 
 
+def _normalize_deprecated_runtime_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Persist the retired backlog-deletion switch at its only safe value."""
+
+    bot_payload = payload.get("bot")
+    if (
+        isinstance(bot_payload, dict)
+        and "drop_pending_updates" in bot_payload
+        and bot_payload["drop_pending_updates"] is False
+    ):
+        return payload, False
+
+    normalized = dict(payload)
+    normalized_bot = dict(bot_payload) if isinstance(bot_payload, dict) else {}
+    normalized_bot["drop_pending_updates"] = False
+    normalized["bot"] = normalized_bot
+    return normalized, True
+
+
 class RuntimeConfigManager:
     def __init__(
         self,
@@ -956,10 +984,24 @@ class RuntimeConfigManager:
                     revision = 1
                     log.info("Imported legacy runtime settings into the database")
                 else:
-                    config = RuntimeConfig.model_validate(row.payload or {})
+                    raw_payload, payload_normalized = (
+                        _normalize_deprecated_runtime_payload(row.payload or {})
+                    )
+                    config = RuntimeConfig.model_validate(raw_payload)
                     secrets = await self._load_secret_map(session)
                     config = config.with_secrets(secrets)
                     revision = int(row.revision or 1)
+                    if payload_normalized:
+                        # This is an internal safety migration, not an operator
+                        # edit. Preserve the revision so an already-open admin
+                        # page does not encounter a needless conflict.
+                        row.payload = raw_payload
+                        row.schema_version = CONFIG_SCHEMA_VERSION
+                        await session.commit()
+                        log.info(
+                            "Normalized deprecated bot.drop_pending_updates=false "
+                            "without changing runtime config revision"
+                        )
 
             config.apply_to_settings(self.settings)
             self._config = config
@@ -1110,7 +1152,6 @@ class RuntimeConfigManager:
             },
             "restart_required_paths": [
                 "bot.parse_mode",
-                "bot.drop_pending_updates",
             ],
         }
 

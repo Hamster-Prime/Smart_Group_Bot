@@ -264,6 +264,55 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    async def test_successful_history_hard_cap_cleanup_logs_at_info(self) -> None:
+        tmpdir = self._workspace_tmpdir()
+        try:
+            db_path = tmpdir / "bot.db"
+            engine, session_factory = await init_db(self._sqlite_url(db_path))
+            group_id = 12345
+            async with session_factory() as session:
+                session.add_all(
+                    MessageVector(
+                        group_id=group_id,
+                        message_id=f"{group_id}:cap-{idx}",
+                        role="user",
+                        content=f"message {idx}",
+                        vector_id=f"{group_id}:cap-{idx}",
+                    )
+                    for idx in range(3)
+                )
+                await session.commit()
+
+            memory = MemoryService(
+                BotConfig(max_context_tokens=4096, max_output_tokens=2048),
+                _StubLLM(),
+                session_factory=session_factory,
+            )
+            with (
+                patch("bot.services.memory._HISTORY_MAX_MESSAGES_PER_GROUP", 2),
+                self.assertLogs("bot.services.memory", level="INFO") as captured,
+            ):
+                await memory._ensure_history_loaded(group_id)
+                prune_task = memory._history_prune_tasks[group_id]
+                await asyncio.wait_for(prune_task, timeout=5)
+
+            cleanup_log = next(
+                entry for entry in captured.output if "history hard cap applied" in entry
+            )
+            self.assertTrue(cleanup_log.startswith("INFO:"), cleanup_log)
+            async with session_factory() as session:
+                rows = list(
+                    (
+                        await session.execute(
+                            select(MessageVector).where(MessageVector.group_id == group_id)
+                        )
+                    ).scalars()
+                )
+            self.assertEqual(len(rows), 2)
+            await engine.dispose()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     async def test_history_for_llm_includes_structured_memory_rules(self) -> None:
         tmpdir = self._workspace_tmpdir()
         try:

@@ -476,6 +476,15 @@ class AuthorizedGroup(Base):
 
     group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     authorized_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Keep the durable authorization intent when Telegram reports that the bot
+    # left or was kicked.  Inactive rows are excluded from normal authorization
+    # and global fan-out queries, but can be reactivated by a later
+    # ``my_chat_member`` join without resurrecting a manually deleted grant.
+    bot_present: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

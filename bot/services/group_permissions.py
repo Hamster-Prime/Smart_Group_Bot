@@ -30,6 +30,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ChatPermissions
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -93,6 +94,15 @@ _PERMISSION_LABELS = {
     "can_pin_messages": "置顶消息",
     "can_manage_topics": "管理话题",
 }
+
+
+def _is_chat_not_modified(exc: TelegramBadRequest) -> bool:
+    """Return whether Telegram confirms the requested permissions already exist."""
+    detail = str(getattr(exc, "message", "")).strip().upper()
+    prefix = "BAD REQUEST:"
+    if detail.startswith(prefix):
+        detail = detail[len(prefix) :].strip()
+    return detail.replace(" ", "_") == "CHAT_NOT_MODIFIED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +632,7 @@ class GroupPermissionService:
                 await session.execute(
                     select(Group.id)
                     .join(AuthorizedGroup, AuthorizedGroup.group_id == Group.id)
+                    .where(AuthorizedGroup.bot_present.is_(True))
                     .order_by(Group.id)
                 )
             ).all()
@@ -655,7 +666,11 @@ class GroupPermissionService:
             async with self.session_factory() as session:
                 authorized = await session.get(AuthorizedGroup, group_id)
                 group = await session.get(Group, group_id)
-            if authorized is None or group is None:
+            if (
+                authorized is None
+                or not bool(getattr(authorized, "bot_present", True))
+                or group is None
+            ):
                 self.forget_group(group_id)
                 return False
             settings_data = group.settings if isinstance(group.settings, Mapping) else {}
@@ -771,6 +786,7 @@ class GroupPermissionService:
             and elapsed < self.reconcile_interval_seconds
         ):
             return False
+        already_current = False
         try:
             result = await self.bot.set_chat_permissions(
                 chat_id=group_id,
@@ -779,6 +795,17 @@ class GroupPermissionService:
             )
             if result is False:
                 raise RuntimeError("Telegram returned false")
+        except TelegramBadRequest as exc:
+            if _is_chat_not_modified(exc):
+                already_current = True
+            else:
+                self._last_errors[group_id] = str(exc) or type(exc).__name__
+                log.exception(
+                    "group default permission apply failed | group=%s active_windows=%s",
+                    group_id,
+                    ",".join(resolved.active_window_ids) or "none",
+                )
+                return False
         except Exception as exc:
             self._last_errors[group_id] = str(exc) or type(exc).__name__
             log.exception(
@@ -793,7 +820,8 @@ class GroupPermissionService:
         self._last_applied_at[group_id] = resolved.local_datetime
         self._last_errors.pop(group_id, None)
         log.info(
-            "group default permissions applied | group=%s active_windows=%s",
+            "group default permissions %s | group=%s active_windows=%s",
+            "already current" if already_current else "applied",
             group_id,
             ",".join(resolved.active_window_ids) or "none",
         )

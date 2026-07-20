@@ -71,6 +71,7 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         legacy.bot.auto_delete_categories = ["reply", "call_admin", "vote"]
         legacy.bot.auto_delete_category_seconds = {"vote": 90}
         legacy.bot.auto_delete_category_mode = {"call_admin": "button"}
+        legacy.bot.drop_pending_updates = True
 
         imported = build_legacy_runtime_config(
             "/tmp/nonexistent-smart-group-bot.toml",
@@ -94,6 +95,61 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             imported.bot.auto_delete_category_mode,
             {"call_admin": "button"},
         )
+        self.assertFalse(imported.bot.drop_pending_updates)
+
+    async def test_deprecated_drop_pending_setting_is_normalized_on_save(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["bot"]["drop_pending_updates"] = True
+
+        await self.manager.save(
+            payload,
+            expected_revision=1,
+            updated_by=42,
+        )
+
+        self.assertFalse(self.manager.config.bot.drop_pending_updates)
+        self.assertFalse(self.settings.bot.drop_pending_updates)
+        self.assertNotIn(
+            "bot.drop_pending_updates",
+            self.manager.api_document()["restart_required_paths"],
+        )
+        async with self.session_factory() as session:
+            row = await session.get(RuntimeConfigRecord, 1)
+            self.assertFalse(row.payload["bot"]["drop_pending_updates"])
+
+    async def test_deprecated_drop_pending_row_migrates_without_revision_bump(self) -> None:
+        async with self.session_factory() as session:
+            row = await session.get(RuntimeConfigRecord, 1)
+            payload = dict(row.payload)
+            bot_payload = dict(payload["bot"])
+            bot_payload["drop_pending_updates"] = True
+            payload["bot"] = bot_payload
+            row.payload = payload
+            row.revision = 7
+            await session.commit()
+
+        reloaded_settings = Settings(
+            _env_file=None,
+            bot_token="42:TEST_TOKEN",
+            super_admin_id=42,
+            config_master_key="unit-test-master-key",
+        )
+        reloaded_settings.bot.token = reloaded_settings.bot_token
+        reloaded = RuntimeConfigManager(
+            session_factory=self.session_factory,
+            settings=reloaded_settings,
+            legacy_raw_env={},
+        )
+
+        await reloaded.initialize()
+
+        self.assertEqual(reloaded.revision, 7)
+        self.assertFalse(reloaded.config.bot.drop_pending_updates)
+        self.assertFalse(reloaded_settings.bot.drop_pending_updates)
+        async with self.session_factory() as session:
+            row = await session.get(RuntimeConfigRecord, 1)
+            self.assertEqual(row.revision, 7)
+            self.assertFalse(row.payload["bot"]["drop_pending_updates"])
 
     async def test_secret_is_encrypted_masked_and_preserved_on_regular_save(self) -> None:
         payload = self.manager.config.public_payload()

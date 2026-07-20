@@ -8,11 +8,12 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from sqlalchemy import select
 
 from bot.handlers import membership
 from bot.db.engine import init_db
-from bot.db.models import Group, UserWarning
+from bot.db.models import AuthorizedGroup, Group, JoinVerification, UserWarning
 from bot.services.join_screening import add_global_ban, get_global_ban, remove_global_ban
 from bot.services.request_priority import (
     ExecutionPriority,
@@ -65,6 +66,9 @@ from bot.services.join_verification import (
     restore_member_permissions,
     restrict_new_member,
     release_join_verification_lease,
+    resume_group_verification_recovery,
+    telegram_group_is_unreachable_error,
+    telegram_group_requires_operator_action,
     upsert_join_verification,
     verification_keys_for_provider,
     verification_service_ready,
@@ -108,6 +112,25 @@ class _DbTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_group_error_classification_requires_deterministic_telegram_error(self) -> None:
+        method = SimpleNamespace()
+        self.assertTrue(
+            telegram_group_is_unreachable_error(
+                TelegramBadRequest(method=method, message="CHAT_NOT_FOUND")
+            )
+        )
+        self.assertTrue(
+            telegram_group_requires_operator_action(
+                TelegramBadRequest(method=method, message="CHAT_ADMIN_REQUIRED")
+            )
+        )
+        self.assertFalse(telegram_group_is_unreachable_error(RuntimeError("chat not found")))
+        self.assertFalse(
+            telegram_group_is_unreachable_error(
+                TelegramNetworkError(method=method, message="chat not found")
+            )
+        )
+
     def test_ready_requires_keys_and_url(self) -> None:
         self.assertTrue(join_verification_ready(_settings()))
         self.assertFalse(join_verification_ready(_settings(join_verification_enabled=False)))
@@ -3210,6 +3233,92 @@ class PrivateStartTests(_DbTestCase):
 
 
 class SweeperTests(_DbTestCase):
+    async def test_unreachable_unban_is_single_attempt_and_persistently_isolated(self) -> None:
+        async with self.session_factory() as session:
+            recovery = await lease_join_verification_for_unban(
+                session,
+                -100,
+                946,
+                now=now_shanghai_naive() - timedelta(minutes=3),
+            )
+            self.assertIsNotNone(recovery)
+            await session.commit()
+
+        error = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="CHAT_NOT_FOUND",
+        )
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(side_effect=error),
+            ban_chat_member=AsyncMock(),
+            restrict_chat_member=AsyncMock(),
+        )
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+        self.assertEqual(bot.unban_chat_member.await_count, 1)
+        async with self.session_factory() as session:
+            record = await get_join_verification(session, -100, 946)
+            authorization = await session.get(AuthorizedGroup, -100)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.status, VERIFICATION_STATUS_UNBANNING)
+            self.assertGreater(
+                record.lease_until,
+                now_shanghai_naive() + timedelta(hours=11),
+            )
+            self.assertFalse(authorization.bot_present)
+
+    async def test_resume_only_shortens_long_isolation_lease_with_safety_barrier(self) -> None:
+        now = now_shanghai_naive()
+        leases = {
+            947: now + timedelta(seconds=90),
+            948: now + timedelta(minutes=10),
+            949: now + timedelta(hours=12),
+        }
+        async with self.session_factory() as session:
+            for user_id, lease_until in leases.items():
+                session.add(
+                    JoinVerification(
+                        group_id=-100,
+                        user_id=user_id,
+                        kind=VERIFICATION_KIND_MODERATION,
+                        provider="turnstile",
+                        status=VERIFICATION_STATUS_UNBANNING,
+                        lease_until=lease_until,
+                        deadline_at=now,
+                    )
+                )
+            await session.commit()
+            self.assertEqual(
+                await resume_group_verification_recovery(
+                    session,
+                    -100,
+                    now=now,
+                ),
+                1,
+            )
+            await session.commit()
+
+            rows = {
+                row.user_id: row
+                for row in (
+                    await session.execute(
+                        select(JoinVerification).where(
+                            JoinVerification.group_id == -100
+                        )
+                    )
+                ).scalars()
+            }
+            self.assertEqual(rows[947].lease_until, leases[947])
+            self.assertEqual(rows[948].lease_until, leases[948])
+            self.assertEqual(
+                rows[949].lease_until,
+                now + timedelta(seconds=105),
+            )
+
     async def test_crashed_unban_journal_retries_unban_then_deletes(self) -> None:
         async with self.session_factory() as session:
             recovery = await lease_join_verification_for_unban(

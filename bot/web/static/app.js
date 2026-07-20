@@ -501,7 +501,6 @@
     const restartPaths = state.document.restart_required_paths || [];
     const pathLabels = {
       "bot.parse_mode": "消息解析格式",
-      "bot.drop_pending_updates": "启动时丢弃待处理消息",
     };
     return `
       ${pageHead("运行概览", "数据库中的配置会立即应用；启动参数保持只读。")}

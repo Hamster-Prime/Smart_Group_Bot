@@ -800,7 +800,10 @@ async def cmd_settings(
         allowed = bool(await session.scalar(
             select(Admin.id)
             .join(AuthorizedGroup, AuthorizedGroup.group_id == Admin.group_id)
-            .where(Admin.user_id == user_id)
+            .where(
+                Admin.user_id == user_id,
+                AuthorizedGroup.bot_present.is_(True),
+            )
             .limit(1)
         ))
     if not allowed:

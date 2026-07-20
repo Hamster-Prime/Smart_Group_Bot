@@ -339,7 +339,11 @@ def _build_auth_group_list_page(
         "",
     ]
     for idx, row in enumerate(rows[start:end], start=start + 1):
-        lines.append(f"{idx}. <b>群ID</b>: {row.group_id} | 授权人: {row.authorized_by or 0}")
+        reachability = "可用" if bool(getattr(row, "bot_present", True)) else "Bot 不可达/暂停"
+        lines.append(
+            f"{idx}. <b>群ID</b>: {row.group_id} | 授权人: "
+            f"{row.authorized_by or 0} | 状态: {reachability}"
+        )
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     nav_row: list[InlineKeyboardButton] = []
@@ -647,7 +651,7 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
     if not await ensure_super_admin(message, settings):
         return
 
-    rows = await list_authorized_groups(session)
+    rows = await list_authorized_groups(session, include_inactive=True)
     await session.commit()
     if not rows:
         await _answer(message, settings, "<b>已授权群组</b>\n当前为空。")
@@ -822,8 +826,15 @@ def _resolve_ban_target(message: Message, args: str) -> tuple[int | None, str]:
         return None, ""
 
 
-async def _authorized_group_ids(session: AsyncSession) -> list[int]:
-    rows = await list_authorized_groups(session)
+async def _authorized_group_ids(
+    session: AsyncSession,
+    *,
+    include_inactive: bool = False,
+) -> list[int]:
+    rows = await list_authorized_groups(
+        session,
+        include_inactive=include_inactive,
+    )
     return [int(row.group_id) for row in rows]
 
 
@@ -1600,11 +1611,16 @@ async def _perform_global_ban_locked(
         # terminal state is intentionally reused: its recovery routine reads
         # the latest durable policy and therefore enforces the global ban when
         # present, or restores access if a concurrent global unban wins.
+        journal_group_ids = await _authorized_group_ids(
+            session,
+            include_inactive=True,
+        )
         group_ids = await _authorized_group_ids(session)
+        active_group_set = set(group_ids)
         recoveries = await lease_join_verifications_for_user_unban(
             session,
             target_id,
-            group_ids=group_ids,
+            group_ids=journal_group_ids,
             manual_unban=False,
         )
         created = await add_global_ban(
@@ -1618,6 +1634,7 @@ async def _perform_global_ban_locked(
             (item.group_id, item.prompt_message_id)
             for item in recoveries
             if item.prompt_message_id > 0
+            and int(item.group_id) in active_group_set
         )
         await session.commit()
     await _publish_privileged_result(
@@ -1684,6 +1701,12 @@ async def _perform_global_ban_locked(
     ]
     if reason:
         lines.insert(3, f"<b>原因</b>: {html.escape(reason)}")
+    deferred_groups = max(0, len(journal_group_ids) - len(group_ids))
+    if deferred_groups:
+        lines.append(
+            f"<b>离线群延后</b>: {deferred_groups} 个；"
+            "Bot 重回群后由持久工单补偿。"
+        )
     failure_summary = _failure_summary(outcomes)
     if failure_summary:
         lines.append(f"<b>未完成分类</b>: {html.escape(failure_summary)}")
@@ -1716,11 +1739,16 @@ async def _perform_global_unban_locked(
     operator_id: int,
 ) -> str:
     async with session_factory() as session:
+        journal_group_ids = await _authorized_group_ids(
+            session,
+            include_inactive=True,
+        )
         group_ids = await _authorized_group_ids(session)
+        active_group_set = set(group_ids)
         recoveries = await lease_join_verifications_for_user_unban(
             session,
             target_id,
-            group_ids=group_ids,
+            group_ids=journal_group_ids,
         )
         removed = await remove_global_ban(
             session,
@@ -1731,9 +1759,10 @@ async def _perform_global_unban_locked(
             (item.group_id, item.prompt_message_id)
             for item in recoveries
             if item.prompt_message_id > 0
+            and int(item.group_id) in active_group_set
         )
         cleared_total = 0
-        for group_id in group_ids:
+        for group_id in journal_group_ids:
             cleared_count, _ = await _clear_user_warning(
                 session,
                 group_id,
@@ -1808,6 +1837,12 @@ async def _perform_global_unban_locked(
         ),
         "<b>资料审查</b>: 已加入资料审查豁免（消息内容仍会正常审核）",
     ]
+    deferred_groups = max(0, len(journal_group_ids) - len(group_ids))
+    if deferred_groups:
+        lines.append(
+            f"<b>离线群延后</b>: {deferred_groups} 个；"
+            "Bot 重回群后由持久工单继续解封。"
+        )
     failure_summary = _failure_summary(outcomes)
     if failure_summary:
         lines.append(f"<b>未完成分类</b>: {html.escape(failure_summary)}")
@@ -2860,7 +2895,7 @@ async def on_authlist_paging(
         return
     page = _parse_int(parts[1], default=0)
 
-    rows = await list_authorized_groups(session)
+    rows = await list_authorized_groups(session, include_inactive=True)
     await session.commit()
     if not rows:
         await msg.edit_text("<b>已授权群组</b>\n当前为空。", reply_markup=None)

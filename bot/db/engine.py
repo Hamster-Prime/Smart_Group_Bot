@@ -1185,6 +1185,18 @@ async def init_db(
                 await _sqlite_migrate_telegram_delete_jobs(conn)
         await conn.run_sync(Base.metadata.create_all)
         if is_sqlite:
+            await _sqlite_ensure_column(
+                conn,
+                "authorized_groups",
+                "bot_present",
+                "bot_present BOOLEAN NOT NULL DEFAULT 1",
+            )
+            await conn.execute(
+                text(
+                    "UPDATE authorized_groups SET bot_present = 1 "
+                    "WHERE bot_present IS NULL"
+                )
+            )
             # Ensure message_vectors schema keeps compatibility with previous versions.
             await _sqlite_ensure_column(
                 conn,

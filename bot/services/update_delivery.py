@@ -825,8 +825,9 @@ async def _run_update_delivery_started(
     # not part of the bot's automatic lifecycle.
     polling_drop_pending_updates = False
     if settings.bot.drop_pending_updates:
-        log.warning(
-            "drop_pending_updates 已停用：启动和自动降级始终保留 Telegram 积压更新"
+        log.debug(
+            "ignored deprecated drop_pending_updates=true; "
+            "Telegram backlog preservation remains enforced"
         )
 
     if webhook is not None:

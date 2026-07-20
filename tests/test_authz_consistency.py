@@ -10,7 +10,8 @@ from sqlalchemy.exc import IntegrityError
 
 from bot.config import Settings
 from bot.db.engine import init_db
-from bot.handlers import admin
+from bot.db.models import AuthorizedGroup
+from bot.handlers import admin, membership
 from bot.services.authz import (
     authorize_group,
     authorize_group_admin,
@@ -95,6 +96,73 @@ class AuthorizationConsistencyTests(unittest.IsolatedAsyncioTestCase):
         authorize_admin.assert_not_awaited()
         session.commit.assert_awaited_once()
         self.assertIn("目标群组尚未授权", answer.await_args.args[2])
+
+    async def test_my_chat_member_replay_uses_live_membership(self) -> None:
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            row = await session.get(AuthorizedGroup, -100)
+            row.bot_present = False
+            await session.commit()
+
+            event = SimpleNamespace(
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                # Simulate an old replay that says the bot left; live state wins.
+                new_chat_member=SimpleNamespace(
+                    status="left",
+                    user=SimpleNamespace(id=999, is_bot=True),
+                ),
+                bot=SimpleNamespace(
+                    get_chat_member=AsyncMock(
+                        return_value=SimpleNamespace(
+                            status="administrator",
+                            can_restrict_members=True,
+                        )
+                    )
+                ),
+            )
+            await membership.on_bot_membership_change(
+                event,
+                session=session,
+                settings=Settings(_env_file=None),
+            )
+
+            refreshed = await session.get(AuthorizedGroup, -100)
+            self.assertTrue(refreshed.bot_present)
+
+    async def test_my_chat_member_transient_failure_keeps_authorization(self) -> None:
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await session.commit()
+            event = SimpleNamespace(
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                new_chat_member=SimpleNamespace(user=SimpleNamespace(id=999, is_bot=True)),
+                bot=SimpleNamespace(
+                    get_chat_member=AsyncMock(side_effect=RuntimeError("temporary outage"))
+                ),
+            )
+            await membership.on_bot_membership_change(
+                event,
+                session=session,
+                settings=Settings(_env_file=None),
+            )
+            refreshed = await session.get(AuthorizedGroup, -100)
+            self.assertTrue(refreshed.bot_present)
+
+    async def test_my_chat_member_does_not_authorize_unknown_group(self) -> None:
+        lookup = AsyncMock()
+        async with self.session_factory() as session:
+            event = SimpleNamespace(
+                chat=SimpleNamespace(id=-999, type="supergroup"),
+                new_chat_member=SimpleNamespace(user=SimpleNamespace(id=999, is_bot=True)),
+                bot=SimpleNamespace(get_chat_member=lookup),
+            )
+            await membership.on_bot_membership_change(
+                event,
+                session=session,
+                settings=Settings(_env_file=None),
+            )
+            self.assertIsNone(await session.get(AuthorizedGroup, -999))
+        lookup.assert_not_awaited()
 
 
 if __name__ == "__main__":

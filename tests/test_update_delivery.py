@@ -64,6 +64,7 @@ class _MainDispatcher(dict):
         self.message = _MiddlewareEndpoint()
         self.callback_query = _MiddlewareEndpoint()
         self.chat_member = _MiddlewareEndpoint()
+        self.my_chat_member = _MiddlewareEndpoint()
 
     def include_router(self, _router: object) -> None:
         return None
@@ -536,15 +537,17 @@ class UpdateDeliveryTests(unittest.IsolatedAsyncioTestCase):
         dispatcher = _dispatcher()
         bot = SimpleNamespace(delete_webhook=AsyncMock(return_value=True))
 
-        await run_update_delivery(
-            bot=bot,
-            dispatcher=dispatcher,
-            settings=settings,
-            webhook=None,
-            fallback_reason="未配置 WEBHOOK_URL",
-        )
+        with self.assertLogs("bot.services.update_delivery", level="INFO") as captured:
+            await run_update_delivery(
+                bot=bot,
+                dispatcher=dispatcher,
+                settings=settings,
+                webhook=None,
+                fallback_reason="未配置 WEBHOOK_URL",
+            )
 
         bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+        self.assertNotIn("drop_pending_updates", "\n".join(captured.output))
 
     async def test_invalid_config_fallback_preserves_pending_updates(self) -> None:
         settings = _settings(

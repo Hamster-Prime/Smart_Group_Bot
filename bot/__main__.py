@@ -357,6 +357,7 @@ async def main() -> None:
     dp.message.middleware(DbSessionMiddleware(session_factory))
     dp.callback_query.middleware(DbSessionMiddleware(session_factory))
     dp.chat_member.middleware(DbSessionMiddleware(session_factory))
+    dp.my_chat_member.middleware(DbSessionMiddleware(session_factory))
 
     dp.include_router(commands.router)
     dp.include_router(admin.router)

@@ -16,9 +16,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import Group, JoinVerification, UserWarning
+from bot.db.models import AuthorizedGroup, Group, JoinVerification, UserWarning
 from bot.services.admin_status import invalidate_admin_status_cache
-from bot.services.authz import is_group_authorized, is_super_admin_user_id
+from bot.services.authz import (
+    is_group_authorized,
+    is_super_admin_user_id,
+    set_group_bot_present,
+)
 from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
@@ -59,6 +63,7 @@ from bot.services.join_verification import (
     delete_join_verification,
     delete_verification_prompt,
     enforce_ban_with_policy_reconciliation,
+    extend_pending_verification_deadlines,
     get_join_verification,
     join_verification_ready,
     join_verification_policy,
@@ -76,9 +81,11 @@ from bot.services.join_verification import (
     renew_join_verification_lease,
     renew_prepared_join_verification,
     restore_member_permissions,
+    resume_group_verification_recovery,
     rollback_group_ban,
     restrict_new_member,
     shield_abort_prepared_join_verification,
+    telegram_group_is_unreachable_error,
     upsert_join_verification,
     verification_deadline_passed,
     verification_release_blocked_by_ban,
@@ -2264,6 +2271,97 @@ async def _process_member_join(
         user_id,
         current_profile_ban_policy,
         current_profile_restriction_required,
+    )
+
+
+def _member_status_value(member: object) -> str:
+    raw = getattr(member, "status", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+@router.my_chat_member()
+async def on_bot_membership_change(
+    event: ChatMemberUpdated,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Keep authorized-group reachability in sync with Telegram authority.
+
+    Durable inbox replay can deliver an old membership event.  The event's
+    transition is therefore only a trigger: current bot membership is fetched
+    from Telegram before changing the persisted state.
+    """
+
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    group_id = int(event.chat.id)
+    authorized = await session.get(AuthorizedGroup, group_id)
+    if authorized is None:
+        # Being added to a group never grants authorization implicitly.
+        return
+    # Do not hold a database read transaction across the Telegram authority
+    # check; membership updates are rare but the API timeout is still seconds.
+    await session.commit()
+
+    bot_user = getattr(getattr(event, "new_chat_member", None), "user", None)
+    bot_user_id = int(getattr(bot_user, "id", 0) or 0)
+    if not bot_user_id:
+        return
+
+    try:
+        async with asyncio.timeout(6.0):
+            current = await event.bot.get_chat_member(group_id, bot_user_id)
+        current_status = _member_status_value(current)
+        present = current_status not in {"left", "kicked"}
+        operational = bool(
+            current_status == "creator"
+            or current_status == "administrator"
+            and bool(getattr(current, "can_restrict_members", False))
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if not telegram_group_is_unreachable_error(exc):
+            log.warning(
+                "bot membership refresh failed; authorization unchanged | "
+                "group=%s error=%s",
+                group_id,
+                exc,
+            )
+            return
+        present = False
+        operational = False
+
+    changed = await set_group_bot_present(
+        session,
+        group_id,
+        present=present,
+    )
+    if not changed and not (present and operational):
+        return
+    if present:
+        if operational:
+            resumed = await resume_group_verification_recovery(session, group_id)
+            refreshed = await extend_pending_verification_deadlines(
+                session,
+                settings=settings,
+                group_id=group_id,
+            )
+        else:
+            resumed = 0
+            refreshed = 0
+    else:
+        resumed = 0
+        refreshed = 0
+    await session.commit()
+    log.info(
+        "authorized group bot membership changed | group=%s present=%s "
+        "operational=%s recovery_resumed=%s pending_refreshed=%s",
+        group_id,
+        present,
+        operational,
+        resumed,
+        refreshed,
     )
 
 

@@ -1063,6 +1063,7 @@ class RaidGuardService:
             result = await session.execute(
                 select(Group.id, Group.settings)
                 .join(AuthorizedGroup, AuthorizedGroup.group_id == Group.id)
+                .where(AuthorizedGroup.bot_present.is_(True))
                 .order_by(Group.id)
             )
             rows = list(result.all())

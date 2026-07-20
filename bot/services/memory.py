@@ -509,6 +509,7 @@ class MemoryService:
         async with self._session_factory() as session:
             authorized_rows = await session.execute(
                 select(AuthorizedGroup.group_id)
+                .where(AuthorizedGroup.bot_present.is_(True))
                 .order_by(AuthorizedGroup.group_id.asc())
                 .limit(1024)
             )
@@ -660,7 +661,7 @@ class MemoryService:
                     removed += len(batch_ids)
                 await asyncio.sleep(0.05)
             if removed:
-                log.warning(
+                log.info(
                     "memory history hard cap applied: group=%s removed=%d retained=%d",
                     group_id,
                     removed,
@@ -937,7 +938,7 @@ class MemoryService:
                         )
                     )
                 await session.commit()
-            log.warning(
+            log.info(
                 "memory history background prune: group=%s removed=%d retained=%d",
                 group_id,
                 len(ids),
