@@ -77,6 +77,10 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         )
         message._test_session = session
         group_row = SimpleNamespace(settings={"mute_all_replies": True})
+
+        async def enforce_ban(bot, group_id, user_id, *_args, **_kwargs):
+            return bool(await group.ban_member(bot, group_id, user_id))
+
         patches = [
             patch(
                 "bot.handlers.group.ensure_group_authorized",
@@ -85,6 +89,27 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "bot.handlers.group._fresh_group_authorized_for_moderation",
                 new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.lease_join_verification_for_unban",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        verification_id=9001,
+                        lease_until=object(),
+                    )
+                ),
+            ),
+            patch(
+                "bot.handlers.group.complete_leased_join_verification",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.enforce_ban_with_policy_reconciliation",
+                new=AsyncMock(side_effect=enforce_ban),
             ),
             patch(
                 "bot.handlers.group._record_group_activity_cas",

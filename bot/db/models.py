@@ -81,6 +81,10 @@ class ModerationRule(Base):
 
     group: Mapped[Group] = relationship(back_populates="moderation_rules")
 
+    __table_args__ = (
+        Index("ix_moderation_rules_group_enabled_id", "group_id", "enabled", "id"),
+    )
+
 
 class KeywordReply(Base):
     """Per-group keyword auto replies, managed from the Mini App.
@@ -226,7 +230,8 @@ class VoteBanSession(Base):
     # active / enforcing / passed / failed / expired / cancelled
     status: Mapped[str] = mapped_column(String(16), default="active")
     # "" = resolved by vote threshold / timeout; "admin_ban" / "admin_cancel"
-    # = a group admin resolved the poll early via its admin buttons.
+    # = a group admin resolved the poll early via its admin buttons;
+    # "manual_unban" = a newer explicit unban cancelled open enforcement.
     resolution: Mapped[str] = mapped_column(
         String(16), default="", server_default=""
     )
@@ -252,6 +257,7 @@ class VoteBanSession(Base):
 
     __table_args__ = (
         Index("ix_vote_ban_group_status", "group_id", "status"),
+        Index("ix_vote_ban_status_deadline", "status", "deadline_at"),
         # One open/enforcing poll per (group, target), enforced at the DB level so
         # two concurrent /voteban commands cannot both open a session.
         Index(
@@ -333,6 +339,7 @@ class BanAuditEvent(Base):
 
     __table_args__ = (
         Index("ix_ban_audit_group_created", "group_id", "created_at"),
+        Index("ix_ban_audit_group_id_desc", "group_id", "id"),
         Index(
             "ix_ban_audit_group_target_created",
             "group_id",
@@ -379,6 +386,12 @@ class Violation(Base):
     group: Mapped[Group] = relationship(back_populates="violations")
 
     __table_args__ = (
+        Index(
+            "ix_violations_group_user_ban",
+            "group_id",
+            "user_id",
+            "ban_enforced",
+        ),
         Index(
             "ix_violations_group_source_message",
             "group_id",
@@ -568,6 +581,7 @@ class JoinVerification(Base):
     __table_args__ = (
         Index("ix_join_verification_group_user", "group_id", "user_id", unique=True),
         Index("ix_join_verifications_status_lease", "status", "lease_until"),
+        Index("ix_join_verifications_status_deadline", "status", "deadline_at"),
         {"sqlite_autoincrement": True},
     )
 
@@ -632,6 +646,12 @@ class WebhookInboxUpdate(Base):
 
     update_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    priority: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
+    auth_candidate: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+    )
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -648,10 +668,20 @@ class WebhookInboxUpdate(Base):
     __table_args__ = (
         Index(
             "ix_webhook_inbox_recovery",
+            "priority",
+            "auth_candidate",
             "completed_at",
             "dead_lettered_at",
             "next_attempt_at",
             "lease_until",
+        ),
+        Index(
+            "ix_webhook_inbox_completed_retention",
+            "completed_at",
+        ),
+        Index(
+            "ix_webhook_inbox_dead_letter_retention",
+            "dead_lettered_at",
         ),
     )
 
@@ -755,6 +785,7 @@ class MessageVector(Base):
 
     __table_args__ = (
         Index("ix_message_vectors_group_created", "group_id", "created_at"),
+        Index("ix_message_vectors_group_row", "group_id", "id"),
     )
 
 

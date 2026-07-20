@@ -40,6 +40,10 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
                 "bot.handlers.group._record_group_activity_cas",
                 new=AsyncMock(return_value=group_row.settings),
             ) as record_activity,
@@ -110,6 +114,10 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group.ensure_group_authorized", new=AsyncMock(return_value=True)),
             patch(
                 "bot.handlers.group._fresh_group_authorized_for_moderation",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
                 new=AsyncMock(return_value=True),
             ),
             patch(
@@ -214,6 +222,10 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
                 "bot.handlers.group._record_group_activity_cas",
                 new=AsyncMock(return_value=group_row.settings),
             ),
@@ -227,7 +239,7 @@ class GroupChannelSenderTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group.ModerationService", return_value=moderation_service),
             patch("bot.handlers.group.answer_with_auto_delete", new=AsyncMock()),
         )
-        with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6], common_patches[7], common_patches[8], common_patches[9], common_patches[10], common_patches[11]:
+        with common_patches[0], common_patches[1], common_patches[2], common_patches[3], common_patches[4], common_patches[5], common_patches[6], common_patches[7], common_patches[8], common_patches[9], common_patches[10], common_patches[11], common_patches[12]:
             await group.on_group_message(message, session=session, settings=settings)
             await group.on_group_message(message, session=session, settings=settings)
 

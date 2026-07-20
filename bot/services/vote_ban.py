@@ -30,7 +30,16 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
-from bot.services.join_verification import ban_member
+from bot.services.join_verification import (
+    UnbanRecovery,
+    ban_member,
+    complete_leased_join_verification,
+    join_verification_lease_is_current,
+    lease_join_verification_for_unban,
+    reconcile_moderation_ban_after_lost_lease,
+    verification_release_blocked_by_ban,
+    verification_restriction_required,
+)
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -42,6 +51,7 @@ log = logging.getLogger(__name__)
 VOTE_BAN_CALLBACK_PREFIX = "vban"
 VOTE_BAN_ADMIN_RESOLUTION_BAN = "admin_ban"
 VOTE_BAN_ADMIN_RESOLUTION_CANCEL = "admin_cancel"
+VOTE_BAN_MANUAL_UNBAN_RESOLUTION = "manual_unban"
 VOTE_BAN_ENABLED_KEY = "vote_ban_enabled"
 VOTE_BAN_THRESHOLD_KEY = "vote_ban_threshold"
 VOTE_BAN_DURATION_KEY = "vote_ban_duration_seconds"
@@ -293,6 +303,42 @@ async def get_active_session(
             VoteBanSession.status.in_(("active", "enforcing")),
         )
     )
+
+
+async def cancel_vote_bans_for_manual_unban(
+    session: AsyncSession,
+    *,
+    target_user_id: int,
+    group_ids: tuple[int, ...] | list[int] | set[int] | None = None,
+) -> int:
+    """Atomically make a newer manual unban win over open vote enforcement.
+
+    An ``enforcing`` vote may already be inside the Telegram ban call.  Merely
+    clearing ``UserWarning`` is therefore insufficient: the old worker would
+    otherwise publish its successful ban afterwards.  Changing the vote status
+    in the same transaction as the unban recovery generation makes its final
+    lease CAS fail, after which the worker reconciles Telegram to current policy.
+    """
+
+    conditions = [
+        VoteBanSession.target_user_id == int(target_user_id),
+        VoteBanSession.status.in_(("active", "enforcing")),
+    ]
+    selected_groups = tuple(
+        dict.fromkeys(int(group_id) for group_id in (group_ids or ()))
+    )
+    if selected_groups:
+        conditions.append(VoteBanSession.group_id.in_(selected_groups))
+    result = await session.execute(
+        update(VoteBanSession)
+        .where(*conditions)
+        .values(
+            status="cancelled",
+            enforcing_started_at=None,
+            resolution=VOTE_BAN_MANUAL_UNBAN_RESOLUTION,
+        )
+    )
+    return int(result.rowcount or 0)
 
 
 async def count_approvals(session: AsyncSession, session_id: int) -> int:
@@ -957,6 +1003,7 @@ async def record_vote_ban_outcome(
     approvals: int,
     banned: bool,
     lease_token: datetime | None,
+    recovery: UnbanRecovery | None,
 ) -> bool:
     """Persist the real outcome only while this worker owns the lease.
 
@@ -964,7 +1011,26 @@ async def record_vote_ban_outcome(
     transaction.  A slow worker whose lease was taken over cannot overwrite
     a newer result or append a second final fact.
     """
-    if lease_token is None:
+    if lease_token is None or recovery is None:
+        await session.rollback()
+        return False
+    if banned:
+        recovery_claimed = await complete_leased_join_verification(
+            session,
+            verification_id=int(recovery.verification_id),
+            lease_until=recovery.lease_until,
+            status="unbanning",
+        )
+    else:
+        # An unconfirmed/failed Telegram attempt keeps its compensation row for
+        # the sweeper, but this worker must still prove it owns that exact row.
+        recovery_claimed = await join_verification_lease_is_current(
+            session,
+            verification_id=int(recovery.verification_id),
+            lease_until=recovery.lease_until,
+            status="unbanning",
+        )
+    if not recovery_claimed:
         await session.rollback()
         return False
     terminal_status = "passed" if banned else "failed"
@@ -1047,6 +1113,54 @@ async def record_vote_ban_outcome(
     return True
 
 
+async def reconcile_vote_ban_after_lost_generation(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    group_id: int,
+    target_user_id: int,
+) -> bool:
+    """Make Telegram match durable policy after a vote worker loses either CAS."""
+
+    async def preserve_ban() -> bool:
+        await session.rollback()
+        blocked = await verification_release_blocked_by_ban(
+            session,
+            group_id=int(group_id),
+            user_id=int(target_user_id),
+        )
+        if not blocked:
+            blocked = bool(
+                await session.scalar(
+                    select(VoteBanSession.id).where(
+                        VoteBanSession.group_id == int(group_id),
+                        VoteBanSession.target_user_id == int(target_user_id),
+                        VoteBanSession.status == "enforcing",
+                    )
+                )
+            )
+        await session.commit()
+        return bool(blocked)
+
+    async def restriction_required() -> bool:
+        await session.rollback()
+        required = await verification_restriction_required(
+            session,
+            group_id=int(group_id),
+            user_id=int(target_user_id),
+        )
+        await session.commit()
+        return bool(required)
+
+    return await reconcile_moderation_ban_after_lost_lease(
+        bot,
+        int(group_id),
+        int(target_user_id),
+        preserve_ban,
+        restriction_required=restriction_required,
+    )
+
+
 def admin_cancel_outcome_line(record: VoteBanSession) -> str:
     """User-visible result line for a poll cancelled by a group admin."""
     resolver = _mention(
@@ -1104,10 +1218,28 @@ async def recover_stale_vote_enforcement(
     if int(claimed.rowcount or 0) != 1:
         await session.rollback()
         return None
+    recovery = await lease_join_verification_for_unban(
+        session,
+        int(record.group_id),
+        int(record.target_user_id),
+        manual_unban=False,
+    )
+    if recovery is None:
+        await session.rollback()
+        return None
     await session.commit()
 
     fresh = await session.get(VoteBanSession, int(record.id), populate_existing=True)
     if fresh is None or fresh.status != "enforcing":
+        await session.commit()
+        return None
+    owns_generation = await join_verification_lease_is_current(
+        session,
+        verification_id=int(recovery.verification_id),
+        lease_until=recovery.lease_until,
+        status="unbanning",
+    )
+    if not owns_generation:
         await session.commit()
         return None
     approvals = await count_approvals(session, int(fresh.id))
@@ -1124,22 +1256,13 @@ async def recover_stale_vote_enforcement(
         target_user_id=int(fresh.target_user_id),
     )
     try:
-        if banned:
-            # Keep pending verification state consistent with the confirmed
-            # Telegram ban; this participates in the final transaction.
-            from bot.services.join_verification import delete_join_verification
-
-            await delete_join_verification(
-                session,
-                int(fresh.group_id),
-                int(fresh.target_user_id),
-            )
         persisted = await record_vote_ban_outcome(
             session,
             fresh,
             approvals=approvals,
             banned=banned,
             lease_token=current,
+            recovery=recovery,
         )
     except Exception:
         await session.rollback()
@@ -1151,6 +1274,19 @@ async def recover_stale_vote_enforcement(
         return None
 
     if not persisted:
+        try:
+            await reconcile_vote_ban_after_lost_generation(
+                bot,
+                session,
+                group_id=int(fresh.group_id),
+                target_user_id=int(fresh.target_user_id),
+            )
+        except Exception:
+            log.exception(
+                "vote-ban lost-generation reconciliation failed | group=%s session=%s",
+                fresh.group_id,
+                fresh.id,
+            )
         latest = await session.get(
             VoteBanSession,
             int(fresh.id),

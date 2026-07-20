@@ -6,14 +6,14 @@ import tempfile
 import unittest
 from datetime import timedelta
 
-from sqlalchemy import text
+from sqlalchemy import create_engine, inspect, text
 
 from bot.db.engine import (
     _SQLITE_VOTE_BAN_DEDUPE_SQL,
     _SQLITE_VOTE_BAN_INDEX_SQL,
     init_db,
 )
-from bot.db.models import VoteBanSession
+from bot.db.models import Base, VoteBanSession
 from bot.utils.timezone import now_shanghai_naive
 
 
@@ -51,6 +51,26 @@ class VoteBanMigrationTests(unittest.TestCase):
                 "(id, group_id, target_user_id, status) "
                 "VALUES (5, -100, 7, 'active')"
             )
+
+
+class PerformanceIndexTests(unittest.TestCase):
+    def test_hot_path_indexes_exist_in_canonical_schema(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        inspector = inspect(engine)
+
+        expected = {
+            "moderation_rules": "ix_moderation_rules_group_enabled_id",
+            "violations": "ix_violations_group_user_ban",
+            "ban_audit_events": "ix_ban_audit_group_id_desc",
+            "join_verifications": "ix_join_verifications_status_deadline",
+            "vote_ban_sessions": "ix_vote_ban_status_deadline",
+            "message_vectors": "ix_message_vectors_group_row",
+        }
+        for table, index_name in expected.items():
+            names = {index["name"] for index in inspector.get_indexes(table)}
+            self.assertIn(index_name, names, table)
 
 
 class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -599,6 +619,8 @@ class DurableQueueMigrationTests(unittest.IsolatedAsyncioTestCase):
                 }
                 self.assertIn("next_attempt_at", webhook_columns)
                 self.assertIn("dead_lettered_at", webhook_columns)
+                self.assertIn("priority", webhook_columns)
+                self.assertIn("auth_candidate", webhook_columns)
                 webhook_indexes = {
                     str(row[1])
                     for row in (
@@ -608,6 +630,14 @@ class DurableQueueMigrationTests(unittest.IsolatedAsyncioTestCase):
                     ).all()
                 }
                 self.assertIn("ix_webhook_inbox_recovery", webhook_indexes)
+                self.assertIn(
+                    "ix_webhook_inbox_completed_retention",
+                    webhook_indexes,
+                )
+                self.assertIn(
+                    "ix_webhook_inbox_dead_letter_retention",
+                    webhook_indexes,
+                )
                 self.assertNotIn("ix_webhook_inbox_completed_lease", webhook_indexes)
                 webhook_recovery_columns = tuple(
                     str(row[2])
@@ -620,6 +650,8 @@ class DurableQueueMigrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     webhook_recovery_columns,
                     (
+                        "priority",
+                        "auth_candidate",
                         "completed_at",
                         "dead_lettered_at",
                         "next_attempt_at",

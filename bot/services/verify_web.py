@@ -25,6 +25,7 @@ import logging
 import secrets
 import time
 from collections import OrderedDict, deque
+from contextvars import Context
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,12 +72,37 @@ from bot.services.join_verification import (
     verification_provider,
     verification_subproviders,
 )
+from bot.services.request_priority import (
+    ExecutionPriority,
+    execution_priority_scope,
+    privileged_request_scope,
+)
+from bot.services.resource_health import (
+    register_resource_health_provider,
+    resource_health_snapshot,
+    unregister_resource_health_provider,
+)
 from bot.services.runtime_config import RuntimeConfigManager
-from bot.services.update_delivery import WEBHOOK_MAX_CONCURRENT_UPDATES
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
     bind_update_completion,
     reset_update_completion,
+)
+from bot.services.update_delivery import (
+    WEBHOOK_AUTH_CONCURRENT_UPDATES,
+    WEBHOOK_AUTH_QUEUE_CAPACITY,
+    WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
+    WEBHOOK_CRITICAL_QUEUE_CAPACITY,
+    WEBHOOK_MAX_CONCURRENT_UPDATES,
+    WEBHOOK_SECURITY_CONCURRENT_UPDATES,
+    WEBHOOK_SECURITY_QUEUE_CAPACITY,
+    TELEGRAM_AUTH_CANDIDATE_BURST,
+    mark_privileged_operator,
+    privileged_operator_is_trusted,
+    telegram_update_chat_id,
+    telegram_update_is_auth_candidate,
+    telegram_update_sender_id,
+    telegram_update_priority,
 )
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
@@ -166,6 +192,22 @@ _WEB_MAX_REQUEST_BYTES = 1024 * 1024
 # request may disconnect sooner; the shielded shared result remains available
 # to Telegram's retry and still prevents duplicate execution.
 _WEBHOOK_UPDATE_TIMEOUT_SECONDS = 150.0
+# Privileged updates receive a fresh execution budget when a reserved worker
+# takes them.  Queue wait must not consume the time needed to acknowledge an
+# administrator callback or enforce a membership change.  Long batch work is
+# handed off by the handlers and therefore should not need the ordinary 150s
+# end-to-end queue budget.
+_WEBHOOK_CRITICAL_UPDATE_TIMEOUT_SECONDS = 60.0
+_WEBHOOK_SECURITY_UPDATE_TIMEOUT_SECONDS = 120.0
+_WEBHOOK_AUTH_UPDATE_TIMEOUT_SECONDS = 45.0
+_WEBHOOK_CRITICAL_QUEUE_WARN_SECONDS = 2.0
+_WEBHOOK_SECURITY_QUEUE_WARN_SECONDS = 5.0
+_WEBHOOK_UNTRUSTED_CRITICAL_WINDOW_SECONDS = 10.0
+_WEBHOOK_UNTRUSTED_CRITICAL_BURST = 6
+_WEBHOOK_UNTRUSTED_AUTH_WINDOW_SECONDS = 10.0
+_WEBHOOK_UNTRUSTED_AUTH_BURST = TELEGRAM_AUTH_CANDIDATE_BURST
+_WEBHOOK_ORPHAN_FATAL_AGE_SECONDS = 120.0
+_WEBHOOK_LATE_FINALIZER_FATAL_AGE_SECONDS = 300.0
 _WEBHOOK_HTTP_RESPONSE_TIMEOUT_SECONDS = 155.0
 _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS = 2.0
 _WEBHOOK_DRAIN_TIMEOUT_SECONDS = 15.0
@@ -589,6 +631,199 @@ class _QueuedWebhookUpdate:
     enqueued_at: float
     result: asyncio.Future[bool]
     lease_until: datetime | None = None
+    priority: ExecutionPriority = ExecutionPriority.NORMAL
+    auth_candidate: bool = False
+
+    @property
+    def privileged(self) -> bool:
+        return self.priority < ExecutionPriority.NORMAL
+
+    @property
+    def critical(self) -> bool:
+        return self.priority <= ExecutionPriority.CRITICAL
+
+
+class _BoundedPriorityUpdateQueue:
+    """Four FIFO lanes with hard capacity reserved by urgency.
+
+    Ordinary work cannot consume security capacity, and automatic membership
+    work cannot consume the critical operator lane. Unknown management-command
+    candidates use a separate, unprivileged authentication lane: they bypass
+    ordinary backlog without being allowed to consume trusted capacity. This
+    is stronger than a plain ``PriorityQueue`` because already-queued low-
+    priority items cannot consume another class's admission or worker capacity.
+    """
+
+    def __init__(
+        self,
+        *,
+        ordinary_capacity: int,
+        auth_capacity: int,
+        security_capacity: int,
+        critical_capacity: int,
+    ) -> None:
+        self._ordinary: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
+            maxsize=max(1, int(ordinary_capacity))
+        )
+        self._auth: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
+            maxsize=max(1, int(auth_capacity))
+        )
+        self._security: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
+            maxsize=max(1, int(security_capacity))
+        )
+        self._critical: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
+            maxsize=max(1, int(critical_capacity))
+        )
+        self.ordinary_maxsize = self._ordinary.maxsize
+        self.auth_maxsize = self._auth.maxsize
+        self.security_maxsize = self._security.maxsize
+        self.critical_maxsize = self._critical.maxsize
+        self.maxsize = (
+            self.ordinary_maxsize
+            + self.auth_maxsize
+            + self.security_maxsize
+            + self.critical_maxsize
+        )
+
+    def _queue_for(
+        self,
+        priority: ExecutionPriority,
+        *,
+        auth_candidate: bool = False,
+    ) -> asyncio.Queue[_QueuedWebhookUpdate]:
+        if auth_candidate:
+            return self._auth
+        if priority <= ExecutionPriority.CRITICAL:
+            return self._critical
+        if priority <= ExecutionPriority.HIGH:
+            return self._security
+        return self._ordinary
+
+    def qsize(self) -> int:
+        return (
+            self._critical.qsize()
+            + self._security.qsize()
+            + self._auth.qsize()
+            + self._ordinary.qsize()
+        )
+
+    def ordinary_qsize(self) -> int:
+        return self._ordinary.qsize()
+
+    def auth_qsize(self) -> int:
+        return self._auth.qsize()
+
+    def security_qsize(self) -> int:
+        return self._security.qsize()
+
+    def critical_qsize(self) -> int:
+        return self._critical.qsize()
+
+    def empty(self) -> bool:
+        return (
+            self._critical.empty()
+            and self._security.empty()
+            and self._auth.empty()
+            and self._ordinary.empty()
+        )
+
+    def full(self) -> bool:
+        return (
+            self._critical.full()
+            and self._security.full()
+            and self._auth.full()
+            and self._ordinary.full()
+        )
+
+    def ordinary_full(self) -> bool:
+        return self._ordinary.full()
+
+    def auth_full(self) -> bool:
+        return self._auth.full()
+
+    def security_full(self) -> bool:
+        return self._security.full()
+
+    def critical_full(self) -> bool:
+        return self._critical.full()
+
+    def can_accept(
+        self,
+        *,
+        priority: ExecutionPriority,
+        auth_candidate: bool = False,
+    ) -> bool:
+        # Keep the explicit overall check so tests and emergency instrumentation
+        # can force the queue closed by replacing ``full``.
+        if self.full():
+            return False
+        return not self._queue_for(
+            priority,
+            auth_candidate=auth_candidate,
+        ).full()
+
+    def put_nowait(self, item: _QueuedWebhookUpdate) -> None:
+        self._queue_for(
+            item.priority,
+            auth_candidate=item.auth_candidate,
+        ).put_nowait(item)
+
+    async def get(
+        self,
+        *,
+        priority: ExecutionPriority,
+        auth_candidate: bool = False,
+    ) -> _QueuedWebhookUpdate:
+        return await self._queue_for(
+            priority,
+            auth_candidate=auth_candidate,
+        ).get()
+
+    def get_nowait(self) -> _QueuedWebhookUpdate:
+        try:
+            return self._critical.get_nowait()
+        except asyncio.QueueEmpty:
+            try:
+                return self._security.get_nowait()
+            except asyncio.QueueEmpty:
+                try:
+                    return self._auth.get_nowait()
+                except asyncio.QueueEmpty:
+                    return self._ordinary.get_nowait()
+
+    def task_done(self, item: _QueuedWebhookUpdate) -> None:
+        self._queue_for(
+            item.priority,
+            auth_candidate=item.auth_candidate,
+        ).task_done()
+
+    async def join(self) -> None:
+        await asyncio.gather(
+            self._critical.join(),
+            self._security.join(),
+            self._auth.join(),
+            self._ordinary.join(),
+        )
+
+    def items(
+        self,
+        *,
+        priority: ExecutionPriority | None = None,
+        auth_candidate: bool = False,
+    ) -> tuple[_QueuedWebhookUpdate, ...]:
+        if priority is not None:
+            return tuple(
+                self._queue_for(
+                    priority,
+                    auth_candidate=auth_candidate,
+                )._queue  # type: ignore[attr-defined]
+            )
+        return (
+            *tuple(self._critical._queue),  # type: ignore[attr-defined]
+            *tuple(self._security._queue),  # type: ignore[attr-defined]
+            *tuple(self._auth._queue),  # type: ignore[attr-defined]
+            *tuple(self._ordinary._queue),  # type: ignore[attr-defined]
+        )
 
 
 class _WebhookUpdateDeadlineExceeded(TimeoutError):
@@ -611,27 +846,59 @@ class _WebhookUpdateQueue:
         session_factory: async_sessionmaker[AsyncSession] | None,
         secret_token: str,
         worker_count: int,
+        critical_worker_count: int = WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
+        security_worker_count: int = WEBHOOK_SECURITY_CONCURRENT_UPDATES,
+        auth_worker_count: int = WEBHOOK_AUTH_CONCURRENT_UPDATES,
+        critical_queue_capacity: int = WEBHOOK_CRITICAL_QUEUE_CAPACITY,
+        security_queue_capacity: int = WEBHOOK_SECURITY_QUEUE_CAPACITY,
+        auth_queue_capacity: int = WEBHOOK_AUTH_QUEUE_CAPACITY,
     ) -> None:
         self.dispatcher = dispatcher
         self.bot = bot
         self.session_factory = session_factory
         self.secret_token = secret_token
         self.worker_count = max(1, int(worker_count))
-        self.queue: asyncio.Queue[_QueuedWebhookUpdate] = asyncio.Queue(
-            maxsize=self.worker_count * 4
+        self.critical_worker_count = max(1, int(critical_worker_count))
+        self.security_worker_count = max(1, int(security_worker_count))
+        self.auth_worker_count = max(1, int(auth_worker_count))
+        self.queue = _BoundedPriorityUpdateQueue(
+            ordinary_capacity=self.worker_count * 4,
+            auth_capacity=max(
+                self.auth_worker_count,
+                int(auth_queue_capacity),
+            ),
+            critical_capacity=max(
+                self.critical_worker_count,
+                int(critical_queue_capacity),
+            ),
+            security_capacity=max(
+                self.security_worker_count,
+                int(security_queue_capacity),
+            ),
         )
         self._workers: list[asyncio.Task[None]] = []
+        self._ordinary_workers: list[asyncio.Task[None]] = []
+        self._auth_workers: list[asyncio.Task[None]] = []
+        self._critical_workers: list[asyncio.Task[None]] = []
+        self._security_workers: list[asyncio.Task[None]] = []
         self._workers_started = False
         self._processing_tasks: set[asyncio.Task[Any]] = set()
         self._orphaned_tasks: set[asyncio.Task[Any]] = set()
+        self._orphaned_started_at: dict[asyncio.Task[Any], float] = {}
         self._deferred_tasks: set[asyncio.Task[Any]] = set()
         self._late_finalizers: dict[int, asyncio.Task[Any]] = {}
+        self._late_finalizer_started_at: dict[int, float] = {}
         self._recovery_task: asyncio.Task[None] | None = None
         self._last_cleanup_at = 0.0
         self._active_started_at: dict[int, float] = {}
+        self._active_auth_started_at: dict[int, float] = {}
+        self._active_privileged_started_at: dict[int, float] = {}
+        self._active_critical_started_at: dict[int, float] = {}
+        self._active_security_started_at: dict[int, float] = {}
         self._start_lock = asyncio.Lock()
         self._dedup_lock = asyncio.Lock()
         self._stopped = False
+        self._quiescing = False
         self._stop_task: asyncio.Task[None] | None = None
         self._fatal_error: str | None = None
         self._consecutive_failures = 0
@@ -639,8 +906,20 @@ class _WebhookUpdateQueue:
         self._completed_update_ids: dict[int, float] = {}
         self._seen_update_ids: dict[int, float] = {}
         self._accepted_updates = 0
+        self._accepted_auth_updates = 0
+        self._accepted_privileged_updates = 0
+        self._accepted_critical_updates = 0
+        self._accepted_security_updates = 0
         self._completed_updates = 0
+        self._completed_auth_updates = 0
+        self._completed_privileged_updates = 0
+        self._completed_critical_updates = 0
+        self._completed_security_updates = 0
         self._failed_updates = 0
+        self._failed_auth_updates = 0
+        self._failed_privileged_updates = 0
+        self._failed_critical_updates = 0
+        self._failed_security_updates = 0
         self._timed_out_updates = 0
         self._retried_updates = 0
         self._dropped_updates = 0
@@ -656,10 +935,150 @@ class _WebhookUpdateQueue:
         self._last_recovery_error: str | None = None
         self._last_success_at: float | None = None
         self._last_failure_at: float | None = None
+        self._priority_cache: OrderedDict[
+            int, tuple[ExecutionPriority, bool, float]
+        ] = OrderedDict()
+        self._untrusted_critical_windows: dict[tuple[int, int], deque[float]] = {}
+        self._untrusted_auth_windows: dict[tuple[int, int], deque[float]] = {}
+        self._demoted_untrusted_critical_updates = 0
+        self._demoted_untrusted_auth_updates = 0
+
+    def _classification_for_update(
+        self,
+        update: Any,
+    ) -> tuple[ExecutionPriority, bool]:
+        """Atomically classify one update and protect reserved lanes from spam."""
+
+        update_id_raw = (
+            update.get("update_id")
+            if isinstance(update, dict)
+            else getattr(update, "update_id", 0)
+        )
+        try:
+            update_id = int(update_id_raw or 0)
+        except (TypeError, ValueError):
+            update_id = 0
+        now = time.monotonic()
+        if update_id:
+            cached = self._priority_cache.get(update_id)
+            if cached is not None and now - cached[2] <= _WEBHOOK_DEDUP_TTL_SECONDS:
+                self._priority_cache.move_to_end(update_id)
+                return cached[0], cached[1]
+
+        priority = telegram_update_priority(update)
+        sender_id = telegram_update_sender_id(update)
+        chat_id = telegram_update_chat_id(update)
+        if (
+            priority <= ExecutionPriority.CRITICAL
+            and sender_id > 0
+            and not privileged_operator_is_trusted(sender_id, group_id=chat_id)
+        ):
+            scope_key = (chat_id, sender_id)
+            window = self._untrusted_critical_windows.setdefault(scope_key, deque())
+            cutoff = now - _WEBHOOK_UNTRUSTED_CRITICAL_WINDOW_SECONDS
+            while window and window[0] <= cutoff:
+                window.popleft()
+            if len(window) >= _WEBHOOK_UNTRUSTED_CRITICAL_BURST:
+                # Still use the isolated security lane; only the operator-only
+                # reserve is protected from an unauthenticated flood.
+                priority = ExecutionPriority.HIGH
+                self._demoted_untrusted_critical_updates += 1
+            else:
+                window.append(now)
+
+        auth_candidate = telegram_update_is_auth_candidate(
+            update,
+            priority=priority,
+        )
+        if auth_candidate:
+            scope_key = (chat_id, sender_id)
+            window = self._untrusted_auth_windows.setdefault(scope_key, deque())
+            cutoff = now - _WEBHOOK_UNTRUSTED_AUTH_WINDOW_SECONDS
+            while window and window[0] <= cutoff:
+                window.popleft()
+            if len(window) >= _WEBHOOK_UNTRUSTED_AUTH_BURST:
+                # Duplicate/forged candidates keep ordinary delivery semantics
+                # after a small fast-auth burst. A successful first check warms
+                # the trusted cache, so subsequent real administrator commands
+                # are classified CRITICAL instead of reaching this branch.
+                auth_candidate = False
+                self._demoted_untrusted_auth_updates += 1
+            else:
+                window.append(now)
+
+        if update_id:
+            self._priority_cache[update_id] = (priority, auth_candidate, now)
+            self._priority_cache.move_to_end(update_id)
+            while len(self._priority_cache) > _WEBHOOK_DEDUP_MAX_UPDATES:
+                self._priority_cache.popitem(last=False)
+        if len(self._untrusted_critical_windows) > 4096:
+            for scope_key, window in tuple(self._untrusted_critical_windows.items()):
+                if not window or window[-1] <= now - _WEBHOOK_UNTRUSTED_CRITICAL_WINDOW_SECONDS:
+                    self._untrusted_critical_windows.pop(scope_key, None)
+        if len(self._untrusted_auth_windows) > 4096:
+            for scope_key, window in tuple(self._untrusted_auth_windows.items()):
+                if (
+                    not window
+                    or window[-1]
+                    <= now - _WEBHOOK_UNTRUSTED_AUTH_WINDOW_SECONDS
+                ):
+                    self._untrusted_auth_windows.pop(scope_key, None)
+        return priority, auth_candidate
+
+    def _priority_for_update(self, update: Any) -> ExecutionPriority:
+        return self._classification_for_update(update)[0]
 
     @property
     def _durable_inbox_enabled(self) -> bool:
         return callable(self.session_factory)
+
+    def _record_priority_accepted(
+        self,
+        priority: ExecutionPriority,
+        *,
+        auth_candidate: bool = False,
+    ) -> None:
+        if auth_candidate:
+            self._accepted_auth_updates += 1
+        if priority >= ExecutionPriority.NORMAL:
+            return
+        self._accepted_privileged_updates += 1
+        if priority <= ExecutionPriority.CRITICAL:
+            self._accepted_critical_updates += 1
+        else:
+            self._accepted_security_updates += 1
+
+    def _record_priority_completed(
+        self,
+        priority: ExecutionPriority,
+        *,
+        auth_candidate: bool = False,
+    ) -> None:
+        if auth_candidate:
+            self._completed_auth_updates += 1
+        if priority >= ExecutionPriority.NORMAL:
+            return
+        self._completed_privileged_updates += 1
+        if priority <= ExecutionPriority.CRITICAL:
+            self._completed_critical_updates += 1
+        else:
+            self._completed_security_updates += 1
+
+    def _record_priority_failed(
+        self,
+        priority: ExecutionPriority,
+        *,
+        auth_candidate: bool = False,
+    ) -> None:
+        if auth_candidate:
+            self._failed_auth_updates += 1
+        if priority >= ExecutionPriority.NORMAL:
+            return
+        self._failed_privileged_updates += 1
+        if priority <= ExecutionPriority.CRITICAL:
+            self._failed_critical_updates += 1
+        else:
+            self._failed_security_updates += 1
 
     def verify_secret(self, request: web.Request) -> bool:
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
@@ -675,29 +1094,43 @@ class _WebhookUpdateQueue:
         if not self._durable_inbox_enabled:
             return False
         assert self.session_factory is not None
-        async with self.session_factory() as session:
-            dialect = getattr(getattr(session, "bind", None), "dialect", None)
-            if getattr(dialect, "name", "") == "sqlite":
-                await session.execute(
-                    sqlite_insert(WebhookInboxUpdate)
-                    .values(update_id=int(update_id), payload=dict(payload))
-                    .on_conflict_do_nothing(index_elements=[WebhookInboxUpdate.update_id])
-                )
-            else:
-                row = await session.get(WebhookInboxUpdate, int(update_id))
-                if row is None:
-                    session.add(
-                        WebhookInboxUpdate(
+        priority, auth_candidate = self._classification_for_update(payload)
+        with execution_priority_scope(priority):
+            async with self.session_factory() as session:
+                dialect = getattr(getattr(session, "bind", None), "dialect", None)
+                if getattr(dialect, "name", "") == "sqlite":
+                    await session.execute(
+                        sqlite_insert(WebhookInboxUpdate)
+                        .values(
                             update_id=int(update_id),
                             payload=dict(payload),
+                            priority=int(priority),
+                            auth_candidate=auth_candidate,
+                        )
+                        .on_conflict_do_nothing(
+                            index_elements=[WebhookInboxUpdate.update_id]
                         )
                     )
-            await session.commit()
-            row = await session.get(WebhookInboxUpdate, int(update_id))
-            return bool(
-                row is not None
-                and (row.completed_at is not None or row.dead_lettered_at is not None)
-            )
+                else:
+                    row = await session.get(WebhookInboxUpdate, int(update_id))
+                    if row is None:
+                        session.add(
+                            WebhookInboxUpdate(
+                                update_id=int(update_id),
+                                payload=dict(payload),
+                                priority=int(priority),
+                                auth_candidate=auth_candidate,
+                            )
+                        )
+                await session.commit()
+                row = await session.get(WebhookInboxUpdate, int(update_id))
+                return bool(
+                    row is not None
+                    and (
+                        row.completed_at is not None
+                        or row.dead_lettered_at is not None
+                    )
+                )
 
     async def accept_durable_update(self, payload: dict[str, Any]) -> int:
         """Persist one update before a transport is allowed to acknowledge it.
@@ -711,7 +1144,7 @@ class _WebhookUpdateQueue:
 
         if not self._durable_inbox_enabled:
             raise RuntimeError("durable Telegram update inbox is unavailable")
-        if self._stopped:
+        if self._stopped or self._quiescing:
             raise RuntimeError("durable Telegram update inbox is stopping")
         if not isinstance(payload, dict):
             raise ValueError("Telegram update payload must be an object")
@@ -730,7 +1163,10 @@ class _WebhookUpdateQueue:
 
         async def _publish_persisted() -> None:
             try:
-                await self._enqueue_durable_update(update_id)
+                await self._enqueue_durable_update(
+                    update_id,
+                    priority_hint=self._classification_for_update(payload)[0],
+                )
             except Exception:
                 # Persistence, not queue publication, is the acknowledgement
                 # boundary. Recovery will retry this row after queue pressure or
@@ -972,33 +1408,49 @@ class _WebhookUpdateQueue:
         now = now_shanghai_naive()
         completed_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_RETENTION_SECONDS)
         dead_cutoff = now - timedelta(seconds=_WEBHOOK_INBOX_DLQ_RETENTION_SECONDS)
-        async with self.session_factory() as session:
-            stale_ids = (
-                select(WebhookInboxUpdate.update_id)
-                .where(
-                    or_(
-                        and_(
-                            WebhookInboxUpdate.completed_at.is_not(None),
-                            WebhookInboxUpdate.completed_at < completed_cutoff,
-                        ),
-                        and_(
-                            WebhookInboxUpdate.dead_lettered_at.is_not(None),
-                            WebhookInboxUpdate.dead_lettered_at < dead_cutoff,
-                        ),
+        cleaned_total = 0
+        cleanup_deadline = time.monotonic() + 0.25
+        # Drain several batches per pass while yielding between commits.  A
+        # single 256-row batch/minute had a hard growth threshold of only
+        # 4.27 updates/s, below realistic traffic for multiple active groups.
+        while cleaned_total < _WEBHOOK_INBOX_CLEANUP_BATCH * 16:
+            cleaned_round = 0
+            for terminal_column, cutoff in (
+                (WebhookInboxUpdate.completed_at, completed_cutoff),
+                (WebhookInboxUpdate.dead_lettered_at, dead_cutoff),
+            ):
+                remaining = _WEBHOOK_INBOX_CLEANUP_BATCH * 16 - cleaned_total
+                if remaining <= 0:
+                    break
+                batch_limit = min(_WEBHOOK_INBOX_CLEANUP_BATCH, remaining)
+                async with self.session_factory() as session:
+                    stale_ids = (
+                        select(WebhookInboxUpdate.update_id)
+                        .where(
+                            terminal_column.is_not(None),
+                            terminal_column < cutoff,
+                        )
+                        .order_by(terminal_column)
+                        .limit(batch_limit)
                     )
-                )
-                .order_by(WebhookInboxUpdate.updated_at)
-                .limit(_WEBHOOK_INBOX_CLEANUP_BATCH)
-            )
-            result = await session.execute(
-                delete(WebhookInboxUpdate).where(
-                    WebhookInboxUpdate.update_id.in_(stale_ids)
-                )
-            )
-            await session.commit()
-        cleaned = max(0, int(result.rowcount or 0))
-        self._cleaned_inbox_updates += cleaned
-        return cleaned
+                    result = await session.execute(
+                        delete(WebhookInboxUpdate).where(
+                            WebhookInboxUpdate.update_id.in_(stale_ids)
+                        )
+                    )
+                    await session.commit()
+                cleaned = max(0, int(result.rowcount or 0))
+                cleaned_round += cleaned
+                cleaned_total += cleaned
+                if time.monotonic() >= cleanup_deadline:
+                    break
+            if cleaned_round == 0:
+                break
+            if time.monotonic() >= cleanup_deadline:
+                break
+            await asyncio.sleep(0)
+        self._cleaned_inbox_updates += cleaned_total
+        return cleaned_total
 
     async def _prepare_durable_recovery(self) -> None:
         if not self._durable_inbox_enabled:
@@ -1045,44 +1497,91 @@ class _WebhookUpdateQueue:
         )
 
     async def _recover_durable_once(self) -> int:
-        if not self._durable_inbox_enabled or self._stopped:
+        if not self._durable_inbox_enabled or self._stopped or self._quiescing:
             return 0
         assert self.session_factory is not None
         now = now_shanghai_naive()
         async with self.session_factory() as session:
-            rows = (
-                await session.execute(
-                    select(
-                        WebhookInboxUpdate.update_id,
-                        WebhookInboxUpdate.payload,
+            eligibility = (
+                WebhookInboxUpdate.completed_at.is_(None),
+                WebhookInboxUpdate.dead_lettered_at.is_(None),
+                WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
+                or_(
+                    WebhookInboxUpdate.next_attempt_at.is_(None),
+                    WebhookInboxUpdate.next_attempt_at <= now,
+                ),
+                or_(
+                    WebhookInboxUpdate.lease_until.is_(None),
+                    WebhookInboxUpdate.lease_until <= now,
+                ),
+            )
+            lane_ranges = (
+                (
+                    WebhookInboxUpdate.priority
+                    <= int(ExecutionPriority.CRITICAL),
+                ),
+                (
+                    and_(
+                        WebhookInboxUpdate.priority
+                        > int(ExecutionPriority.CRITICAL),
+                        WebhookInboxUpdate.priority
+                        < int(ExecutionPriority.NORMAL),
+                    ),
+                ),
+                (
+                    WebhookInboxUpdate.priority
+                    >= int(ExecutionPriority.NORMAL),
+                    WebhookInboxUpdate.auth_candidate.is_(True),
+                ),
+                (
+                    WebhookInboxUpdate.priority
+                    >= int(ExecutionPriority.NORMAL),
+                    or_(
+                        WebhookInboxUpdate.auth_candidate.is_(False),
+                        WebhookInboxUpdate.auth_candidate.is_(None),
+                    ),
+                ),
+            )
+            rows: list[Any] = []
+            for lane_range in lane_ranges:
+                lane_rows = (
+                    await session.execute(
+                        select(
+                            WebhookInboxUpdate.update_id,
+                            WebhookInboxUpdate.payload,
+                        )
+                        .where(*eligibility, *lane_range)
+                        .order_by(WebhookInboxUpdate.created_at)
+                        .limit(_WEBHOOK_INBOX_RECOVERY_BATCH)
                     )
-                    .where(
-                        WebhookInboxUpdate.completed_at.is_(None),
-                        WebhookInboxUpdate.dead_lettered_at.is_(None),
-                        WebhookInboxUpdate.attempts < _WEBHOOK_INBOX_MAX_ATTEMPTS,
-                        or_(
-                            WebhookInboxUpdate.next_attempt_at.is_(None),
-                            WebhookInboxUpdate.next_attempt_at <= now,
-                        ),
-                        or_(
-                            WebhookInboxUpdate.lease_until.is_(None),
-                            WebhookInboxUpdate.lease_until <= now,
-                        ),
-                    )
-                    .order_by(WebhookInboxUpdate.created_at)
-                    .limit(_WEBHOOK_INBOX_RECOVERY_BATCH)
-                )
-            ).all()
+                ).all()
+                rows.extend(lane_rows)
 
+        # Prefer critical, then automatic-security work within each recovery
+        # page while preserving FIFO order inside every class (sort is stable).
+        def recovery_order(row: Any) -> tuple[int, bool]:
+            priority, auth_candidate = self._classification_for_update(row[1])
+            return int(priority), not auth_candidate
+
+        prioritized_rows = sorted(rows, key=recovery_order)
         recovered = 0
-        for update_id, payload in rows:
-            if self._stopped or self.queue.full():
+        for update_id, payload in prioritized_rows:
+            if self._stopped or self._quiescing or self.queue.full():
                 break
+            priority, auth_candidate = self._classification_for_update(payload)
+            if not self.queue.can_accept(
+                priority=priority,
+                auth_candidate=auth_candidate,
+            ):
+                # A full ordinary lane must not hide a privileged row later in
+                # this recovery page, and vice versa.
+                continue
             async with self._dedup_lock:
                 self._prune_dedup_state(now=asyncio.get_running_loop().time())
                 if int(update_id) in self._inflight_updates:
                     continue
-            lease_until = await self._claim_durable_update(int(update_id))
+            with execution_priority_scope(priority):
+                lease_until = await self._claim_durable_update(int(update_id))
             if lease_until is None:
                 continue
             loop = asyncio.get_running_loop()
@@ -1093,10 +1592,18 @@ class _WebhookUpdateQueue:
                 enqueued_at=time.monotonic(),
                 result=result,
                 lease_until=lease_until,
+                priority=priority,
+                auth_candidate=auth_candidate,
             )
             must_unclaim = False
             async with self._dedup_lock:
-                if int(update_id) in self._inflight_updates or self.queue.full():
+                if (
+                    int(update_id) in self._inflight_updates
+                    or not self.queue.can_accept(
+                        priority=priority,
+                        auth_candidate=auth_candidate,
+                    )
+                ):
                     must_unclaim = True
                 else:
                     try:
@@ -1106,20 +1613,34 @@ class _WebhookUpdateQueue:
                     else:
                         self._completed_update_ids.pop(int(update_id), None)
                         self._inflight_updates[int(update_id)] = result
+                        if int(update_id) in self._seen_update_ids:
+                            self._retried_updates += 1
+                        self._seen_update_ids[int(update_id)] = loop.time()
+                        self._accepted_updates += 1
+                        self._record_priority_accepted(
+                            priority,
+                            auth_candidate=auth_candidate,
+                        )
                         recovered += 1
             if must_unclaim:
-                await self._unclaim_durable_update(
-                    queued,
-                    reason="recovery queue full or update already active",
-                )
+                with execution_priority_scope(priority):
+                    await self._unclaim_durable_update(
+                        queued,
+                        reason="recovery queue full or update already active",
+                    )
                 if self.queue.full():
                     break
         return recovered
 
-    async def _enqueue_durable_update(self, update_id: int) -> bool:
+    async def _enqueue_durable_update(
+        self,
+        update_id: int,
+        *,
+        priority_hint: ExecutionPriority | None = None,
+    ) -> bool:
         """Best-effort publish of a persisted row to the in-process queue."""
 
-        if self._stopped or self.queue.full():
+        if self._stopped or self._quiescing or self.queue.full():
             return False
         loop = asyncio.get_running_loop()
         async with self._dedup_lock:
@@ -1127,24 +1648,27 @@ class _WebhookUpdateQueue:
             if update_id in self._inflight_updates:
                 return True
 
-        lease_until = await self._claim_durable_update(update_id)
+        selected_priority = (
+            priority_hint
+            if priority_hint is not None
+            else ExecutionPriority.NORMAL
+        )
+        with execution_priority_scope(selected_priority):
+            payload = await self._load_durable_payload(update_id)
+        if payload is None:
+            return False
+        priority, auth_candidate = self._classification_for_update(payload)
+        if not self.queue.can_accept(
+            priority=priority,
+            auth_candidate=auth_candidate,
+        ):
+            return False
+
+        with execution_priority_scope(priority):
+            lease_until = await self._claim_durable_update(update_id)
         if lease_until is None:
             # Completed, delayed, dead-lettered, or already owned. Every case is
             # safe to ACK because the canonical payload is already durable.
-            return False
-        payload = await self._load_durable_payload(update_id)
-        if payload is None:
-            placeholder = _QueuedWebhookUpdate(
-                update={},
-                update_id=update_id,
-                enqueued_at=time.monotonic(),
-                result=asyncio.get_running_loop().create_future(),
-                lease_until=lease_until,
-            )
-            await self._unclaim_durable_update(
-                placeholder,
-                reason="durable webhook payload is missing or invalid",
-            )
             return False
         result = loop.create_future()
         queued = _QueuedWebhookUpdate(
@@ -1153,10 +1677,18 @@ class _WebhookUpdateQueue:
             enqueued_at=time.monotonic(),
             result=result,
             lease_until=lease_until,
+            priority=priority,
+            auth_candidate=auth_candidate,
         )
         must_unclaim = False
         async with self._dedup_lock:
-            if update_id in self._inflight_updates or self.queue.full():
+            if (
+                update_id in self._inflight_updates
+                or not self.queue.can_accept(
+                    priority=priority,
+                    auth_candidate=auth_candidate,
+                )
+            ):
                 must_unclaim = True
             else:
                 try:
@@ -1170,16 +1702,21 @@ class _WebhookUpdateQueue:
                     self._seen_update_ids[update_id] = now
                     self._inflight_updates[update_id] = result
                     self._accepted_updates += 1
+                    self._record_priority_accepted(
+                        priority,
+                        auth_candidate=auth_candidate,
+                    )
         if must_unclaim:
-            await self._unclaim_durable_update(
-                queued,
-                reason="webhook queue full or update already active",
-            )
+            with execution_priority_scope(priority):
+                await self._unclaim_durable_update(
+                    queued,
+                    reason="webhook queue full or update already active",
+                )
             return False
         return True
 
     async def _recovery_loop(self) -> None:
-        while not self._stopped:
+        while not self._stopped and not self._quiescing:
             try:
                 await self._recover_durable_once()
                 now = time.monotonic()
@@ -1249,8 +1786,24 @@ class _WebhookUpdateQueue:
 
             result = self._inflight_updates.get(update_id)
             if result is None:
-                issue = self.delivery_issue()
-                if issue is not None:
+                priority, auth_candidate = self._classification_for_update(update)
+                hard_issue = (
+                    self._stopped
+                    or self._fatal_error is not None
+                )
+                ordinary_business_failure = (
+                    self._business_failure_issue is not None
+                    and priority >= ExecutionPriority.NORMAL
+                    and not auth_candidate
+                )
+                if (
+                    hard_issue
+                    or ordinary_business_failure
+                    or not self.queue.can_accept(
+                        priority=priority,
+                        auth_candidate=auth_candidate,
+                    )
+                ):
                     return web.Response(text="Webhook unavailable", status=503)
                 lease_until = None
                 result = loop.create_future()
@@ -1260,6 +1813,8 @@ class _WebhookUpdateQueue:
                     enqueued_at=time.monotonic(),
                     result=result,
                     lease_until=lease_until,
+                    priority=priority,
+                    auth_candidate=auth_candidate,
                 )
                 try:
                     self.queue.put_nowait(queued)
@@ -1270,6 +1825,10 @@ class _WebhookUpdateQueue:
                 self._seen_update_ids[update_id] = loop.time()
                 self._inflight_updates[update_id] = result
                 self._accepted_updates += 1
+                self._record_priority_accepted(
+                    priority,
+                    auth_candidate=auth_candidate,
+                )
 
         # The worker returns success only after synchronous handlers finish, or
         # after a detached group-reply job is both enqueued and represented by
@@ -1317,21 +1876,70 @@ class _WebhookUpdateQueue:
                 queued.result.set_result(succeeded)
 
     async def _ensure_workers(self) -> None:
-        if self._workers or self._stopped:
+        if self._stopped:
             return
         async with self._start_lock:
-            if self._workers or self._stopped:
+            if self._stopped:
                 return
             self._workers_started = True
-            self._workers = [
-                asyncio.create_task(
-                    self._worker(),
-                    name=f"telegram-webhook-worker-{index + 1}",
-                )
-                for index in range(self.worker_count)
+            self._ordinary_workers = [
+                worker for worker in self._ordinary_workers if not worker.done()
             ]
-            for worker in self._workers:
+            self._auth_workers = [
+                worker for worker in self._auth_workers if not worker.done()
+            ]
+            self._security_workers = [
+                worker for worker in self._security_workers if not worker.done()
+            ]
+            self._critical_workers = [
+                worker for worker in self._critical_workers if not worker.done()
+            ]
+
+            while len(self._ordinary_workers) < self.worker_count:
+                index = len(self._ordinary_workers)
+                worker = asyncio.create_task(
+                    self._worker(priority=ExecutionPriority.NORMAL),
+                    name=f"telegram-webhook-worker-{index + 1}",
+                    context=Context(),
+                )
                 worker.add_done_callback(self._worker_finished)
+                self._ordinary_workers.append(worker)
+            while len(self._auth_workers) < self.auth_worker_count:
+                index = len(self._auth_workers)
+                worker = asyncio.create_task(
+                    self._worker(
+                        priority=ExecutionPriority.NORMAL,
+                        auth_candidate=True,
+                    ),
+                    name=f"telegram-auth-candidate-worker-{index + 1}",
+                    context=Context(),
+                )
+                worker.add_done_callback(self._worker_finished)
+                self._auth_workers.append(worker)
+            while len(self._security_workers) < self.security_worker_count:
+                index = len(self._security_workers)
+                worker = asyncio.create_task(
+                    self._worker(priority=ExecutionPriority.HIGH),
+                    name=f"telegram-security-worker-{index + 1}",
+                    context=Context(),
+                )
+                worker.add_done_callback(self._worker_finished)
+                self._security_workers.append(worker)
+            while len(self._critical_workers) < self.critical_worker_count:
+                index = len(self._critical_workers)
+                worker = asyncio.create_task(
+                    self._worker(priority=ExecutionPriority.CRITICAL),
+                    name=f"telegram-critical-worker-{index + 1}",
+                    context=Context(),
+                )
+                worker.add_done_callback(self._worker_finished)
+                self._critical_workers.append(worker)
+            self._workers = [
+                *self._ordinary_workers,
+                *self._auth_workers,
+                *self._security_workers,
+                *self._critical_workers,
+            ]
 
     def _worker_finished(self, task: asyncio.Task[None]) -> None:
         if self._stopped:
@@ -1350,6 +1958,14 @@ class _WebhookUpdateQueue:
                     else "webhook worker 意外正常退出"
                 )
         self._set_fatal(issue)
+        try:
+            asyncio.create_task(
+                self._ensure_workers(),
+                name="telegram-update-worker-replenish",
+                context=Context(),
+            )
+        except RuntimeError:
+            pass
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -1366,9 +1982,11 @@ class _WebhookUpdateQueue:
             self._consume_task_result(task)
             return
         self._orphaned_tasks.add(task)
+        self._orphaned_started_at.setdefault(task, time.monotonic())
 
         def finished(done: asyncio.Task[Any]) -> None:
             self._orphaned_tasks.discard(done)
+            self._orphaned_started_at.pop(done, None)
             self._consume_task_result(done)
 
         task.add_done_callback(finished)
@@ -1474,9 +2092,20 @@ class _WebhookUpdateQueue:
             self._track_orphan(task)
             raise
 
-    def _record_deferred_failure(self, update_id: int, error: str) -> None:
+    def _record_deferred_failure(
+        self,
+        update_id: int,
+        error: str,
+        *,
+        priority: ExecutionPriority = ExecutionPriority.NORMAL,
+        auth_candidate: bool = False,
+    ) -> None:
         self._deferred_failed_updates += 1
         self._failed_updates += 1
+        self._record_priority_failed(
+            priority,
+            auth_candidate=auth_candidate,
+        )
         self._last_failure_at = time.time()
         self._record_business_failure(update_id, error)
 
@@ -1492,11 +2121,20 @@ class _WebhookUpdateQueue:
                 f"{distinct_failures} consecutive distinct updates"
             )
 
-    def _record_durable_success(self) -> None:
+    def _record_durable_success(
+        self,
+        *,
+        priority: ExecutionPriority = ExecutionPriority.NORMAL,
+        auth_candidate: bool = False,
+    ) -> None:
         self._consecutive_failures = 0
         self._failed_update_ids_since_success.clear()
         self._business_failure_issue = None
         self._completed_updates += 1
+        self._record_priority_completed(
+            priority,
+            auth_candidate=auth_candidate,
+        )
         self._last_success_at = time.time()
 
     async def _finalize_deferred_update(
@@ -1517,10 +2155,18 @@ class _WebhookUpdateQueue:
                 persisted = await self._complete_durable_update(queued)
                 if persisted:
                     durably_completed = True
-                    self._record_durable_success()
+                    self._record_durable_success(
+                        priority=queued.priority,
+                        auth_candidate=queued.auth_candidate,
+                    )
                     return
                 error = "deferred completion lease was lost"
-            self._record_deferred_failure(queued.update_id, error)
+            self._record_deferred_failure(
+                queued.update_id,
+                error,
+                priority=queued.priority,
+                auth_candidate=queued.auth_candidate,
+            )
             failure_recorded = True
             await self._release_durable_update(queued, error=error)
         except asyncio.CancelledError:
@@ -1531,6 +2177,8 @@ class _WebhookUpdateQueue:
                 self._record_deferred_failure(
                     queued.update_id,
                     "deferred finalizer persistence failure",
+                    priority=queued.priority,
+                    auth_candidate=queued.auth_candidate,
                 )
             log.exception(
                 "failed to finalize durable deferred webhook update | update=%s",
@@ -1578,6 +2226,7 @@ class _WebhookUpdateQueue:
                     name=f"webhook-late-silent:{queued.update_id}",
                 )
                 await self._wait_task_with_lease(queued, silent_task)
+            receipt.seal()
             if receipt.deferred:
                 receipt_task = asyncio.create_task(
                     receipt.wait(),
@@ -1588,7 +2237,10 @@ class _WebhookUpdateQueue:
             if not await self._complete_durable_update(queued):
                 raise RuntimeError("durable webhook completion lease was lost")
             durably_completed = True
-            self._record_durable_success()
+            self._record_durable_success(
+                priority=queued.priority,
+                auth_candidate=queued.auth_candidate,
+            )
         except asyncio.CancelledError:
             # Only real server/process shutdown cancels late finalizers. Keep the
             # lease intact; startup recovery will reclaim it after the old
@@ -1598,6 +2250,10 @@ class _WebhookUpdateQueue:
             error = str(exc) or type(exc).__name__
             self._late_failed_updates += 1
             self._failed_updates += 1
+            self._record_priority_failed(
+                queued.priority,
+                auth_candidate=queued.auth_candidate,
+            )
             self._last_failure_at = time.time()
             self._record_business_failure(queued.update_id, error)
             try:
@@ -1617,6 +2273,7 @@ class _WebhookUpdateQueue:
                 current_late = self._late_finalizers.get(queued.update_id)
                 if current_late is asyncio.current_task():
                     self._late_finalizers.pop(queued.update_id, None)
+                    self._late_finalizer_started_at.pop(queued.update_id, None)
                 current = self._inflight_updates.get(queued.update_id)
                 if current is queued.result:
                     self._inflight_updates.pop(queued.update_id, None)
@@ -1627,14 +2284,37 @@ class _WebhookUpdateQueue:
                 else:
                     self._completed_update_ids.pop(queued.update_id, None)
 
+    @staticmethod
+    def _update_timeout_seconds(queued: _QueuedWebhookUpdate) -> float:
+        if queued.auth_candidate:
+            return _WEBHOOK_AUTH_UPDATE_TIMEOUT_SECONDS
+        if queued.priority <= ExecutionPriority.CRITICAL:
+            return _WEBHOOK_CRITICAL_UPDATE_TIMEOUT_SECONDS
+        if queued.priority <= ExecutionPriority.HIGH:
+            return _WEBHOOK_SECURITY_UPDATE_TIMEOUT_SECONDS
+        return _WEBHOOK_UPDATE_TIMEOUT_SECONDS
+
     async def _process_update(self, queued: _QueuedWebhookUpdate) -> bool:
         loop = asyncio.get_running_loop()
-        # The budget starts when the HTTP request is accepted into the queue,
-        # not when a worker eventually dequeues it. Queue pressure therefore
-        # cannot add another full execution budget before the HTTP response.
-        deadline = queued.enqueued_at + _WEBHOOK_UPDATE_TIMEOUT_SECONDS
+        if queued.privileged or queued.auth_candidate:
+            # Reserved workers make queueing exceptional.  If a short burst did
+            # queue this update, do not turn that wait into an already-expired
+            # callback or half-applied permission change.
+            deadline = loop.time() + self._update_timeout_seconds(queued)
+        else:
+            # Ordinary work retains the original end-to-end budget so queue
+            # pressure cannot add another full execution window.
+            deadline = queued.enqueued_at + _WEBHOOK_UPDATE_TIMEOUT_SECONDS
         key = id(queued)
         self._active_started_at[key] = loop.time()
+        if queued.auth_candidate:
+            self._active_auth_started_at[key] = loop.time()
+        if queued.privileged:
+            self._active_privileged_started_at[key] = loop.time()
+        if queued.critical:
+            self._active_critical_started_at[key] = loop.time()
+        elif queued.priority <= ExecutionPriority.HIGH:
+            self._active_security_started_at[key] = loop.time()
         receipt = UpdateCompletionReceipt()
         receipt_token = bind_update_completion(receipt)
         durable_handed_off = False
@@ -1649,6 +2329,7 @@ class _WebhookUpdateQueue:
                     ),
                     deadline=deadline,
                 )
+                receipt.seal()
             finally:
                 reset_update_completion(receipt_token)
             if isinstance(result, TelegramMethod):
@@ -1683,23 +2364,35 @@ class _WebhookUpdateQueue:
             terminal_error = "update processing cancelled"
             raise
         except _WebhookUpdateDeadlineExceeded as exc:
+            if exc.unfinished_task is None:
+                receipt.seal()
             terminal_error = "update processing deadline exceeded"
             self._timed_out_updates += 1
-            self._failed_updates += 1
+            late_handoff = bool(
+                self._durable_inbox_enabled
+                and exc.unfinished_task is not None
+            )
+            if not late_handoff:
+                self._failed_updates += 1
+                self._record_priority_failed(
+                    queued.priority,
+                    auth_candidate=queued.auth_candidate,
+                )
             self._last_failure_at = time.time()
-            if self._durable_inbox_enabled:
+            if self._durable_inbox_enabled and not late_handoff:
                 self._record_business_failure(
                     queued.update_id,
                     "processing exceeded "
-                    f"{_WEBHOOK_UPDATE_TIMEOUT_SECONDS:.1f}s",
+                    f"{self._update_timeout_seconds(queued):.1f}s",
                 )
             else:
                 self._set_fatal(
                     f"update processing exceeded "
-                    f"{_WEBHOOK_UPDATE_TIMEOUT_SECONDS:.1f}s"
+                    f"{self._update_timeout_seconds(queued):.1f}s"
                 )
             log.exception("Telegram webhook update processing timed out")
-            if self._durable_inbox_enabled and exc.unfinished_task is not None:
+            if late_handoff:
+                assert exc.unfinished_task is not None
                 late = asyncio.create_task(
                     self._finalize_late_update(
                         queued,
@@ -1710,12 +2403,18 @@ class _WebhookUpdateQueue:
                     name=f"webhook-late-finalizer:{queued.update_id}",
                 )
                 self._late_finalizers[queued.update_id] = late
+                self._late_finalizer_started_at[queued.update_id] = time.monotonic()
                 self._track_deferred_task(late)
                 durable_handed_off = True
             return False
         except Exception as exc:
+            receipt.seal()
             terminal_error = str(exc)
             self._failed_updates += 1
+            self._record_priority_failed(
+                queued.priority,
+                auth_candidate=queued.auth_candidate,
+            )
             self._last_failure_at = time.time()
             if self._durable_inbox_enabled:
                 self._record_business_failure(
@@ -1736,10 +2435,17 @@ class _WebhookUpdateQueue:
             return False
         else:
             if not (self._durable_inbox_enabled and receipt.deferred):
-                self._record_durable_success()
+                self._record_durable_success(
+                    priority=queued.priority,
+                    auth_candidate=queued.auth_candidate,
+                )
             return True
         finally:
             self._active_started_at.pop(key, None)
+            self._active_auth_started_at.pop(key, None)
+            self._active_privileged_started_at.pop(key, None)
+            self._active_critical_started_at.pop(key, None)
+            self._active_security_started_at.pop(key, None)
             if self._durable_inbox_enabled and not durable_handed_off:
                 try:
                     await self._release_durable_update(
@@ -1752,50 +2458,234 @@ class _WebhookUpdateQueue:
                         queued.update_id,
                     )
 
-    async def _worker(self) -> None:
+    async def _worker(
+        self,
+        *,
+        priority: ExecutionPriority,
+        auth_candidate: bool = False,
+    ) -> None:
         while True:
-            queued = await self.queue.get()
+            queued = await self.queue.get(
+                priority=priority,
+                auth_candidate=auth_candidate,
+            )
             succeeded = False
             try:
-                succeeded = await self._process_update(queued)
+                if priority <= ExecutionPriority.CRITICAL:
+                    with privileged_request_scope():
+                        succeeded = await self._process_update(queued)
+                elif priority <= ExecutionPriority.HIGH:
+                    with privileged_request_scope(background=True):
+                        succeeded = await self._process_update(queued)
+                elif auth_candidate:
+                    # Fast authorization needs a reserved outbound path too,
+                    # but remains below the trusted CRITICAL operator reserve.
+                    # The lane is independently bounded, so unauthenticated
+                    # command spam cannot fan out without limit.
+                    with privileged_request_scope(background=True):
+                        succeeded = await self._process_update(queued)
+                else:
+                    succeeded = await self._process_update(queued)
             finally:
-                await asyncio.shield(
-                    self._finish_queued_update(queued, succeeded=succeeded)
+                finish_task = asyncio.create_task(
+                    self._finish_queued_update(queued, succeeded=succeeded),
+                    name=f"webhook-finish:{queued.update_id}",
                 )
-                self.queue.task_done()
+                self._track_deferred_task(finish_task)
+                try:
+                    await asyncio.shield(finish_task)
+                finally:
+                    # Queue accounting must remain balanced even when shutdown
+                    # cancels this worker while its dedup/result bookkeeping is
+                    # still completing in the shielded child task.
+                    self.queue.task_done(queued)
 
     def fatal_issue(self) -> str | None:
+        self._promote_stale_tasks_to_fatal()
         return self._fatal_error or self._business_failure_issue
 
-    def _oldest_queue_age(self) -> float:
-        try:
-            queued = self.queue._queue[0]  # type: ignore[attr-defined]
-        except (AttributeError, IndexError):
-            return 0.0
-        return max(0.0, time.monotonic() - queued.enqueued_at)
+    def _promote_stale_tasks_to_fatal(self) -> None:
+        if self._fatal_error is not None:
+            return
+        oldest_orphan_age = self._oldest_orphan_age()
+        if oldest_orphan_age >= _WEBHOOK_ORPHAN_FATAL_AGE_SECONDS:
+            self._set_fatal(
+                "oldest orphaned webhook update task is "
+                f"{oldest_orphan_age:.1f}s old"
+            )
+            return
+        oldest_late_finalizer_age = self._oldest_late_finalizer_age()
+        if oldest_late_finalizer_age >= _WEBHOOK_LATE_FINALIZER_FATAL_AGE_SECONDS:
+            self._set_fatal(
+                "oldest webhook late finalizer is "
+                f"{oldest_late_finalizer_age:.1f}s old"
+            )
 
-    def _oldest_active_age(self) -> float:
-        if not self._active_started_at:
+    def _oldest_queue_age(
+        self,
+        *,
+        priority: ExecutionPriority | None = None,
+        auth_candidate: bool = False,
+    ) -> float:
+        items = self.queue.items(
+            priority=priority,
+            auth_candidate=auth_candidate,
+        )
+        if not items:
             return 0.0
-        return max(0.0, time.monotonic() - min(self._active_started_at.values()))
+        enqueued_at = min(item.enqueued_at for item in items)
+        return max(0.0, time.monotonic() - enqueued_at)
+
+    def _oldest_active_age(
+        self,
+        *,
+        priority: ExecutionPriority | None = None,
+        auth_candidate: bool = False,
+    ) -> float:
+        if auth_candidate:
+            active = self._active_auth_started_at
+        elif priority is None:
+            active = self._active_started_at
+        elif priority <= ExecutionPriority.CRITICAL:
+            active = self._active_critical_started_at
+        elif priority <= ExecutionPriority.HIGH:
+            active = self._active_security_started_at
+        else:
+            privileged_keys = self._active_privileged_started_at
+            auth_keys = self._active_auth_started_at
+            active = {
+                key: started_at
+                for key, started_at in self._active_started_at.items()
+                if key not in privileged_keys and key not in auth_keys
+            }
+        if not active:
+            return 0.0
+        return max(0.0, time.monotonic() - min(active.values()))
+
+    def _oldest_orphan_age(self) -> float:
+        active = {
+            task: started_at
+            for task, started_at in self._orphaned_started_at.items()
+            if not task.done()
+        }
+        if not active:
+            return 0.0
+        return max(0.0, time.monotonic() - min(active.values()))
+
+    def _oldest_late_finalizer_age(self) -> float:
+        active_started = [
+            started_at
+            for update_id, started_at in self._late_finalizer_started_at.items()
+            if (
+                (task := self._late_finalizers.get(update_id)) is not None
+                and not task.done()
+            )
+        ]
+        if not active_started:
+            return 0.0
+        return max(0.0, time.monotonic() - min(active_started))
 
     def delivery_issue(self) -> str | None:
         if self._stopped:
             return "webhook processor is stopped"
-        if self._fatal_error is not None:
-            return self._fatal_error
-        if self._business_failure_issue is not None:
-            return self._business_failure_issue
+        fatal = self.fatal_issue()
+        if fatal is not None:
+            return fatal
         if self._workers_started:
-            alive = sum(not worker.done() for worker in self._workers)
-            if alive != self.worker_count:
-                return f"only {alive}/{self.worker_count} webhook workers are alive"
-        if self.queue.full():
-            return "webhook update queue is saturated"
-        oldest_queue_age = self._oldest_queue_age()
+            ordinary_alive = sum(
+                not worker.done() for worker in self._ordinary_workers
+            )
+            auth_alive = sum(not worker.done() for worker in self._auth_workers)
+            security_alive = sum(
+                not worker.done() for worker in self._security_workers
+            )
+            critical_alive = sum(
+                not worker.done() for worker in self._critical_workers
+            )
+            if ordinary_alive != self.worker_count:
+                return (
+                    f"only {ordinary_alive}/{self.worker_count} ordinary "
+                    "webhook workers are alive"
+                )
+            if auth_alive != self.auth_worker_count:
+                return (
+                    f"only {auth_alive}/{self.auth_worker_count} authentication "
+                    "webhook workers are alive"
+                )
+            if security_alive != self.security_worker_count:
+                return (
+                    f"only {security_alive}/{self.security_worker_count} "
+                    "security webhook workers are alive"
+                )
+            if critical_alive != self.critical_worker_count:
+                return (
+                    f"only {critical_alive}/{self.critical_worker_count} "
+                    "critical webhook workers are alive"
+                )
+        if self.queue.critical_full():
+            return "critical webhook update queue is saturated"
+        if self.queue.security_full():
+            return "security webhook update queue is saturated"
+        if self.queue.ordinary_full():
+            return "ordinary webhook update queue is saturated"
+        critical_queue_age = self._oldest_queue_age(
+            priority=ExecutionPriority.CRITICAL
+        )
+        if critical_queue_age > _WEBHOOK_CRITICAL_QUEUE_WARN_SECONDS:
+            return (
+                "oldest critical queued update is "
+                f"{critical_queue_age:.1f}s old"
+            )
+        security_queue_age = self._oldest_queue_age(
+            priority=ExecutionPriority.HIGH
+        )
+        if security_queue_age > _WEBHOOK_SECURITY_QUEUE_WARN_SECONDS:
+            return (
+                "oldest security queued update is "
+                f"{security_queue_age:.1f}s old"
+            )
+        oldest_queue_age = self._oldest_queue_age(
+            priority=ExecutionPriority.NORMAL
+        )
         if oldest_queue_age > _WEBHOOK_UPDATE_TIMEOUT_SECONDS:
             return f"oldest queued update is {oldest_queue_age:.1f}s old"
-        oldest_active_age = self._oldest_active_age()
+        critical_active_age = self._oldest_active_age(
+            priority=ExecutionPriority.CRITICAL
+        )
+        if (
+            critical_active_age
+            > _WEBHOOK_CRITICAL_UPDATE_TIMEOUT_SECONDS
+            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+        ):
+            return (
+                "oldest critical active update is "
+                f"{critical_active_age:.1f}s old"
+            )
+        security_active_age = self._oldest_active_age(
+            priority=ExecutionPriority.HIGH
+        )
+        if (
+            security_active_age
+            > _WEBHOOK_SECURITY_UPDATE_TIMEOUT_SECONDS
+            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+        ):
+            return (
+                "oldest security active update is "
+                f"{security_active_age:.1f}s old"
+            )
+        auth_active_age = self._oldest_active_age(auth_candidate=True)
+        if (
+            auth_active_age
+            > _WEBHOOK_AUTH_UPDATE_TIMEOUT_SECONDS
+            + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
+        ):
+            return (
+                "oldest authentication-candidate active update is "
+                f"{auth_active_age:.1f}s old"
+            )
+        oldest_active_age = self._oldest_active_age(
+            priority=ExecutionPriority.NORMAL
+        )
         if (
             oldest_active_age
             > _WEBHOOK_UPDATE_TIMEOUT_SECONDS + _WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS
@@ -1809,19 +2699,139 @@ class _WebhookUpdateQueue:
             "ok": issue is None,
             "issue": issue,
             "stopped": self._stopped,
-            "workers_configured": self.worker_count,
+            "workers_configured": (
+                self.worker_count
+                + self.auth_worker_count
+                + self.security_worker_count
+                + self.critical_worker_count
+            ),
             "workers_alive": sum(not worker.done() for worker in self._workers),
+            "ordinary_workers_configured": self.worker_count,
+            "ordinary_workers_alive": sum(
+                not worker.done() for worker in self._ordinary_workers
+            ),
+            "auth_workers_configured": self.auth_worker_count,
+            "auth_workers_alive": sum(
+                not worker.done() for worker in self._auth_workers
+            ),
+            "privileged_workers_configured": (
+                self.security_worker_count + self.critical_worker_count
+            ),
+            "privileged_workers_alive": sum(
+                not worker.done()
+                for worker in (*self._security_workers, *self._critical_workers)
+            ),
+            "security_workers_configured": self.security_worker_count,
+            "security_workers_alive": sum(
+                not worker.done() for worker in self._security_workers
+            ),
+            "critical_workers_configured": self.critical_worker_count,
+            "critical_workers_alive": sum(
+                not worker.done() for worker in self._critical_workers
+            ),
             "queue_size": self.queue.qsize(),
             "queue_capacity": self.queue.maxsize,
+            "ordinary_queue_size": self.queue.ordinary_qsize(),
+            "ordinary_queue_capacity": self.queue.ordinary_maxsize,
+            "auth_queue_size": self.queue.auth_qsize(),
+            "auth_queue_capacity": self.queue.auth_maxsize,
+            "auth_queue_saturated": self.queue.auth_full(),
+            "privileged_queue_size": (
+                self.queue.security_qsize() + self.queue.critical_qsize()
+            ),
+            "privileged_queue_capacity": (
+                self.queue.security_maxsize + self.queue.critical_maxsize
+            ),
+            "security_queue_size": self.queue.security_qsize(),
+            "security_queue_capacity": self.queue.security_maxsize,
+            "critical_queue_size": self.queue.critical_qsize(),
+            "critical_queue_capacity": self.queue.critical_maxsize,
             "oldest_queue_age_seconds": round(self._oldest_queue_age(), 3),
+            "oldest_ordinary_queue_age_seconds": round(
+                self._oldest_queue_age(priority=ExecutionPriority.NORMAL),
+                3,
+            ),
+            "oldest_auth_queue_age_seconds": round(
+                self._oldest_queue_age(
+                    priority=ExecutionPriority.NORMAL,
+                    auth_candidate=True,
+                ),
+                3,
+            ),
+            "oldest_privileged_queue_age_seconds": round(
+                max(
+                    self._oldest_queue_age(priority=ExecutionPriority.CRITICAL),
+                    self._oldest_queue_age(priority=ExecutionPriority.HIGH),
+                ),
+                3,
+            ),
+            "oldest_critical_queue_age_seconds": round(
+                self._oldest_queue_age(priority=ExecutionPriority.CRITICAL),
+                3,
+            ),
+            "oldest_security_queue_age_seconds": round(
+                self._oldest_queue_age(priority=ExecutionPriority.HIGH),
+                3,
+            ),
             "active_updates": len(self._active_started_at),
             "oldest_active_age_seconds": round(self._oldest_active_age(), 3),
+            "active_auth_updates": len(self._active_auth_started_at),
+            "oldest_auth_active_age_seconds": round(
+                self._oldest_active_age(auth_candidate=True),
+                3,
+            ),
+            "active_privileged_updates": len(
+                self._active_privileged_started_at
+            ),
+            "oldest_privileged_active_age_seconds": round(
+                max(
+                    self._oldest_active_age(priority=ExecutionPriority.CRITICAL),
+                    self._oldest_active_age(priority=ExecutionPriority.HIGH),
+                ),
+                3,
+            ),
+            "active_critical_updates": len(self._active_critical_started_at),
+            "oldest_critical_active_age_seconds": round(
+                self._oldest_active_age(priority=ExecutionPriority.CRITICAL),
+                3,
+            ),
+            "active_security_updates": len(self._active_security_started_at),
+            "oldest_security_active_age_seconds": round(
+                self._oldest_active_age(priority=ExecutionPriority.HIGH),
+                3,
+            ),
             "orphaned_update_tasks": len(self._orphaned_tasks),
+            "oldest_orphaned_update_age_seconds": round(
+                self._oldest_orphan_age(),
+                3,
+            ),
             "deferred_reply_jobs": len(self._deferred_tasks),
             "late_finalizers": len(self._late_finalizers),
+            "oldest_late_finalizer_age_seconds": round(
+                self._oldest_late_finalizer_age(),
+                3,
+            ),
             "accepted_updates": self._accepted_updates,
+            "accepted_auth_updates": self._accepted_auth_updates,
+            "accepted_privileged_updates": self._accepted_privileged_updates,
+            "accepted_critical_updates": self._accepted_critical_updates,
+            "accepted_security_updates": self._accepted_security_updates,
+            "demoted_untrusted_critical_updates": (
+                self._demoted_untrusted_critical_updates
+            ),
+            "demoted_untrusted_auth_updates": (
+                self._demoted_untrusted_auth_updates
+            ),
             "completed_updates": self._completed_updates,
+            "completed_auth_updates": self._completed_auth_updates,
+            "completed_privileged_updates": self._completed_privileged_updates,
+            "completed_critical_updates": self._completed_critical_updates,
+            "completed_security_updates": self._completed_security_updates,
             "failed_updates": self._failed_updates,
+            "failed_auth_updates": self._failed_auth_updates,
+            "failed_privileged_updates": self._failed_privileged_updates,
+            "failed_critical_updates": self._failed_critical_updates,
+            "failed_security_updates": self._failed_security_updates,
             "timed_out_updates": self._timed_out_updates,
             "retried_updates": self._retried_updates,
             "dropped_updates": self._dropped_updates,
@@ -1860,12 +2870,13 @@ class _WebhookUpdateQueue:
                         queued.update_id,
                     )
                 await self._finish_queued_update(queued, succeeded=False)
-                self.queue.task_done()
+                self.queue.task_done(queued)
         self._dropped_updates += discarded
         return discarded
 
     async def _stop_impl(self) -> None:
         self._stopped = True
+        self._quiescing = True
         if self._recovery_task is not None:
             recovery_task = self._recovery_task
             recovery_task.cancel()
@@ -1911,6 +2922,10 @@ class _WebhookUpdateQueue:
                 for task in pending:
                     task.add_done_callback(self._consume_task_result)
             self._workers.clear()
+            self._ordinary_workers.clear()
+            self._auth_workers.clear()
+            self._security_workers.clear()
+            self._critical_workers.clear()
 
         outstanding = list(self._processing_tasks | self._orphaned_tasks)
         for task in outstanding:
@@ -1968,6 +2983,37 @@ class _WebhookUpdateQueue:
             await asyncio.wait({self._stop_task}, timeout=1.0)
             raise
 
+    async def quiesce(self, *, timeout_seconds: float = 20.0) -> bool:
+        """Stop new/recovery ingestion and drain dispatched handlers only.
+
+        Deferred completion finalizers deliberately remain alive so their
+        explicit owners (privileged jobs, pending replies and memory writes)
+        can finish before :meth:`stop` closes the processor.
+        """
+
+        self._quiescing = True
+        recovery_task = self._recovery_task
+        self._recovery_task = None
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            done, _pending = await asyncio.wait(
+                {recovery_task},
+                timeout=_WEBHOOK_UPDATE_CANCEL_GRACE_SECONDS,
+            )
+            if recovery_task in done:
+                self._consume_task_result(recovery_task)
+            else:
+                self._track_orphan(recovery_task)
+        try:
+            await asyncio.wait_for(
+                self.queue.join(),
+                timeout=max(0.01, float(timeout_seconds)),
+            )
+            return True
+        except TimeoutError:
+            self._set_fatal("Telegram update processor quiesce timed out")
+            return False
+
 
 class VerifyWebServer:
     """aiohttp server hosting the settings and human-verification Mini Apps."""
@@ -1990,6 +3036,10 @@ class VerifyWebServer:
         self.webhook_dispatcher = webhook_dispatcher
         self.webhook_path = webhook_path
         self.webhook_secret = webhook_secret
+        mark_privileged_operator(
+            int(settings.super_admin_id or 0),
+            ttl_seconds=365 * 24 * 60 * 60.0,
+        )
         self.webhook_route_error: str | None = None
         self._webhook_accepting_updates = False
         self._delivery_mode = "starting"
@@ -1997,6 +3047,10 @@ class VerifyWebServer:
         self._webhook_request_tasks: set[asyncio.Task[Any]] = set()
         self._runner: web.AppRunner | None = None
         self._stop_task: asyncio.Task[None] | None = None
+        self._resource_health_provider = self._update_processor_health_snapshot
+        # Production owns one server. Clearing a stale registration here also
+        # prevents reload/test instances from retaining an old queue graph.
+        unregister_resource_health_provider("telegram_update_processor")
         self._completed_verifications: dict[
             tuple[int, int], tuple[float, _VerificationFingerprint]
         ] = {}
@@ -2286,8 +3340,18 @@ class VerifyWebServer:
                 ),
                 secret_token=self.webhook_secret,
                 worker_count=WEBHOOK_MAX_CONCURRENT_UPDATES,
+                auth_worker_count=WEBHOOK_AUTH_CONCURRENT_UPDATES,
+                critical_worker_count=WEBHOOK_CRITICAL_CONCURRENT_UPDATES,
+                security_worker_count=WEBHOOK_SECURITY_CONCURRENT_UPDATES,
+                critical_queue_capacity=WEBHOOK_CRITICAL_QUEUE_CAPACITY,
+                security_queue_capacity=WEBHOOK_SECURITY_QUEUE_CAPACITY,
+                auth_queue_capacity=WEBHOOK_AUTH_QUEUE_CAPACITY,
             )
             self._webhook_processor = processor
+            register_resource_health_provider(
+                "telegram_update_processor",
+                self._resource_health_provider,
+            )
 
             async def close_webhook_handler(_app: web.Application) -> None:
                 await self.disable_webhook_route()
@@ -2370,6 +3434,11 @@ class VerifyWebServer:
 
         await self._stop_webhook_processor()
 
+    async def quiesce_update_processor(self) -> bool:
+        if self._webhook_processor is None:
+            return True
+        return await self._webhook_processor.quiesce()
+
     async def start_update_processor(self) -> None:
         """Start the transport-neutral durable Telegram inbox consumer.
 
@@ -2409,6 +3478,22 @@ class VerifyWebServer:
         if self._webhook_processor is None:
             return "webhook route is enabled without an update processor"
         return self._webhook_processor.fatal_issue()
+
+    def _update_processor_health_snapshot(self) -> dict[str, Any]:
+        processor = self._webhook_processor
+        if processor is None:
+            return {
+                "ok": self.webhook_dispatcher is None,
+                "fatal": False,
+                "issue": (
+                    None
+                    if self.webhook_dispatcher is None
+                    else "Telegram update processor is not initialized"
+                ),
+            }
+        snapshot = processor.health_snapshot()
+        snapshot["fatal"] = processor.fatal_issue() is not None
+        return snapshot
 
     async def start(self) -> None:
         app = self.build_app()
@@ -2471,6 +3556,10 @@ class VerifyWebServer:
                     except Exception:
                         log.exception("Mini App web server cleanup failed")
         finally:
+            unregister_resource_health_provider(
+                "telegram_update_processor",
+                self._resource_health_provider,
+            )
             await _flush_public_body_tasks()
             await flush_member_identity_tasks()
 
@@ -2490,6 +3579,7 @@ class VerifyWebServer:
     async def handle_health(self, _request: web.Request) -> web.Response:
         processor = self._webhook_processor
         webhook_health = processor.health_snapshot() if processor is not None else None
+        resources = resource_health_snapshot()
         webhook_issue = (
             processor.delivery_issue()
             if processor is not None
@@ -2509,6 +3599,7 @@ class VerifyWebServer:
         ok = (
             webhook_issue is None
             and self._delivery_mode in {"webhook", "polling"}
+            and bool(resources.get("ok", False))
         )
         return web.json_response(
             {
@@ -2516,6 +3607,7 @@ class VerifyWebServer:
                 "delivery_mode": self._delivery_mode,
                 "webhook_accepting_updates": self._webhook_accepting_updates,
                 "webhook": webhook_health,
+                "resources": resources,
                 "config_revision": self.runtime_config.revision
                 if self.runtime_config is not None
                 else None,

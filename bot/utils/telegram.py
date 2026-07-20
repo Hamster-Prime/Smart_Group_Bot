@@ -7,6 +7,7 @@ import html
 import logging
 import re
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
@@ -19,6 +20,11 @@ from aiogram.types import Message
 
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
+from bot.services.request_priority import (
+    ExecutionPriority,
+    current_execution_priority,
+)
+from bot.services.resource_health import register_resource_health_provider
 from bot.utils.timezone import now_shanghai_naive
 
 if TYPE_CHECKING:
@@ -27,12 +33,14 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
+_TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
 _TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
 _UNINITIALIZED_AUTO_DELETE_WARNED = False
 
 
 def _observe_telegram_background_task(task: asyncio.Task[object]) -> None:
     _TELEGRAM_BACKGROUND_TASKS.discard(task)
+    _TELEGRAM_BACKGROUND_STARTED.pop(task, None)
     if task.cancelled():
         return
     try:
@@ -45,6 +53,7 @@ def _track_telegram_background_task(task: asyncio.Task[object]) -> None:
     """Keep a detached Telegram operation observable until it really exits."""
 
     _TELEGRAM_BACKGROUND_TASKS.add(task)
+    _TELEGRAM_BACKGROUND_STARTED.setdefault(task, time.monotonic())
     task.add_done_callback(_observe_telegram_background_task)
 
 
@@ -52,9 +61,29 @@ def _schedule_telegram_background_task(
     awaitable: Awaitable[object],
     *,
     name: str,
-) -> None:
+) -> bool:
+    priority = current_execution_priority()
+    limit = (
+        _TELEGRAM_BACKGROUND_FATAL_LIMIT
+        if priority <= ExecutionPriority.HIGH
+        else _TELEGRAM_BACKGROUND_SOFT_LIMIT
+    )
+    if len(_TELEGRAM_BACKGROUND_TASKS) >= limit:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        log.warning(
+            "Telegram background task rejected by capacity limit | "
+            "name=%s active=%d limit=%d priority=%s",
+            name,
+            len(_TELEGRAM_BACKGROUND_TASKS),
+            limit,
+            priority.name.lower(),
+        )
+        return False
     task = asyncio.create_task(awaitable, name=name)
     _track_telegram_background_task(task)
+    return True
 
 
 async def flush_telegram_background_tasks(*, timeout_seconds: float = 2.0) -> None:
@@ -82,6 +111,33 @@ async def flush_telegram_background_tasks(*, timeout_seconds: float = 2.0) -> No
         )
 
 
+def telegram_background_health_snapshot() -> dict[str, object]:
+    now = time.monotonic()
+    active = [task for task in _TELEGRAM_BACKGROUND_TASKS if not task.done()]
+    oldest_age = max(
+        (now - _TELEGRAM_BACKGROUND_STARTED.get(task, now) for task in active),
+        default=0.0,
+    )
+    count = len(active)
+    fatal = bool(
+        count >= _TELEGRAM_BACKGROUND_FATAL_LIMIT
+        or oldest_age >= _TELEGRAM_BACKGROUND_MAX_AGE_SECONDS
+    )
+    return {
+        "ok": count < _TELEGRAM_BACKGROUND_SOFT_LIMIT and not fatal,
+        "fatal": fatal,
+        "task_count": count,
+        "oldest_task_seconds": round(oldest_age, 3),
+        "chat_send_semaphores": len(_SEND_SEMAPHORES),
+    }
+
+
+register_resource_health_provider(
+    "telegram_background",
+    telegram_background_health_snapshot,
+)
+
+
 def configure_telegram_cleanup_scheduler(
     scheduler: TelegramCleanupScheduler | None,
 ) -> None:
@@ -99,7 +155,15 @@ TG_TLS_RECORD_RETRY_DELAY = 0.35
 _TYPING_SEND_TIMEOUT_SECONDS = 3.0
 _TELEGRAM_CANCEL_GRACE_SECONDS = 0.25
 _TYPING_WORKER_CANCEL_GRACE_SECONDS = 1.0
-_SEND_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_TELEGRAM_BACKGROUND_SOFT_LIMIT = 16
+_TELEGRAM_BACKGROUND_FATAL_LIMIT = 32
+_TELEGRAM_BACKGROUND_MAX_AGE_SECONDS = 60.0
+_SEND_TOTAL_DEADLINE_SECONDS = 60.0
+_STREAM_MAX_INCREMENTAL_EDITS = 12
+_STREAM_MAX_PACING_SECONDS = 8.0
+_SEND_SEMAPHORES: weakref.WeakValueDictionary[int, asyncio.Semaphore] = (
+    weakref.WeakValueDictionary()
+)
 _MENTION_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_/])@([A-Za-z][A-Za-z0-9_]{4,31})")
 _TG_USER_LINK_HTML_RE = re.compile(
     r"""<a\s+href\s*=\s*(?:(['"])tg://user\?id=\d+\1|tg://user\?id=\d+)\s*>(.*?)</a>""",
@@ -128,6 +192,27 @@ _REPLY_TARGET_MISSING_MARKERS = (
     "message to be replied not found",
     "replied message not found",
 )
+
+
+def _bounded_retry_after_seconds(exc: TelegramRetryAfter) -> float | None:
+    requested = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+    priority = current_execution_priority()
+    if priority <= ExecutionPriority.CRITICAL:
+        maximum = 2.0
+    elif priority <= ExecutionPriority.HIGH:
+        maximum = 5.0
+    else:
+        maximum = 15.0
+    return requested if requested <= maximum else None
+
+
+def _send_total_deadline_seconds() -> float:
+    priority = current_execution_priority()
+    if priority <= ExecutionPriority.CRITICAL:
+        return 12.0
+    if priority <= ExecutionPriority.HIGH:
+        return 30.0
+    return _SEND_TOTAL_DEADLINE_SECONDS
 
 
 def sanitize_outgoing_mentions(text: str) -> str:
@@ -872,6 +957,10 @@ async def typing_action(
     chat_id = message.chat.id
 
     async def _send_typing_once() -> bool:
+        if len(_TELEGRAM_BACKGROUND_TASKS) >= _TELEGRAM_BACKGROUND_SOFT_LIMIT:
+            # Typing is cosmetic.  Never add more work while real Telegram
+            # operations are already showing cancellation pressure.
+            return False
         task = asyncio.create_task(
             message.bot.send_chat_action(
                 chat_id=chat_id,
@@ -1008,7 +1097,10 @@ async def send_reply(
                     )
                 return sent
             except TelegramRetryAfter as exc:
-                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                wait_s = _bounded_retry_after_seconds(exc)
+                if wait_s is None:
+                    log.warning("telegram flood control exceeds send deadline; aborting")
+                    return None
                 log.warning("telegram flood control on send, waiting %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
                 attempt += 1
@@ -1059,7 +1151,9 @@ async def send_reply(
                     return True
                 return False
             except TelegramRetryAfter as exc:
-                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                wait_s = _bounded_retry_after_seconds(exc)
+                if wait_s is None:
+                    return False
                 log.warning("telegram flood control on edit, waiting %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
                 attempt += 1
@@ -1092,7 +1186,15 @@ async def send_reply(
         return False
 
     async def _send_stream_segment(segment: str) -> bool:
-        chunks = _stream_chunks(segment, chunk_size=stream_chunk_size)
+        # Bound edit amplification and pacing time.  The old 36-character
+        # cadence could spend almost a minute editing a 2K reply and exceed the
+        # reply-batch deadline before the final text landed.
+        adaptive_chunk_size = max(
+            int(stream_chunk_size),
+            max(1, (len(segment) + _STREAM_MAX_INCREMENTAL_EDITS - 1)
+                // _STREAM_MAX_INCREMENTAL_EDITS),
+        )
+        chunks = _stream_chunks(segment, chunk_size=adaptive_chunk_size)
         if len(chunks) <= 1 and len(segment) >= 18:
             mid = max(1, len(segment) // 2)
             chunks = [segment[:mid], segment[mid:]]
@@ -1117,11 +1219,15 @@ async def send_reply(
 
         merged = chunks[0]
         last_edit_ts = time.monotonic()
+        effective_interval = min(
+            max(0.0, float(stream_interval)),
+            _STREAM_MAX_PACING_SECONDS / max(1, len(chunks) - 1),
+        )
         for chunk in chunks[1:]:
             merged += chunk
             elapsed = time.monotonic() - last_edit_ts
-            if elapsed < stream_interval:
-                await asyncio.sleep(stream_interval - elapsed)
+            if elapsed < effective_interval:
+                await asyncio.sleep(effective_interval - elapsed)
             edited = await _safe_edit(sent, merged, parse_mode=None, retries=3)
             if edited:
                 last_edit_ts = time.monotonic()
@@ -1146,35 +1252,50 @@ async def send_reply(
     if not payload:
         return False
 
-    semaphore = _SEND_SEMAPHORES.setdefault(message.chat.id, asyncio.Semaphore(CHAT_SEND_PARALLEL))
-    async with semaphore:
-        if not stream:
+    semaphore = _SEND_SEMAPHORES.setdefault(
+        message.chat.id,
+        asyncio.Semaphore(CHAT_SEND_PARALLEL),
+    )
+
+    async def _deliver_payload() -> bool:
+        async with semaphore:
+            if not stream:
+                parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+                ok = True
+                for part in parts:
+                    html = md_to_html(part)
+                    sent = await _safe_send(html, parse_mode="HTML", retries=3)
+                    if not sent:
+                        sent = await _safe_send(part, parse_mode="Markdown", retries=2)
+                    if not sent:
+                        sent = await _safe_send(part, parse_mode=None, retries=2)
+                    ok = ok and bool(sent)
+                return ok
+
             parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
-            ok = True
+            if not parts:
+                return False
+
+            all_ok = True
             for part in parts:
-                html = md_to_html(part)
-                sent = await _safe_send(html, parse_mode="HTML", retries=3)
-                if not sent:
-                    sent = await _safe_send(part, parse_mode="Markdown", retries=2)
-                if not sent:
-                    sent = await _safe_send(part, parse_mode=None, retries=2)
-                ok = ok and bool(sent)
-            return ok
+                if len(part) > TG_MESSAGE_LIMIT:
+                    slices = [
+                        part[i : i + TG_STREAM_SAFE_LIMIT]
+                        for i in range(0, len(part), TG_STREAM_SAFE_LIMIT)
+                    ]
+                else:
+                    slices = [part]
+                for segment in slices:
+                    seg_ok = await _send_stream_segment(segment)
+                    all_ok = all_ok and seg_ok
+            return all_ok
 
-        parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
-        if not parts:
-            return False
-
-        all_ok = True
-        for part in parts:
-            if len(part) > TG_MESSAGE_LIMIT:
-                slices = [part[i : i + TG_STREAM_SAFE_LIMIT] for i in range(0, len(part), TG_STREAM_SAFE_LIMIT)]
-            else:
-                slices = [part]
-            for segment in slices:
-                seg_ok = await _send_stream_segment(segment)
-                all_ok = all_ok and seg_ok
-        return all_ok
+    try:
+        async with asyncio.timeout(_send_total_deadline_seconds()):
+            return await _deliver_payload()
+    except TimeoutError:
+        log.error("Telegram reply total deadline exceeded | chat_id=%s", message.chat.id)
+        return False
 
 
 async def send_reply_messages(
@@ -1258,7 +1379,10 @@ async def send_chat_message(
                 )
                 return sent
             except TelegramRetryAfter as exc:
-                wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                wait_s = _bounded_retry_after_seconds(exc)
+                if wait_s is None:
+                    log.warning("telegram flood control exceeds scheduled send deadline; aborting")
+                    return None
                 log.warning("telegram flood control on scheduled send, waiting %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
                 attempt += 1
@@ -1285,23 +1409,41 @@ async def send_chat_message(
                 await asyncio.sleep(retry_delay * attempt)
         return None
 
-    semaphore = _SEND_SEMAPHORES.setdefault(chat_id, asyncio.Semaphore(CHAT_SEND_PARALLEL))
-    async with semaphore:
-        ok = True
-        for part in _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT):
-            html_body = md_to_html(part)
-            sent = await _safe_send(html_body, parse_mode="HTML", reply_id=reply_to_message_id, retries=3)
-            if not sent:
-                sent = await _safe_send(
-                    part,
-                    parse_mode="Markdown",
-                    reply_id=reply_to_message_id,
-                    retries=2,
-                )
-            if not sent:
-                sent = await _safe_send(part, parse_mode=None, reply_id=reply_to_message_id, retries=2)
-            ok = ok and bool(sent)
-        return ok
+    semaphore = _SEND_SEMAPHORES.setdefault(
+        chat_id,
+        asyncio.Semaphore(CHAT_SEND_PARALLEL),
+    )
+    try:
+        async with asyncio.timeout(_send_total_deadline_seconds()):
+            async with semaphore:
+                ok = True
+                for part in _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT):
+                    html_body = md_to_html(part)
+                    sent = await _safe_send(
+                        html_body,
+                        parse_mode="HTML",
+                        reply_id=reply_to_message_id,
+                        retries=3,
+                    )
+                    if not sent:
+                        sent = await _safe_send(
+                            part,
+                            parse_mode="Markdown",
+                            reply_id=reply_to_message_id,
+                            retries=2,
+                        )
+                    if not sent:
+                        sent = await _safe_send(
+                            part,
+                            parse_mode=None,
+                            reply_id=reply_to_message_id,
+                            retries=2,
+                        )
+                    ok = ok and bool(sent)
+                return ok
+    except TimeoutError:
+        log.error("Telegram scheduled send total deadline exceeded | chat_id=%s", chat_id)
+        return False
 
 
 def extract_message_text(message: Message) -> tuple[str, str]:

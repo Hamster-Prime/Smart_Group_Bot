@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import time
 from typing import Any
 
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from bot.services.request_priority import ExecutionPriority, current_execution_priority
+from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
 
@@ -15,11 +19,76 @@ _SQLITE_WRITE_LOCK_INFO_SECONDS = 0.1
 _SQLITE_WRITE_LOCK_WARN_SECONDS = 1.0
 
 
-def _sqlite_write_lock() -> asyncio.Lock:
+class _PrioritySQLiteWriteLock:
+    """Single-writer lock that reserves ordering priority for security work."""
+
+    def __init__(self) -> None:
+        self._locked = False
+        self._waiters: dict[ExecutionPriority, deque[asyncio.Future[bool]]] = {
+            priority: deque() for priority in ExecutionPriority
+        }
+
+    def locked(self) -> bool:
+        return self._locked
+
+    async def acquire(self) -> bool:
+        priority = current_execution_priority()
+        if not self._locked and not any(self._waiters.values()):
+            self._locked = True
+            return True
+
+        future = asyncio.get_running_loop().create_future()
+        self._waiters[priority].append(future)
+        try:
+            await future
+            return True
+        except BaseException:
+            # If ownership was handed to this waiter immediately before its
+            # task was cancelled, pass it on instead of leaking the writer.
+            if future.done() and not future.cancelled():
+                self.release()
+            else:
+                future.cancel()
+            raise
+
+    def release(self) -> None:
+        if not self._locked:
+            raise RuntimeError("SQLite priority write lock is not acquired")
+        for priority in ExecutionPriority:
+            queue = self._waiters[priority]
+            while queue:
+                future = queue.popleft()
+                if future.done():
+                    continue
+                # Ownership transfers directly; _locked intentionally remains
+                # true so no newcomer can jump ahead between callbacks.
+                future.set_result(True)
+                return
+        self._locked = False
+
+    def snapshot(self) -> dict[str, int | bool]:
+        return {
+            "locked": self._locked,
+            "waiting_critical": sum(
+                not future.done()
+                for future in self._waiters[ExecutionPriority.CRITICAL]
+            ),
+            "waiting_high": sum(
+                not future.done()
+                for future in self._waiters[ExecutionPriority.HIGH]
+            ),
+            "waiting_normal": sum(
+                not future.done()
+                for future in self._waiters[ExecutionPriority.NORMAL]
+            ),
+        }
+
+
+def _sqlite_write_lock() -> _PrioritySQLiteWriteLock:
     loop = asyncio.get_running_loop()
     lock = getattr(loop, "_smart_group_bot_sqlite_write_lock", None)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = _PrioritySQLiteWriteLock()
         setattr(loop, "_smart_group_bot_sqlite_write_lock", lock)
     return lock
 
@@ -33,6 +102,43 @@ def _sqlite_write_lock_owner() -> dict[str, Any] | None:
 def _set_sqlite_write_lock_owner(owner: dict[str, Any] | None) -> None:
     loop = asyncio.get_running_loop()
     setattr(loop, "_smart_group_bot_sqlite_write_lock_owner", owner)
+
+
+def sqlite_write_resource_health_snapshot() -> dict[str, Any]:
+    try:
+        lock = _sqlite_write_lock()
+    except RuntimeError:
+        return {"ok": True, "fatal": False, "locked": False}
+    snapshot = lock.snapshot()
+    owner = _sqlite_write_lock_owner() or {}
+    acquired_at = owner.get("acquired_at")
+    held_seconds = (
+        max(0.0, time.perf_counter() - acquired_at)
+        if isinstance(acquired_at, (int, float))
+        else 0.0
+    )
+    critical_waiting = int(snapshot["waiting_critical"])
+    total_waiters = sum(
+        int(snapshot[key])
+        for key in ("waiting_critical", "waiting_high", "waiting_normal")
+    )
+    fatal = bool(
+        held_seconds >= 30.0
+        or critical_waiting and held_seconds >= _SQLITE_WRITE_LOCK_TIMEOUT_SECONDS
+        or total_waiters >= 64
+    )
+    return {
+        "ok": not fatal and held_seconds < _SQLITE_WRITE_LOCK_WARN_SECONDS,
+        "fatal": fatal,
+        **snapshot,
+        "held_seconds": round(held_seconds, 3),
+        "owner_operation": str(owner.get("op", "")),
+        "owner_priority": str(owner.get("priority", "")),
+        "total_waiters": total_waiters,
+    }
+
+
+register_resource_health_provider("sqlite_writer", sqlite_write_resource_health_snapshot)
 
 
 def is_database_locked_error(exc: BaseException) -> bool:
@@ -54,7 +160,7 @@ def _statement_is_write(statement: Any) -> bool:
 class SQLiteSafeAsyncSession(AsyncSession):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._sqlite_write_lock_held: asyncio.Lock | None = None
+        self._sqlite_write_lock_held: _PrioritySQLiteWriteLock | None = None
 
     def _uses_sqlite(self) -> bool:
         try:
@@ -106,6 +212,7 @@ class SQLiteSafeAsyncSession(AsyncSession):
                 "session_id": id(self),
                 "op": op,
                 "acquired_at": acquired_at,
+                "priority": current_execution_priority().name.lower(),
             }
         )
         waited_ms = int((time.perf_counter() - started) * 1000)

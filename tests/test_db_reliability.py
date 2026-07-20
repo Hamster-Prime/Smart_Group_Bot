@@ -15,10 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.engine import init_db, _normalize_database_url, _warn_about_sqlite_shadow_paths
-from bot.db.sqlite_session import SQLiteSafeAsyncSession, is_database_locked_error
+from bot.db.sqlite_session import (
+    SQLiteSafeAsyncSession,
+    _PrioritySQLiteWriteLock,
+    is_database_locked_error,
+)
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
+from bot.services.request_priority import ExecutionPriority, execution_priority_scope
 from bot.services.join_screening import profile_screen_signature
+from bot.services.request_priority import ExecutionPriority, execution_priority_scope
 
 
 class _TrackedContext:
@@ -133,6 +139,58 @@ class SQLiteFilePermissionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SQLiteWriteLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_critical_waiter_overtakes_queued_normal_writer(self) -> None:
+        lock = _PrioritySQLiteWriteLock()
+        await lock.acquire()
+        acquired: list[str] = []
+
+        async def waiter(label: str) -> None:
+            await lock.acquire()
+            acquired.append(label)
+            lock.release()
+
+        with execution_priority_scope(ExecutionPriority.NORMAL):
+            normal = asyncio.create_task(waiter("normal"))
+        await asyncio.sleep(0)
+        with execution_priority_scope(ExecutionPriority.CRITICAL):
+            critical = asyncio.create_task(waiter("critical"))
+        await asyncio.sleep(0)
+
+        lock.release()
+        await asyncio.wait_for(asyncio.gather(normal, critical), timeout=0.2)
+
+        self.assertEqual(acquired, ["critical", "normal"])
+
+    async def test_security_writer_overtakes_ordinary_waiters(self) -> None:
+        owner = SQLiteSafeAsyncSession()
+        ordinary = SQLiteSafeAsyncSession()
+        critical = SQLiteSafeAsyncSession()
+        for session in (owner, ordinary, critical):
+            session._uses_sqlite = lambda: True  # type: ignore[method-assign]
+        order: list[str] = []
+        await owner._acquire_write_lock(op="owner")
+
+        async def wait_for(session: SQLiteSafeAsyncSession, label: str, priority: ExecutionPriority) -> None:
+            with execution_priority_scope(priority):
+                await session._acquire_write_lock(op=label)
+                order.append(label)
+                session._release_write_lock()
+
+        ordinary_task = asyncio.create_task(
+            wait_for(ordinary, "ordinary", ExecutionPriority.NORMAL)
+        )
+        await asyncio.sleep(0)
+        critical_task = asyncio.create_task(
+            wait_for(critical, "critical", ExecutionPriority.CRITICAL)
+        )
+        await asyncio.sleep(0)
+        owner._release_write_lock()
+        await asyncio.gather(ordinary_task, critical_task)
+        self.assertEqual(order, ["critical", "ordinary"])
+        await owner.close()
+        await ordinary.close()
+        await critical.close()
+
     async def test_write_lock_wait_has_a_hard_deadline(self) -> None:
         owner = SQLiteSafeAsyncSession()
         waiter = SQLiteSafeAsyncSession()
@@ -354,9 +412,11 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
         )
         event = self._event()
 
-        async def enforce(_bot, chat_id, user_id):
+        async def enforce(_bot, chat_id, user_id, preserve_ban, restriction_required):
             self.assertEqual(state.active, 0)
             self.assertEqual((chat_id, user_id), (-100, 42))
+            self.assertTrue(callable(preserve_ban))
+            self.assertTrue(callable(restriction_required))
             return True
 
         with (
@@ -368,7 +428,10 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
                 "bot.middlewares.global_ban.is_globally_banned",
                 new=AsyncMock(return_value=True),
             ),
-            patch("bot.middlewares.global_ban.ban_member", side_effect=enforce) as ban_mock,
+            patch(
+                "bot.middlewares.global_ban.enforce_ban_with_policy_reconciliation",
+                side_effect=enforce,
+            ) as ban_mock,
         ):
             result = await middleware(
                 AsyncMock(return_value="handled"),
@@ -378,7 +441,8 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
         event.delete.assert_awaited_once()
-        ban_mock.assert_awaited_once_with(event.bot, -100, 42)
+        ban_mock.assert_awaited_once()
+        self.assertEqual(ban_mock.await_args.args[:3], (event.bot, -100, 42))
 
     async def test_profile_cache_session_is_closed_before_downstream_handler(self) -> None:
         state = SimpleNamespace(active=0)

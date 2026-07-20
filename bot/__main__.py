@@ -19,6 +19,7 @@ from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
 from bot.services import memory_holder
+from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
     JoinVerificationSweeper,
     VERIFICATION_PROVIDERS,
@@ -30,13 +31,19 @@ from bot.services.group_permissions import (
     GroupPermissionService,
     init_group_permission_service,
 )
-from bot.services.llm import LLMService, flush_llm_request_tasks
+from bot.services.llm import LLMService, close_llm_clients, flush_llm_request_tasks
 from bot.services.memory import MemoryService
 from bot.services.patrol import PatrolService, init_patrol_service
 from bot.services.raid_guard import RaidGuardService, init_raid_guard_service
 from bot.services.proactive import ProactiveTopicService
-from bot.services.runtime_config import RuntimeConfig, RuntimeConfigManager
+from bot.services.privileged_tasks import flush_privileged_tasks
+from bot.services.resource_health import (
+    run_resource_watchdog,
+    start_hard_loop_watchdog,
+)
 from bot.services.runtime_config import (
+    RuntimeConfig,
+    RuntimeConfigManager,
     hcaptcha_key_configuration_issue,
     turnstile_key_configuration_issue,
 )
@@ -64,11 +71,12 @@ _CLEANUP_TIMEOUT_SECONDS = 20.0
 # The reply-batch budget is configurable up to 120 seconds.  Leave enough
 # room for its own bounded failure notification/cleanup instead of cancelling
 # a healthy flush at the old 30-second outer limit.
-_PENDING_FLUSH_TIMEOUT_SECONDS = 130.0
-_WEB_SERVER_CLEANUP_TIMEOUT_SECONDS = 60.0
+_PENDING_FLUSH_TIMEOUT_SECONDS = 35.0
+_WEB_SERVER_CLEANUP_TIMEOUT_SECONDS = 20.0
 _CANCELLATION_GRACE_SECONDS = 1.0
 _FINAL_LOOP_DRAIN_SECONDS = 2.0
 _FORCED_PROCESS_EXIT_SECONDS = 5.0
+_ORDERED_SHUTDOWN_HARD_LIMIT_SECONDS = 110.0
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -210,16 +218,21 @@ async def _drain_final_loop_tasks(*, timeout_seconds: float) -> None:
             setattr(task, "_log_destroy_pending", False)
 
 
-def _arm_forced_exit_watchdog() -> None:
+def _arm_forced_exit_watchdog(
+    timeout_seconds: float = _FORCED_PROCESS_EXIT_SECONDS,
+) -> threading.Event:
+    stopped = threading.Event()
+
     def _force_exit() -> None:
-        time.sleep(_FORCED_PROCESS_EXIT_SECONDS)
-        os._exit(1)
+        if not stopped.wait(max(0.1, float(timeout_seconds))):
+            os._exit(1)
 
     threading.Thread(
         target=_force_exit,
         name="bot-shutdown-watchdog",
         daemon=True,
     ).start()
+    return stopped
 
 
 def run_async_entrypoint(
@@ -231,6 +244,7 @@ def run_async_entrypoint(
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    hard_loop_watchdog = start_hard_loop_watchdog(loop)
     try:
         return loop.run_until_complete(awaitable)
     finally:
@@ -245,7 +259,10 @@ def run_async_entrypoint(
             )
         finally:
             asyncio.set_event_loop(None)
-            loop.close()
+            try:
+                loop.close()
+            finally:
+                hard_loop_watchdog.set()
 
 
 def run_bot() -> None:
@@ -321,6 +338,9 @@ async def main() -> None:
     dp["settings"] = settings
     dp["session_factory"] = session_factory
     dp["runtime_config"] = runtime_config
+    warmed_operators = await warm_privileged_operator_cache(session_factory)
+    if warmed_operators:
+        log.info("Preloaded %d delegated privileged operator scope(s)", warmed_operators)
 
     dp.update.outer_middleware(DurableInboxUpdateDedupMiddleware(session_factory))
     dp.message.outer_middleware(GlobalBanEnforcementMiddleware(session_factory))
@@ -426,8 +446,10 @@ async def main() -> None:
             session_factory=session_factory,
         )
         init_raid_guard_service(raid_guard)
+        logging_config_snapshot = runtime_config.config.logging.model_dump(mode="json")
 
         async def apply_runtime_update(_config: RuntimeConfig) -> None:
+            nonlocal logging_config_snapshot
             llm.reconfigure(
                 settings.bot.main_model,
                 settings.bot.decision_model,
@@ -442,7 +464,10 @@ async def main() -> None:
                 5.0,
                 float(settings.join_verification_check_interval_seconds),
             )
-            configure_logging(force=True, config=runtime_config.config.logging)
+            next_logging_config = runtime_config.config.logging.model_dump(mode="json")
+            if next_logging_config != logging_config_snapshot:
+                configure_logging(force=True, config=runtime_config.config.logging)
+                logging_config_snapshot = next_logging_config
 
         runtime_config.set_apply_callback(apply_runtime_update)
 
@@ -546,6 +571,10 @@ async def main() -> None:
                 group_permissions.run_forever(),
                 name="group-permission-runner",
             ),
+            asyncio.create_task(
+                run_resource_watchdog(),
+                name="resource-health-watchdog",
+            ),
         ]
 
         await _run_with_background_supervision(
@@ -565,11 +594,6 @@ async def main() -> None:
                     "start_update_processor",
                     None,
                 ),
-                stop_update_processor=getattr(
-                    verify_web,
-                    "stop_update_processor",
-                    None,
-                ),
                 durable_update_ingest=getattr(
                     verify_web,
                     "accept_polling_update",
@@ -579,6 +603,9 @@ async def main() -> None:
             background_tasks=background_tasks,
         )
     finally:
+        ordered_shutdown_watchdog = _arm_forced_exit_watchdog(
+            _ORDERED_SHUTDOWN_HARD_LIMIT_SECONDS
+        )
         await _cancel_tasks_bounded(
             background_tasks,
             label="background services",
@@ -587,13 +614,17 @@ async def main() -> None:
             flush_update_delivery_tasks(),
             label="update delivery control tasks",
         )
-        # Stop the durable webhook inbox consumer before taking a snapshot of
-        # pending replies/skills/LLM work.  The HTTP server itself stays live
-        # until its later ordered shutdown, but no new persisted update may
-        # enter those subsystems while they are being flushed.
+        # Transport delivery has stopped. Quiesce recovery/dispatch first, but
+        # keep durable finalizers alive until every explicit detached owner has
+        # finished; otherwise a graceful deploy can strand a live lease for the
+        # full recovery interval.
         await _await_cleanup_bounded(
-            verify_web.stop_update_processor(),
-            label="webhook update processor",
+            verify_web.quiesce_update_processor(),
+            label="Telegram update processor quiesce",
+        )
+        await _await_cleanup_bounded(
+            flush_privileged_tasks(),
+            label="privileged security tasks",
         )
         await _await_cleanup_bounded(
             raid_guard.shutdown(),
@@ -611,6 +642,12 @@ async def main() -> None:
             label="pending inbound batches",
             timeout=_PENDING_FLUSH_TIMEOUT_SECONDS,
         )
+        memory_shutdown = getattr(memory, "shutdown", None)
+        if callable(memory_shutdown):
+            await _await_cleanup_bounded(
+                memory_shutdown(),
+                label="memory maintenance tasks",
+            )
         await _await_cleanup_bounded(
             flush_skill_execution_tasks(),
             label="skill execution tasks",
@@ -620,12 +657,20 @@ async def main() -> None:
             label="LLM request tasks",
         )
         await _await_cleanup_bounded(
+            close_llm_clients(),
+            label="LiteLLM HTTP clients",
+        )
+        await _await_cleanup_bounded(
             flush_vote_ban_tasks(),
             label="vote-ban tasks",
         )
         await _await_cleanup_bounded(
             flush_kick_cleanup_tasks(),
             label="kick cleanup tasks",
+        )
+        await _await_cleanup_bounded(
+            verify_web.stop_update_processor(),
+            label="Telegram update processor finalizers",
         )
         await _await_cleanup_bounded(
             verify_web.stop(),
@@ -652,6 +697,7 @@ async def main() -> None:
             engine.dispose(),
             label="database engine",
         )
+        ordered_shutdown_watchdog.set()
 
 
 if __name__ == "__main__":

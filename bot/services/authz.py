@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from aiogram.types import Message
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import Admin, AuthorizedGroup
+from bot.services.update_delivery import mark_privileged_operator
 
 
 async def _schedule_auto_delete(sent: Message | None, settings: Settings) -> None:
@@ -35,6 +36,7 @@ async def _end_read_transaction(session: AsyncSession) -> None:
 async def ensure_super_admin(message: Message, settings: Settings) -> bool:
     user = message.from_user
     if user and is_super_admin_user_id(user.id, settings):
+        mark_privileged_operator(int(user.id))
         return True
     sent = await message.answer("仅最高管理员可使用该命令。")
     await _schedule_auto_delete(sent, settings)
@@ -139,6 +141,26 @@ async def list_group_admins(session: AsyncSession, group_id: int) -> list[Admin]
     return list(result.scalars().all())
 
 
+async def warm_privileged_operator_cache(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> int:
+    """Preload durable delegated-admin grants into the admission cache."""
+
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(Admin.group_id, Admin.user_id).join(
+                    AuthorizedGroup,
+                    AuthorizedGroup.group_id == Admin.group_id,
+                )
+            )
+        ).all()
+        await session.commit()
+    for group_id, user_id in rows:
+        mark_privileged_operator(int(user_id), group_id=int(group_id))
+    return len(rows)
+
+
 async def ensure_group_authorized(
     message: Message,
     session: AsyncSession,
@@ -177,6 +199,7 @@ async def ensure_group_admin_permission(
 
     user = message.from_user
     if user and allow_super_admin and is_super_admin_user_id(user.id, settings):
+        mark_privileged_operator(int(user.id))
         return True
 
     if not user:
@@ -187,6 +210,7 @@ async def ensure_group_admin_permission(
     ok = await is_group_admin_authorized(session, message.chat.id, user.id)
     await _end_read_transaction(session)
     if ok:
+        mark_privileged_operator(int(user.id), group_id=int(message.chat.id))
         return True
 
     sent = await message.answer("你没有群管理权限，请联系最高管理员授权。")

@@ -13,9 +13,9 @@ from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
-    ban_member,
-    delete_join_verification,
+    enforce_ban_with_policy_reconciliation,
     reconcile_moderation_ban_after_lost_lease,
+    verification_restriction_required,
 )
 from bot.services.update_completion import request_current_update_retry
 
@@ -89,8 +89,6 @@ async def _confirm_pending_local_bans(
                 reference_type="violation",
                 reference_id=int(violation.id),
             )
-        if confirmed:
-            await delete_join_verification(session, group_id, user_id)
         await session.commit()
         return confirmed
 
@@ -186,22 +184,38 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
         except Exception:
             pass
         try:
-            enforced = await ban_member(event.bot, chat.id, user.id)
-            if not enforced:
+            async def preserve_ban() -> bool:
+                return await _durable_ban_policy_exists(
+                    self.session_factory,
+                    group_id=int(chat.id),
+                    user_id=int(user.id),
+                )
+
+            async def restriction_required() -> bool:
+                async with self.session_factory() as policy_session:
+                    required = await verification_restriction_required(
+                        policy_session,
+                        group_id=int(chat.id),
+                        user_id=int(user.id),
+                    )
+                    await policy_session.commit()
+                    return required
+
+            final_banned = await enforce_ban_with_policy_reconciliation(
+                event.bot,
+                int(chat.id),
+                int(user.id),
+                preserve_ban,
+                restriction_required,
+            )
+            if final_banned is None:
                 log.warning(
                     "[%s] durable ban enforcement was not confirmed | user=%s",
                     chat.id,
                     user.id,
                 )
                 request_current_update_retry()
-            elif locally_banned:
-                async def preserve_ban() -> bool:
-                    return await _durable_ban_policy_exists(
-                        self.session_factory,
-                        group_id=int(chat.id),
-                        user_id=int(user.id),
-                    )
-
+            elif final_banned and locally_banned:
                 try:
                     confirmed = await _confirm_pending_local_bans(
                         self.session_factory,
@@ -214,6 +228,7 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
                             int(chat.id),
                             int(user.id),
                             preserve_ban,
+                            restriction_required=restriction_required,
                         )
                         if not reconciled:
                             log.error(
@@ -235,6 +250,7 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
                             int(chat.id),
                             int(user.id),
                             preserve_ban,
+                            restriction_required=restriction_required,
                         )
         except Exception:
             log.exception("[%s] global ban enforcement failed | user=%s", chat.id, user.id)

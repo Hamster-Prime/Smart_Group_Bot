@@ -5,7 +5,11 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import weakref
+from collections.abc import Callable
+from inspect import isawaitable
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
@@ -18,24 +22,199 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 import litellm
 
 from bot.config import ChatEndpointConfig, EmbedConfig, EmbedEndpointConfig, ModelConfig
+from bot.services.request_priority import ReservedCapacityGate
+from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
 
 # Keep slow/upstream-broken providers from consuming every Telegram update
 # worker at once.  The semaphore is process-wide because LLMService instances
 # are intentionally short lived (one is built for each pending reply batch).
-_LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(4)
+_LLM_REQUEST_CAPACITY = 4
+_LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(_LLM_REQUEST_CAPACITY)
+_LLM_PRIORITY_GATE = ReservedCapacityGate(
+    total_capacity=_LLM_REQUEST_CAPACITY,
+    noncritical_capacity=3,
+    # Ordinary replies may use at most two slots. One additional slot remains
+    # available to HIGH join/raid screening and the final slot is reserved for
+    # CRITICAL permission controls.
+    normal_capacity=2,
+)
 _LLM_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
+_LLM_ORPHAN_STARTED: dict[asyncio.Future[Any], float] = {}
+_LLM_CLEANUP_TASKS: set[asyncio.Future[Any]] = set()
+_LLM_CLEANUP_STARTED: dict[asyncio.Future[Any], float] = {}
+_LLM_CLEANUP_TASK_LIMIT = 32
+_LLM_ORPHAN_MAX_AGE_SECONDS = 120.0
+_LLM_MAX_RETRY_ATTEMPTS = 3
+_LLM_MAX_ATTEMPT_TIMEOUT_SECONDS = 60.0
+_LLM_MAX_CANDIDATES = 4
+_LLM_STAGE_DEADLINES = {
+    "decision": 35.0,
+    "moderation": 35.0,
+    "embed": 60.0,
+    "compress": 90.0,
+    "vision": 90.0,
+    "main": 120.0,
+    "skill": 120.0,
+}
 _LLM_CIRCUIT_FAILURE_THRESHOLD = 3
 _LLM_CIRCUIT_COOLDOWN_SECONDS = 30.0
+_LLM_TOKENIZER_THREAD_CAPACITY = 2
+_LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS = 1.0
+_LLM_TOKENIZER_STALE_SECONDS = 30.0
+_LLM_TOKENIZER_THREAD_SLOTS = threading.BoundedSemaphore(
+    _LLM_TOKENIZER_THREAD_CAPACITY
+)
+_LLM_TOKENIZER_STATS_LOCK = threading.Lock()
+_LLM_TOKENIZER_ACTIVE_STARTED: dict[object, float] = {}
+_LLM_TOKENIZER_STARTED_TOTAL = 0
+_LLM_TOKENIZER_SATURATED_TOTAL = 0
+_LLM_TOKENIZER_TIMEOUT_TOTAL = 0
+_LLM_TOKENIZER_FAILURE_TOTAL = 0
+_LLM_TOKENIZER_WARNING_INTERVAL_SECONDS = 30.0
+_LLM_TOKENIZER_LAST_WARNING_AT = 0.0
 _LLM_CIRCUITS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     dict[tuple[str, str, str, str], tuple[int, float]],
 ] = weakref.WeakKeyDictionary()
 
 
+def _tokenizer_stats_snapshot() -> dict[str, int | float]:
+    now = time.monotonic()
+    with _LLM_TOKENIZER_STATS_LOCK:
+        oldest_age = max(
+            (now - started for started in _LLM_TOKENIZER_ACTIVE_STARTED.values()),
+            default=0.0,
+        )
+        return {
+            "capacity": _LLM_TOKENIZER_THREAD_CAPACITY,
+            "active": len(_LLM_TOKENIZER_ACTIVE_STARTED),
+            "oldest_active_seconds": round(oldest_age, 3),
+            "started_total": _LLM_TOKENIZER_STARTED_TOTAL,
+            "saturated_total": _LLM_TOKENIZER_SATURATED_TOTAL,
+            "timeout_total": _LLM_TOKENIZER_TIMEOUT_TOTAL,
+            "failure_total": _LLM_TOKENIZER_FAILURE_TOTAL,
+        }
+
+
+def _log_tokenizer_warning(message: str, *args: Any) -> None:
+    global _LLM_TOKENIZER_LAST_WARNING_AT
+
+    now = time.monotonic()
+    with _LLM_TOKENIZER_STATS_LOCK:
+        if now - _LLM_TOKENIZER_LAST_WARNING_AT < _LLM_TOKENIZER_WARNING_INTERVAL_SECONDS:
+            return
+        _LLM_TOKENIZER_LAST_WARNING_AT = now
+    log.warning(message, *args)
+
+
+async def _run_bounded_tokenizer_call(
+    call: Callable[[], int],
+    *,
+    fallback: int,
+) -> tuple[int, bool]:
+    """Run synchronous tokenizer CPU work without blocking the event loop.
+
+    A timed-out tokenizer thread deliberately keeps its slot until the real
+    call exits.  This prevents cancellation-resistant tokenizer work from
+    creating an unbounded number of threads while later requests immediately
+    fall back to a conservative estimate.
+    """
+
+    global _LLM_TOKENIZER_FAILURE_TOTAL
+    global _LLM_TOKENIZER_SATURATED_TOTAL
+    global _LLM_TOKENIZER_STARTED_TOTAL
+    global _LLM_TOKENIZER_TIMEOUT_TOTAL
+
+    if not _LLM_TOKENIZER_THREAD_SLOTS.acquire(blocking=False):
+        with _LLM_TOKENIZER_STATS_LOCK:
+            _LLM_TOKENIZER_SATURATED_TOTAL += 1
+        _log_tokenizer_warning(
+            "LLM tokenizer capacity exhausted; using conservative estimate"
+        )
+        return fallback, False
+
+    loop = asyncio.get_running_loop()
+    result_future: asyncio.Future[int] = loop.create_future()
+    call_token = object()
+    with _LLM_TOKENIZER_STATS_LOCK:
+        _LLM_TOKENIZER_STARTED_TOTAL += 1
+        _LLM_TOKENIZER_ACTIVE_STARTED[call_token] = time.monotonic()
+
+    def _settle(result: int | None = None, error: BaseException | None = None) -> None:
+        if result_future.done():
+            return
+        if error is not None:
+            result_future.set_exception(error)
+        else:
+            result_future.set_result(max(0, int(result or 0)))
+
+    def _worker() -> None:
+        try:
+            result = call()
+        except BaseException as exc:
+            try:
+                loop.call_soon_threadsafe(_settle, None, exc)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                loop.call_soon_threadsafe(_settle, result, None)
+            except RuntimeError:
+                pass
+        finally:
+            with _LLM_TOKENIZER_STATS_LOCK:
+                _LLM_TOKENIZER_ACTIVE_STARTED.pop(call_token, None)
+            _LLM_TOKENIZER_THREAD_SLOTS.release()
+
+    try:
+        threading.Thread(
+            target=_worker,
+            name="llm-tokenizer",
+            daemon=True,
+        ).start()
+    except RuntimeError:
+        with _LLM_TOKENIZER_STATS_LOCK:
+            _LLM_TOKENIZER_ACTIVE_STARTED.pop(call_token, None)
+            _LLM_TOKENIZER_FAILURE_TOTAL += 1
+        _LLM_TOKENIZER_THREAD_SLOTS.release()
+        log.exception("Unable to start bounded LLM tokenizer thread")
+        return fallback, False
+
+    try:
+        done, _ = await asyncio.wait(
+            {result_future},
+            timeout=_LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        result_future.cancel()
+        raise
+    if not done:
+        result_future.cancel()
+        with _LLM_TOKENIZER_STATS_LOCK:
+            _LLM_TOKENIZER_TIMEOUT_TOTAL += 1
+        _log_tokenizer_warning(
+            "LLM tokenizer exceeded %.2fs; using conservative estimate",
+            _LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS,
+        )
+        return fallback, False
+    try:
+        return result_future.result(), True
+    except BaseException as exc:
+        with _LLM_TOKENIZER_STATS_LOCK:
+            _LLM_TOKENIZER_FAILURE_TOTAL += 1
+        _log_tokenizer_warning(
+            "LLM tokenizer failed (%s: %s); using conservative estimate",
+            type(exc).__name__,
+            exc,
+        )
+        return fallback, False
+
+
 def _observe_llm_task(task: asyncio.Future[Any]) -> None:
     _LLM_ORPHAN_TASKS.discard(task)
+    _LLM_ORPHAN_STARTED.pop(task, None)
     try:
         task.result()
     except (asyncio.CancelledError, Exception):
@@ -47,22 +226,109 @@ def _track_llm_orphan(task: asyncio.Future[Any]) -> None:
         _observe_llm_task(task)
         return
     _LLM_ORPHAN_TASKS.add(task)
+    _LLM_ORPHAN_STARTED.setdefault(task, time.monotonic())
     task.add_done_callback(_observe_llm_task)
+
+
+def _observe_llm_cleanup_task(task: asyncio.Future[Any]) -> None:
+    _LLM_CLEANUP_TASKS.discard(task)
+    _LLM_CLEANUP_STARTED.pop(task, None)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_llm_cleanup_task(task: asyncio.Future[Any]) -> None:
+    """Observe best-effort stream cleanup without counting it as a permit leak.
+
+    Stream ``aclose()`` is scheduled after the provider request has yielded its
+    response and the request coroutine can release the real LLM semaphore.
+    Treating that cleanup task as a request orphan could therefore mark the
+    process fatal even though all request permits were available.
+    """
+
+    if task.done():
+        _observe_llm_cleanup_task(task)
+        return
+    _LLM_CLEANUP_TASKS.add(task)
+    _LLM_CLEANUP_STARTED.setdefault(task, time.monotonic())
+    task.add_done_callback(_observe_llm_cleanup_task)
 
 
 async def flush_llm_request_tasks(*, timeout_seconds: float = 15.0) -> None:
     """Cancel and join cancellation-resistant provider calls at shutdown."""
 
-    tasks = {task for task in _LLM_ORPHAN_TASKS if not task.done()}
+    tasks = {
+        task
+        for task in (*_LLM_ORPHAN_TASKS, *_LLM_CLEANUP_TASKS)
+        if not task.done()
+    }
     for task in tasks:
         task.cancel()
     if not tasks:
         return
     done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
     for task in done:
-        _observe_llm_task(task)
+        if task in _LLM_ORPHAN_TASKS:
+            _observe_llm_task(task)
+        if task in _LLM_CLEANUP_TASKS:
+            _observe_llm_cleanup_task(task)
     if pending:
         log.error("%d LLM request task(s) ignored shutdown cancellation", len(pending))
+
+
+async def close_llm_clients() -> None:
+    """Close LiteLLM's cached HTTP clients on shutdown/reconfiguration exit."""
+
+    close = getattr(litellm, "close_litellm_async_clients", None)
+    if not callable(close):
+        return
+    result = close()
+    if isawaitable(result):
+        await result
+
+
+def llm_resource_health_snapshot() -> dict[str, Any]:
+    now = time.monotonic()
+    active_orphans = [task for task in _LLM_ORPHAN_TASKS if not task.done()]
+    active_cleanup = [task for task in _LLM_CLEANUP_TASKS if not task.done()]
+    oldest_age = max(
+        (now - _LLM_ORPHAN_STARTED.get(task, now) for task in active_orphans),
+        default=0.0,
+    )
+    semaphore_waiters = getattr(_LLM_REQUEST_SEMAPHORE, "_waiters", None)
+    orphan_count = len(active_orphans)
+    oldest_cleanup_age = max(
+        (now - _LLM_CLEANUP_STARTED.get(task, now) for task in active_cleanup),
+        default=0.0,
+    )
+    tokenizer = _tokenizer_stats_snapshot()
+    tokenizer_fatal = bool(
+        tokenizer["active"] >= _LLM_TOKENIZER_THREAD_CAPACITY
+        and tokenizer["oldest_active_seconds"] >= _LLM_TOKENIZER_STALE_SECONDS
+    )
+    fatal = bool(
+        orphan_count >= _LLM_REQUEST_CAPACITY
+        or oldest_age >= _LLM_ORPHAN_MAX_AGE_SECONDS
+        or tokenizer_fatal
+    )
+    return {
+        "ok": not fatal,
+        "fatal": fatal,
+        "capacity": _LLM_REQUEST_CAPACITY,
+        "available_permits": int(getattr(_LLM_REQUEST_SEMAPHORE, "_value", 0)),
+        "semaphore_waiters": len(semaphore_waiters or ()),
+        "orphan_count": orphan_count,
+        "oldest_orphan_seconds": round(oldest_age, 3),
+        "cleanup_task_count": len(active_cleanup),
+        "oldest_cleanup_task_seconds": round(oldest_cleanup_age, 3),
+        "tokenizer": tokenizer,
+        "priority_gate": _LLM_PRIORITY_GATE.snapshot(),
+    }
+
+
+register_resource_health_provider("llm", llm_resource_health_snapshot)
 
 _PROVIDER_CREDENTIAL_ENV_KEYS = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
@@ -298,7 +564,7 @@ class LLMService:
 
     @staticmethod
     def _chat_candidates(cfg: ModelConfig) -> list[ChatEndpointConfig]:
-        return [
+        candidates = [
             ChatEndpointConfig(
                 model=cfg.model,
                 provider=getattr(cfg, "provider", ""),
@@ -317,10 +583,11 @@ class LLMService:
             ),
             *cfg.fallbacks,
         ]
+        return candidates[:_LLM_MAX_CANDIDATES]
 
     @staticmethod
     def _embed_candidates(cfg: EmbedConfig) -> list[EmbedEndpointConfig]:
-        return [
+        candidates = [
             EmbedEndpointConfig(
                 model=cfg.model,
                 provider=getattr(cfg, "provider", ""),
@@ -334,6 +601,7 @@ class LLMService:
             ),
             *cfg.fallbacks,
         ]
+        return candidates[:_LLM_MAX_CANDIDATES]
 
     @staticmethod
     def chat_configuration_issue(cfg: ChatEndpointConfig) -> str:
@@ -455,7 +723,7 @@ class LLMService:
     @classmethod
     def _merge_stream_content_slot(
         cls,
-        merged: dict[tuple[int, int], str],
+        merged: dict[tuple[int, int], list[str]],
         *,
         output_index: Any,
         content_index: Any,
@@ -466,14 +734,14 @@ class LLMService:
             return
         slot = (cls._coerce_int(output_index), cls._coerce_int(content_index))
         if replace:
-            merged[slot] = piece
+            merged[slot] = [piece]
             return
-        merged[slot] = cls._append_stream_piece(merged.get(slot, ""), piece)
+        merged.setdefault(slot, []).append(piece)
 
     @classmethod
     def _replace_stream_output_text(
         cls,
-        merged: dict[tuple[int, int], str],
+        merged: dict[tuple[int, int], list[str]],
         *,
         output_index: Any,
         text: str,
@@ -484,11 +752,13 @@ class LLMService:
         out_idx = cls._coerce_int(output_index)
         for slot in [s for s in merged if s[0] == out_idx]:
             del merged[slot]
-        merged[(out_idx, 0)] = text
+        merged[(out_idx, 0)] = [text]
 
     @staticmethod
-    def _joined_stream_content_slots(merged: dict[tuple[int, int], str]) -> str:
-        return "".join(text for _, text in sorted(merged.items()))
+    def _joined_stream_content_slots(
+        merged: dict[tuple[int, int], list[str]],
+    ) -> str:
+        return "".join("".join(parts) for _, parts in sorted(merged.items()))
 
     @classmethod
     def _stream_delta_text(cls, delta: Any) -> str:
@@ -803,7 +1073,7 @@ class LLMService:
         return ""
 
     async def _consume_chat_stream(self, stream_resp: Any) -> Any:
-        content_parts: dict[tuple[int, int], str] = {}
+        content_parts: dict[tuple[int, int], list[str]] = {}
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
         completed_response: Any = None
@@ -979,7 +1249,7 @@ class LLMService:
         )
 
     def _consume_chat_stream_sync(self, stream_resp: Any) -> Any:
-        content_parts: dict[tuple[int, int], str] = {}
+        content_parts: dict[tuple[int, int], list[str]] = {}
         tool_calls: list[dict[str, Any]] = []
         usage: SimpleNamespace | None = None
         completed_response: Any = None
@@ -1181,6 +1451,26 @@ class LLMService:
             return f"{max(0, int(used_tokens))}/{int(total_tokens)}"
         return f"{max(0, int(used_tokens))}/?"
 
+    @staticmethod
+    def _conservative_prompt_token_estimate(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, int]:
+        """Return ``(estimate, source_characters)`` without model tokenization.
+
+        One token per source character plus a small per-message allowance is a
+        deliberately high estimate for the bot's usual Chinese/English text
+        and structured tool payloads. Inexact estimates are used for telemetry
+        and fallback only; ordinary requests are not rejected as if the value
+        were model-exact.
+        """
+
+        raw_characters = sum(len(str(msg.get("content", ""))) for msg in messages)
+        if tools:
+            raw_characters += len(str(tools))
+        estimate = max(1, raw_characters + (len(messages) * 16))
+        return estimate, raw_characters
+
     def _count_prompt_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -1188,21 +1478,50 @@ class LLMService:
         tools: list[dict[str, Any]] | None = None,
         cfg: ChatEndpointConfig | None = None,
     ) -> tuple[int, bool]:
+        """Return a non-blocking estimate for synchronous callers.
+
+        Exact LiteLLM tokenization is intentionally available only through the
+        async method below so no caller can accidentally run tokenizer CPU on
+        the asyncio event-loop thread.
+        """
+
+        del cfg
+        estimate, raw_characters = self._conservative_prompt_token_estimate(
+            messages,
+            tools,
+        )
+        if raw_characters >= 100_000:
+            # Treat the estimate as a conservative hard-budget upper bound.
+            # This avoids synchronous tokenizer CPU on pathological prompts
+            # while still preventing multi-megabyte requests from bypassing
+            # context checks merely because the estimate is not model-exact.
+            return estimate, True
+        return estimate, False
+
+    async def _count_prompt_tokens_async(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        cfg: ChatEndpointConfig | None = None,
+    ) -> tuple[int, bool]:
+        fallback, raw_characters = self._conservative_prompt_token_estimate(
+            messages,
+            tools,
+        )
+        if raw_characters >= 100_000:
+            return fallback, True
+
         kwargs: dict[str, Any] = {
             "model": (cfg.model if cfg is not None else self.main.model),
             "messages": messages,
         }
         if tools:
             kwargs["tools"] = tools
-        try:
-            return int(litellm.token_counter(**kwargs)), True
-        except Exception:
-            fallback = 0
-            for msg in messages:
-                fallback += len(str(msg.get("content", "")))
-            if tools:
-                fallback += len(str(tools))
-            return fallback, False
+        return await _run_bounded_tokenizer_call(
+            lambda: int(litellm.token_counter(**kwargs)),
+            fallback=fallback,
+        )
 
     def count_prompt_tokens(
         self,
@@ -1240,7 +1559,10 @@ class LLMService:
 
     @staticmethod
     def _retry_attempts(cfg: ChatEndpointConfig | EmbedEndpointConfig) -> int:
-        return max(1, int(getattr(cfg, "retry_attempts", 1) or 1))
+        return min(
+            _LLM_MAX_RETRY_ATTEMPTS,
+            max(1, int(getattr(cfg, "retry_attempts", 1) or 1)),
+        )
 
     @staticmethod
     def _retry_backoff_seconds(cfg: ChatEndpointConfig | EmbedEndpointConfig, attempt: int) -> float:
@@ -1254,7 +1576,14 @@ class LLMService:
     ) -> float:
         base = max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0))
         multiplier = max(1.0, float(getattr(cfg, "retry_timeout_multiplier", 1.0) or 1.0))
-        return base * (multiplier ** max(0, attempt - 1))
+        return min(
+            _LLM_MAX_ATTEMPT_TIMEOUT_SECONDS,
+            base * (multiplier ** max(0, attempt - 1)),
+        )
+
+    @staticmethod
+    def _stage_deadline_seconds(label: str) -> float:
+        return _LLM_STAGE_DEADLINES.get(label, 120.0)
 
     @staticmethod
     def _circuit_key(
@@ -1362,6 +1691,17 @@ class LLMService:
                 log.debug("LLM stream aclose failed", exc_info=True)
                 return
             if asyncio.iscoroutine(result):
+                active_cleanup = sum(
+                    not task.done() for task in _LLM_CLEANUP_TASKS
+                )
+                if active_cleanup >= _LLM_CLEANUP_TASK_LIMIT:
+                    # Cleanup does not own a request permit and must never be
+                    # allowed to grow into an unbounded secondary task leak.
+                    result.close()
+                    log.warning(
+                        "LLM stream cleanup task limit reached; dropping aclose"
+                    )
+                    return
                 try:
                     task = asyncio.create_task(result, name="llm-stream-close")
                 except RuntimeError:
@@ -1374,7 +1714,7 @@ class LLMService:
                     except (asyncio.CancelledError, Exception):
                         log.debug("LLM stream async close failed", exc_info=True)
 
-                _track_llm_orphan(task)
+                _track_llm_cleanup_task(task)
                 task.add_done_callback(_observe_close)
             return
 
@@ -1614,7 +1954,7 @@ class LLMService:
     ) -> Any | None:
         label_cn = self._label_cn(label)
         total_attempts = self._retry_attempts(cfg)
-        prompt_tokens, token_count_exact = self._count_prompt_tokens(
+        prompt_tokens, token_count_exact = await self._count_prompt_tokens_async(
             messages,
             tools=tools,
             cfg=cfg,
@@ -1697,48 +2037,49 @@ class LLMService:
                     # released only when that orphan really exits; nominal
                     # timeouts therefore cannot create unbounded real network
                     # concurrency behind a semaphore that was released early.
-                    async with _LLM_REQUEST_SEMAPHORE:
-                        raw_resp: Any
-                        request: Any
-                        if self._uses_responses_api(cfg):
-                            request = self._responses_async_request(
-                                messages=messages,
-                                cfg=cfg,
-                                stream=stream,
-                                tools=tools,
-                                tool_choice=tool_choice,
-                                exclude_params=set(excluded_params),
-                                timeout_sec=timeout_sec,
-                            )
-                        else:
-                            if tools:
-                                tool_kwargs: dict[str, Any] = {
-                                    "tools": tools,
-                                    "tool_choice": tool_choice,
-                                }
-                                if not any(
-                                    isinstance(tool, dict)
-                                    and str(tool.get("type", "")).strip().lower() == "mcp"
-                                    for tool in tools
-                                ):
-                                    # LiteLLM 1.92 imports its optional Proxy/MCP stack
-                                    # before it checks that these are ordinary function tools.
-                                    tool_kwargs["_skip_mcp_handler"] = True
-                                request = litellm.acompletion(
+                    async with _LLM_PRIORITY_GATE.slot(timeout=timeout_sec):
+                        async with _LLM_REQUEST_SEMAPHORE:
+                            raw_resp: Any
+                            request: Any
+                            if self._uses_responses_api(cfg):
+                                request = self._responses_async_request(
                                     messages=messages,
-                                    **tool_kwargs,
-                                    **kwargs,
+                                    cfg=cfg,
+                                    stream=stream,
+                                    tools=tools,
+                                    tool_choice=tool_choice,
+                                    exclude_params=set(excluded_params),
+                                    timeout_sec=timeout_sec,
                                 )
                             else:
-                                request = litellm.acompletion(messages=messages, **kwargs)
+                                if tools:
+                                    tool_kwargs: dict[str, Any] = {
+                                        "tools": tools,
+                                        "tool_choice": tool_choice,
+                                    }
+                                    if not any(
+                                        isinstance(tool, dict)
+                                        and str(tool.get("type", "")).strip().lower() == "mcp"
+                                        for tool in tools
+                                    ):
+                                        # LiteLLM 1.92 imports its optional Proxy/MCP stack
+                                        # before it checks that these are ordinary function tools.
+                                        tool_kwargs["_skip_mcp_handler"] = True
+                                    request = litellm.acompletion(
+                                        messages=messages,
+                                        **tool_kwargs,
+                                        **kwargs,
+                                    )
+                                else:
+                                    request = litellm.acompletion(messages=messages, **kwargs)
 
-                        raw_resp = await request
-                        if stream:
-                            try:
-                                return await self._consume_chat_stream(raw_resp)
-                            finally:
-                                self._close_stream_best_effort(raw_resp)
-                        return self._normalize_response_object(raw_resp)
+                            raw_resp = await request
+                            if stream:
+                                try:
+                                    return await self._consume_chat_stream(raw_resp)
+                                finally:
+                                    self._close_stream_best_effort(raw_resp)
+                            return self._normalize_response_object(raw_resp)
 
                 resp = await self._await_with_timeout(
                     _perform_attempt(),
@@ -1768,7 +2109,9 @@ class LLMService:
                 tokens_in = getattr(usage, "prompt_tokens", 0)
                 tokens_out = getattr(usage, "completion_tokens", 0)
                 if not tokens_in:
-                    tokens_in = self.count_prompt_tokens(messages, tools=tools, cfg=cfg)
+                    # Reuse the admission-time count instead of running the
+                    # synchronous tokenizer a second time on the event loop.
+                    tokens_in = prompt_tokens
                 preview, truncated = self._preview_for_log(content, limit=preview_limit)
                 log.info(
                     "LLM response | stage=%s | model=%s | attempt=%d/%d | len=%d | tool_calls=%d | prompt_tokens=%s | output_tokens=%d | preview_truncated=%s | preview=%s",
@@ -1852,13 +2195,28 @@ class LLMService:
         preview_limit: int,
     ) -> str:
         total = len(candidates)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stage_deadline_seconds(label)
         for idx, cfg in enumerate(candidates, start=1):
-            resp = await self._chat_completion_response_with_retries(
-                messages=messages,
-                cfg=cfg,
-                label=label,
-                preview_limit=preview_limit,
-            )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                log.error("LLM total deadline exhausted | stage=%s", self._label_cn(label))
+                return ""
+            try:
+                async with asyncio.timeout(remaining):
+                    resp = await self._chat_completion_response_with_retries(
+                        messages=messages,
+                        cfg=cfg,
+                        label=label,
+                        preview_limit=preview_limit,
+                    )
+            except TimeoutError:
+                log.error(
+                    "LLM total deadline exceeded | stage=%s deadline=%.1fs",
+                    self._label_cn(label),
+                    self._stage_deadline_seconds(label),
+                )
+                return ""
             if resp is not None:
                 return self._normalize_content_text(resp.choices[0].message.content)
             if idx < total:
@@ -1882,15 +2240,29 @@ class LLMService:
     ) -> Any | None:
         candidates = self._chat_candidates(cfg or self.main)
         total = len(candidates)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stage_deadline_seconds(label)
         for idx, candidate in enumerate(candidates, start=1):
-            resp = await self._chat_completion_response_with_retries(
-                messages=messages,
-                cfg=candidate,
-                label=label,
-                preview_limit=preview_limit,
-                tools=tools,
-                tool_choice="auto",
-            )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                async with asyncio.timeout(remaining):
+                    resp = await self._chat_completion_response_with_retries(
+                        messages=messages,
+                        cfg=candidate,
+                        label=label,
+                        preview_limit=preview_limit,
+                        tools=tools,
+                        tool_choice="auto",
+                    )
+            except TimeoutError:
+                log.error(
+                    "LLM tool total deadline exceeded | stage=%s deadline=%.1fs",
+                    self._label_cn(label),
+                    self._stage_deadline_seconds(label),
+                )
+                return None
             if resp is not None:
                 return resp
             if idx < total:
@@ -1993,6 +2365,8 @@ class LLMService:
         """Generate embeddings."""
         candidates = self._embed_candidates(self.embed_config)
         total = len(candidates)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stage_deadline_seconds("embed")
         for idx, cfg in enumerate(candidates, start=1):
             if self._circuit_is_open(cfg, stage="embed"):
                 log.warning(
@@ -2002,8 +2376,15 @@ class LLMService:
                 continue
             total_attempts = self._retry_attempts(cfg)
             for attempt in range(1, total_attempts + 1):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    log.error("LLM total deadline exhausted | stage=embed")
+                    return []
                 kwargs = self._build_embed_kwargs(cfg, texts)
-                timeout_sec = self._attempt_timeout_seconds(cfg, attempt)
+                timeout_sec = min(
+                    self._attempt_timeout_seconds(cfg, attempt),
+                    remaining,
+                )
                 kwargs["timeout"] = timeout_sec
                 log.info(
                     "LLM request | stage=embed | model=%s | attempt=%d/%d | texts=%d | timeout=%.1fs",
@@ -2015,8 +2396,9 @@ class LLMService:
                 )
                 try:
                     async def _perform_embedding() -> Any:
-                        async with _LLM_REQUEST_SEMAPHORE:
-                            return await litellm.aembedding(**kwargs)
+                        async with _LLM_PRIORITY_GATE.slot(timeout=timeout_sec):
+                            async with _LLM_REQUEST_SEMAPHORE:
+                                return await litellm.aembedding(**kwargs)
 
                     resp = await self._await_with_timeout(
                         _perform_embedding(),

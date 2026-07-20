@@ -2,6 +2,7 @@ import asyncio
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -13,6 +14,10 @@ from bot.handlers import membership
 from bot.db.engine import init_db
 from bot.db.models import Group, UserWarning
 from bot.services.join_screening import add_global_ban, get_global_ban, remove_global_ban
+from bot.services.request_priority import (
+    ExecutionPriority,
+    execution_priority_scope,
+)
 from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
     JoinVerificationSweeper,
@@ -33,6 +38,7 @@ from bot.services.join_verification import (
     build_private_challenge_keyboard,
     build_private_deep_link,
     build_verification_callback_data,
+    chat_member_is_present,
     claim_join_verification,
     activate_prepared_join_verification,
     complete_leased_join_verification,
@@ -55,6 +61,7 @@ from bot.services.join_verification import (
     parse_private_verify_group_id,
     prepare_join_verification,
     reconcile_moderation_ban_after_lost_lease,
+    reconcile_stale_verification_restriction,
     restore_member_permissions,
     restrict_new_member,
     release_join_verification_lease,
@@ -164,6 +171,8 @@ class HelperTests(unittest.TestCase):
         )
         # Only Turnstile keys are present: combined mode is not configured.
         self.assertFalse(verification_service_ready(settings))
+
+
         settings.join_verification_hcaptcha_site_key = "h-site"
         settings.join_verification_hcaptcha_secret_key = "h-secret"
         self.assertTrue(verification_service_ready(settings))
@@ -252,6 +261,126 @@ class HelperTests(unittest.TestCase):
         button = keyboard.inline_keyboard[0][0]
         self.assertIsNone(getattr(button, "url", None))
         self.assertEqual(button.web_app.url, "https://verify.example.com/verify")
+
+
+class _NoopSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+class _NoopSessionFactory:
+    def __call__(self) -> _NoopSession:
+        return _NoopSession()
+
+
+class SecurityReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_membership_confirmation_distinguishes_left_and_uncertain(self) -> None:
+        bot = SimpleNamespace(
+            get_chat_member=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(status="left"),
+                    SimpleNamespace(status="restricted"),
+                    RuntimeError("network down"),
+                ]
+            )
+        )
+        self.assertFalse(await chat_member_is_present(bot, -100, 1))
+        self.assertTrue(await chat_member_is_present(bot, -100, 1))
+        self.assertIsNone(await chat_member_is_present(bot, -100, 1))
+
+    async def test_lost_restriction_restores_only_when_no_new_intent_exists(self) -> None:
+        bot = SimpleNamespace()
+        restore = AsyncMock(return_value=True)
+        restrict = AsyncMock(return_value=True)
+        ban = AsyncMock(return_value=True)
+        recovery = SimpleNamespace(
+            verification_id=9,
+            group_id=-100,
+            user_id=77,
+            kind=VERIFICATION_KIND_MODERATION,
+            lease_until=now_shanghai_naive() + timedelta(minutes=1),
+            prompt_message_id=0,
+        )
+        with (
+            patch(
+                "bot.services.join_verification.verification_release_blocked_by_ban",
+                new=AsyncMock(side_effect=[False, False]),
+            ),
+            patch(
+                "bot.services.join_verification.get_join_verification",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "bot.services.join_verification.restore_member_permissions",
+                new=restore,
+            ),
+            patch(
+                "bot.services.join_verification.restrict_new_member",
+                new=restrict,
+            ),
+            patch(
+                "bot.services.join_verification.ban_member",
+                new=ban,
+            ),
+            patch(
+                "bot.services.join_verification.prepare_join_verification",
+                new=AsyncMock(return_value=recovery),
+            ) as prepare_recovery,
+            patch(
+                "bot.services.join_verification.delete_prepared_join_verification",
+                new=AsyncMock(return_value=True),
+            ) as delete_recovery,
+        ):
+            self.assertTrue(
+                await reconcile_stale_verification_restriction(
+                    bot,
+                    _NoopSessionFactory(),
+                    -100,
+                    77,
+                )
+            )
+
+        restore.assert_awaited_once_with(bot, -100, 77)
+        restrict.assert_not_awaited()
+        ban.assert_not_awaited()
+        prepare_recovery.assert_awaited_once()
+        delete_recovery.assert_awaited_once()
+
+    async def test_lost_restriction_does_not_unmute_a_new_challenge(self) -> None:
+        record = SimpleNamespace(status="pending")
+        restore = AsyncMock(return_value=True)
+        with (
+            patch(
+                "bot.services.join_verification.verification_release_blocked_by_ban",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.services.join_verification.get_join_verification",
+                new=AsyncMock(return_value=record),
+            ),
+            patch(
+                "bot.services.join_verification.restore_member_permissions",
+                new=restore,
+            ),
+        ):
+            self.assertTrue(
+                await reconcile_stale_verification_restriction(
+                    SimpleNamespace(),
+                    _NoopSessionFactory(),
+                    -100,
+                    78,
+                )
+            )
+        restore.assert_not_awaited()
 
 
 class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
@@ -534,22 +663,24 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
                     0.01,
                 ),
             ):
-                owner = asyncio.create_task(
-                    verification_module._bounded_telegram_call(
-                        stubborn_call(timeout_started),
-                        timeout_seconds=0.01,
+                with execution_priority_scope(ExecutionPriority.HIGH):
+                    owner = asyncio.create_task(
+                        verification_module._bounded_telegram_call(
+                            stubborn_call(timeout_started),
+                            timeout_seconds=0.01,
+                        )
                     )
-                )
                 await asyncio.wait_for(timeout_started.wait(), timeout=1.0)
                 with self.assertRaises(asyncio.TimeoutError):
                     await owner
 
-                cancelled_owner = asyncio.create_task(
-                    verification_module._bounded_telegram_call(
-                        stubborn_call(cancellation_started),
-                        timeout_seconds=60.0,
+                with execution_priority_scope(ExecutionPriority.CRITICAL):
+                    cancelled_owner = asyncio.create_task(
+                        verification_module._bounded_telegram_call(
+                            stubborn_call(cancellation_started),
+                            timeout_seconds=60.0,
+                        )
                     )
-                )
                 await asyncio.wait_for(cancellation_started.wait(), timeout=1.0)
                 cancelled_owner.cancel()
                 with self.assertRaises(asyncio.CancelledError):
@@ -625,15 +756,16 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
                     0.02,
                 ),
             ):
-                owners = [
-                    asyncio.create_task(
-                        verification_module._bounded_telegram_call(
-                            stubborn_call(),
-                            timeout_seconds=60.0,
+                with execution_priority_scope(ExecutionPriority.CRITICAL):
+                    owners = [
+                        asyncio.create_task(
+                            verification_module._bounded_telegram_call(
+                                stubborn_call(),
+                                timeout_seconds=60.0,
+                            )
                         )
-                    )
-                    for _ in range(8)
-                ]
+                        for _ in range(8)
+                    ]
                 await asyncio.wait_for(capacity_reached.wait(), timeout=1.0)
                 await asyncio.sleep(0.05)
                 self.assertEqual(total_started, 2)
@@ -652,51 +784,160 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
                 timeout_seconds=0.5
             )
 
-    async def test_telegram_acquire_cancel_same_tick_returns_won_permit(self) -> None:
+    async def test_security_saturation_keeps_critical_reserve_available(self) -> None:
         import bot.services.join_verification as verification_module
 
-        class RacingSemaphore:
-            def __init__(self) -> None:
-                self.owner: asyncio.Task[object] | None = None
-                self.acquired = 0
-                self.released = 0
+        release = asyncio.Event()
+        high_started = [asyncio.Event() for _ in range(3)]
+        critical_started = asyncio.Event()
 
-            async def acquire(self) -> bool:
-                self.acquired += 1
-                assert self.owner is not None
-                asyncio.get_running_loop().call_soon(self.owner.cancel)
-                return True
-
-            def release(self) -> None:
-                self.released += 1
-
-        semaphore = RacingSemaphore()
-        state = SimpleNamespace(
-            semaphore=semaphore,
-            lock=asyncio.Lock(),
-            draining=False,
-            tasks=set(),
-            waiters=0,
-        )
-
-        async def never_started() -> bool:
+        async def hold(started: asyncio.Event) -> bool:
+            started.set()
+            await release.wait()
             return True
 
-        with patch.object(
-            verification_module,
-            "_telegram_call_state",
-            return_value=state,
-        ):
-            owner = asyncio.create_task(
-                verification_module._start_telegram_call(never_started())
-            )
-            semaphore.owner = owner
-            result = await asyncio.gather(owner, return_exceptions=True)
+        owners: list[asyncio.Task[object]] = []
+        try:
+            with (
+                patch.object(verification_module, "_TELEGRAM_CALL_CAPACITY", 4),
+                patch.object(
+                    verification_module,
+                    "_TELEGRAM_CALL_CRITICAL_RESERVE",
+                    1,
+                ),
+                patch.object(
+                    verification_module,
+                    "_TELEGRAM_CALL_NORMAL_CAPACITY",
+                    3,
+                ),
+                patch.object(
+                    verification_module,
+                    "_TELEGRAM_CALL_BACKPRESSURE_SECONDS",
+                    0.03,
+                ),
+            ):
+                with execution_priority_scope(ExecutionPriority.HIGH):
+                    owners.extend(
+                        asyncio.create_task(
+                            verification_module._bounded_telegram_call(
+                                hold(started),
+                                timeout_seconds=60.0,
+                            )
+                        )
+                        for started in high_started
+                    )
+                await asyncio.gather(
+                    *(
+                        asyncio.wait_for(started.wait(), timeout=1.0)
+                        for started in high_started
+                    )
+                )
 
-        self.assertIsInstance(result[0], asyncio.CancelledError)
-        self.assertEqual(semaphore.acquired, 1)
-        self.assertEqual(semaphore.released, 1)
-        self.assertEqual(state.waiters, 0)
+                with execution_priority_scope(ExecutionPriority.CRITICAL):
+                    critical = asyncio.create_task(
+                        verification_module._bounded_telegram_call(
+                            hold(critical_started),
+                            timeout_seconds=60.0,
+                        )
+                    )
+                owners.append(critical)
+                await asyncio.wait_for(critical_started.wait(), timeout=1.0)
+
+                rejected_started = asyncio.Event()
+                with execution_priority_scope(ExecutionPriority.HIGH):
+                    rejected = asyncio.create_task(
+                        verification_module._bounded_telegram_call(
+                            hold(rejected_started),
+                            timeout_seconds=1.0,
+                        )
+                    )
+                with self.assertRaises(
+                    verification_module._TelegramCallCapacityError
+                ):
+                    await rejected
+                self.assertFalse(rejected_started.is_set())
+        finally:
+            release.set()
+            if owners:
+                await asyncio.gather(*owners, return_exceptions=True)
+            await verification_module.flush_join_verification_telegram_tasks(
+                timeout_seconds=0.5
+            )
+
+    async def test_started_telegram_timeout_is_not_misclassified_as_saturation(
+        self,
+    ) -> None:
+        import bot.services.join_verification as verification_module
+
+        async def fail_after_admission() -> bool:
+            raise asyncio.TimeoutError("upstream timeout")
+
+        with self.assertRaisesRegex(asyncio.TimeoutError, "upstream timeout"):
+            with execution_priority_scope(ExecutionPriority.CRITICAL):
+                await verification_module._bounded_telegram_call(
+                    fail_after_admission(),
+                    timeout_seconds=1.0,
+                )
+
+    async def test_stale_cancellation_resistant_gate_saturation_is_fatal(self) -> None:
+        import bot.services.join_verification as verification_module
+
+        release = asyncio.Event()
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def stubborn(marker: asyncio.Event) -> bool:
+            marker.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return True
+
+        owners: list[asyncio.Task[object]] = []
+        try:
+            with (
+                patch.object(verification_module, "_TELEGRAM_CALL_CAPACITY", 2),
+                patch.object(
+                    verification_module,
+                    "_TELEGRAM_CALL_BACKPRESSURE_SECONDS",
+                    0.02,
+                ),
+            ):
+                with execution_priority_scope(ExecutionPriority.CRITICAL):
+                    owners = [
+                        asyncio.create_task(
+                            verification_module._bounded_telegram_call(
+                                stubborn(marker),
+                                timeout_seconds=0.1,
+                            )
+                        )
+                        for marker in started
+                    ]
+                await asyncio.gather(
+                    *(asyncio.wait_for(marker.wait(), timeout=1.0) for marker in started)
+                )
+                await asyncio.gather(*owners, return_exceptions=True)
+
+                state = verification_module._telegram_call_state()
+                stale = time.monotonic() - 121.0
+                for task in tuple(state.orphan_started_at):
+                    state.orphan_started_at[task] = stale
+                    state.active_started_at[task] = stale
+
+                snapshot = (
+                    verification_module.join_verification_telegram_health_snapshot()
+                )
+                self.assertTrue(snapshot["fatal"])
+                self.assertFalse(snapshot["ok"])
+                self.assertTrue(snapshot["exhausted"])
+                self.assertEqual(snapshot["orphan_count"], 2)
+                self.assertGreaterEqual(snapshot["oldest_orphan_seconds"], 120.0)
+        finally:
+            release.set()
+            await verification_module.flush_join_verification_telegram_tasks(
+                timeout_seconds=0.5
+            )
 
     async def test_prompt_delete_failure_still_removes_live_keyboard(self) -> None:
         bot = SimpleNamespace(
@@ -1725,6 +1966,114 @@ class ModerationChallengeTests(_DbTestCase):
         self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "jv:v:918")
         self.assertEqual(keyboard.inline_keyboard[1][0].callback_data, "jv:a:918")
         self.assertEqual(keyboard.inline_keyboard[1][1].callback_data, "jv:r:918")
+
+    async def test_manual_unban_between_generation_check_and_mute_is_restored(self) -> None:
+        settings = _settings(join_verification_enabled=False)
+        calls = 0
+
+        async def restrict_side_effect(*_args, **_kwargs) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # Simulate a newer /unban completing after the exact pre-check
+                # but before Telegram returns from the stale mute.
+                async with self.session_factory() as policy_session:
+                    recovery = await lease_join_verification_for_unban(
+                        policy_session,
+                        -100,
+                        928,
+                    )
+                    self.assertIsNotNone(recovery)
+                    await policy_session.commit()
+                    completed = await complete_leased_join_verification(
+                        policy_session,
+                        verification_id=int(recovery.verification_id),
+                        lease_until=recovery.lease_until,
+                        status=VERIFICATION_STATUS_UNBANNING,
+                    )
+                    self.assertTrue(completed)
+                    await policy_session.commit()
+            return True
+
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(side_effect=restrict_side_effect),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=828)),
+            get_chat_member=AsyncMock(),
+        )
+
+        async with self.session_factory() as session:
+            started = await begin_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=self.session_factory,
+                settings=settings,
+                group_id=-100,
+                user_id=928,
+                display_name="竞态用户",
+                bot_username="my_bot",
+                reason="竞态测试",
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        restore_call = bot.restrict_chat_member.await_args
+        self.assertTrue(restore_call.kwargs["permissions"].can_send_messages)
+        bot.send_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 928))
+
+    async def test_manual_unban_during_prompt_reconciles_lost_activation(self) -> None:
+        settings = _settings(join_verification_enabled=False)
+
+        async def send_side_effect(*_args, **_kwargs):
+            # The stale worker has already muted the member. A newer /unban
+            # removes its exact preparation before activation can commit.
+            async with self.session_factory() as policy_session:
+                recovery = await lease_join_verification_for_unban(
+                    policy_session,
+                    -100,
+                    929,
+                )
+                self.assertIsNotNone(recovery)
+                await policy_session.commit()
+                completed = await complete_leased_join_verification(
+                    policy_session,
+                    verification_id=int(recovery.verification_id),
+                    lease_until=recovery.lease_until,
+                    status=VERIFICATION_STATUS_UNBANNING,
+                )
+                self.assertTrue(completed)
+                await policy_session.commit()
+            return SimpleNamespace(message_id=829)
+
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(return_value=True),
+            send_message=AsyncMock(side_effect=send_side_effect),
+            delete_message=AsyncMock(return_value=True),
+            edit_message_reply_markup=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(),
+        )
+
+        async with self.session_factory() as session:
+            started = await begin_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=self.session_factory,
+                settings=settings,
+                group_id=-100,
+                user_id=929,
+                display_name="提示竞态用户",
+                bot_username="my_bot",
+                reason="提示竞态测试",
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+        restore_call = bot.restrict_chat_member.await_args
+        self.assertTrue(restore_call.kwargs["permissions"].can_send_messages)
+        bot.delete_message.assert_awaited_once_with(-100, 829)
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 929))
 
     async def test_cancelled_moderation_prompt_compensates_mute_and_preparation(self) -> None:
         settings = _settings(join_verification_enabled=False)
@@ -3186,7 +3535,7 @@ class SweeperTests(_DbTestCase):
             930,
             only_if_banned=True,
         )
-        self.assertEqual(
+        self.assertCountEqual(
             bot.ban_chat_member.await_args_list,
             [
                 call(-100, 930, revoke_messages=True),

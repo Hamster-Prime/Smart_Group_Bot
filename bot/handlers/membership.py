@@ -4,23 +4,28 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from aiogram import F, Router
 from aiogram.filters import IS_NOT_MEMBER, IS_MEMBER, ChatMemberUpdatedFilter
-from aiogram.types import CallbackQuery, ChatMemberUpdated
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Update
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import Group, JoinVerification, UserWarning
 from bot.services.admin_status import invalidate_admin_status_cache
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.callback_auth import is_group_admin_or_higher
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
     add_global_ban,
     build_join_profile_text,
     is_globally_banned,
+    is_join_screening_exempt,
     mark_profile_screened,
     moderation_rules_fingerprint,
     profile_screen_signature,
@@ -48,21 +53,28 @@ from bot.services.join_verification import (
     build_group_prompt_text,
     build_private_deep_link,
     claim_join_verification,
+    chat_member_is_present,
     complete_leased_join_verification,
     commit_prepared_join_verification,
     delete_join_verification,
     delete_verification_prompt,
+    enforce_ban_with_policy_reconciliation,
     get_join_verification,
     join_verification_ready,
     join_verification_policy,
+    join_verification_lease_is_current,
+    manual_unban_generation_is_active,
     kick_member,
     lease_expired_join_verification,
+    lease_join_verification_for_unban,
     mark_group_banned,
     parse_verification_callback_data,
     prepare_join_verification,
     reconcile_moderation_ban_after_lost_lease,
+    reconcile_stale_verification_restriction,
     refresh_pending_join_verification,
     renew_join_verification_lease,
+    renew_prepared_join_verification,
     restore_member_permissions,
     rollback_group_ban,
     restrict_new_member,
@@ -70,6 +82,7 @@ from bot.services.join_verification import (
     upsert_join_verification,
     verification_deadline_passed,
     verification_release_blocked_by_ban,
+    verification_restriction_required,
     verification_timeout_seconds_for_kind,
 )
 from bot.services.llm import LLMService
@@ -77,9 +90,14 @@ from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.services.raid_guard import (
     RAID_REMOVE_CALLBACK_DATA,
+    RaidRemovalResult,
     get_raid_guard_service,
     remove_raid_challenged_users,
 )
+from bot.services.privileged_tasks import submit_privileged_task
+from bot.services.request_priority import privileged_request_scope
+from bot.services.update_completion import request_current_update_retry
+from bot.services.update_delivery import unmark_privileged_operator
 from bot.services.welcome import send_group_welcome
 from bot.utils.bot_identity import get_bot_identity
 from bot.utils.telegram import (
@@ -92,6 +110,111 @@ router = Router()
 log = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class _PendingMemberJoinSecurity:
+    job_key: str
+    version: int
+    latest_update_id: int
+    event: ChatMemberUpdated
+    settings: Settings
+
+
+_PENDING_MEMBER_JOIN_SECURITY: dict[tuple[int, int], _PendingMemberJoinSecurity] = {}
+_MEMBER_JOIN_JOB_SEQUENCE = 0
+
+
+async def _ack_security_callback(
+    callback: CallbackQuery,
+    text: str,
+    *,
+    show_alert: bool = False,
+) -> None:
+    with privileged_request_scope():
+        task = asyncio.create_task(
+            callback.answer(text, show_alert=show_alert),
+            name="security-callback-ack",
+        )
+    done, _pending = await asyncio.wait({task}, timeout=2.0)
+    if task in done:
+        try:
+            await task
+        except Exception:
+            log.debug("security callback acknowledgement failed", exc_info=True)
+        return
+    task.cancel()
+
+    def consume(done: asyncio.Task[object]) -> None:
+        if done.cancelled():
+            return
+        try:
+            done.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    task.add_done_callback(consume)
+
+
+async def _publish_security_callback_result(
+    callback: CallbackQuery,
+    text: str,
+) -> None:
+    message = callback.message
+    try:
+        if message is not None and hasattr(message, "answer"):
+            await message.answer(text)
+        else:
+            chat = getattr(message, "chat", None)
+            chat_id = int(getattr(chat, "id", 0) or 0)
+            if chat_id:
+                await callback.bot.send_message(chat_id, text)
+    except Exception:
+        log.debug("security callback result delivery failed", exc_info=True)
+
+
+async def _publish_raid_removal_result(
+    callback: CallbackQuery,
+    *,
+    group_id: int,
+    prompt_message_id: int,
+    result: RaidRemovalResult,
+) -> None:
+    removed_count = len(result.removed_user_ids)
+    failed_count = len(result.failed_user_ids)
+    if failed_count == 0:
+        try:
+            async with asyncio.timeout(5.0):
+                await callback.bot.edit_message_reply_markup(
+                    chat_id=group_id,
+                    message_id=prompt_message_id,
+                    reply_markup=None,
+                )
+        except Exception:
+            log.debug(
+                "raid bulk-remove keyboard cleanup failed | group=%s message=%s",
+                group_id,
+                prompt_message_id,
+                exc_info=True,
+            )
+    if result.pending_count == 0:
+        text = "该批追溯用户已全部处理。"
+    elif failed_count:
+        text = f"爆破防护批量移除完成：已移除 {removed_count} 人，{failed_count} 人待重试。"
+    else:
+        text = f"爆破防护批量移除完成：已移除 {removed_count} 名被追溯用户。"
+    message = callback.message
+    try:
+        if message is not None and hasattr(message, "answer"):
+            await message.answer(text)
+        else:
+            await callback.bot.send_message(group_id, text)
+    except Exception:
+        log.exception(
+            "raid bulk-remove result delivery failed | group=%s message=%s",
+            group_id,
+            prompt_message_id,
+        )
+
+
 async def _fetch_user_bio(event: ChatMemberUpdated, user_id: int) -> str:
     """Bio is only exposed via a full getChat on the user's private chat."""
     try:
@@ -100,6 +223,73 @@ async def _fetch_user_bio(event: ChatMemberUpdated, user_id: int) -> str:
     except Exception as exc:
         log.info("join screening bio fetch failed | user=%s error=%s", user_id, exc)
         return ""
+
+
+async def _join_member_still_present(
+    event: ChatMemberUpdated,
+    user_id: int,
+    *,
+    stage: str,
+) -> bool:
+    """Confirm queued join work still targets a current chat member.
+
+    An inconclusive Telegram lookup is retryable and must fail the durable
+    security job instead of silently admitting or mutating a stale user.
+    """
+
+    present = await chat_member_is_present(event.bot, int(event.chat.id), int(user_id))
+    if present is None:
+        raise RuntimeError(
+            f"membership could not be confirmed before join security stage {stage}"
+        )
+    if not present:
+        log.info(
+            "join security stopped | reason=member_left stage=%s group=%s user=%s",
+            stage,
+            event.chat.id,
+            user_id,
+        )
+    return present
+
+
+async def _reconcile_stale_restriction(
+    event: ChatMemberUpdated,
+    session: AsyncSession,
+    *,
+    user_id: int,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+) -> bool:
+    if session_factory is not None:
+        return await reconcile_stale_verification_restriction(
+            event.bot,
+            session_factory,
+            int(event.chat.id),
+            int(user_id),
+        )
+
+    # Direct helper/unit invocations do not always carry a factory. Keep the
+    # same latest-intent semantics without sharing a transaction across the
+    # Telegram call.
+    await session.rollback()
+    blocked = await verification_release_blocked_by_ban(
+        session,
+        group_id=int(event.chat.id),
+        user_id=int(user_id),
+    )
+    current = await get_join_verification(session, int(event.chat.id), int(user_id))
+    current_status = (
+        str(current.status or VERIFICATION_STATUS_PENDING) if current is not None else ""
+    )
+    await session.commit()
+    if blocked:
+        return await ban_member(event.bot, int(event.chat.id), int(user_id))
+    if current_status in {
+        VERIFICATION_STATUS_PREPARING,
+        VERIFICATION_STATUS_PENDING,
+        VERIFICATION_STATUS_ENFORCING,
+    }:
+        return True
+    return await restore_member_permissions(event.bot, int(event.chat.id), int(user_id))
 
 
 def _build_llm(settings: Settings) -> LLMService:
@@ -121,12 +311,29 @@ async def _ban_and_notify(
     user_id: int,
     display_name: str,
     reason: str,
+    preserve_ban: Callable[[], Awaitable[bool]] | None = None,
+    restriction_required: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
-    if not await ban_member(event.bot, int(event.chat.id), int(user_id)):
+    if preserve_ban is None:
+        final_banned: bool | None = (
+            True
+            if await ban_member(event.bot, int(event.chat.id), int(user_id))
+            else None
+        )
+    else:
+        final_banned = await enforce_ban_with_policy_reconciliation(
+            event.bot,
+            int(event.chat.id),
+            int(user_id),
+            preserve_ban,
+            restriction_required,
+        )
+    if final_banned is not True:
         log.error(
-            "join screening ban unconfirmed; durable policy retained | group=%s user=%s",
+            "join screening ban not retained by latest policy | group=%s user=%s state=%s",
             event.chat.id,
             user_id,
+            final_banned,
         )
         return False
     shown = html.escape(display_name or str(user_id))
@@ -155,6 +362,7 @@ def _invalidate_admin_cache(event: ChatMemberUpdated) -> None:
     user = getattr(getattr(event, "new_chat_member", None), "user", None)
     if user is not None:
         invalidate_admin_status_cache(event.chat.id, user.id)
+        unmark_privileged_operator(user.id, group_id=event.chat.id)
 
 
 async def _start_join_verification(
@@ -165,6 +373,8 @@ async def _start_join_verification(
     user_id: int,
     display_name: str,
     provider: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    require_current_membership: bool = False,
 ) -> None:
     """Durably prepare, mute, prompt, then activate a join challenge.
 
@@ -256,6 +466,13 @@ async def _start_join_verification(
                     group_id,
                     prompt_message_id,
                 )
+            if recovery is None:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
 
         # ``existing`` has now been reduced to immutable ids/deadlines. End
         # the duplicate-record read transaction before restricting the member
@@ -263,7 +480,31 @@ async def _start_join_verification(
         # short transaction only after those Telegram calls finish.
         await session.commit()
         try:
+            if require_current_membership and not await _join_member_still_present(
+                event,
+                user_id,
+                stage="duplicate_challenge_restrict",
+            ):
+                return
             if not await restrict_new_member(event.bot, group_id, user_id):
+                return
+            current = await get_join_verification(session, group_id, user_id)
+            current_owned = bool(
+                current is not None
+                and int(current.id) == existing_id
+                and str(current.status or VERIFICATION_STATUS_PENDING)
+                == VERIFICATION_STATUS_PENDING
+                and current.deadline_at == old_deadline
+                and current.kind == VERIFICATION_KIND_JOIN
+            )
+            await session.commit()
+            if not current_owned:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
                 return
             sent = await event.bot.send_message(
                 group_id,
@@ -346,12 +587,61 @@ async def _start_join_verification(
     prompt_message_id = 0
     activated = False
     try:
+        if require_current_membership and not await _join_member_still_present(
+            event,
+            user_id,
+            stage="challenge_prepare",
+        ):
+            await shield_abort_prepared_join_verification(
+                event.bot,
+                session,
+                prepared=prepared,
+                restore_permissions=False,
+            )
+            return
+        renewed = await renew_prepared_join_verification(session, prepared=prepared)
+        if renewed is None:
+            await session.rollback()
+            return
+        await session.commit()
+        prepared = renewed
         if not await restrict_new_member(event.bot, group_id, user_id):
             await shield_abort_prepared_join_verification(
                 event.bot,
                 session,
                 prepared=prepared,
             )
+            return
+
+        renewed = await renew_prepared_join_verification(session, prepared=prepared)
+        if renewed is None:
+            await session.rollback()
+            await _reconcile_stale_restriction(
+                event,
+                session,
+                user_id=user_id,
+                session_factory=session_factory,
+            )
+            return
+        await session.commit()
+        prepared = renewed
+        if require_current_membership and not await _join_member_still_present(
+            event,
+            user_id,
+            stage="challenge_prompt",
+        ):
+            compensated = await shield_abort_prepared_join_verification(
+                event.bot,
+                session,
+                prepared=prepared,
+            )
+            if not compensated:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
             return
 
         sent = await event.bot.send_message(
@@ -386,21 +676,35 @@ async def _start_join_verification(
                 )
             raise
         if not activated:
-            await shield_abort_prepared_join_verification(
+            compensated = await shield_abort_prepared_join_verification(
                 event.bot,
                 session,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
             )
+            if not compensated:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
             return
     except asyncio.CancelledError:
         if not activated:
-            await shield_abort_prepared_join_verification(
+            compensated = await shield_abort_prepared_join_verification(
                 event.bot,
                 session,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
             )
+            if not compensated:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
         raise
     except Exception:
         log.exception(
@@ -409,12 +713,19 @@ async def _start_join_verification(
             user_id,
         )
         if not activated:
-            await shield_abort_prepared_join_verification(
+            compensated = await shield_abort_prepared_join_verification(
                 event.bot,
                 session,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
             )
+            if not compensated:
+                await _reconcile_stale_restriction(
+                    event,
+                    session,
+                    user_id=user_id,
+                    session_factory=session_factory,
+                )
         return
     if old_prompt_message_id and old_prompt_message_id != prompt_message_id:
         await delete_verification_prompt(
@@ -522,12 +833,35 @@ async def _enforce_pending_moderation_challenge(
             record.user_id,
         )
         await session.commit()
+
+        async def preserve_timeout_ban() -> bool:
+            await session.rollback()
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=int(record.group_id),
+                user_id=int(record.user_id),
+            )
+            await session.commit()
+            return blocked
+
+        async def timeout_restriction_required() -> bool:
+            await session.rollback()
+            required = await verification_restriction_required(
+                session,
+                group_id=int(record.group_id),
+                user_id=int(record.user_id),
+            )
+            await session.commit()
+            return required
+
         enforced = await _ban_and_notify(
             event,
             settings,
             user_id=record.user_id,
             display_name=display_name,
             reason="消息审查真人验证超时",
+            preserve_ban=preserve_timeout_ban,
+            restriction_required=timeout_restriction_required,
         )
         if not enforced:
             deferred = await _defer_terminal_verification(
@@ -584,8 +918,20 @@ async def _enforce_pending_moderation_challenge(
         else:
             await session.rollback()
         return
-    if int(current.id) != int(record.id) or current.kind != record.kind:
+    if (
+        int(current.id) != int(record.id)
+        or current.kind != record.kind
+        or str(current.status or VERIFICATION_STATUS_PENDING)
+        != VERIFICATION_STATUS_PENDING
+    ):
         # A newer challenge now owns this member's permissions.
+        await session.commit()
+        await _reconcile_stale_restriction(
+            event,
+            session,
+            user_id=int(record.user_id),
+            session_factory=None,
+        )
         return
     log.info(
         "%s challenge re-enforced after rejoin | group=%s user=%s",
@@ -780,7 +1126,7 @@ async def _verification_callback_record(
     message = callback.message
     chat = getattr(message, "chat", None)
     if message is None or chat is None or chat.type not in ("group", "supergroup"):
-        await callback.answer("验证消息已失效", show_alert=True)
+        await _ack_security_callback(callback, "验证消息已失效", show_alert=True)
         return None
 
     record = await get_join_verification(session, int(chat.id), target_user_id)
@@ -797,7 +1143,11 @@ async def _verification_callback_record(
         # failure and prevents repeated "expired" clicks.
         await session.commit()
         await delete_verification_prompt(callback.bot, int(chat.id), message_id)
-        await callback.answer("验证已失效、过期或已处理", show_alert=True)
+        await _ack_security_callback(
+            callback,
+            "验证已失效、过期或已处理",
+            show_alert=True,
+        )
         return None
     # Callers only need the immutable-in-practice challenge snapshot. Release
     # the SELECT transaction before bot.me(), callback.answer(), permission
@@ -884,22 +1234,23 @@ async def _handle_verification_admin_callback(
     *,
     action: str,
     target_user_id: int,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     message = callback.message
     chat = getattr(message, "chat", None)
     operator = callback.from_user
     if message is None or chat is None or chat.type not in ("group", "supergroup"):
-        await callback.answer("验证消息已失效", show_alert=True)
+        await _ack_security_callback(callback, "验证消息已失效", show_alert=True)
         return
     if operator is None:
-        await callback.answer("无法识别操作者", show_alert=True)
+        await _ack_security_callback(callback, "无法识别操作者", show_alert=True)
         return
     group_id = int(chat.id)
     operator_id = int(operator.id)
     authorized = await is_group_authorized(session, group_id)
     await session.commit()
     if not authorized:
-        await callback.answer("当前群组未授权", show_alert=True)
+        await _ack_security_callback(callback, "当前群组未授权", show_alert=True)
         return
     if not await is_group_admin_or_higher(
         bot=callback.bot,
@@ -908,7 +1259,11 @@ async def _handle_verification_admin_callback(
         group_id=group_id,
         user_id=operator_id,
     ):
-        await callback.answer("仅群管理员及以上权限可操作", show_alert=True)
+        await _ack_security_callback(
+            callback,
+            "仅群管理员及以上权限可操作",
+            show_alert=True,
+        )
         return
 
     record = await _verification_callback_record(callback, session, target_user_id)
@@ -917,7 +1272,7 @@ async def _handle_verification_admin_callback(
     if action == VERIFICATION_CALLBACK_REJECT and is_super_admin_user_id(
         target_user_id, settings
     ):
-        await callback.answer("不能封禁最高管理员", show_alert=True)
+        await _ack_security_callback(callback, "不能封禁最高管理员", show_alert=True)
         return
     if action == VERIFICATION_CALLBACK_APPROVE:
         locally_banned = bool(
@@ -932,7 +1287,11 @@ async def _handle_verification_admin_callback(
         globally_banned = await is_globally_banned(session, target_user_id)
         await session.commit()
         if locally_banned or globally_banned:
-            await callback.answer("该用户已被封禁，请先解封后再通过", show_alert=True)
+            await _ack_security_callback(
+                callback,
+                "该用户已被封禁，请先解封后再通过",
+                show_alert=True,
+            )
             return
 
     snapshot = _verification_snapshot(record)
@@ -949,11 +1308,29 @@ async def _handle_verification_admin_callback(
         target_status=terminal_status,
     )
     if lease_until is None:
-        await callback.answer("验证已由其他操作处理", show_alert=True)
+        await _ack_security_callback(
+            callback,
+            "验证已由其他操作处理",
+            show_alert=True,
+        )
         return
 
     kind = str(snapshot["kind"])
     shown = html.escape(str(snapshot["display_name"] or target_user_id))
+    lease_is_current = await join_verification_lease_is_current(
+        session,
+        verification_id=int(record.id),
+        lease_until=lease_until,
+        status=terminal_status,
+    )
+    await session.commit()
+    if not lease_is_current:
+        await _ack_security_callback(
+            callback,
+            "验证状态已被更高优先级的权限操作更新",
+            show_alert=True,
+        )
+        return
     if action == VERIFICATION_CALLBACK_APPROVE:
         restored = await restore_member_permissions(callback.bot, group_id, target_user_id)
         if not restored:
@@ -963,7 +1340,8 @@ async def _handle_verification_admin_callback(
                 lease_until=lease_until,
                 status=VERIFICATION_STATUS_RELEASING,
             )
-            await callback.answer(
+            await _ack_security_callback(
+                callback,
                 "权限恢复失败，后台将继续重试放行"
                 if deferred
                 else "权限恢复失败，恢复工单已由后台接管",
@@ -976,7 +1354,17 @@ async def _handle_verification_admin_callback(
             lease_until=lease_until,
             status=VERIFICATION_STATUS_RELEASING,
         ):
-            await callback.answer("权限已恢复，验证状态由后台继续确认", show_alert=True)
+            await _reconcile_stale_restriction(
+                SimpleNamespace(bot=callback.bot, chat=chat),
+                session,
+                user_id=target_user_id,
+                session_factory=session_factory,
+            )
+            await _ack_security_callback(
+                callback,
+                "权限已按最新策略校准，验证状态由后台继续确认",
+                show_alert=True,
+            )
             return
         approved_text = (
             f"✅ <b>{shown}</b> 已由管理员直接通过消息审查验证，发言权限已恢复。"
@@ -984,7 +1372,7 @@ async def _handle_verification_admin_callback(
             else f"✅ <b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
         )
         await _edit_verification_prompt(callback, settings, text=approved_text)
-        await callback.answer("已直接通过验证")
+        await _ack_security_callback(callback, "已直接通过验证")
         if kind == VERIFICATION_KIND_JOIN:
             await send_group_welcome(
                 callback.bot,
@@ -1030,7 +1418,8 @@ async def _handle_verification_admin_callback(
                 target_user_id,
                 rolled_back,
             )
-            await callback.answer(
+            await _ack_security_callback(
+                callback,
                 "封禁失败，验证已保留待处理"
                 if requeued
                 else "Telegram 封禁失败，群内状态已变化，请人工检查",
@@ -1065,7 +1454,8 @@ async def _handle_verification_admin_callback(
                 lease_until=lease_until,
                 status=VERIFICATION_STATUS_ENFORCING,
             )
-            await callback.answer(
+            await _ack_security_callback(
+                callback,
                 "移出群聊失败，验证已保留待处理"
                 if requeued
                 else "移出群聊失败，执行工单已由后台接管",
@@ -1092,10 +1482,21 @@ async def _handle_verification_admin_callback(
             status=VERIFICATION_STATUS_ENFORCING,
         )
     if not completed:
-        await callback.answer("操作已执行，验证状态由后台继续确认", show_alert=True)
+        if kind != VERIFICATION_KIND_MODERATION:
+            await _reconcile_stale_restriction(
+                SimpleNamespace(bot=callback.bot, chat=chat),
+                session,
+                user_id=target_user_id,
+                session_factory=session_factory,
+            )
+        await _ack_security_callback(
+            callback,
+            "操作已执行，验证状态由后台继续确认",
+            show_alert=True,
+        )
         return
     await _edit_verification_prompt(callback, settings, text=rejected_text)
-    await callback.answer("已直接拒绝验证")
+    await _ack_security_callback(callback, "已直接拒绝验证")
 
 
 @router.callback_query(F.data.startswith(f"{VERIFICATION_CALLBACK_PREFIX}:"))
@@ -1103,6 +1504,7 @@ async def on_verification_callback(
     callback: CallbackQuery,
     session: AsyncSession,
     settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     parsed = parse_verification_callback_data(callback.data or "")
     if parsed is None:
@@ -1112,12 +1514,103 @@ async def on_verification_callback(
     if action == VERIFICATION_CALLBACK_START:
         await _handle_verification_start_callback(callback, session, target_user_id)
         return
-    await _handle_verification_admin_callback(
+    if session_factory is None:
+        await _handle_verification_admin_callback(
+            callback,
+            session,
+            settings,
+            action=action,
+            target_user_id=target_user_id,
+        )
+        return
+
+    # Release Telegram's spinner and the reserved update worker before any
+    # lease transition, permission restore, kick, or ban. Authorization itself
+    # stays in the HIGH admission lane: untrusted callback data must never be
+    # able to allocate a CRITICAL background job.
+    await _ack_security_callback(callback, "正在验证权限并执行…")
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    group_id = int(getattr(chat, "id", 0) or 0)
+    if (
+        message is None
+        or chat is None
+        or getattr(chat, "type", "") not in {"group", "supergroup"}
+        or operator is None
+        or group_id == 0
+    ):
+        await session.commit()
+        await _publish_security_callback_result(callback, "验证操作消息已失效")
+        return
+    if not await is_group_authorized(session, group_id):
+        await session.commit()
+        await _publish_security_callback_result(callback, "当前群组未授权")
+        return
+    await session.commit()
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=int(operator.id),
+    ):
+        await _publish_security_callback_result(
+            callback,
+            "仅群管理员及以上权限可操作",
+        )
+        return
+    in_transaction = getattr(session, "in_transaction", None)
+    if callable(in_transaction) and in_transaction():
+        await session.commit()
+
+    async def operation() -> None:
+        async with session_factory() as work_session:
+            await _handle_verification_admin_callback(
+                callback,
+                work_session,
+                settings,
+                action=action,
+                target_user_id=target_user_id,
+                session_factory=session_factory,
+            )
+
+    submission = submit_privileged_task(
+        # Approve/reject are mutually exclusive mutations of one generation;
+        # omit the action so two buttons cannot execute concurrently.
+        key=f"verification-admin:{group_id}:{message_id}:{target_user_id}",
+        label=(
+            f"verification admin {action} for {target_user_id} "
+            f"in {group_id} prompt {message_id}"
+        ),
+        operation=operation,
+        lane="critical",
+        priority=0,
+        timeout_seconds=120.0,
+    )
+    if submission.accepted:
+        if not submission.created and message is not None and hasattr(message, "answer"):
+            try:
+                await message.answer("该验证权限操作正在执行，未重复提交。")
+            except Exception:
+                pass
+        return
+
+    # Saturation must not silently drop a permission decision, but it also must
+    # not move a minutes-long Telegram operation back into the HIGH update
+    # worker. Keep the durable inbox row retryable instead.
+    log.error(
+        "verification admin queue rejected task; scheduling durable retry | "
+        "group=%s user=%s reason=%s",
+        group_id,
+        target_user_id,
+        submission.reason,
+    )
+    request_current_update_retry()
+    await _publish_security_callback_result(
         callback,
-        session,
-        settings,
-        action=action,
-        target_user_id=target_user_id,
+        "权限任务队列正忙，本次操作会自动重试。",
     )
 
 
@@ -1192,6 +1685,7 @@ async def on_raid_remove_callback(
     callback: CallbackQuery,
     session: AsyncSession,
     settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     """Administrator-only bulk removal for one raid challenge message."""
     message = callback.message
@@ -1203,11 +1697,18 @@ async def on_raid_remove_callback(
     if operator is None:
         await callback.answer("无法识别操作者", show_alert=True)
         return
+    # Stop Telegram's callback spinner before authorization or bulk work. The
+    # acknowledgement discloses no privileged result and is safe for any user.
+    await _ack_security_callback(callback, "正在验证权限并提交任务…")
     group_id = int(chat.id)
     authorized = await is_group_authorized(session, group_id)
     await session.commit()
     if not authorized:
-        await callback.answer("当前群组未授权", show_alert=True)
+        await _ack_security_callback(callback, "当前群组未授权", show_alert=True)
+        try:
+            await message.answer("当前群组未授权，未执行批量移除。")
+        except Exception:
+            pass
         return
     if not await is_group_admin_or_higher(
         bot=callback.bot,
@@ -1216,7 +1717,78 @@ async def on_raid_remove_callback(
         group_id=group_id,
         user_id=int(operator.id),
     ):
-        await callback.answer("仅群管理员可一键移除追溯用户", show_alert=True)
+        await _ack_security_callback(
+            callback,
+            "仅群管理员可一键移除追溯用户",
+            show_alert=True,
+        )
+        try:
+            await message.answer("仅群管理员可一键移除追溯用户。")
+        except Exception:
+            pass
+        return
+
+    await session.commit()
+    if session_factory is not None:
+        prompt_message_id = int(message.message_id)
+
+        async def operation() -> None:
+            async with session_factory() as work_session:
+                still_authorized = await is_group_authorized(work_session, group_id)
+                await work_session.commit()
+                still_operator = bool(
+                    still_authorized
+                    and await is_group_admin_or_higher(
+                        bot=callback.bot,
+                        session=work_session,
+                        settings=settings,
+                        group_id=group_id,
+                        user_id=int(operator.id),
+                    )
+                )
+                await work_session.commit()
+                if not still_operator:
+                    try:
+                        await message.answer(
+                            "爆破防护批量移除已取消：执行前复验发现群授权或操作者权限已失效。"
+                        )
+                    except Exception:
+                        pass
+                    return
+                result = await remove_raid_challenged_users(
+                    bot=callback.bot,
+                    session=work_session,
+                    session_factory=session_factory,
+                    settings=settings,
+                    group_id=group_id,
+                    prompt_message_id=prompt_message_id,
+                    group_settings=None,
+                )
+            await _publish_raid_removal_result(
+                callback,
+                group_id=group_id,
+                prompt_message_id=prompt_message_id,
+                result=result,
+            )
+
+        submission = submit_privileged_task(
+            key=f"raid-remove:{group_id}:{prompt_message_id}",
+            label=f"raid bulk remove in {group_id} prompt {prompt_message_id}",
+            operation=operation,
+            lane="critical_bulk",
+            priority=10,
+            timeout_seconds=180.0,
+        )
+        if not submission.accepted:
+            try:
+                await message.answer("权限任务队列正忙，本次未受理，请再次点击。")
+            except Exception:
+                pass
+        elif not submission.created:
+            try:
+                await message.answer("该批移除任务正在执行，未重复提交。")
+            except Exception:
+                pass
         return
 
     result = await remove_raid_challenged_users(
@@ -1258,9 +1830,13 @@ async def on_raid_remove_callback(
         await callback.answer(f"已移除 {removed_count} 名被追溯用户")
 
 
-@router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
-async def on_member_join(
-    event: ChatMemberUpdated, session: AsyncSession, settings: Settings
+async def _process_member_join(
+    event: ChatMemberUpdated,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    require_current_membership: bool = False,
 ) -> None:
     log.info(
         "member join event | group=%s user=%s",
@@ -1272,6 +1848,12 @@ async def on_member_join(
     _invalidate_admin_cache(event)
     user = event.new_chat_member.user
     if user.is_bot:
+        return
+    if require_current_membership and not await _join_member_still_present(
+        event,
+        int(user.id),
+        stage="start",
+    ):
         return
     if not await is_group_authorized(session, event.chat.id):
         return
@@ -1318,6 +1900,34 @@ async def on_member_join(
     # End the read transaction before any Telegram API call below.
     await session.commit()
     if globally_banned or locally_banned:
+        async def current_ban_policy() -> bool:
+            await session.rollback()
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+            )
+            await session.commit()
+            return blocked
+
+        async def current_restriction_required() -> bool:
+            await session.rollback()
+            required = await verification_restriction_required(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+            )
+            await session.commit()
+            return required
+
+        if not await current_ban_policy():
+            log.info(
+                "join ban snapshot discarded | reason=manual_unban "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+            )
+            return
         ban_scope = "global" if globally_banned else "local"
         log.info(
             "join blocked | reason=%s_ban group=%s user=%s",
@@ -1325,7 +1935,7 @@ async def on_member_join(
             group_id,
             user_id,
         )
-        await _ban_and_notify(
+        enforced = await _ban_and_notify(
             event,
             settings,
             user_id=user_id,
@@ -1335,6 +1945,16 @@ async def on_member_join(
                 if globally_banned
                 else "该用户在本群封禁名单中"
             ),
+            preserve_ban=current_ban_policy,
+            restriction_required=current_restriction_required,
+        )
+        return
+
+    if manual_unban_generation_is_active(group_id, user_id):
+        log.info(
+            "join security stopped | reason=recent_manual_unban group=%s user=%s",
+            group_id,
+            user_id,
         )
         return
 
@@ -1405,9 +2025,22 @@ async def on_member_join(
     await session.commit()
 
     async def _maybe_start_verification() -> bool:
+        if manual_unban_generation_is_active(group_id, user_id):
+            return False
+        await session.rollback()
+        if not await is_group_authorized(session, group_id):
+            await session.commit()
+            return False
         group = await session.get(Group, group_id)
         group_settings = group.settings if group is not None else None
         enabled, provider = join_verification_policy(settings, group_settings)
+        await session.commit()
+        if require_current_membership and not await _join_member_still_present(
+            event,
+            user_id,
+            stage="verification_policy",
+        ):
+            return False
         if enabled and join_verification_ready(settings, group_settings):
             await _start_join_verification(
                 event,
@@ -1416,11 +2049,19 @@ async def on_member_join(
                 user_id=user_id,
                 display_name=user.full_name or "",
                 provider=provider,
+                session_factory=session_factory,
+                require_current_membership=require_current_membership,
             )
             return True
         return False
 
     async def _admit_member() -> None:
+        if require_current_membership and not await _join_member_still_present(
+            event,
+            user_id,
+            stage="admission",
+        ):
+            return
         # Verification (when enabled) owns the admission moment: the welcome
         # is sent after the challenge passes instead of on the raw join.
         if await _maybe_start_verification():
@@ -1439,6 +2080,12 @@ async def on_member_join(
         return
 
     bio = await _fetch_user_bio(event, user_id)
+    if require_current_membership and not await _join_member_still_present(
+        event,
+        user_id,
+        stage="profile_screening",
+    ):
+        return
     profile_text = build_join_profile_text(
         full_name=user.full_name or "",
         username=user.username or "",
@@ -1475,6 +2122,50 @@ async def on_member_join(
             user_id,
         )
         return
+    await session.commit()
+    if require_current_membership and not await _join_member_still_present(
+        event,
+        user_id,
+        stage="profile_verdict",
+    ):
+        return
+    # A manual /unban performed while profile moderation was in flight is the
+    # newer operator intent.  Re-read both the exemption and recovery row before
+    # applying the old verdict or starting a new challenge.
+    # Obtain SQLite's process-wide writer gate before the final exemption read.
+    # Whichever of this stale screening verdict and a concurrent /unban commits
+    # last becomes authoritative; an older verdict can no longer delete an
+    # exemption that was created while its LLM request was in flight.
+    await acquire_group_settings_write_intent(session, group_id)
+    if not await is_group_authorized(session, group_id):
+        await session.rollback()
+        return
+    if (
+        manual_unban_generation_is_active(group_id, user_id)
+        or await is_join_screening_exempt(session, user_id)
+    ):
+        await session.commit()
+        log.info(
+            "join screening verdict discarded | reason=manual_unban_exemption "
+            "group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        return
+    current_verification = await get_join_verification(session, group_id, user_id)
+    if current_verification is not None and str(current_verification.status or "") in {
+        VERIFICATION_STATUS_RELEASING,
+        VERIFICATION_STATUS_UNBANNING,
+    }:
+        await session.commit()
+        log.info(
+            "join screening verdict discarded | reason=permission_recovery_%s "
+            "group=%s user=%s",
+            current_verification.status,
+            group_id,
+            user_id,
+        )
+        return
     if not violated:
         # Record the checked signature so on-message re-screening skips this
         # user until their visible profile or the enabled rules change. The
@@ -1496,6 +2187,20 @@ async def on_member_join(
         await _admit_member()
         return
 
+    recovery = await lease_join_verification_for_unban(
+        session,
+        group_id,
+        user_id,
+        manual_unban=False,
+    )
+    if recovery is None:
+        await session.rollback()
+        log.error(
+            "join profile ban recovery journal could not be created | group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        return
     await add_global_ban(
         session,
         user_id,
@@ -1506,13 +2211,162 @@ async def on_member_join(
     # The registry entry must be durable and the SQLite write lock released
     # before Telegram ban/notification calls.
     await session.commit()
-    await _ban_and_notify(
+
+    async def current_profile_ban_policy() -> bool:
+        if manual_unban_generation_is_active(group_id, user_id):
+            return False
+        await session.rollback()
+        if not await is_group_authorized(session, group_id):
+            await session.commit()
+            return False
+        blocked = await verification_release_blocked_by_ban(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        await session.commit()
+        return blocked
+
+    async def current_profile_restriction_required() -> bool:
+        await session.rollback()
+        required = await verification_restriction_required(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        await session.commit()
+        return required
+
+    enforced = await _ban_and_notify(
         event,
         settings,
         user_id=user_id,
         display_name=user.full_name,
         reason=reason,
+        preserve_ban=current_profile_ban_policy,
+        restriction_required=current_profile_restriction_required,
     )
+    if not enforced:
+        return
+    completed = await complete_leased_join_verification(
+        session,
+        verification_id=int(recovery.verification_id),
+        lease_until=recovery.lease_until,
+        status=VERIFICATION_STATUS_UNBANNING,
+    )
+    if completed:
+        await session.commit()
+        return
+    await session.rollback()
+    await enforce_ban_with_policy_reconciliation(
+        event.bot,
+        group_id,
+        user_id,
+        current_profile_ban_policy,
+        current_profile_restriction_required,
+    )
+
+
+@router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
+async def on_member_join(
+    event: ChatMemberUpdated,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    event_update: Update | None = None,
+) -> None:
+    """Hand join security work to its reserved bounded lane.
+
+    The critical administrator lane is separate, so slow profile moderation
+    can no longer delay ``/ban``/``/unban``. Direct unit calls without the
+    injected factory retain the synchronous implementation.
+    """
+
+    if session_factory is None:
+        await _process_member_join(event, session, settings)
+        return
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    user = getattr(getattr(event, "new_chat_member", None), "user", None)
+    if user is None or bool(getattr(user, "is_bot", False)):
+        return
+    _invalidate_admin_cache(event)
+    await session.commit()
+
+    pair = (int(event.chat.id), int(user.id))
+    update_id = int(getattr(event_update, "update_id", 0) or 0)
+    pending = _PENDING_MEMBER_JOIN_SECURITY.get(pair)
+    if pending is None:
+        global _MEMBER_JOIN_JOB_SEQUENCE
+        _MEMBER_JOIN_JOB_SEQUENCE += 1
+        pending = _PendingMemberJoinSecurity(
+            job_key=(
+                f"member-join:{pair[0]}:{pair[1]}:"
+                f"{update_id or _MEMBER_JOIN_JOB_SEQUENCE}"
+            ),
+            version=1,
+            latest_update_id=update_id,
+            event=event,
+            settings=settings,
+        )
+        _PENDING_MEMBER_JOIN_SECURITY[pair] = pending
+    else:
+        # Exact durable replays attach their receipt to the same job. A newer
+        # Telegram update replaces the snapshot and forces the active job to
+        # run another generation before it can complete either receipt.
+        is_new_generation = (
+            update_id > pending.latest_update_id
+            if update_id and pending.latest_update_id
+            else pending.event is not event
+        )
+        if is_new_generation:
+            pending.version += 1
+            pending.latest_update_id = update_id
+            pending.event = event
+            pending.settings = settings
+
+    async def operation() -> None:
+        while True:
+            generation = pending.version
+            current_event = pending.event
+            current_settings = pending.settings
+            async with session_factory() as work_session:
+                await _process_member_join(
+                    current_event,
+                    work_session,
+                    current_settings,
+                    session_factory=session_factory,
+                    require_current_membership=True,
+                )
+            if pending.version != generation:
+                continue
+            if _PENDING_MEMBER_JOIN_SECURITY.get(pair) is pending:
+                _PENDING_MEMBER_JOIN_SECURITY.pop(pair, None)
+            return
+
+    submission = submit_privileged_task(
+        key=pending.job_key,
+        label=f"member join security {int(user.id)} in {int(event.chat.id)}",
+        operation=operation,
+        lane="security",
+        priority=0,
+        timeout_seconds=180.0,
+    )
+    if submission.accepted:
+        return
+
+    # Fail-safe path: never silently drop a join security event. Queue
+    # saturation is exceptional and may occupy this update worker, but it is
+    # preferable to admitting a banned or unverified member unchecked.
+    log.error(
+        "join security queue rejected event; running inline | group=%s user=%s reason=%s",
+        int(event.chat.id),
+        int(user.id),
+        submission.reason,
+    )
+    if _PENDING_MEMBER_JOIN_SECURITY.get(pair) is pending:
+        _PENDING_MEMBER_JOIN_SECURITY.pop(pair, None)
+    await _process_member_join(event, session, settings)
 
 
 @router.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_MEMBER >> IS_NOT_MEMBER))

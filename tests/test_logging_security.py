@@ -7,7 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bot.utils.logging_setup import _SecureRotatingFileHandler, configure_logging
+from bot.utils.logging_setup import (
+    _SecureRotatingFileHandler,
+    configure_logging,
+    flush_logging,
+    logging_resource_health_snapshot,
+    reset_log_context,
+    set_log_context,
+    shutdown_logging,
+)
 
 
 class LoggingFilePermissionTests(unittest.TestCase):
@@ -25,13 +33,13 @@ class LoggingFilePermissionTests(unittest.TestCase):
                 os.environ.pop("LOG_FILE_PATH", None)
                 configure_logging(force=True)
                 logging.getLogger("default-log-path-test").info("persist me")
-                for handler in root.handlers:
-                    handler.flush()
+                self.assertTrue(flush_logging(timeout=2.0))
+                snapshot = logging_resource_health_snapshot()
+                self.assertTrue(snapshot["listener_alive"])
+                self.assertEqual(snapshot["dropped_records"], 0)
                 self.assertTrue((Path(tmpdir) / "data" / "bot.log").is_file())
             finally:
-                for handler in list(root.handlers):
-                    if handler not in old_handlers:
-                        handler.close()
+                shutdown_logging(timeout=2.0)
                 root.handlers = old_handlers
                 root.setLevel(old_level)
                 os.chdir(old_cwd)
@@ -43,6 +51,30 @@ class LoggingFilePermissionTests(unittest.TestCase):
                     os.environ.pop("LOG_FILE_PATH", None)
                 else:
                     os.environ["LOG_FILE_PATH"] = old_log_file_path
+
+    def test_context_is_captured_before_record_crosses_listener_thread(self) -> None:
+        root = logging.getLogger()
+        old_handlers = list(root.handlers)
+        old_level = root.level
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                os.environ["LOG_TO_FILE"] = "true"
+                os.environ["LOG_FILE_PATH"] = str(Path(tmpdir) / "context.log")
+                configure_logging(force=True)
+                tokens = set_log_context(flow_id="flow-123")
+                try:
+                    logging.getLogger("context-capture-test").info("captured")
+                finally:
+                    reset_log_context(tokens)
+                self.assertTrue(flush_logging(timeout=2.0))
+                text = (Path(tmpdir) / "context.log").read_text(encoding="utf-8")
+                self.assertIn("流=flow-123", text)
+            finally:
+                shutdown_logging(timeout=2.0)
+                root.handlers = old_handlers
+                root.setLevel(old_level)
+                os.environ.pop("LOG_TO_FILE", None)
+                os.environ.pop("LOG_FILE_PATH", None)
 
     def test_log_file_and_rollover_remain_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

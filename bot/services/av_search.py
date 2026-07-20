@@ -6,12 +6,15 @@ import logging
 import re
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import TypeVar
 from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 
 import aiohttp
 
 from bot.config import Settings
+from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.platform_common import fetch_text
 
 log = logging.getLogger(__name__)
@@ -26,6 +29,85 @@ _FC2_CODE_RE = re.compile(r"\bFC2[-_ ]?(?:PPV[-_ ]?)?(\d{5,9})\b", re.IGNORECASE
 _FC2_ARTICLE_RE = re.compile(r"/article/(\d{5,9})", re.IGNORECASE)
 _STAR_ID_RE = re.compile(r"/star/([A-Za-z0-9]+)", re.IGNORECASE)
 _STAR_NAME_CACHE: dict[str, str] = {}
+_STAR_NAME_CACHE_MAX = 512
+_AV_QUERY_CONCURRENCY = 3
+_AV_QUERY_DEADLINE_SECONDS = 45.0
+_AV_QUERY_ADMISSION_TIMEOUT_SECONDS = 2.0
+_AV_QUERY_SEMAPHORE = asyncio.Semaphore(_AV_QUERY_CONCURRENCY)
+_AV_RESULT = TypeVar("_AV_RESULT")
+
+
+async def _run_av_query_bounded(
+    operation: Callable[[], Awaitable[_AV_RESULT]],
+    *,
+    fallback: _AV_RESULT,
+    label: str,
+) -> _AV_RESULT:
+    """Run one AV query with a deadline that includes semaphore admission.
+
+    Starting the timeout only after acquiring the semaphore allowed an
+    arbitrary number of callers to wait forever during an upstream outage.
+    AV lookup is best-effort work, so reject it quickly under saturation and
+    preserve event-loop/update capacity for interactive security operations.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AV_QUERY_DEADLINE_SECONDS
+    acquired = False
+    try:
+        admission_budget = min(
+            _AV_QUERY_ADMISSION_TIMEOUT_SECONDS,
+            max(0.01, deadline - loop.time()),
+        )
+        try:
+            async with asyncio.timeout(admission_budget):
+                await _AV_QUERY_SEMAPHORE.acquire()
+                acquired = True
+        except TimeoutError:
+            log.warning("av query admission timed out | %s", label)
+            return fallback
+
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            log.warning(
+                "av query total deadline exceeded before execution | %s",
+                label,
+            )
+            return fallback
+        try:
+            async with asyncio.timeout(remaining):
+                return await operation()
+        except TimeoutError:
+            log.warning("av query total deadline exceeded | %s", label)
+            return fallback
+    finally:
+        if acquired:
+            _AV_QUERY_SEMAPHORE.release()
+
+
+def av_resource_health_snapshot() -> dict[str, object]:
+    waiters = getattr(_AV_QUERY_SEMAPHORE, "_waiters", None)
+    return {
+        "ok": True,
+        "fatal": False,
+        "capacity": _AV_QUERY_CONCURRENCY,
+        "available": int(getattr(_AV_QUERY_SEMAPHORE, "_value", 0)),
+        "waiters": len(waiters or ()),
+        "star_name_cache_entries": len(_STAR_NAME_CACHE),
+    }
+
+
+register_resource_health_provider("av_search", av_resource_health_snapshot)
+
+
+def _cache_star_name(star_id: str, name: str) -> None:
+    if star_id in _STAR_NAME_CACHE:
+        _STAR_NAME_CACHE.pop(star_id, None)
+    elif len(_STAR_NAME_CACHE) >= _STAR_NAME_CACHE_MAX:
+        oldest = next(iter(_STAR_NAME_CACHE), None)
+        if oldest is not None:
+            _STAR_NAME_CACHE.pop(oldest, None)
+    _STAR_NAME_CACHE[star_id] = name
 
 
 def normalize_av_code(raw: str) -> str:
@@ -345,7 +427,10 @@ class AVQuerySessionStore:
 
 class AVSearchService:
     def __init__(self, settings: Settings) -> None:
-        self.timeout_seconds = max(5.0, float(getattr(settings, "av_http_timeout_sec", 15.0)))
+        self.timeout_seconds = min(
+            20.0,
+            max(5.0, float(getattr(settings, "av_http_timeout_sec", 15.0))),
+        )
         self.max_results = max(5, int(getattr(settings, "av_max_results", 18)))
         self.javbus_base = str(
             getattr(settings, "av_javbus_base_url", "https://www.javbus.com")
@@ -404,6 +489,13 @@ class AVSearchService:
             return 599, url, ""
 
     async def search(self, query: str, *, max_results: int | None = None) -> list[AVSearchItem]:
+        return await _run_av_query_bounded(
+            lambda: self._search_impl(query, max_results=max_results),
+            fallback=[],
+            label=f"search query={_clean_text(query, 40)}",
+        )
+
+    async def _search_impl(self, query: str, *, max_results: int | None = None) -> list[AVSearchItem]:
         if not self.enabled:
             return []
         cleaned_query = _clean_text(query, max_len=120)
@@ -454,6 +546,13 @@ class AVSearchService:
         return merged
 
     async def lookup_by_code(self, code_or_query: str) -> AVDetail | None:
+        return await _run_av_query_bounded(
+            lambda: self._lookup_by_code_impl(code_or_query),
+            fallback=None,
+            label=f"lookup query={_clean_text(code_or_query, 40)}",
+        )
+
+    async def _lookup_by_code_impl(self, code_or_query: str) -> AVDetail | None:
         if not self.enabled:
             return None
         fc2_code = normalize_fc2_code(code_or_query)
@@ -510,6 +609,13 @@ class AVSearchService:
         return None
 
     async def fetch_detail(self, item: AVSearchItem) -> AVDetail | None:
+        return await _run_av_query_bounded(
+            lambda: self._fetch_detail_impl(item),
+            fallback=None,
+            label=f"detail url={_clean_text(item.url, 80)}",
+        )
+
+    async def _fetch_detail_impl(self, item: AVSearchItem) -> AVDetail | None:
         if not self.enabled:
             return None
         source = (item.source or "").strip().lower()
@@ -1231,14 +1337,14 @@ class AVSearchService:
             # Example: 推川ゆうり - 女優 - 影片
             name = _clean_text(title.split(" - ", 1)[0], max_len=80)
             if _looks_like_person_name(name):
-                _STAR_NAME_CACHE[sid] = name
+                _cache_star_name(sid, name)
                 return name
 
         og_title = _clean_text(_extract_meta(content, "og:title"), max_len=180)
         if og_title:
             name = _clean_text(og_title.split(" - ", 1)[0], max_len=80)
             if _looks_like_person_name(name):
-                _STAR_NAME_CACHE[sid] = name
+                _cache_star_name(sid, name)
                 return name
         return ""
 

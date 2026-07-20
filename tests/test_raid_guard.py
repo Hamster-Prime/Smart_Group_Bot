@@ -531,6 +531,16 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 raid_guard_module,
+                "join_verification_lease_is_current",
+                new=AsyncMock(side_effect=query_true),
+            ),
+            patch.object(
+                raid_guard_module,
+                "chat_member_is_present",
+                new=AsyncMock(side_effect=assert_no_open_transaction),
+            ),
+            patch.object(
+                raid_guard_module,
                 "complete_leased_join_verification",
                 new=AsyncMock(side_effect=query_true),
             ),
@@ -609,10 +619,13 @@ class DetectionTests(_DbTestCase):
         )
 
         self.assertEqual(enforced, [])
-        self.assertEqual(bot.restrict_chat_member.await_count, 2)
-        self.assertEqual(
+        # The chunk is intentionally muted concurrently.  Both requests may
+        # already be in flight when the first one observes deauthorization;
+        # every member that was muted must then receive a compensating restore.
+        self.assertEqual(bot.restrict_chat_member.await_count, 4)
+        self.assertCountEqual(
             [item.args[1] for item in bot.restrict_chat_member.await_args_list],
-            [92, 92],
+            [92, 92, 93, 93],
         )
         bot.send_message.assert_not_awaited()
         async with self.session_factory() as session:
@@ -1147,6 +1160,12 @@ class CallbackTests(_DbTestCase):
             ban_chat_member=AsyncMock(return_value=True),
             unban_chat_member=AsyncMock(return_value=True),
             edit_message_reply_markup=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(
+                    status="member",
+                    can_send_messages=True,
+                )
+            ),
         )
         return SimpleNamespace(
             data=data,

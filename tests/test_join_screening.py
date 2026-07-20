@@ -722,6 +722,12 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
         message.chat.get_member = AsyncMock(
             return_value=SimpleNamespace(status="administrator")
         )
+        message.bot.get_chat_member = AsyncMock(
+            side_effect=lambda _chat_id, user_id: SimpleNamespace(
+                status="administrator" if int(user_id) == 42 else "member",
+                can_restrict_members=int(user_id) == 42,
+            )
+        )
 
         async with self.session_factory() as session:
             with patch("bot.handlers.admin._answer", new=AsyncMock()) as answer_mock:
@@ -734,7 +740,10 @@ class BanCommandTests(unittest.IsolatedAsyncioTestCase):
                     UserWarning.user_id == 777,
                 )
             )
-            self.assertIsNotNone(warning)
+            self.assertIsNotNone(
+                warning,
+                msg=str(answer_mock.await_args.args[2]),
+            )
             self.assertTrue(warning.is_banned)
             message.bot.ban_chat_member.assert_awaited_once_with(
                 -100,

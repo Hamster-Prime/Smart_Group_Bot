@@ -41,22 +41,32 @@ from bot.services.proactive import (
 from bot.services.join_screening import add_global_ban, list_global_bans, remove_global_ban
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
+    activate_manual_unban_recoveries,
+    activate_manual_unban_recovery,
     ban_member as enforce_ban_member,
+    complete_leased_join_verification,
     delete_join_verification,
-    delete_join_verifications_for_user,
     delete_verification_prompts,
     get_join_verification,
-    join_verification_prompts_for_user,
     join_verification_policy,
     lease_join_verification_for_unban,
     lease_join_verifications_for_user_unban,
+    reconcile_moderation_ban_after_lost_lease,
+    release_moderation_restriction_after_exemption,
     restore_member_permissions,
     turnstile_verification_configured,
     unban_member as enforce_unban_member,
     verification_provider,
     verification_release_blocked_by_ban,
+    verification_restriction_required,
     verification_service_ready,
 )
+from bot.services.update_delivery import (
+    clear_privileged_operator_group,
+    mark_privileged_operator,
+    unmark_privileged_operator,
+)
+from bot.services.request_priority import privileged_request_scope
 from bot.services.group_permissions import (
     GROUP_PERMISSIONS_SETTINGS_KEY,
     PERMISSION_FIELDS,
@@ -85,6 +95,31 @@ from bot.utils.timezone import now_shanghai_naive
 from bot.web.auth import require_authenticated_user, require_super_admin
 
 log = logging.getLogger(__name__)
+
+
+async def _run_privileged_group_fanout(
+    group_ids: list[int],
+    operation: Callable[[int], Awaitable[bool]],
+) -> list[bool]:
+    semaphore = asyncio.Semaphore(4)
+
+    async def run_one(group_id: int) -> bool:
+        async with semaphore:
+            try:
+                with privileged_request_scope():
+                    async with asyncio.timeout(45.0):
+                        return bool(await operation(int(group_id)))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info(
+                    "web privileged group operation failed | group=%s",
+                    group_id,
+                    exc_info=True,
+                )
+                return False
+
+    return list(await asyncio.gather(*(run_one(group_id) for group_id in group_ids)))
 
 _GROUP_SETTING_FIELDS = {
     "av_enabled",
@@ -1426,7 +1461,8 @@ def register_settings_routes(
                     bot_token=bot_token,
                     super_admin_id=settings.super_admin_id,
                 )
-                return await handler(request, user)
+                with privileged_request_scope():
+                    return await handler(request, user)
             except web.HTTPException:
                 raise
             except _APIError as exc:
@@ -1457,7 +1493,8 @@ def register_settings_routes(
         async def wrapped(request: web.Request) -> web.StreamResponse:
             try:
                 user = await require_authenticated_user(request, bot_token=bot_token)
-                return await handler(request, user)
+                with privileged_request_scope():
+                    return await handler(request, user)
             except web.HTTPException:
                 raise
             except _APIError as exc:
@@ -1590,6 +1627,7 @@ def register_settings_routes(
                 await session.delete(row)
             await session.execute(delete(Admin).where(Admin.group_id == group_id))
             await session.commit()
+        clear_privileged_operator_group(group_id)
         return _success_response({"deleted": row is not None})
 
     @any_admin
@@ -1710,6 +1748,7 @@ def register_settings_routes(
                     "admin_conflict",
                     "管理员授权发生并发冲突，请重试。",
                 ) from exc
+        mark_privileged_operator(body.user_id, group_id=group_id)
         return _success_response({"created": True})
 
     @authenticated
@@ -1724,6 +1763,7 @@ def register_settings_routes(
             if row is not None:
                 await session.delete(row)
             await session.commit()
+        unmark_privileged_operator(user_id, group_id=group_id)
         return _success_response({"deleted": row is not None})
 
     @authenticated
@@ -1756,6 +1796,18 @@ def register_settings_routes(
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 封禁接口。")
         previous_warning: tuple[int, bool] | None = None
         async with session_factory() as session:
+            group_ids = [
+                int(value)
+                for value in (
+                    await session.scalars(select(AuthorizedGroup.group_id))
+                ).all()
+            ]
+            recoveries = await lease_join_verifications_for_user_unban(
+                session,
+                body.user_id,
+                group_ids=group_ids,
+                manual_unban=False,
+            )
             await add_global_ban(
                 session,
                 body.user_id,
@@ -1763,24 +1815,58 @@ def register_settings_routes(
                 source="manual",
                 created_by=int(user.id),
             )
-            prompts = await join_verification_prompts_for_user(
-                session, body.user_id
+            prompts = tuple(
+                (item.group_id, item.prompt_message_id)
+                for item in recoveries
+                if item.prompt_message_id > 0
             )
-            await delete_join_verifications_for_user(session, body.user_id)
-            group_ids = [int(value) for value in (await session.scalars(select(AuthorizedGroup.group_id))).all()]
             await session.commit()
+        recovery_by_group = {int(item.group_id): item for item in recoveries}
+
+        async def complete_recovery(group_id: int) -> bool:
+            recovery = recovery_by_group.get(int(group_id))
+            if recovery is None:
+                return True
+            async with session_factory() as completion_session:
+                completed = await complete_leased_join_verification(
+                    completion_session,
+                    verification_id=int(recovery.verification_id),
+                    lease_until=recovery.lease_until,
+                    status="unbanning",
+                )
+                if completed:
+                    await completion_session.commit()
+                    return True
+                await completion_session.rollback()
+                return False
+
+        async def ban_one(group_id: int) -> bool:
+            async with session_factory() as policy_session:
+                if not await is_globally_banned(policy_session, body.user_id):
+                    if await enforce_unban_member(bot, group_id, body.user_id):
+                        await restore_member_permissions(bot, group_id, body.user_id)
+                        await complete_recovery(group_id)
+                    return False
+            enforced = await enforce_ban_member(bot, group_id, body.user_id)
+            if not enforced:
+                return False
+            async with session_factory() as policy_session:
+                still_banned = await is_globally_banned(
+                    policy_session,
+                    body.user_id,
+                )
+            if still_banned:
+                await complete_recovery(group_id)
+                return True
+            if await enforce_unban_member(bot, group_id, body.user_id):
+                await restore_member_permissions(bot, group_id, body.user_id)
+                await complete_recovery(group_id)
+            return False
+
+        outcomes = await _run_privileged_group_fanout(group_ids, ban_one)
         await delete_verification_prompts(bot, prompts)
-        succeeded = 0
-        failures = 0
-        for group_id in group_ids:
-            try:
-                if await enforce_ban_member(bot, group_id, body.user_id):
-                    succeeded += 1
-                else:
-                    failures += 1
-            except Exception:
-                failures += 1
-                log.info("web ban failed | group=%s user=%s", group_id, body.user_id)
+        succeeded = sum(outcomes)
+        failures = len(outcomes) - succeeded
         if failures:
             raise _APIError(
                 502,
@@ -1796,20 +1882,12 @@ def register_settings_routes(
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
         async with session_factory() as session:
-            group_ids = sorted(
-                {
-                    *(
-                        int(value)
-                        for value in (await session.scalars(select(Group.id))).all()
-                    ),
-                    *(
-                        int(value)
-                        for value in (
-                            await session.scalars(select(AuthorizedGroup.group_id))
-                        ).all()
-                    ),
-                }
-            )
+            group_ids = [
+                int(value)
+                for value in (
+                    await session.scalars(select(AuthorizedGroup.group_id))
+                ).all()
+            ]
             recoveries = await lease_join_verifications_for_user_unban(
                 session,
                 target_id,
@@ -1821,44 +1899,61 @@ def register_settings_routes(
                 operator_id=int(user.id),
             )
             await session.execute(
-                delete(UserWarning).where(UserWarning.user_id == target_id)
+                delete(UserWarning).where(
+                    UserWarning.user_id == target_id,
+                    UserWarning.group_id.in_(group_ids),
+                )
             )
             await session.commit()
+        activate_manual_unban_recoveries(recoveries)
         prompts = tuple(
             (item.group_id, item.prompt_message_id)
             for item in recoveries
             if item.prompt_message_id > 0
         )
-        await delete_verification_prompts(bot, prompts)
-        succeeded = 0
-        restored = 0
-        failures = 0
-        for group_id in group_ids:
-            try:
-                async def preserve_ban(group_id: int = group_id) -> bool:
-                    async with session_factory() as session:
-                        return await verification_release_blocked_by_ban(
-                            session,
-                            group_id=group_id,
-                            user_id=target_id,
-                        )
+        recovery_by_group = {int(item.group_id): item for item in recoveries}
+        restored_group_ids: set[int] = set()
 
-                if not await enforce_unban_member(
-                    bot,
-                    group_id,
-                    target_id,
-                    preserve_ban=preserve_ban,
-                ):
-                    failures += 1
-                    continue
-                succeeded += 1
-                if await restore_member_permissions(bot, group_id, target_id):
-                    restored += 1
-                else:
-                    failures += 1
-            except Exception:
-                failures += 1
-                log.info("web unban failed | group=%s user=%s", group_id, target_id)
+        async def unban_one(group_id: int) -> bool:
+            async def preserve_ban() -> bool:
+                async with session_factory() as session:
+                    return await verification_release_blocked_by_ban(
+                        session,
+                        group_id=group_id,
+                        user_id=target_id,
+                    )
+
+            if not await enforce_unban_member(
+                bot,
+                group_id,
+                target_id,
+                preserve_ban=preserve_ban,
+            ):
+                return False
+            if not await restore_member_permissions(bot, group_id, target_id):
+                # Keep the recovery journal for the verification sweeper.
+                return True
+            restored_group_ids.add(int(group_id))
+            recovery = recovery_by_group.get(int(group_id))
+            if recovery is not None:
+                async with session_factory() as completion_session:
+                    completed = await complete_leased_join_verification(
+                        completion_session,
+                        verification_id=int(recovery.verification_id),
+                        lease_until=recovery.lease_until,
+                        status="unbanning",
+                    )
+                    if completed:
+                        await completion_session.commit()
+                    else:
+                        await completion_session.rollback()
+            return True
+
+        outcomes = await _run_privileged_group_fanout(group_ids, unban_one)
+        await delete_verification_prompts(bot, prompts)
+        succeeded = sum(outcomes)
+        restored = len(restored_group_ids)
+        failures = (len(outcomes) - succeeded) + (succeeded - restored)
         if failures:
             raise _APIError(
                 502,
@@ -2559,11 +2654,19 @@ def register_settings_routes(
             )
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
-            await lease_join_verification_for_unban(
+            recovery = await lease_join_verification_for_unban(
                 session,
                 group_id,
                 body.user_id,
+                manual_unban=False,
             )
+            if recovery is None:
+                await session.rollback()
+                raise _APIError(
+                    503,
+                    "group_ban_recovery_unavailable",
+                    "无法建立封禁恢复工单，请立即重试。",
+                )
             await session.commit()
         try:
             result = await enforce_ban_member(bot, group_id, body.user_id)
@@ -2592,22 +2695,60 @@ def register_settings_routes(
                 )
             raise _APIError(502, "telegram_ban_failed", "Telegram 群内封禁失败，请稍后重试。") from exc
         async with session_factory() as session:
-            current_verification = await get_join_verification(
-                session, group_id, body.user_id
+            claimed = await complete_leased_join_verification(
+                session,
+                verification_id=int(recovery.verification_id),
+                lease_until=recovery.lease_until,
+                status="unbanning",
             )
-            if (
-                current_verification is not None
-                and int(current_verification.prompt_message_id or 0) > 0
-            ):
-                prompts.add(
-                    (group_id, int(current_verification.prompt_message_id))
+            if not claimed:
+                await session.rollback()
+
+                async def preserve_latest_ban() -> bool:
+                    async with session_factory() as policy_session:
+                        return bool(
+                            await verification_release_blocked_by_ban(
+                                policy_session,
+                                group_id=group_id,
+                                user_id=body.user_id,
+                            )
+                        )
+
+                async def preserve_latest_restriction() -> bool:
+                    async with session_factory() as policy_session:
+                        return bool(
+                            await verification_restriction_required(
+                                policy_session,
+                                group_id=group_id,
+                                user_id=body.user_id,
+                            )
+                        )
+
+                try:
+                    await reconcile_moderation_ban_after_lost_lease(
+                        bot,
+                        group_id,
+                        body.user_id,
+                        preserve_latest_ban,
+                        restriction_required=preserve_latest_restriction,
+                    )
+                except Exception:
+                    log.exception(
+                        "web group ban superseded-state reconciliation failed | "
+                        "group=%s user=%s",
+                        group_id,
+                        body.user_id,
+                    )
+                raise _APIError(
+                    409,
+                    "group_ban_state_changed",
+                    "封禁期间权限策略已被其他操作更新，已按最新策略校准。",
                 )
             row = await _set_group_banned_after_telegram(
                 session,
                 group_id=group_id,
                 user_id=body.user_id,
             )
-            await delete_join_verification(session, group_id, body.user_id)
             await record_ban_event(
                 session,
                 group_id=group_id,
@@ -2639,18 +2780,25 @@ def register_settings_routes(
                 UserWarning.group_id == group_id,
                 UserWarning.user_id == target_id,
             ))
-            if row is None or not row.is_banned:
-                return _success_response({"deleted": False, "restored": False})
             warning_snapshot = (
-                int(row.id),
-                max(0, int(row.count or 0)),
-                bool(row.is_banned),
+                (
+                    int(row.id),
+                    max(0, int(row.count or 0)),
+                    bool(row.is_banned),
+                )
+                if row is not None and bool(row.is_banned)
+                else None
             )
             verification = await get_join_verification(session, group_id, target_id)
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
-            await lease_join_verification_for_unban(session, group_id, target_id)
+            recovery = await lease_join_verification_for_unban(
+                session,
+                group_id,
+                target_id,
+            )
             await session.commit()
+        activate_manual_unban_recovery(recovery)
         unban_member = getattr(bot, "unban_chat_member", None)
         if not callable(unban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 解封接口。")
@@ -2676,17 +2824,27 @@ def register_settings_routes(
                     "group_ban_locked",
                     "解封期间该用户被加入全局封禁名单，已保留封禁状态。",
                 )
-            warning_id, previous_count, was_banned = warning_snapshot
-            deleted = await session.execute(
-                delete(UserWarning).where(
-                    UserWarning.id == warning_id,
-                    UserWarning.group_id == group_id,
-                    UserWarning.user_id == target_id,
-                    UserWarning.count == previous_count,
-                    UserWarning.is_banned.is_(was_banned),
+            if warning_snapshot is None:
+                current = await session.scalar(
+                    select(UserWarning).where(
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == target_id,
+                    )
                 )
-            )
-            if int(deleted.rowcount or 0) != 1:
+                claimed = current is None or not bool(current.is_banned)
+            else:
+                warning_id, previous_count, was_banned = warning_snapshot
+                deleted = await session.execute(
+                    delete(UserWarning).where(
+                        UserWarning.id == warning_id,
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == target_id,
+                        UserWarning.count == previous_count,
+                        UserWarning.is_banned.is_(was_banned),
+                    )
+                )
+                claimed = int(deleted.rowcount or 0) == 1
+            if not claimed:
                 await session.rollback()
                 current = await session.scalar(
                     select(UserWarning).where(
@@ -2739,6 +2897,18 @@ def register_settings_routes(
                 ) from exc
         await delete_verification_prompts(bot, prompts)
         restored = await restore_member_permissions(bot, group_id, target_id)
+        if restored and recovery is not None:
+            async with session_factory() as completion_session:
+                completed = await complete_leased_join_verification(
+                    completion_session,
+                    verification_id=int(recovery.verification_id),
+                    lease_until=recovery.lease_until,
+                    status="unbanning",
+                )
+                if completed:
+                    await completion_session.commit()
+                else:
+                    await completion_session.rollback()
         try:
             async with session_factory() as session:
                 await record_ban_event(
@@ -2759,7 +2929,10 @@ def register_settings_routes(
                 group_id,
                 target_id,
             )
-        return _success_response({"deleted": True, "restored": bool(restored)})
+        return _success_response({
+            "deleted": warning_snapshot is not None,
+            "restored": bool(restored),
+        })
 
     async def _create_user_row(
         request: web.Request,
@@ -2770,6 +2943,8 @@ def register_settings_routes(
         group_id = _group_id(request)
         await _require_group_access(group_id, int(user.id))
         body = _UserIdCreate.model_validate(await _json_object(request))
+        recovery = None
+        released = True
         async with session_factory() as session:
             row = await session.scalar(select(model).where(
                 model.group_id == group_id,
@@ -2778,9 +2953,33 @@ def register_settings_routes(
             if row is None:
                 row = model(group_id=group_id, user_id=body.user_id, created_by=int(user.id))
                 session.add(row)
-                await session.commit()
-                await session.refresh(row)
-        return _success_response({key: _user_policy_document(row)})
+            if model is ModerationExemption:
+                recovery = await lease_join_verification_for_unban(
+                    session,
+                    group_id,
+                    body.user_id,
+                    manual_unban=False,
+                )
+                if recovery is None:
+                    await session.rollback()
+                    raise _APIError(
+                        503,
+                        "exemption_recovery_unavailable",
+                        "无法建立豁免恢复工单，请立即重试。",
+                    )
+            await session.commit()
+            await session.refresh(row)
+            if recovery is not None:
+                activate_manual_unban_recovery(recovery)
+                released = await release_moderation_restriction_after_exemption(
+                    bot,
+                    session,
+                    recovery,
+                )
+        payload = {key: _user_policy_document(row)}
+        if model is ModerationExemption:
+            payload["restriction_reconciled"] = bool(released)
+        return _success_response(payload)
 
     async def _delete_user_row(
         request: web.Request,

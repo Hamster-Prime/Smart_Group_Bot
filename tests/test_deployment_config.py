@@ -12,8 +12,26 @@ class DeploymentConfigTests(unittest.TestCase):
         compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn('user: "${APP_UID:-1000}:${APP_GID:-1000}"', compose)
         self.assertIn("init: true", compose)
-        self.assertIn("${MINIAPP_BIND_ADDRESS:-127.0.0.1}:8480:8480", compose)
-        self.assertRegex(compose, r"(?m)^\s*stop_grace_period:\s*8m\s*$")
+        self.assertIn(
+            "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:"
+            "${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}",
+            compose,
+        )
+        self.assertIn("os.environ.get('MINIAPP_LISTEN_PORT', '8480')", compose)
+        self.assertRegex(compose, r"(?m)^\s*stop_grace_period:\s*125s\s*$")
+
+    def test_compose_bounds_swap_fds_pids_and_logs(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn('mem_limit: "${BOT_MEMORY_LIMIT:-1536m}"', compose)
+        self.assertIn(
+            'memswap_limit: "${BOT_MEMORY_SWAP_LIMIT:-1536m}"',
+            compose,
+        )
+        self.assertIn("pids_limit: ${BOT_PIDS_LIMIT:-128}", compose)
+        self.assertRegex(compose, r"(?m)^\s*nofile:\s*$")
+        self.assertRegex(compose, r"(?m)^\s*soft:\s*8192\s*$")
+        self.assertRegex(compose, r"(?m)^\s*hard:\s*8192\s*$")
+        self.assertIn("driver: local", compose)
 
     def test_image_runs_non_root_and_uses_locked_dependencies(self) -> None:
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

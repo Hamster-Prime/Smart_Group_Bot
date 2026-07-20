@@ -32,10 +32,13 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
 import weakref
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 from urllib.parse import urlencode
 
 from aiogram import Bot
@@ -56,6 +59,12 @@ from bot.db.models import AuthorizedGroup, JoinVerification, UserWarning
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.background_health import record_background_failure
 from bot.services.join_screening import is_globally_banned
+from bot.services.request_priority import (
+    ExecutionPriority,
+    ReservedCapacityGate,
+    current_execution_priority,
+)
+from bot.services.resource_health import register_resource_health_provider
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -63,6 +72,8 @@ from bot.utils.telegram import (
 from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
+
+_VERIFICATION_SWEEP_DEADLINE_SECONDS = 300.0
 
 _MODERATION_CHALLENGE_LOCKS: weakref.WeakValueDictionary[
     tuple[int, int], asyncio.Lock
@@ -76,17 +87,22 @@ _BLOCKED_VERIFICATION_CONFIGS: dict[
 # unbounded number of cancellation-resistant requests when Telegram is wedged.
 _TELEGRAM_CALL_CAPACITY = 16
 _TELEGRAM_CALL_BACKPRESSURE_SECONDS = 0.5
+_TELEGRAM_CALL_CRITICAL_RESERVE = 4
+_TELEGRAM_CALL_NORMAL_CAPACITY = 8
+_TELEGRAM_CALL_ORPHAN_MAX_AGE_SECONDS = 120.0
+_TELEGRAM_CALL_EXHAUSTED_MAX_AGE_SECONDS = 60.0
 _TELEGRAM_CALL_TASKS: set[asyncio.Future[object]] = set()
 
 
 @dataclass(slots=True)
 class _TelegramCallState:
     capacity: int
-    semaphore: asyncio.BoundedSemaphore
+    gate: ReservedCapacityGate
     lock: asyncio.Lock
     tasks: set[asyncio.Future[object]]
+    active_started_at: dict[asyncio.Future[object], float]
+    orphan_started_at: dict[asyncio.Future[object], float]
     draining: bool = False
-    waiters: int = 0
 
 
 _TELEGRAM_CALL_STATES: weakref.WeakKeyDictionary[
@@ -103,11 +119,26 @@ def _telegram_call_state() -> _TelegramCallState:
     state = _TELEGRAM_CALL_STATES.get(loop)
     if state is None:
         capacity = max(1, int(_TELEGRAM_CALL_CAPACITY))
+        critical_reserve = min(
+            max(0, capacity - 1),
+            max(1, int(_TELEGRAM_CALL_CRITICAL_RESERVE)),
+        )
+        noncritical_capacity = max(1, capacity - critical_reserve)
+        normal_capacity = max(
+            1,
+            min(noncritical_capacity, int(_TELEGRAM_CALL_NORMAL_CAPACITY)),
+        )
         state = _TelegramCallState(
             capacity=capacity,
-            semaphore=asyncio.BoundedSemaphore(capacity),
+            gate=ReservedCapacityGate(
+                total_capacity=capacity,
+                noncritical_capacity=noncritical_capacity,
+                normal_capacity=normal_capacity,
+            ),
             lock=asyncio.Lock(),
             tasks=set(),
+            active_started_at={},
+            orphan_started_at={},
         )
         _TELEGRAM_CALL_STATES[loop] = state
     return state
@@ -126,7 +157,7 @@ def _discard_telegram_call_state_if_idle(
     loop: asyncio.AbstractEventLoop,
     state: _TelegramCallState,
 ) -> None:
-    if state.draining or state.tasks or state.waiters or state.lock.locked():
+    if state.draining or state.tasks or state.lock.locked():
         return
     if _TELEGRAM_CALL_STATES.get(loop) is state:
         _TELEGRAM_CALL_STATES.pop(loop, None)
@@ -139,7 +170,8 @@ def _observe_telegram_call_task(
     if task in state.tasks:
         state.tasks.discard(task)
         _TELEGRAM_CALL_TASKS.discard(task)
-        state.semaphore.release()
+    state.active_started_at.pop(task, None)
+    state.orphan_started_at.pop(task, None)
     try:
         task.result()
     except (asyncio.CancelledError, Exception):
@@ -161,81 +193,205 @@ def _discard_unstarted_awaitable(awaitable: object) -> None:
             pass
 
 
-def _cancel_telegram_acquire_and_return_late_permit(
-    acquire_task: asyncio.Task[bool],
+async def _run_telegram_call(
+    awaitable: object,
+    *,
     state: _TelegramCallState,
-) -> None:
-    """Return a permit won in the same tick that its owner was cancelled."""
+    priority: ExecutionPriority,
+    admission_timeout: float,
+    ready: asyncio.Event,
+    approved: asyncio.Event,
+) -> object:
+    """Hold the real priority permit until the Telegram child actually exits."""
 
-    def _finished(done: asyncio.Task[bool]) -> None:
-        if done.cancelled():
-            return
-        try:
-            done.result()
-        except (asyncio.CancelledError, Exception):
-            return
-        state.semaphore.release()
-        _discard_telegram_call_state_if_idle(done.get_loop(), state)
-
-    acquire_task.cancel()
-    if acquire_task.done():
-        _finished(acquire_task)
-    else:
-        acquire_task.add_done_callback(_finished)
-
-
-async def _start_telegram_call(awaitable: object) -> asyncio.Future[object]:
-    loop = asyncio.get_running_loop()
-    state = _telegram_call_state()
-    acquired = False
-    state.waiters += 1
-    acquire_task = asyncio.create_task(state.semaphore.acquire())
     try:
-        wait_seconds = max(0.0, float(_TELEGRAM_CALL_BACKPRESSURE_SECONDS))
-        done, _pending = await asyncio.wait(
-            {acquire_task},
-            timeout=wait_seconds,
-        )
-        if acquire_task not in done:
-            _cancel_telegram_acquire_and_return_late_permit(acquire_task, state)
-            raise asyncio.TimeoutError
-        await acquire_task
-        acquired = True
-    except asyncio.TimeoutError as exc:
+        async with state.gate.slot(priority=priority, timeout=admission_timeout):
+            async with state.lock:
+                if state.draining:
+                    raise _TelegramCallCapacityError(
+                        "join verification Telegram calls are shutting down"
+                    )
+                ready.set()
+
+            # The caller approves the start only after it has observed that a
+            # slot was won.  If admission times out/cancels in the same tick,
+            # the coroutine is closed without ever reaching Telegram.
+            await approved.wait()
+            task = asyncio.current_task()
+            if task is not None:
+                state.active_started_at[task] = time.monotonic()
+            return await awaitable  # type: ignore[misc]
+    except TimeoutError as exc:
+        if ready.is_set() and approved.is_set():
+            raise
         _discard_unstarted_awaitable(awaitable)
         raise _TelegramCallCapacityError(
             "join verification Telegram call capacity is saturated"
         ) from exc
     except BaseException:
-        if not acquired:
-            _cancel_telegram_acquire_and_return_late_permit(acquire_task, state)
-        _discard_unstarted_awaitable(awaitable)
+        if not approved.is_set():
+            _discard_unstarted_awaitable(awaitable)
+        raise
+
+
+async def _start_telegram_call(awaitable: object) -> asyncio.Future[object]:
+    state = _telegram_call_state()
+    priority = ExecutionPriority(current_execution_priority())
+    wait_seconds = max(0.01, float(_TELEGRAM_CALL_BACKPRESSURE_SECONDS))
+    ready = asyncio.Event()
+    approved = asyncio.Event()
+    task = asyncio.create_task(
+        _run_telegram_call(
+            awaitable,
+            state=state,
+            priority=priority,
+            admission_timeout=wait_seconds,
+            ready=ready,
+            approved=approved,
+        ),
+        name="join-verification-telegram-call",
+    )
+    state.tasks.add(task)
+    _TELEGRAM_CALL_TASKS.add(task)
+    task.add_done_callback(
+        lambda done, owned_state=state: _observe_telegram_call_task(
+            done, owned_state
+        )
+    )
+
+    ready_waiter = asyncio.create_task(ready.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {task, ready_waiter},
+            timeout=wait_seconds + 0.05,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if ready_waiter in done and ready.is_set():
+            approved.set()
+            return task
+        if task in done:
+            task.result()
+            raise _TelegramCallCapacityError(
+                "join verification Telegram call ended before admission"
+            )
+        task.cancel()
+        raise _TelegramCallCapacityError(
+            "join verification Telegram call capacity is saturated"
+        )
+    except BaseException:
+        if not approved.is_set():
+            task.cancel()
         raise
     finally:
-        state.waiters -= 1
-        if not acquired:
-            _discard_telegram_call_state_if_idle(loop, state)
+        ready_waiter.cancel()
 
+
+def _track_telegram_call_orphan(task: asyncio.Future[object]) -> None:
+    if task.done():
+        return
+    for state in tuple(_TELEGRAM_CALL_STATES.values()):
+        if task in state.tasks:
+            state.orphan_started_at.setdefault(task, time.monotonic())
+            return
+
+
+def join_verification_telegram_health_snapshot() -> dict[str, Any]:
+    now = time.monotonic()
     try:
-        async with state.lock:
-            if state.draining:
-                raise _TelegramCallCapacityError(
-                    "join verification Telegram calls are shutting down"
-                )
-            task = asyncio.ensure_future(awaitable)
-            state.tasks.add(task)
-            _TELEGRAM_CALL_TASKS.add(task)
-            task.add_done_callback(
-                lambda done, owned_state=state: _observe_telegram_call_task(
-                    done, owned_state
-                )
-            )
-            return task
-    except BaseException:
-        state.semaphore.release()
-        _discard_unstarted_awaitable(awaitable)
-        _discard_telegram_call_state_if_idle(loop, state)
-        raise
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        states = tuple(_TELEGRAM_CALL_STATES.values())
+    else:
+        current_state = _TELEGRAM_CALL_STATES.get(current_loop)
+        states = (current_state,) if current_state is not None else ()
+    active_count = 0
+    orphan_count = 0
+    oldest_active_age = 0.0
+    oldest_orphan_age = 0.0
+    waiting_critical = 0
+    waiting_high = 0
+    waiting_normal = 0
+    active_critical = 0
+    active_high = 0
+    active_normal = 0
+    total_capacity = 0
+
+    for state in states:
+        started_tasks = [
+            task
+            for task in state.active_started_at
+            if not task.done() and task in state.tasks
+        ]
+        active_count += len(started_tasks)
+        orphan_tasks = [
+            task
+            for task in state.orphan_started_at
+            if not task.done() and task in state.tasks
+        ]
+        orphan_count += len(orphan_tasks)
+        oldest_active_age = max(
+            oldest_active_age,
+            max(
+                (
+                    now - state.active_started_at.get(task, now)
+                    for task in started_tasks
+                ),
+                default=0.0,
+            ),
+        )
+        oldest_orphan_age = max(
+            oldest_orphan_age,
+            max(
+                (
+                    now - state.orphan_started_at.get(task, now)
+                    for task in orphan_tasks
+                ),
+                default=0.0,
+            ),
+        )
+        gate = state.gate.snapshot()
+        total_capacity += state.capacity
+        active_critical += gate["active_critical"]
+        active_high += gate["active_high"]
+        active_normal += gate["active_normal"]
+        waiting_critical += gate["waiting_critical"]
+        waiting_high += gate["waiting_high"]
+        waiting_normal += gate["waiting_normal"]
+
+    exhausted = bool(total_capacity and active_count >= total_capacity)
+    fatal = bool(
+        oldest_orphan_age >= _TELEGRAM_CALL_ORPHAN_MAX_AGE_SECONDS
+        or exhausted
+        and oldest_active_age >= _TELEGRAM_CALL_EXHAUSTED_MAX_AGE_SECONDS
+    )
+    degraded = bool(
+        fatal
+        or orphan_count
+        or waiting_critical
+        or exhausted
+    )
+    return {
+        "ok": not degraded,
+        "fatal": fatal,
+        "capacity": total_capacity,
+        "active_count": active_count,
+        "active_critical": active_critical,
+        "active_high": active_high,
+        "active_normal": active_normal,
+        "waiting_critical": waiting_critical,
+        "waiting_high": waiting_high,
+        "waiting_normal": waiting_normal,
+        "orphan_count": orphan_count,
+        "oldest_active_seconds": round(oldest_active_age, 3),
+        "oldest_orphan_seconds": round(oldest_orphan_age, 3),
+        "exhausted": exhausted,
+    }
+
+
+register_resource_health_provider(
+    "join_verification_telegram",
+    join_verification_telegram_health_snapshot,
+)
 
 # Constant /start payload used after the target-locked group callback. Mini App
 # (web_app) buttons are only allowed in private chats, so the callback redirects
@@ -262,6 +418,7 @@ VERIFICATION_STATUS_UNBANNING = "unbanning"
 PREPARING_LEASE_SECONDS = 90
 TERMINAL_LEASE_SECONDS = 90
 UNBAN_RECOVERY_GRACE_SECONDS = 15
+_RECENT_MANUAL_UNBAN_GENERATIONS: dict[tuple[int, int], datetime] = {}
 VERIFICATION_KINDS = frozenset(
     {
         VERIFICATION_KIND_JOIN,
@@ -318,6 +475,69 @@ class UnbanRecovery:
     user_id: int
     lease_until: datetime
     prompt_message_id: int = 0
+
+
+def _record_manual_unban_generation(
+    group_id: int,
+    user_id: int,
+    *,
+    until: datetime,
+) -> None:
+    _RECENT_MANUAL_UNBAN_GENERATIONS[(int(group_id), int(user_id))] = until
+
+
+def activate_manual_unban_recovery(recovery: UnbanRecovery | None) -> None:
+    """Publish an in-process unban generation only after its DB commit succeeds."""
+
+    if recovery is None:
+        return
+    _record_manual_unban_generation(
+        int(recovery.group_id),
+        int(recovery.user_id),
+        until=recovery.lease_until,
+    )
+
+
+def activate_manual_unban_recoveries(
+    recoveries: Iterable[UnbanRecovery],
+) -> None:
+    for recovery in recoveries:
+        activate_manual_unban_recovery(recovery)
+
+
+def manual_unban_generation_is_active(
+    group_id: int,
+    user_id: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Whether an in-process stale security worker must yield to /unban.
+
+    The durable ``unbanning`` row can be completed as soon as Telegram is
+    reconciled, while an older cancellation-resistant LLM/HTTP task may still
+    return later.  This short generation marker bridges that gap. It need not
+    survive restart because all workers whose snapshots predate the unban are
+    gone after restart as well.
+    """
+
+    current = now or now_shanghai_naive()
+    key = (int(group_id), int(user_id))
+    expires_at = _RECENT_MANUAL_UNBAN_GENERATIONS.get(key)
+    if expires_at is None:
+        return False
+    if expires_at <= current:
+        _RECENT_MANUAL_UNBAN_GENERATIONS.pop(key, None)
+        return False
+    # Opportunistically cap stale keys without a background cleanup task.
+    if len(_RECENT_MANUAL_UNBAN_GENERATIONS) > 4096:
+        expired = [
+            candidate
+            for candidate, deadline in _RECENT_MANUAL_UNBAN_GENERATIONS.items()
+            if deadline <= current
+        ]
+        for candidate in expired:
+            _RECENT_MANUAL_UNBAN_GENERATIONS.pop(candidate, None)
+    return True
 
 
 def normalize_verification_provider(value: object, *, default: str = "turnstile") -> str:
@@ -901,7 +1121,8 @@ async def get_join_verification(
         )
         .execution_options(populate_existing=True)
     )
-    with session.no_autoflush:
+    no_autoflush = getattr(session, "no_autoflush", nullcontext())
+    with no_autoflush:
         result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -1450,10 +1671,22 @@ async def lease_join_verification_for_unban(
     user_id: int,
     *,
     now: datetime | None = None,
+    manual_unban: bool = True,
 ) -> UnbanRecovery | None:
     """Persist cancellation before a manual group unban touches Telegram."""
 
     current = now or now_shanghai_naive()
+    if manual_unban:
+        # Local import avoids a module cycle: vote_ban itself uses the recovery
+        # helpers below.  The status transition shares this exact transaction so
+        # an in-flight vote worker cannot publish an older ban after the unban.
+        from bot.services.vote_ban import cancel_vote_bans_for_manual_unban
+
+        await cancel_vote_bans_for_manual_unban(
+            session,
+            target_user_id=int(user_id),
+            group_ids=(int(group_id),),
+        )
     # Every enforcing heartbeat is capped at TERMINAL_LEASE_SECONDS and the
     # Telegram ban call is bounded.  This fixed barrier outlives both even when
     # the stale worker refreshed immediately before this atomic cancellation.
@@ -1525,23 +1758,45 @@ async def lease_join_verifications_for_user_unban(
     *,
     group_ids: Iterable[int] = (),
     now: datetime | None = None,
+    manual_unban: bool = True,
 ) -> tuple[UnbanRecovery, ...]:
     """Persist per-group recovery journals before a global unban commit."""
 
     current = now or now_shanghai_naive()
+    selected_group_ids = tuple(
+        dict.fromkeys(int(value) for value in group_ids)
+    )
+    if manual_unban:
+        from bot.services.vote_ban import cancel_vote_bans_for_manual_unban
+
+        await cancel_vote_bans_for_manual_unban(
+            session,
+            target_user_id=int(user_id),
+            # A vote may belong to a group de-authorized after the poll opened.
+            # Global unban still invalidates that stale enforcement intent even
+            # though Telegram fan-out is limited to currently authorized groups.
+            group_ids=None,
+        )
+    if not selected_group_ids:
+        return ()
     recovery_at = current + timedelta(
         seconds=TERMINAL_LEASE_SECONDS + UNBAN_RECOVERY_GRACE_SECONDS
     )
-    for group_id in dict.fromkeys(int(value) for value in group_ids):
+    for group_id in selected_group_ids:
         await lease_join_verification_for_unban(
             session,
             group_id,
             int(user_id),
             now=current,
+            # The bulk cancellation above already covered every selected group.
+            manual_unban=False,
         )
     await session.execute(
         update(JoinVerification)
-        .where(JoinVerification.user_id == int(user_id))
+        .where(
+            JoinVerification.user_id == int(user_id),
+            JoinVerification.group_id.in_(selected_group_ids),
+        )
         .values(
             status=VERIFICATION_STATUS_UNBANNING,
             lease_until=recovery_at,
@@ -1553,6 +1808,7 @@ async def lease_join_verifications_for_user_unban(
                 select(JoinVerification)
                 .where(
                     JoinVerification.user_id == int(user_id),
+                    JoinVerification.group_id.in_(selected_group_ids),
                     JoinVerification.status == VERIFICATION_STATUS_UNBANNING,
                     JoinVerification.lease_until == recovery_at,
                 )
@@ -1770,6 +2026,84 @@ async def renew_join_verification_lease(
     return bool(result.rowcount)
 
 
+async def join_verification_lease_is_current(
+    session: AsyncSession,
+    *,
+    verification_id: int,
+    lease_until: datetime,
+    status: str,
+) -> bool:
+    """Return whether one exact terminal generation still owns side effects.
+
+    Manual unban converts the row to ``unbanning`` (or deletes it after the
+    recovery journal completes).  Long-running raid/sweeper workers must check
+    this exact generation immediately before a Telegram mutation instead of
+    acting on the snapshot they claimed seconds earlier.
+    """
+
+    if status not in {
+        VERIFICATION_STATUS_ENFORCING,
+        VERIFICATION_STATUS_RELEASING,
+        VERIFICATION_STATUS_UNBANNING,
+    }:
+        raise ValueError(f"unsupported terminal verification status: {status}")
+    no_autoflush = getattr(session, "no_autoflush", nullcontext())
+    with no_autoflush:
+        current = await session.scalar(
+            select(JoinVerification.id).where(
+                JoinVerification.id == int(verification_id),
+                JoinVerification.status == status,
+                JoinVerification.lease_until == lease_until,
+            )
+        )
+    return current is not None
+
+
+async def _join_verification_generation_is_current(
+    session: AsyncSession,
+    *,
+    verification_id: int,
+    group_id: int,
+    user_id: int,
+    kind: str,
+    status: str,
+    deadline_at: datetime,
+    lease_until: datetime | None,
+) -> bool:
+    """Check the exact challenge generation immediately before a side effect.
+
+    A manual unban can replace a pending/preparing moderation challenge while
+    its worker is between database commits and ``restrictChatMember``.  Matching
+    only ``(group_id, user_id)`` would let that stale worker mute the member
+    after the newer release completed, so every immutable generation field is
+    included in this read.
+    """
+
+    conditions = [
+        JoinVerification.id == int(verification_id),
+        JoinVerification.group_id == int(group_id),
+        JoinVerification.user_id == int(user_id),
+        JoinVerification.kind == str(kind),
+        JoinVerification.status == str(status),
+        JoinVerification.deadline_at == deadline_at,
+    ]
+    if status in {
+        VERIFICATION_STATUS_PREPARING,
+        VERIFICATION_STATUS_ENFORCING,
+        VERIFICATION_STATUS_RELEASING,
+        VERIFICATION_STATUS_UNBANNING,
+    } and lease_until is None:
+        return False
+    if lease_until is None:
+        conditions.append(JoinVerification.lease_until.is_(None))
+    else:
+        conditions.append(JoinVerification.lease_until == lease_until)
+    no_autoflush = getattr(session, "no_autoflush", nullcontext())
+    with no_autoflush:
+        current = await session.scalar(select(JoinVerification.id).where(*conditions))
+    return current is not None
+
+
 async def list_expired_preparing_verifications(
     session: AsyncSession,
     *,
@@ -1886,6 +2220,22 @@ async def verification_release_blocked_by_ban(
             )
         )
     )
+
+
+async def verification_restriction_required(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+) -> bool:
+    record = await get_join_verification(session, int(group_id), int(user_id))
+    if record is None:
+        return False
+    return str(record.status or VERIFICATION_STATUS_PENDING) in {
+        VERIFICATION_STATUS_PREPARING,
+        VERIFICATION_STATUS_PENDING,
+        VERIFICATION_STATUS_ENFORCING,
+    }
 
 
 async def extend_pending_verification_deadlines(
@@ -2030,6 +2380,38 @@ async def restore_member_permissions(bot: Bot, chat_id: int, user_id: int) -> bo
     return False
 
 
+async def chat_member_is_present(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> bool | None:
+    """Return current membership, or ``None`` when Telegram cannot confirm it.
+
+    Queued join-security work can start long after the original update.  The
+    update's ``new_chat_member`` snapshot is therefore not authority for a new
+    restrict/ban.  Callers treat ``None`` as retryable/unsafe rather than
+    mutating a member based on stale state.
+    """
+
+    try:
+        member = await _bounded_telegram_call(
+            bot.get_chat_member(int(chat_id), int(user_id)),
+            timeout_seconds=4.0,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning(
+            "join security membership confirmation failed | chat=%s user=%s",
+            chat_id,
+            user_id,
+            exc_info=True,
+        )
+        return None
+    status = str(getattr(member, "status", "") or "").lower()
+    return status not in {"left", "kicked"}
+
+
 _KICK_CLEANUP_TASKS: set[asyncio.Task[bool]] = set()
 
 
@@ -2097,10 +2479,12 @@ async def _bounded_telegram_call(awaitable: object, *, timeout_seconds: float) -
         done, _ = await asyncio.wait({task}, timeout=max(0.1, timeout_seconds))
     except asyncio.CancelledError:
         task.cancel()
+        _track_telegram_call_orphan(task)
         raise
     if task in done:
         return task.result()
     task.cancel()
+    _track_telegram_call_orphan(task)
     raise asyncio.TimeoutError
 
 
@@ -2326,11 +2710,215 @@ async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
     return False
 
 
+async def enforce_ban_with_policy_reconciliation(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    preserve_ban: Callable[[], Awaitable[bool]],
+    restriction_required: Callable[[], Awaitable[bool]] | None = None,
+) -> bool | None:
+    """Ban once, then make the newest durable policy authoritative.
+
+    Returns ``True`` when the final policy still requires a ban, ``False``
+    when a newer release policy was successfully reflected to Telegram, and
+    ``None`` when either the remote operation or policy reconciliation is
+    ambiguous and the durable caller must retry.
+    """
+
+    if not await ban_member(bot, int(chat_id), int(user_id)):
+        return None
+    try:
+        still_blocked = bool(await preserve_ban())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "post-ban policy check failed | chat=%s user=%s",
+            chat_id,
+            user_id,
+        )
+        return None
+    if still_blocked:
+        return True
+    if not await reconcile_moderation_ban_after_lost_lease(
+        bot,
+        int(chat_id),
+        int(user_id),
+        preserve_ban,
+        restriction_required=restriction_required,
+    ):
+        return None
+    try:
+        return bool(await preserve_ban())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "post-reconciliation policy check failed | chat=%s user=%s",
+            chat_id,
+            user_id,
+        )
+        return None
+
+
+async def reconcile_stale_verification_restriction(
+    bot: Bot,
+    session_factory: async_sessionmaker[AsyncSession],
+    group_id: int,
+    user_id: int,
+) -> bool:
+    """Apply the latest durable intent after a restriction worker loses CAS.
+
+    The old implementation could successfully call ``restrictChatMember`` and
+    then discover that a concurrent ``/unban`` had converted/deleted its row.
+    Merely abandoning the stale worker leaves the user muted.  Conversely,
+    blindly restoring permissions could undo a newer challenge or ban.  This
+    helper reads the current policy twice and makes the latest durable state
+    authoritative on Telegram.
+    """
+
+    async def current_intent() -> tuple[bool, str]:
+        async with session_factory() as session:
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=int(group_id),
+                user_id=int(user_id),
+            )
+            record = await get_join_verification(
+                session,
+                int(group_id),
+                int(user_id),
+            )
+            status = (
+                str(record.status or VERIFICATION_STATUS_PENDING)
+                if record is not None
+                else ""
+            )
+            return bool(blocked), status
+
+    try:
+        blocked, status = await current_intent()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Failing open could lift a newly-created durable ban/challenge.
+        log.exception(
+            "stale verification restriction policy check failed | group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        return False
+    if blocked:
+        return await ban_member(bot, int(group_id), int(user_id))
+    if status in {
+        VERIFICATION_STATUS_PREPARING,
+        VERIFICATION_STATUS_PENDING,
+        VERIFICATION_STATUS_ENFORCING,
+    }:
+        return True
+
+    # If the newer /unban already completed and removed its journal, create an
+    # exact, insert-only preparation before attempting permission restoration.
+    # A failed Telegram restore then remains visible to the sweeper instead of
+    # leaving a permanently muted member with no durable recovery work.
+    recovery: PreparedVerification | None = None
+    if status not in {
+        VERIFICATION_STATUS_RELEASING,
+        VERIFICATION_STATUS_UNBANNING,
+    }:
+        for _attempt in range(2):
+            async with session_factory() as session:
+                recovery = await prepare_join_verification(
+                    session,
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    deadline_at=now_shanghai_naive(),
+                    kind=VERIFICATION_KIND_MODERATION,
+                    reason="旧验证限制恢复工单",
+                    provider="turnstile",
+                )
+                if recovery is not None:
+                    await session.commit()
+                else:
+                    await session.rollback()
+            if recovery is not None:
+                break
+            try:
+                blocked, status = await current_intent()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "stale verification recovery generation check failed | "
+                    "group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return False
+            if blocked:
+                return await ban_member(bot, int(group_id), int(user_id))
+            if status in {
+                VERIFICATION_STATUS_PREPARING,
+                VERIFICATION_STATUS_PENDING,
+                VERIFICATION_STATUS_ENFORCING,
+            }:
+                return True
+            if status in {
+                VERIFICATION_STATUS_RELEASING,
+                VERIFICATION_STATUS_UNBANNING,
+            }:
+                break
+        if recovery is None and status not in {
+            VERIFICATION_STATUS_RELEASING,
+            VERIFICATION_STATUS_UNBANNING,
+        }:
+            return False
+
+    restored = await restore_member_permissions(bot, int(group_id), int(user_id))
+    if not restored:
+        return False
+
+    if recovery is not None:
+        async with session_factory() as session:
+            deleted = await delete_prepared_join_verification(
+                session,
+                prepared=recovery,
+            )
+            if deleted:
+                await session.commit()
+            else:
+                await session.rollback()
+
+    # A policy/challenge created while restoration was in flight wins.
+    try:
+        blocked, status = await current_intent()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "stale verification restriction post-check failed | group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        return False
+    if blocked:
+        return await ban_member(bot, int(group_id), int(user_id))
+    if status in {
+        VERIFICATION_STATUS_PREPARING,
+        VERIFICATION_STATUS_PENDING,
+        VERIFICATION_STATUS_ENFORCING,
+    }:
+        return await restrict_new_member(bot, int(group_id), int(user_id))
+    return True
+
+
 async def reconcile_moderation_ban_after_lost_lease(
     bot: Bot,
     chat_id: int,
     user_id: int,
     preserve_ban: Callable[[], Awaitable[bool]],
+    *,
+    restriction_required: Callable[[], Awaitable[bool]] | None = None,
 ) -> bool:
     """Reconcile a successful Telegram ban whose durable generation was lost.
 
@@ -2371,6 +2959,20 @@ async def reconcile_moderation_ban_after_lost_lease(
         # reflected back to Telegram instead of being lifted by this cleanup.
         if await policy_blocks_release():
             return await ban_member(bot, chat_id, user_id)
+        if restriction_required is not None:
+            try:
+                if await restriction_required():
+                    return await restrict_new_member(bot, chat_id, user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "moderation ban reconciliation challenge check failed | "
+                    "chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return False
         return await restore_member_permissions(bot, chat_id, user_id)
 
     task = asyncio.create_task(
@@ -2384,6 +2986,77 @@ async def reconcile_moderation_ban_after_lost_lease(
     except asyncio.CancelledError:
         await _wait_for_kick_cleanup(task)
         raise
+
+
+async def release_moderation_restriction_after_exemption(
+    bot: Bot,
+    session: AsyncSession,
+    recovery: UnbanRecovery,
+) -> bool:
+    """Publish a new exemption and retire any older ban/mute generation.
+
+    The caller must commit the exemption and ``unbanning`` recovery row before
+    invoking this function, then publish the in-process generation marker.  A
+    newer durable ban/challenge always wins the post-network exact CAS.
+    """
+
+    group_id = int(recovery.group_id)
+    user_id = int(recovery.user_id)
+
+    async def preserve_ban() -> bool:
+        await session.rollback()
+        blocked = await verification_release_blocked_by_ban(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        await session.commit()
+        return bool(blocked)
+
+    async def preserve_restriction() -> bool:
+        await session.rollback()
+        required = await verification_restriction_required(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        await session.commit()
+        return bool(required)
+
+    if await preserve_ban():
+        reconciled = await ban_member(bot, group_id, user_id)
+    else:
+        unbanned = await unban_member(
+            bot,
+            group_id,
+            user_id,
+            preserve_ban=preserve_ban,
+        )
+        reconciled = bool(
+            unbanned
+            and await restore_member_permissions(bot, group_id, user_id)
+        )
+    if not reconciled:
+        return False
+
+    await session.rollback()
+    completed = await complete_leased_join_verification(
+        session,
+        verification_id=int(recovery.verification_id),
+        lease_until=recovery.lease_until,
+        status=VERIFICATION_STATUS_UNBANNING,
+    )
+    if completed:
+        await session.commit()
+        return True
+    await session.rollback()
+    return await reconcile_moderation_ban_after_lost_lease(
+        bot,
+        group_id,
+        user_id,
+        preserve_ban,
+        restriction_required=preserve_restriction,
+    )
 
 
 async def delete_verification_prompt(
@@ -2402,7 +3075,10 @@ async def delete_verification_prompt(
     if not message_id:
         return True
     try:
-        deleted = await bot.delete_message(int(chat_id), message_id)
+        deleted = await _bounded_telegram_call(
+            bot.delete_message(int(chat_id), message_id),
+            timeout_seconds=4.0,
+        )
         return deleted is not False
     except Exception:
         log.debug(
@@ -2415,10 +3091,13 @@ async def delete_verification_prompt(
     # mismatch), at least retire the live keyboard so subsequent taps cannot
     # keep reporting a confusing expired challenge.
     try:
-        edited = await bot.edit_message_reply_markup(
-            chat_id=int(chat_id),
-            message_id=message_id,
-            reply_markup=None,
+        edited = await _bounded_telegram_call(
+            bot.edit_message_reply_markup(
+                chat_id=int(chat_id),
+                message_id=message_id,
+                reply_markup=None,
+            ),
+            timeout_seconds=4.0,
         )
         return edited is not False
     except Exception:
@@ -2443,14 +3122,205 @@ async def delete_verification_prompts(
     }
     if not unique:
         return 0
+    semaphore = asyncio.Semaphore(4)
+
+    async def delete_one(group_id: int, message_id: int) -> bool:
+        async with semaphore:
+            return await delete_verification_prompt(bot, group_id, message_id)
+
     results = await asyncio.gather(
-        *(
-            delete_verification_prompt(bot, group_id, message_id)
-            for group_id, message_id in unique
-        ),
+        *(delete_one(group_id, message_id) for group_id, message_id in unique),
         return_exceptions=True,
     )
     return sum(result is True for result in results)
+
+
+async def _reconcile_moderation_challenge_restriction(
+    *,
+    bot: Bot,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    group_id: int,
+    user_id: int,
+) -> bool:
+    """Make the newest durable intent authoritative after a stale mute.
+
+    Production handlers provide a factory so policy reads never span Telegram
+    calls.  The session fallback keeps direct helper/tests safe while preserving
+    the same read-commit-side-effect-postcheck ordering.
+    """
+
+    if session_factory is not None:
+        return await reconcile_stale_verification_restriction(
+            bot,
+            session_factory,
+            int(group_id),
+            int(user_id),
+        )
+
+    async def current_intent() -> tuple[bool, bool]:
+        await session.rollback()
+        blocked = await verification_release_blocked_by_ban(
+            session,
+            group_id=int(group_id),
+            user_id=int(user_id),
+        )
+        restricted = await verification_restriction_required(
+            session,
+            group_id=int(group_id),
+            user_id=int(user_id),
+        )
+        await session.commit()
+        return bool(blocked), bool(restricted)
+
+    blocked, restricted = await current_intent()
+    if blocked:
+        return await ban_member(bot, int(group_id), int(user_id))
+    if restricted:
+        # The stale call already established the restriction required by the
+        # newer challenge, so no Telegram mutation is needed.
+        return True
+    restored = await restore_member_permissions(bot, int(group_id), int(user_id))
+    if not restored:
+        return False
+
+    # A challenge or ban created while restoration was in flight wins.
+    blocked, restricted = await current_intent()
+    if blocked:
+        return await ban_member(bot, int(group_id), int(user_id))
+    if restricted:
+        return await restrict_new_member(bot, int(group_id), int(user_id))
+    return True
+
+
+async def _shield_reconcile_moderation_challenge_restriction(
+    *,
+    bot: Bot,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    group_id: int,
+    user_id: int,
+) -> bool:
+    """Do not detach latest-intent reconciliation during update cancellation."""
+
+    task = asyncio.create_task(
+        _reconcile_moderation_challenge_restriction(
+            bot=bot,
+            session=session,
+            session_factory=session_factory,
+            group_id=group_id,
+            user_id=user_id,
+        ),
+        name=f"moderation-challenge-reconcile:{group_id}:{user_id}",
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception(
+                "moderation restriction reconciliation failed while cancellation was pending | "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+            )
+        raise
+
+
+async def _compensate_moderation_challenge(
+    *,
+    bot: Bot,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    prepared: PreparedVerification,
+    prompt_message_id: int,
+    restriction_applied: bool,
+) -> tuple[bool, bool]:
+    """Return ``(reconciled, superseded_generation)``."""
+
+    compensated = await abort_prepared_join_verification(
+        bot,
+        session,
+        prepared=prepared,
+        prompt_message_id=prompt_message_id,
+        restore_permissions=restriction_applied,
+    )
+    if compensated:
+        return True, False
+    if int(prompt_message_id or 0) > 0:
+        await delete_verification_prompt(
+            bot,
+            prepared.group_id,
+            int(prompt_message_id),
+        )
+    if not restriction_applied:
+        return False, True
+    reconciled = await _reconcile_moderation_challenge_restriction(
+        bot=bot,
+        session=session,
+        session_factory=session_factory,
+        group_id=prepared.group_id,
+        user_id=prepared.user_id,
+    )
+    if not reconciled:
+        log.critical(
+            "stale moderation restriction reconciliation failed | group=%s user=%s",
+            prepared.group_id,
+            prepared.user_id,
+        )
+    return reconciled, True
+
+
+async def _shield_compensate_moderation_challenge(
+    *,
+    bot: Bot,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    prepared: PreparedVerification,
+    prompt_message_id: int,
+    restriction_applied: bool,
+) -> tuple[bool, bool]:
+    """Drain compensation before propagating cancellation of its DB session."""
+
+    task = asyncio.create_task(
+        _compensate_moderation_challenge(
+            bot=bot,
+            session=session,
+            session_factory=session_factory,
+            prepared=prepared,
+            prompt_message_id=prompt_message_id,
+            restriction_applied=restriction_applied,
+        ),
+        name=f"moderation-challenge-compensate:{prepared.group_id}:{prepared.user_id}",
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception(
+                "moderation challenge compensation failed while cancellation was pending | "
+                "group=%s user=%s",
+                prepared.group_id,
+                prepared.user_id,
+            )
+        raise
 
 
 async def begin_moderation_challenge(
@@ -2463,6 +3333,7 @@ async def begin_moderation_challenge(
     display_name: str,
     bot_username: str,
     reason: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
     """Mute a sender, issue a provider challenge, and persist its deadline.
 
@@ -2486,6 +3357,7 @@ async def begin_moderation_challenge(
             display_name=display_name,
             bot_username=bot_username,
             reason=reason,
+            session_factory=session_factory,
         )
 
 
@@ -2499,6 +3371,7 @@ async def _begin_moderation_challenge_locked(
     display_name: str,
     bot_username: str,
     reason: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
     if not moderation_challenge_ready(settings):
         return False
@@ -2509,6 +3382,15 @@ async def _begin_moderation_challenge_locked(
     current = await get_join_verification(session, group_id, user_id)
     if current is not None:
         current_status = str(current.status or VERIFICATION_STATUS_PENDING)
+        current_generation = {
+            "verification_id": int(current.id),
+            "group_id": int(current.group_id),
+            "user_id": int(current.user_id),
+            "kind": str(current.kind),
+            "status": current_status,
+            "deadline_at": current.deadline_at,
+            "lease_until": getattr(current, "lease_until", None),
+        }
         # The duplicate path only needs this immutable challenge snapshot.
         # End the SELECT transaction before the Telegram restriction call.
         await session.commit()
@@ -2518,8 +3400,45 @@ async def _begin_moderation_challenge_locked(
             in {VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_ENFORCING}
         ):
             # Another concurrent message already issued the challenge. Keep
-            # the original deadline and prompt instead of extending it.
-            await restrict_new_member(bot, group_id, user_id)
+            # the original deadline and prompt instead of extending it. Check
+            # the exact generation both before and after Telegram: /unban can
+            # replace/delete the row in either side of that network await.
+            generation_current = await _join_verification_generation_is_current(
+                session,
+                **current_generation,
+            )
+            await session.commit()
+            if not generation_current:
+                log.info(
+                    "duplicate moderation challenge superseded before mute | "
+                    "group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return True
+            restricted = await restrict_new_member(bot, group_id, user_id)
+            if not restricted:
+                return False
+            generation_current = await _join_verification_generation_is_current(
+                session,
+                **current_generation,
+            )
+            await session.commit()
+            if not generation_current:
+                reconciled = await _shield_reconcile_moderation_challenge_restriction(
+                    bot=bot,
+                    session=session,
+                    session_factory=session_factory,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+                if not reconciled:
+                    log.critical(
+                        "duplicate moderation mute lost generation and could not reconcile | "
+                        "group=%s user=%s",
+                        group_id,
+                        user_id,
+                    )
             return True
         return False
 
@@ -2542,14 +3461,68 @@ async def _begin_moderation_challenge_locked(
 
     prompt_message_id = 0
     activated = False
+    restriction_applied = False
+    compensation_attempted = False
     try:
-        if not await restrict_new_member(bot, group_id, user_id):
-            await shield_abort_prepared_join_verification(
-                bot,
-                session,
-                prepared=prepared,
+        generation_current = await _join_verification_generation_is_current(
+            session,
+            verification_id=prepared.verification_id,
+            group_id=prepared.group_id,
+            user_id=prepared.user_id,
+            kind=prepared.kind,
+            status=VERIFICATION_STATUS_PREPARING,
+            deadline_at=deadline,
+            lease_until=prepared.lease_until,
+        )
+        await session.commit()
+        if not generation_current:
+            log.info(
+                "moderation challenge superseded before mute | group=%s user=%s",
+                group_id,
+                user_id,
             )
-            return False
+            return True
+        if not await restrict_new_member(bot, group_id, user_id):
+            compensation_attempted = True
+            _reconciled, superseded = await _shield_compensate_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=session_factory,
+                prepared=prepared,
+                prompt_message_id=0,
+                restriction_applied=False,
+            )
+            return bool(superseded)
+        restriction_applied = True
+        generation_current = await _join_verification_generation_is_current(
+            session,
+            verification_id=prepared.verification_id,
+            group_id=prepared.group_id,
+            user_id=prepared.user_id,
+            kind=prepared.kind,
+            status=VERIFICATION_STATUS_PREPARING,
+            deadline_at=deadline,
+            lease_until=prepared.lease_until,
+        )
+        await session.commit()
+        if not generation_current:
+            compensation_attempted = True
+            reconciled, _superseded = await _shield_compensate_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=session_factory,
+                prepared=prepared,
+                prompt_message_id=0,
+                restriction_applied=True,
+            )
+            if not reconciled:
+                log.critical(
+                    "moderation challenge mute lost generation and could not reconcile | "
+                    "group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+            return True
         sent = await bot.send_message(
             group_id,
             build_moderation_prompt_text(
@@ -2587,20 +3560,28 @@ async def _begin_moderation_challenge_locked(
                 )
             raise
         if not activated:
-            await shield_abort_prepared_join_verification(
-                bot,
-                session,
+            compensation_attempted = True
+            _reconciled, superseded = await _shield_compensate_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=session_factory,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
+                restriction_applied=restriction_applied,
             )
-            return False
+            # A superseding release/challenge is authoritative. Do not let the
+            # caller fall through to an older warn/ban verdict after cleanup.
+            return bool(superseded)
     except asyncio.CancelledError:
-        if not activated:
-            await shield_abort_prepared_join_verification(
-                bot,
-                session,
+        if not activated and not compensation_attempted:
+            compensation_attempted = True
+            await _shield_compensate_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=session_factory,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
+                restriction_applied=restriction_applied,
             )
         raise
     except Exception:
@@ -2609,13 +3590,18 @@ async def _begin_moderation_challenge_locked(
             group_id,
             user_id,
         )
-        if not activated:
-            await shield_abort_prepared_join_verification(
-                bot,
-                session,
+        if not activated and not compensation_attempted:
+            compensation_attempted = True
+            _reconciled, superseded = await _shield_compensate_moderation_challenge(
+                bot=bot,
+                session=session,
+                session_factory=session_factory,
                 prepared=prepared,
                 prompt_message_id=prompt_message_id,
+                restriction_applied=restriction_applied,
             )
+            if superseded:
+                return True
         return False
     log.info(
         "moderation challenge issued | group=%s user=%s timeout=%ss",
@@ -2804,7 +3790,8 @@ class JoinVerificationSweeper:
         consecutive_failures = 0
         while True:
             try:
-                await self.sweep_once()
+                async with asyncio.timeout(_VERIFICATION_SWEEP_DEADLINE_SECONDS):
+                    await self.sweep_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2954,24 +3941,40 @@ class JoinVerificationSweeper:
             # muted/banned member with no durable work item.
             await session.commit()
 
-        for record in preparing_claimed:
-            await self._recover_preparing(record)
-
-        for record in releasing_claimed:
-            await self._recover_releasing(record)
-
-        for record in unbanning_claimed:
-            await self._recover_unbanning(record)
-
-        for record in unauthorized_enforcing_claimed:
-            await self._recover_unauthorized_enforcing(record)
-
-        for record, protected_owner, globally_banned in claimed:
+        async def enforce_claimed(
+            record: JoinVerification,
+            protected_owner: bool,
+            globally_banned: bool,
+        ) -> None:
+            # Booleans captured during the claim transaction are only hints.
+            # Re-read policy after the lease wait so a concurrent /unban (or a
+            # newly protected owner) wins before any Telegram mutation.
+            del protected_owner, globally_banned
             if not await self._renew_terminal_record(
                 record,
                 status=VERIFICATION_STATUS_ENFORCING,
             ):
-                continue
+                return
+            lease_until = getattr(record, "lease_until", None)
+            if lease_until is None:
+                return
+            protected_owner = bool(
+                self.settings is not None
+                and is_super_admin_user_id(record.user_id, self.settings)
+            )
+            async with self.session_factory() as policy_session:
+                lease_is_current = await join_verification_lease_is_current(
+                    policy_session,
+                    verification_id=int(record.id),
+                    lease_until=lease_until,
+                    status=VERIFICATION_STATUS_ENFORCING,
+                )
+                globally_banned = await is_globally_banned(
+                    policy_session,
+                    int(record.user_id),
+                )
+            if not lease_is_current:
+                return
             log.info(
                 "verification timeout | kind=%s group=%s user=%s",
                 record.kind,
@@ -2981,6 +3984,14 @@ class JoinVerificationSweeper:
             shown = html.escape(
                 (record.display_name or "").strip() or str(record.user_id)
             )
+            if protected_owner:
+                if not await self._recover_protected_owner(record):
+                    return
+                await self._finalize_prompt(
+                    record,
+                    f"✅ <b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
+                )
+                return
             if globally_banned:
                 # The registry is policy, not proof that Telegram enforcement
                 # succeeded in this group. Re-apply the idempotent ban so the
@@ -2998,17 +4009,11 @@ class JoinVerificationSweeper:
                         record.group_id,
                         record.user_id,
                     )
-                    continue
-                await self._complete_enforcement(record)
-                continue
-            if protected_owner:
-                if not await self._recover_protected_owner(record):
-                    continue
-                await self._finalize_prompt(
-                    record,
-                    f"✅ <b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
-                )
-                continue
+                    return
+                completed = await self._complete_enforcement(record)
+                if not completed:
+                    await self._reconcile_lost_moderation_ban(record)
+                return
             if record.kind == VERIFICATION_KIND_MODERATION:
                 enforced = await ban_member(self.bot, record.group_id, record.user_id)
                 if not enforced:
@@ -3019,9 +4024,9 @@ class JoinVerificationSweeper:
                         record.user_id,
                         released,
                     )
-                    continue
+                    return
                 if not await self._complete_enforcement(record, mark_banned=True):
-                    continue
+                    return
                 text = f"⏰ <b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
             else:
                 async def preserve_ban() -> bool:
@@ -3046,9 +4051,15 @@ class JoinVerificationSweeper:
                         record.group_id,
                         record.user_id,
                     )
-                    continue
+                    return
                 if not await self._complete_enforcement(record):
-                    continue
+                    await reconcile_stale_verification_restriction(
+                        self.bot,
+                        self.session_factory,
+                        int(record.group_id),
+                        int(record.user_id),
+                    )
+                    return
                 if record.kind == VERIFICATION_KIND_PATROL:
                     text = (
                         f"⏰ <b>{shown}</b> 资料巡检质询超时，"
@@ -3064,6 +4075,66 @@ class JoinVerificationSweeper:
                         f"⏰ <b>{shown}</b> 验证超时，已移出群聊。可重新加入再次验证。"
                     )
             await self._finalize_prompt(record, text)
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def run_bounded(
+            label: str,
+            operation: Callable[[], Awaitable[object]],
+        ) -> None:
+            async with semaphore:
+                try:
+                    async with asyncio.timeout(45.0):
+                        await operation()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("verification sweep operation failed | operation=%s", label)
+
+        operations: list[tuple[str, Callable[[], Awaitable[object]]]] = []
+        operations.extend(
+            (
+                f"preparing:{record.id}",
+                lambda record=record: self._recover_preparing(record),
+            )
+            for record in preparing_claimed
+        )
+        operations.extend(
+            (
+                f"releasing:{record.id}",
+                lambda record=record: self._recover_releasing(record),
+            )
+            for record in releasing_claimed
+        )
+        operations.extend(
+            (
+                f"unbanning:{record.id}",
+                lambda record=record: self._recover_unbanning(record),
+            )
+            for record in unbanning_claimed
+        )
+        operations.extend(
+            (
+                f"unauthorized-enforcing:{record.id}",
+                lambda record=record: self._recover_unauthorized_enforcing(record),
+            )
+            for record in unauthorized_enforcing_claimed
+        )
+        operations.extend(
+            (
+                f"enforcing:{record.id}",
+                lambda record=record, protected_owner=protected_owner,
+                globally_banned=globally_banned: enforce_claimed(
+                    record,
+                    protected_owner,
+                    globally_banned,
+                ),
+            )
+            for record, protected_owner, globally_banned in claimed
+        )
+        await asyncio.gather(
+            *(run_bounded(label, operation) for label, operation in operations)
+        )
         return (
             len(preparing_claimed)
             + len(releasing_claimed)

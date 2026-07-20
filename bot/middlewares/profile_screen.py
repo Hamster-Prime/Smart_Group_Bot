@@ -13,19 +13,31 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
     add_global_ban,
     build_join_profile_text,
     get_global_ban,
     get_profile_screen_hash,
+    is_join_screening_exempt,
     mark_profile_screened,
     moderation_rules_fingerprint,
     profile_screen_signature,
     screen_member_profile_verbose,
 )
-from bot.services.join_verification import ban_member
+from bot.services.join_verification import (
+    complete_leased_join_verification,
+    enforce_ban_with_policy_reconciliation,
+    lease_join_verification_for_unban,
+    manual_unban_generation_is_active,
+    verification_release_blocked_by_ban,
+    verification_restriction_required,
+)
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
+from bot.services.request_priority import is_privileged_execution
+from bot.services.update_delivery import telegram_message_is_privileged_candidate
+from bot.services.update_completion import request_current_update_retry
 from bot.utils.telegram import answer_with_auto_delete, configured_auto_delete_seconds
 
 log = logging.getLogger(__name__)
@@ -38,6 +50,7 @@ class _ScreeningGate:
     reviewed_signature: str | None = None
     violation_confirmed: bool = False
     reason: str = ""
+    enforcement_outcome: str = ""
 
 
 class ProfileScreenEnforcementMiddleware(BaseMiddleware):
@@ -134,11 +147,18 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             return await handler(event, data)
         if is_super_admin_user_id(user.id, settings):
             return await handler(event, data)
+        # Permission handlers perform authoritative authorization. Never spend
+        # LLM/DB profile capacity on raw management-command candidates: an
+        # attacker can forge command text but cannot pass the handler check.
+        # A real administrator is screened on later ordinary messages instead.
+        if is_privileged_execution() or telegram_message_is_privileged_candidate(event):
+            return await handler(event, data)
 
         full_name = (getattr(user, "full_name", None) or "").strip()
         username = (getattr(user, "username", None) or "").strip()
         violation_confirmed = False
         reason = ""
+        ban_recovery = None
         try:
             # Fast path for an unchanged, previously-passed profile. Always
             # query the ban after the signature read: a concurrent message may
@@ -224,6 +244,15 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                     )
                                     if violated:
                                         async with self.session_factory() as session:
+                                            # Serialize the final policy decision
+                                            # with /unban and exemption writes. An
+                                            # older LLM verdict must never delete a
+                                            # newer administrator exemption through
+                                            # add_global_ban().
+                                            await acquire_group_settings_write_intent(
+                                                session,
+                                                chat.id,
+                                            )
                                             if not await is_group_authorized(
                                                 session,
                                                 chat.id,
@@ -236,6 +265,51 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                                 violation_confirmed = False
                                                 gate.violation_confirmed = False
                                                 gate.reason = ""
+                                                return await handler(event, data)
+                                            if (
+                                                manual_unban_generation_is_active(
+                                                    chat.id,
+                                                    user.id,
+                                                )
+                                                or await is_join_screening_exempt(
+                                                    session,
+                                                    user.id,
+                                                )
+                                                or await moderation.is_user_exempt(
+                                                    session,
+                                                    chat.id,
+                                                    user.id,
+                                                )
+                                            ):
+                                                await session.commit()
+                                                violation_confirmed = False
+                                                gate.violation_confirmed = False
+                                                gate.reason = ""
+                                                gate.reviewed_signature = signature
+                                                log.info(
+                                                    "profile verdict discarded | "
+                                                    "reason=newer_admin_exemption "
+                                                    "chat=%s user=%s",
+                                                    chat.id,
+                                                    user.id,
+                                                )
+                                                return await handler(event, data)
+                                            ban_recovery = (
+                                                await lease_join_verification_for_unban(
+                                                    session,
+                                                    chat.id,
+                                                    user.id,
+                                                    manual_unban=False,
+                                                )
+                                            )
+                                            if ban_recovery is None:
+                                                await session.rollback()
+                                                log.error(
+                                                    "profile ban recovery journal could not be created | "
+                                                    "chat=%s user=%s",
+                                                    chat.id,
+                                                    user.id,
+                                                )
                                                 return await handler(event, data)
                                             await add_global_ban(
                                                 session,
@@ -282,35 +356,121 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
         if not violation_confirmed:
             return await handler(event, data)
 
-        log.info("[%s] profile re-screening hit | user=%s reason=%s", chat.id, user.id, reason or "-")
+        async def preserve_ban() -> bool:
+            if manual_unban_generation_is_active(chat.id, user.id):
+                return False
+            async with self.session_factory() as policy_session:
+                if not await is_group_authorized(policy_session, chat.id):
+                    await policy_session.commit()
+                    return False
+                blocked = await verification_release_blocked_by_ban(
+                    policy_session,
+                    group_id=chat.id,
+                    user_id=user.id,
+                )
+                await policy_session.commit()
+                return blocked
+
+        async def restriction_required() -> bool:
+            async with self.session_factory() as policy_session:
+                required = await verification_restriction_required(
+                    policy_session,
+                    group_id=chat.id,
+                    user_id=user.id,
+                )
+                await policy_session.commit()
+                return required
+
+        async def enforce_once() -> str:
+            log.info(
+                "[%s] profile re-screening hit | user=%s reason=%s",
+                chat.id,
+                user.id,
+                reason or "-",
+            )
+            final_banned = await enforce_ban_with_policy_reconciliation(
+                event.bot,
+                int(chat.id),
+                int(user.id),
+                preserve_ban,
+                restriction_required,
+            )
+            if final_banned is None:
+                log.error(
+                    "[%s] profile screening ban unconfirmed; durable global policy retained | "
+                    "user=%s",
+                    chat.id,
+                    user.id,
+                )
+                request_current_update_retry()
+                return "retry"
+            if not final_banned:
+                return "released"
+            if ban_recovery is not None:
+                async with self.session_factory() as completion_session:
+                    completed = await complete_leased_join_verification(
+                        completion_session,
+                        verification_id=int(ban_recovery.verification_id),
+                        lease_until=ban_recovery.lease_until,
+                        status="unbanning",
+                    )
+                    if completed:
+                        await completion_session.commit()
+                    else:
+                        await completion_session.rollback()
+                        final_banned = await enforce_ban_with_policy_reconciliation(
+                            event.bot,
+                            int(chat.id),
+                            int(user.id),
+                            preserve_ban,
+                            restriction_required,
+                        )
+                        if final_banned is not True:
+                            if final_banned is None:
+                                request_current_update_retry()
+                                return "retry"
+                            return "released"
+            shown = html.escape(full_name or (f"@{username}" if username else str(user.id)))
+            notice = (
+                f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
+                f"原因：{html.escape(reason or '资料命中群规')}\n"
+                "如需解封请管理员使用 /unban 命令。"
+            )
+            try:
+                await answer_with_auto_delete(
+                    event,
+                    notice,
+                    auto_delete_seconds=configured_auto_delete_seconds(
+                        settings, "moderation"
+                    ),
+                )
+            except Exception:
+                log.exception("[%s] profile screening notice failed", chat.id)
+            return "banned"
+
+        async with self._screening_gate(chat.id, user.id) as enforcement_gate:
+            outcome = enforcement_gate.enforcement_outcome
+            if not outcome:
+                outcome = await enforce_once()
+                if outcome != "retry":
+                    enforcement_gate.enforcement_outcome = outcome
+                    if outcome == "released":
+                        enforcement_gate.violation_confirmed = False
+                        enforcement_gate.reason = ""
+
+        if outcome == "released":
+            return await handler(event, data)
+        if outcome == "retry":
+            return None
+        # Only one waiter performs the expensive, idempotent Telegram ban and
+        # sends the moderation notice, but every message that entered this
+        # shared violating-profile generation must still be removed.  Keeping
+        # deletion outside ``enforce_once`` prevents queued messages from
+        # surviving merely because another waiter won the enforcement gate.
         try:
             await event.delete()
         except Exception:
             pass
-        if not await ban_member(event.bot, int(chat.id), int(user.id)):
-            log.error(
-                "[%s] profile screening ban unconfirmed; durable global policy retained | "
-                "user=%s",
-                chat.id,
-                user.id,
-            )
-
-        shown = html.escape(full_name or (f"@{username}" if username else str(user.id)))
-        notice = (
-            f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
-            f"原因：{html.escape(reason or '资料命中群规')}\n"
-            "如需解封请管理员使用 /unban 命令。"
-        )
-        try:
-            await answer_with_auto_delete(
-                event,
-                notice,
-                auto_delete_seconds=configured_auto_delete_seconds(
-                    settings, "moderation"
-                ),
-            )
-        except Exception:
-            log.exception("[%s] profile screening notice failed", chat.id)
         return None
 
 

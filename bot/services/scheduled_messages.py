@@ -40,6 +40,8 @@ from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
+_SCHEDULED_PASS_DEADLINE_SECONDS = 300.0
+
 SCHEDULE_TYPES = ("daily", "interval")
 _CHECK_INTERVAL_SECONDS = 30.0
 _MIN_INTERVAL_MINUTES = 5
@@ -131,7 +133,8 @@ class ScheduledMessageService:
         consecutive_failures = 0
         while True:
             try:
-                await self.run_once(raise_on_total_failure=True)
+                async with asyncio.timeout(_SCHEDULED_PASS_DEADLINE_SECONDS):
+                    await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

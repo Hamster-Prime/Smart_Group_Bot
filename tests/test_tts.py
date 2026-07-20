@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from bot.config import Settings
 from bot.handlers import admin
+from bot.services import doubao_tts as doubao_tts_module
 from bot.services.doubao_tts import DoubaoTTSService
 from bot.services.doubao_tts import (
     TTS_MODE_ALWAYS,
@@ -250,6 +252,48 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("bot.services.doubao_tts._TTS_MAX_AUDIO_BYTES", 4),
             self.assertRaisesRegex(RuntimeError, "ffmpeg_output_too_large"),
+        ):
+            await DoubaoTTSService._convert_mp3_to_ogg_opus(b"mp3")
+
+    async def test_synthesis_slot_admission_is_bounded(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+
+        with (
+            patch.object(
+                doubao_tts_module,
+                "_TTS_SYNTHESIS_SEMAPHORE",
+                asyncio.Semaphore(0),
+            ),
+            patch.object(
+                doubao_tts_module,
+                "_TTS_SYNTHESIS_ADMISSION_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            result = await service.synthesize("你好", uid="1")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "tts_busy")
+
+    async def test_transcode_slot_admission_is_bounded(self) -> None:
+        with (
+            patch.object(
+                doubao_tts_module,
+                "_TTS_TRANSCODE_SEMAPHORE",
+                asyncio.Semaphore(0),
+            ),
+            patch.object(
+                doubao_tts_module,
+                "_TTS_TRANSCODE_ADMISSION_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            self.assertRaisesRegex(RuntimeError, "tts_transcode_busy"),
         ):
             await DoubaoTTSService._convert_mp3_to_ogg_opus(b"mp3")
 

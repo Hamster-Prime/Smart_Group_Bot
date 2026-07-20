@@ -237,6 +237,70 @@ class PatrolTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(service._manual_tasks, set())
 
+    async def test_same_group_reservation_prevents_slot_wait_race(self) -> None:
+        service = PatrolService(
+            bot=_bot_mock(),
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def run_locked(_group_id: int) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {"status": "completed"}
+
+        service._run_group_patrol_locked = run_locked  # type: ignore[method-assign]
+        first = asyncio.create_task(service.run_group_patrol(-100))
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        second = await asyncio.wait_for(service.run_group_patrol(-100), timeout=0.2)
+        self.assertEqual(second, {"status": "already_running"})
+        self.assertEqual(calls, 1)
+        release.set()
+        self.assertEqual((await first)["status"], "completed")
+
+    async def test_run_slot_admission_is_bounded(self) -> None:
+        service = PatrolService(
+            bot=_bot_mock(),
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        service._run_slots = asyncio.Semaphore(0)
+        with patch(
+            "bot.services.patrol._PATROL_RUN_ADMISSION_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            result = await asyncio.wait_for(
+                service.run_group_patrol(-100),
+                timeout=0.2,
+            )
+        self.assertEqual(result, {"status": "busy"})
+        self.assertFalse(service.is_running(-100))
+
+    async def test_manual_duplicate_is_rejected_before_task_starts(self) -> None:
+        service = PatrolService(
+            bot=_bot_mock(),
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        release = asyncio.Event()
+
+        async def blocked_manual(_group_id: int) -> None:
+            await release.wait()
+
+        service._manual_patrol = blocked_manual  # type: ignore[method-assign]
+        first = service.start_manual_patrol(-100)
+        second = service.start_manual_patrol(-100)
+        self.assertTrue(first["started"])
+        self.assertFalse(second["started"])
+        self.assertEqual(second["status"], "already_running")
+        release.set()
+        await asyncio.gather(*service._manual_tasks)
+
 
 class WarningMessageTests(unittest.TestCase):
     def test_warning_mentions_all_violators(self) -> None:

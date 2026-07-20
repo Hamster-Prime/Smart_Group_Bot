@@ -8,6 +8,7 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,7 @@ from aiogram.types import BufferedInputFile, Message
 
 from bot.config import Settings
 from bot.db.models import Group
+from bot.services.resource_health import register_resource_health_provider
 from bot.utils.telegram import (
     is_reply_target_missing_error,
     sanitize_outgoing_text,
@@ -62,6 +64,40 @@ _TTS_MAX_JSON_FRAME_CHARS = 8 * 1024 * 1024
 _TTS_MAX_ERROR_BYTES = 64 * 1024
 _TTS_MAX_AUDIO_BYTES = 20 * 1024 * 1024
 _TTS_TRANSCODE_TIMEOUT_SECONDS = 30.0
+_TTS_MAX_HTTP_TIMEOUT_SECONDS = 60.0
+_TTS_SYNTHESIS_CONCURRENCY = 3
+_TTS_TRANSCODE_CONCURRENCY = 2
+_TTS_MAX_SEGMENTS_PER_MESSAGE = 6
+_TTS_SYNTHESIS_ADMISSION_TIMEOUT_SECONDS = 2.0
+_TTS_TRANSCODE_ADMISSION_TIMEOUT_SECONDS = 2.0
+_TTS_SYNTHESIS_SEMAPHORE = asyncio.Semaphore(_TTS_SYNTHESIS_CONCURRENCY)
+_TTS_TRANSCODE_SEMAPHORE = asyncio.Semaphore(_TTS_TRANSCODE_CONCURRENCY)
+_TTS_SYNTHESIS_SLOT_HELD: ContextVar[bool] = ContextVar(
+    "smart_group_bot_tts_slot_held",
+    default=False,
+)
+
+
+def tts_resource_health_snapshot() -> dict[str, Any]:
+    synth_waiters = getattr(_TTS_SYNTHESIS_SEMAPHORE, "_waiters", None)
+    transcode_waiters = getattr(_TTS_TRANSCODE_SEMAPHORE, "_waiters", None)
+    return {
+        "ok": True,
+        "fatal": False,
+        "synthesis_capacity": _TTS_SYNTHESIS_CONCURRENCY,
+        "synthesis_available": int(
+            getattr(_TTS_SYNTHESIS_SEMAPHORE, "_value", 0)
+        ),
+        "synthesis_waiters": len(synth_waiters or ()),
+        "transcode_capacity": _TTS_TRANSCODE_CONCURRENCY,
+        "transcode_available": int(
+            getattr(_TTS_TRANSCODE_SEMAPHORE, "_value", 0)
+        ),
+        "transcode_waiters": len(transcode_waiters or ()),
+    }
+
+
+register_resource_health_provider("tts", tts_resource_health_snapshot)
 
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword in text for keyword in keywords)
@@ -604,6 +640,41 @@ class DoubaoTTSService:
         if not self.available:
             return TTSSynthesisResult(ok=False, error="tts_not_configured")
 
+        if not _TTS_SYNTHESIS_SLOT_HELD.get():
+            acquired = False
+            try:
+                try:
+                    async with asyncio.timeout(
+                        _TTS_SYNTHESIS_ADMISSION_TIMEOUT_SECONDS
+                    ):
+                        await _TTS_SYNTHESIS_SEMAPHORE.acquire()
+                        acquired = True
+                except TimeoutError:
+                    log.warning("doubao tts synthesis admission timed out")
+                    return TTSSynthesisResult(ok=False, error="tts_busy")
+
+                token = _TTS_SYNTHESIS_SLOT_HELD.set(True)
+                try:
+                    return await self.synthesize(
+                        text,
+                        uid=uid,
+                        emotion=emotion,
+                        emotion_scale=emotion_scale,
+                        speech_rate=speech_rate,
+                        loudness_rate=loudness_rate,
+                        context=context,
+                        audio_format=audio_format,
+                        sample_rate=sample_rate,
+                        bit_rate=bit_rate,
+                        _use_default_emotion=_use_default_emotion,
+                        _auto_style=_auto_style,
+                    )
+                finally:
+                    _TTS_SYNTHESIS_SLOT_HELD.reset(token)
+            finally:
+                if acquired:
+                    _TTS_SYNTHESIS_SEMAPHORE.release()
+
         normalized = self.normalize_text(text)
         if not normalized:
             return TTSSynthesisResult(ok=False, error="empty_text")
@@ -622,7 +693,12 @@ class DoubaoTTSService:
         )
 
         request_id = str(uuid.uuid4())
-        timeout = aiohttp.ClientTimeout(total=max(5.0, self.http_timeout_sec))
+        timeout = aiohttp.ClientTimeout(
+            total=min(
+                _TTS_MAX_HTTP_TIMEOUT_SECONDS,
+                max(5.0, self.http_timeout_sec),
+            )
+        )
         try:
             async with aiohttp.ClientSession(timeout=timeout) as client:
                 async with client.post(
@@ -746,6 +822,35 @@ class DoubaoTTSService:
 
     @staticmethod
     async def _convert_mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TTS_TRANSCODE_TIMEOUT_SECONDS
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(
+                    min(
+                        _TTS_TRANSCODE_ADMISSION_TIMEOUT_SECONDS,
+                        max(0.01, deadline - loop.time()),
+                    )
+                ):
+                    await _TTS_TRANSCODE_SEMAPHORE.acquire()
+                    acquired = True
+            except TimeoutError as exc:
+                raise RuntimeError("tts_transcode_busy") from exc
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError("tts_transcode_timeout")
+            async with asyncio.timeout(remaining):
+                return await DoubaoTTSService._convert_mp3_to_ogg_opus_unbounded(
+                    mp3_bytes
+                )
+        finally:
+            if acquired:
+                _TTS_TRANSCODE_SEMAPHORE.release()
+
+    @staticmethod
+    async def _convert_mp3_to_ogg_opus_unbounded(mp3_bytes: bytes) -> bytes:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-hide_banner",
@@ -753,6 +858,8 @@ class DoubaoTTSService:
             "error",
             "-i",
             "pipe:0",
+            "-threads",
+            "1",
             "-c:a",
             "libopus",
             "-b:a",
@@ -927,6 +1034,8 @@ class DoubaoTTSService:
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                if wait_s > 10.0:
+                    return False
                 await asyncio.sleep(wait_s)
                 attempt += 1
             except TelegramBadRequest as exc:
@@ -965,6 +1074,9 @@ class DoubaoTTSService:
 
         segments = self.split_text(text)
         if not segments:
+            return False
+        if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
+            log.warning("tts message has too many segments: %d", len(segments))
             return False
 
         for idx, segment in enumerate(segments):
@@ -1024,6 +1136,9 @@ class DoubaoTTSService:
 
         segments = self.split_text(text)
         if not segments:
+            return False
+        if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
+            log.warning("tts message has too many segments: %d", len(segments))
             return False
 
         fallback_caption_html = ""
@@ -1089,6 +1204,8 @@ class DoubaoTTSService:
                     break
                 except TelegramRetryAfter as exc:
                     wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+                    if wait_s > 10.0:
+                        return False
                     await asyncio.sleep(wait_s)
                     attempt += 1
                 except TelegramBadRequest as exc:

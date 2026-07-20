@@ -1,8 +1,8 @@
 services:
   bot:
     build: .
-    # Match the bind-mounted ./data owner. Override these on hosts whose service
-    # account is not UID/GID 1000.
+    # Preserve the historical bind-mount owner used by existing deployments.
+    # Fresh hosts may set APP_UID/APP_GID=10001 to match the image account.
     user: "${APP_UID:-1000}:${APP_GID:-1000}"
     init: true
     env_file: .env
@@ -14,8 +14,38 @@ services:
       # Safe default for a reverse proxy on this host. Set
       # MINIAPP_BIND_ADDRESS=0.0.0.0 only when another container/host must reach
       # the backend directly and a firewall protects the port.
-      - "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:8480:8480"
+      - "${MINIAPP_BIND_ADDRESS:-127.0.0.1}:${MINIAPP_LISTEN_PORT:-8480}:${MINIAPP_LISTEN_PORT:-8480}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          port = os.environ.get('MINIAPP_LISTEN_PORT', '8480');
+          urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Keep one bot from exhausting a small shared host. All limits are
+    # overrideable for larger deployments without editing this file.
+    mem_limit: "${BOT_MEMORY_LIMIT:-1536m}"
+    memswap_limit: "${BOT_MEMORY_SWAP_LIMIT:-1536m}"
+    mem_reservation: "${BOT_MEMORY_RESERVATION:-256m}"
+    cpus: "${BOT_CPU_LIMIT:-2.0}"
+    pids_limit: ${BOT_PIDS_LIMIT:-128}
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    logging:
+      driver: local
+      options:
+        max-size: "${BOT_LOG_MAX_SIZE:-10m}"
+        max-file: "${BOT_LOG_MAX_FILES:-5}"
     # The application drains durable updates, replies and cleanup jobs in a
     # bounded sequence; Docker's 10-second default would SIGKILL it mid-drain.
-    stop_grace_period: 8m
+    # Must remain above the application's 110-second hard shutdown watchdog.
+    stop_grace_period: 125s
     restart: unless-stopped

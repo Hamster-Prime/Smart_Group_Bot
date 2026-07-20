@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import re
@@ -36,6 +37,7 @@ class ModerationVerdict:
     rule: ModerationRule | None
     conclusive: bool
     confidence: float = 0.0
+    rules_fingerprint: str = ""
 
 
 def _parse_confidence(value: object) -> tuple[float, bool]:
@@ -224,6 +226,22 @@ class ModerationService:
             )
             for rule in loaded_rules
         ]
+        rules_raw = "\x1e".join(
+            "\x1f".join(
+                str(value)
+                for value in (rule.id, rule.rule_type, rule.pattern, rule.action)
+            )
+            for rule in rules
+        )
+        rules_fingerprint = hashlib.sha256(
+            rules_raw.encode("utf-8")
+        ).hexdigest()[:16]
+
+        def make_verdict(**kwargs: object) -> ModerationVerdict:
+            return ModerationVerdict(
+                **kwargs,
+                rules_fingerprint=rules_fingerprint,
+            )
 
         # A SELECT starts a SQLite transaction and keeps a pooled connection
         # checked out.  End that read-only transaction before regex/LLM work so
@@ -234,7 +252,7 @@ class ModerationService:
 
         if not rules:
             log.info("审核通过 (无启用规则)")
-            return ModerationVerdict(violated=False, reason="", rule=None, conclusive=True)
+            return make_verdict(violated=False, reason="", rule=None, conclusive=True)
 
         deterministic_inconclusive = False
         llm_rules: list[ModerationRule] = []
@@ -255,7 +273,7 @@ class ModerationService:
                     continue
                 if pattern.casefold() in folded_text:
                     log.info("审核命中本地关键词: group=%s rule_id=%s", group_id, rule.id)
-                    return ModerationVerdict(
+                    return make_verdict(
                         violated=True,
                         reason="命中关键词规则",
                         rule=rule,
@@ -299,7 +317,7 @@ class ModerationService:
                     continue
                 if matched is not None:
                     log.info("审核命中本地正则: group=%s rule_id=%s", group_id, rule.id)
-                    return ModerationVerdict(
+                    return make_verdict(
                         violated=True,
                         reason="命中正则规则",
                         rule=rule,
@@ -313,7 +331,7 @@ class ModerationService:
 
         if not llm_rules:
             log.info("审核通过 (检查了 %d 条本地规则)", len(rules))
-            return ModerationVerdict(
+            return make_verdict(
                 violated=False,
                 reason="",
                 rule=None,
@@ -339,7 +357,7 @@ class ModerationService:
             llm_raw = await self.llm.moderation(system_prompt, user_input)
         except Exception:
             log.exception("审核模型调用失败；本地规则已完成检查")
-            return ModerationVerdict(
+            return make_verdict(
                 violated=False,
                 reason="",
                 rule=None,
@@ -359,12 +377,12 @@ class ModerationService:
                 preview_truncated,
                 preview,
             )
-            return ModerationVerdict(violated=False, reason="", rule=None, conclusive=False)
+            return make_verdict(violated=False, reason="", rule=None, conclusive=False)
 
         violated_value = data.get("violated", data.get("violation"))
         if not isinstance(violated_value, bool):
             log.warning("审核模型 violated 字段无效，按不违规处理")
-            return ModerationVerdict(
+            return make_verdict(
                 violated=False,
                 reason="",
                 rule=None,
@@ -401,7 +419,7 @@ class ModerationService:
                 confidence,
                 reason,
             )
-            return ModerationVerdict(
+            return make_verdict(
                 violated=True,
                 reason=reason,
                 rule=hit_rule,
@@ -410,7 +428,7 @@ class ModerationService:
             )
 
         log.info("审核通过 (检查了 %d 条语义规则, AI判定)", len(llm_rules))
-        return ModerationVerdict(
+        return make_verdict(
             violated=False,
             reason="",
             rule=None,

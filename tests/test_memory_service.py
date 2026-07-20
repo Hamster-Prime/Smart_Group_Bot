@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from sqlalchemy import select, text
@@ -14,6 +14,11 @@ from bot.config import BotConfig
 from bot.db.engine import init_db
 from bot.db.models import GroupContextSummary, GroupPermanentMemory, MessageVector
 from bot.services.memory import MemoryService
+from bot.services.update_completion import (
+    UpdateCompletionReceipt,
+    bind_update_completion,
+    reset_update_completion,
+)
 from bot.utils.security import sanitize_history_for_llm
 
 
@@ -44,6 +49,27 @@ class _BlockingSummaryStubLLM(_StubLLM):
         self.started.set()
         await self.resume.wait()
         return "压缩期间之前的摘要"
+
+
+class _ConcurrentSummaryStubLLM(_StubLLM):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def compress(self, system: str, user_text: str) -> str:
+        _ = system, user_text
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.started.set()
+        try:
+            await self.release.wait()
+            return "bounded summary"
+        finally:
+            self.active -= 1
 
 
 def _create_legacy_message_vectors_table(db_path: Path, *, include_embedding: bool = False) -> None:
@@ -175,6 +201,8 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             _StubLLM(),
             session_factory=lambda: _LockedSession(),  # type: ignore[arg-type]
         )
+        memory._history_loaded.add(12345)
+        memory._replace_working_history(12345, [])
 
         with (
             patch("bot.services.memory.asyncio.sleep", new=AsyncMock()),
@@ -327,7 +355,7 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    async def test_history_compacts_when_final_prompt_is_near_limit(self) -> None:
+    async def test_foreground_history_trims_without_waiting_for_compaction(self) -> None:
         tmpdir = self._workspace_tmpdir()
         try:
             db_path = tmpdir / "bot.db"
@@ -365,8 +393,8 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             await engine.dispose()
 
-            self.assertEqual(memory.get_history(12345), [])
-            self.assertEqual(await memory._get_summary(12345), "压缩后摘要")
+            self.assertEqual(len(memory.get_history(12345)), 3)
+            self.assertEqual(await memory._get_summary(12345), "")
             self.assertFalse(any(msg.get("role") == "user" for msg in prompt_history))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -657,6 +685,224 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             await engine.dispose()
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def test_compaction_failure_uses_backoff_before_retrying(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            _StubLLM(),
+            session_factory=Mock(),
+        )
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="needs compaction",
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:one",
+                )
+            ],
+        )
+        memory._count_tokens = lambda _messages: memory.max_context  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        memory._compress_and_publish_locked = AsyncMock(return_value="llm_empty")  # type: ignore[method-assign]
+
+        self.assertFalse(await memory.compact_if_needed(group_id))
+        self.assertFalse(await memory.compact_if_needed(group_id))
+
+        memory._compress_and_publish_locked.assert_awaited_once()
+        self.assertGreater(memory._compaction_retry_at[group_id], 0.0)
+
+    async def test_foreground_history_does_not_invoke_compression(self) -> None:
+        llm = _BlockingSummaryStubLLM()
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            llm,
+            session_factory=Mock(),
+        )
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="reply immediately",
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:one",
+                )
+            ],
+        )
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        history = await asyncio.wait_for(
+            memory.get_history_for_llm(group_id, reserve_tokens=0),
+            timeout=0.2,
+        )
+
+        self.assertEqual([item["content"] for item in history], ["reply immediately"])
+        self.assertFalse(llm.started.is_set())
+
+    async def test_compaction_has_one_dedicated_concurrency_slot(self) -> None:
+        llm = _ConcurrentSummaryStubLLM()
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            llm,
+            session_factory=Mock(),
+        )
+        memory._get_summary = AsyncMock(return_value="")  # type: ignore[method-assign]
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        for group_id in (1, 2):
+            memory._history_loaded.add(group_id)
+            memory._replace_working_history(
+                group_id,
+                [
+                    memory._history_item(
+                        role="user",
+                        content=f"group {group_id}",
+                        created_at=datetime.now(timezone.utc),
+                        sender_id=42,
+                        sender_name="Alice",
+                        message_type="text",
+                        message_id=f"{group_id}:one",
+                    )
+                ],
+            )
+
+        tasks = [asyncio.create_task(memory.compact_now(group_id)) for group_id in (1, 2)]
+        try:
+            await asyncio.wait_for(llm.started.wait(), timeout=0.5)
+            await asyncio.sleep(0.02)
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(llm.max_active, 1)
+            llm.release.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=0.5)
+            self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+            self.assertEqual(llm.max_active, 1)
+        finally:
+            llm.release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_deferred_message_write_does_not_block_caller(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            _StubLLM(),
+            session_factory=Mock(),
+        )
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(group_id, [])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def persist(batch) -> None:
+            self.assertEqual(len(batch), 1)
+            started.set()
+            await release.wait()
+
+        memory._persist_message_batch = AsyncMock(side_effect=persist)  # type: ignore[method-assign]
+
+        await asyncio.wait_for(
+            memory.add_message(
+                group_id,
+                "user",
+                "queued without sqlite wait",
+                message_id="deferred-one",
+                defer_persistence=True,
+            ),
+            timeout=0.1,
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        self.assertEqual(
+            [item["content"] for item in memory.get_history(group_id)],
+            ["queued without sqlite wait"],
+        )
+        self.assertFalse(memory._pending_write_idle.is_set())
+
+        release.set()
+        self.assertTrue(await memory.flush_pending_writes(timeout_seconds=0.2))
+        await memory.shutdown(timeout_seconds=0.2)
+
+    async def test_deferred_write_keeps_update_receipt_pending_until_persisted(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            _StubLLM(),
+            session_factory=Mock(),
+        )
+        group_id = 12346
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(group_id, [])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def persist(_batch) -> None:
+            started.set()
+            await release.wait()
+
+        memory._persist_message_batch = AsyncMock(side_effect=persist)  # type: ignore[method-assign]
+        receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(receipt)
+        try:
+            await memory.add_message(
+                group_id,
+                "user",
+                "durable deferred memory",
+                message_id="deferred-receipt",
+                defer_persistence=True,
+            )
+        finally:
+            reset_update_completion(token)
+
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        waiter = asyncio.create_task(receipt.wait())
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+        release.set()
+        self.assertTrue(await asyncio.wait_for(waiter, timeout=0.2))
+        await memory.shutdown(timeout_seconds=0.2)
+
+    async def test_shutdown_fails_receipt_for_blocked_memory_write(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            _StubLLM(),
+            session_factory=Mock(),
+        )
+        group_id = 12347
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(group_id, [])
+        started = asyncio.Event()
+
+        async def persist(_batch) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        memory._persist_message_batch = AsyncMock(side_effect=persist)  # type: ignore[method-assign]
+        receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(receipt)
+        try:
+            await memory.add_message(
+                group_id,
+                "user",
+                "must replay",
+                message_id="deferred-cancel",
+                defer_persistence=True,
+            )
+        finally:
+            reset_update_completion(token)
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        await memory.shutdown(timeout_seconds=0.01)
+        self.assertFalse(await asyncio.wait_for(receipt.wait(), timeout=0.2))
 
 
 if __name__ == "__main__":

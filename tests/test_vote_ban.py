@@ -12,6 +12,7 @@ from bot.db.engine import init_db
 from bot.db.models import (
     BanAuditEvent,
     Group,
+    JoinVerification,
     UserWarning,
     VoteBanQuotaBucket,
     VoteBanSession,
@@ -151,6 +152,51 @@ class VoteBanConfigTests(unittest.TestCase):
         self.assertEqual(config.threshold, 2)
 
 
+class VoteBanGenerationGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_does_not_ban_after_recovery_generation_is_lost(self) -> None:
+        lease_token = now_shanghai_naive()
+        record = SimpleNamespace(
+            id=12,
+            status="enforcing",
+            enforcing_started_at=lease_token,
+            group_id=-100,
+            target_user_id=555,
+        )
+        recovery = SimpleNamespace(
+            verification_id=99,
+            lease_until=lease_token + timedelta(minutes=5),
+        )
+        session = SimpleNamespace(
+            refresh=AsyncMock(),
+            commit=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            bot=SimpleNamespace(ban_chat_member=AsyncMock()),
+        )
+        with (
+            patch.object(
+                group,
+                "join_verification_lease_is_current",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(group, "apply_vote_ban", new=AsyncMock()) as apply_ban,
+        ):
+            result = await group._finalize_vote_enforcement(
+                callback,
+                _settings(),
+                session,
+                None,
+                record=record,
+                session_id=12,
+                approvals=2,
+                recovery=recovery,
+            )
+
+        self.assertEqual(result, (False, False))
+        apply_ban.assert_not_awaited()
+        session.commit.assert_awaited_once()
+
+
 class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         fd, self._db_path = tempfile.mkstemp(suffix=".db")
@@ -172,7 +218,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 pass
 
-    async def _open_session(self, threshold: int = 3) -> int:
+    async def _open_session(self, threshold: int = 3, *, target_user_id: int = 555) -> int:
         config = resolve_vote_ban_config(
             _settings(vote_ban_threshold=threshold), {}
         )
@@ -180,7 +226,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             record = await open_vote_session(
                 session,
                 group_id=-100,
-                target_user_id=555,
+                target_user_id=target_user_id,
                 target_display="骚扰者",
                 target_username="",
                 starter_user_id=10,
@@ -716,6 +762,117 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(warning.is_banned)
             self.assertEqual(event.outcome, "succeeded")
 
+    async def test_manual_unban_cancels_active_and_enforcing_votes(self) -> None:
+        active_id = await self._open_session(target_user_id=555)
+        enforcing_id = await self._open_session(target_user_id=556)
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    enforcing_id,
+                    expected="active",
+                    new_status="enforcing",
+                )
+            )
+            old_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                556,
+                manual_unban=False,
+            )
+            self.assertIsNotNone(old_recovery)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            active_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+            )
+            newer_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                556,
+            )
+            self.assertIsNotNone(active_recovery)
+            self.assertIsNotNone(newer_recovery)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            active = await session.get(VoteBanSession, active_id)
+            enforcing = await session.get(VoteBanSession, enforcing_id)
+            self.assertEqual(active.status, "cancelled")
+            self.assertEqual(enforcing.status, "cancelled")
+            self.assertEqual(active.resolution, "manual_unban")
+            self.assertEqual(enforcing.resolution, "manual_unban")
+            current = await session.scalar(
+                select(JoinVerification).where(
+                    JoinVerification.group_id == -100,
+                    JoinVerification.user_id == 556,
+                )
+            )
+            self.assertEqual(current.lease_until, newer_recovery.lease_until)
+
+    async def test_old_vote_generation_cannot_publish_after_manual_unban(self) -> None:
+        session_id = await self._open_session(threshold=2)
+        async with self.session_factory() as session:
+            self.assertTrue(await record_vote(session, session_id, 11))
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="enforcing",
+                )
+            )
+            old_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+                manual_unban=False,
+            )
+            record = await session.get(VoteBanSession, session_id)
+            old_vote_token = record.enforcing_started_at
+            await session.commit()
+
+        async with self.session_factory() as session:
+            newer_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+            )
+            await session.commit()
+
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            persisted = await record_vote_ban_outcome(
+                session,
+                record,
+                approvals=2,
+                banned=True,
+                lease_token=old_vote_token,
+                recovery=old_recovery,
+            )
+            self.assertFalse(persisted)
+
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 555,
+                )
+            )
+            current = await session.scalar(
+                select(JoinVerification).where(
+                    JoinVerification.group_id == -100,
+                    JoinVerification.user_id == 555,
+                )
+            )
+            self.assertEqual(record.status, "cancelled")
+            self.assertIsNone(warning)
+            self.assertEqual(current.lease_until, newer_recovery.lease_until)
+
     async def test_old_enforcement_lease_cannot_overwrite_new_owner(self) -> None:
         session_id = await self._open_session(threshold=2)
         async with self.session_factory() as session:
@@ -728,11 +885,24 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                     new_status="enforcing",
                 )
             )
+            old_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+                manual_unban=False,
+            )
             await session.commit()
             record = await session.get(VoteBanSession, session_id)
             old_token = record.enforcing_started_at
             new_token = old_token + timedelta(minutes=2)
             record.enforcing_started_at = new_token
+            new_recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+                now=now_shanghai_naive() + timedelta(minutes=2),
+                manual_unban=False,
+            )
             await session.commit()
 
         async with self.session_factory() as session:
@@ -743,6 +913,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 approvals=2,
                 banned=False,
                 lease_token=old_token,
+                recovery=old_recovery,
             )
         self.assertFalse(persisted)
 
@@ -768,6 +939,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 approvals=2,
                 banned=True,
                 lease_token=new_token,
+                recovery=new_recovery,
             )
             self.assertTrue(persisted)
 

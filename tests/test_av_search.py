@@ -1,6 +1,9 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from bot.services import av_search as av_search_module
 from bot.services.av_search import AVSearchService, is_av_code_query, normalize_fc2_code
 
 
@@ -169,6 +172,25 @@ class AVSearchServiceTests(unittest.TestCase):
         self.assertEqual(detail.studio, "模倣犯")
         self.assertIn("素人", detail.genres)
         self.assertEqual(detail.score, "5")
+
+
+class AVResourceAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saturated_query_slot_fails_fast(self) -> None:
+        service = _make_service()
+        blocked = asyncio.Semaphore(0)
+        started = asyncio.get_running_loop().time()
+        with (
+            patch.object(av_search_module, "_AV_QUERY_SEMAPHORE", blocked),
+            patch.object(
+                av_search_module,
+                "_AV_QUERY_ADMISSION_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            result = await service.search("ABC-123")
+
+        self.assertEqual(result, [])
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.2)
 
 
 if __name__ == "__main__":

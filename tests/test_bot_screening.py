@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -180,6 +180,8 @@ def _rules_lookup_session(has_rules: bool = True) -> SimpleNamespace:
         flush=AsyncMock(),
         commit=AsyncMock(),
         rollback=AsyncMock(),
+        scalar=AsyncMock(return_value=None),
+        add=Mock(),
         execute=AsyncMock(
             return_value=SimpleNamespace(scalar_one_or_none=lambda: rules_row)
         ),
@@ -223,6 +225,10 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=fresh_authorized),
             ),
             patch(
+                "bot.handlers.group._claim_current_moderation_verdict",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
                 "bot.handlers.group._record_group_activity_cas",
                 new=AsyncMock(return_value=group_row.settings),
             ),
@@ -254,7 +260,24 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "bot.handlers.group.lease_join_verification_for_unban",
-                new=AsyncMock(),
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        verification_id=1,
+                        lease_until=None,
+                    )
+                ),
+            ),
+            patch(
+                "bot.handlers.group.complete_leased_join_verification",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.verification_release_blocked_by_ban",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.verification_restriction_required",
+                new=AsyncMock(return_value=False),
             ),
         ]
         with ExitStack() as stack:
@@ -295,7 +318,13 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             is_user_exempt=AsyncMock(return_value=False),
             evaluate=AsyncMock(return_value=verdict),
             is_high_confidence=lambda _verdict: True,
-            record_violation=AsyncMock(),
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(
+                    id=504,
+                    ban_enforced=None,
+                    notice_sent_at=None,
+                )
+            ),
         )
         message = await self._run(
             moderation_service=moderation,
@@ -554,6 +583,10 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch(
                     "bot.handlers.group._fresh_group_authorized_for_moderation",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch(
+                    "bot.handlers.group._claim_current_moderation_verdict",
                     new=AsyncMock(return_value=True),
                 ),
                 patch(

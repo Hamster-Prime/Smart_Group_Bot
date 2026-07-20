@@ -4,12 +4,15 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_preference_context
 from bot.services.llm import LLMService
+from bot.services.request_priority import ReservedCapacityGate
+from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
@@ -42,12 +45,21 @@ from bot.utils.telegram import configured_auto_delete_seconds
 
 log = logging.getLogger(__name__)
 
-_SKILL_EXECUTION_SEMAPHORE = asyncio.Semaphore(8)
+_SKILL_EXECUTION_CAPACITY = 8
+_SKILL_EXECUTION_SEMAPHORE = asyncio.Semaphore(_SKILL_EXECUTION_CAPACITY)
+_SKILL_PRIORITY_GATE = ReservedCapacityGate(
+    total_capacity=_SKILL_EXECUTION_CAPACITY,
+    noncritical_capacity=7,
+    normal_capacity=6,
+)
 _SKILL_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
+_SKILL_ORPHAN_STARTED: dict[asyncio.Task[Any], float] = {}
+_SKILL_ORPHAN_MAX_AGE_SECONDS = 120.0
 
 
 def _observe_skill_task(task: asyncio.Task[Any]) -> None:
     _SKILL_ORPHAN_TASKS.discard(task)
+    _SKILL_ORPHAN_STARTED.pop(task, None)
     try:
         task.result()
     except (asyncio.CancelledError, Exception):
@@ -59,6 +71,7 @@ def _track_skill_orphan(task: asyncio.Task[Any]) -> None:
         _observe_skill_task(task)
         return
     _SKILL_ORPHAN_TASKS.add(task)
+    _SKILL_ORPHAN_STARTED.setdefault(task, time.monotonic())
     task.add_done_callback(_observe_skill_task)
 
 
@@ -75,6 +88,34 @@ async def flush_skill_execution_tasks(*, timeout_seconds: float = 15.0) -> None:
         _observe_skill_task(task)
     if pending:
         log.error("%d skill execution task(s) ignored shutdown cancellation", len(pending))
+
+
+def skill_resource_health_snapshot() -> dict[str, Any]:
+    now = time.monotonic()
+    active_orphans = [task for task in _SKILL_ORPHAN_TASKS if not task.done()]
+    oldest_age = max(
+        (now - _SKILL_ORPHAN_STARTED.get(task, now) for task in active_orphans),
+        default=0.0,
+    )
+    waiters = getattr(_SKILL_EXECUTION_SEMAPHORE, "_waiters", None)
+    orphan_count = len(active_orphans)
+    fatal = bool(
+        orphan_count >= _SKILL_EXECUTION_CAPACITY
+        or oldest_age >= _SKILL_ORPHAN_MAX_AGE_SECONDS
+    )
+    return {
+        "ok": not fatal,
+        "fatal": fatal,
+        "capacity": _SKILL_EXECUTION_CAPACITY,
+        "available_permits": int(getattr(_SKILL_EXECUTION_SEMAPHORE, "_value", 0)),
+        "semaphore_waiters": len(waiters or ()),
+        "orphan_count": orphan_count,
+        "oldest_orphan_seconds": round(oldest_age, 3),
+        "priority_gate": _SKILL_PRIORITY_GATE.snapshot(),
+    }
+
+
+register_resource_health_provider("skills", skill_resource_health_snapshot)
 
 _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "websearch": re.compile(r"^找到\s*\d+\s*[条个]\s*搜索结果[。！？!?\. ]*$"),
@@ -466,33 +507,34 @@ class SkillService:
         )
 
         async def _invoke() -> SkillRunResult:
-            async with _SKILL_EXECUTION_SEMAPHORE:
-                current_task = asyncio.current_task()
-                if current_task is not None and current_task.cancelling():
-                    raise asyncio.CancelledError
-                if tool_context.session is not None or tool_context.session_factory is None:
-                    return await skill.run(arguments, tool_context)
+            async with _SKILL_PRIORITY_GATE.slot(timeout=self.tool_timeout_seconds):
+                async with _SKILL_EXECUTION_SEMAPHORE:
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise asyncio.CancelledError
+                    if tool_context.session is not None or tool_context.session_factory is None:
+                        return await skill.run(arguments, tool_context)
 
-                # A reply batch must not retain one database connection throughout
-                # all model rounds.  Give a DB-backed tool a short-lived session
-                # only for the duration of that tool call.
-                async with tool_context.session_factory() as tool_session:
-                    tool_context.session = tool_session
-                    try:
-                        result = await skill.run(arguments, tool_context)
-                        current_task = asyncio.current_task()
-                        if current_task is not None and current_task.cancelling():
-                            raise asyncio.CancelledError
-                        if result.ok:
-                            await tool_session.commit()
-                        else:
+                    # A reply batch must not retain one database connection throughout
+                    # all model rounds.  Give a DB-backed tool a short-lived session
+                    # only for the duration of that tool call.
+                    async with tool_context.session_factory() as tool_session:
+                        tool_context.session = tool_session
+                        try:
+                            result = await skill.run(arguments, tool_context)
+                            current_task = asyncio.current_task()
+                            if current_task is not None and current_task.cancelling():
+                                raise asyncio.CancelledError
+                            if result.ok:
+                                await tool_session.commit()
+                            else:
+                                await tool_session.rollback()
+                            return result
+                        except BaseException:
                             await tool_session.rollback()
-                        return result
-                    except BaseException:
-                        await tool_session.rollback()
-                        raise
-                    finally:
-                        tool_context.session = None
+                            raise
+                        finally:
+                            tool_context.session = None
 
         task = asyncio.create_task(_invoke(), name=f"skill:{name}")
         try:

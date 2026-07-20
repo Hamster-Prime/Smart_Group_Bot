@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -8,12 +9,20 @@ from aiogram import Bot, Dispatcher
 
 from bot.config import Settings
 from bot.services import update_delivery
+from bot.services import verify_web as verify_web_module
+from bot.services.request_priority import (
+    ExecutionPriority,
+    current_execution_priority,
+)
+from bot.services.update_completion import current_update_completion
 from bot.services.update_delivery import (
     resolve_webhook_config,
     run_update_delivery,
+    telegram_update_is_auth_candidate,
+    telegram_update_is_privileged,
+    telegram_update_priority,
 )
-from bot.services.update_completion import current_update_completion
-from bot.services.verify_web import VerifyWebServer
+from bot.services.verify_web import VerifyWebServer, _WebhookUpdateQueue
 
 WEBHOOK_SECRET = "s" * 32
 
@@ -122,6 +131,148 @@ class WebhookConfigTests(unittest.TestCase):
         assert webhook is not None
         self.assertEqual(webhook.path, "/telegram/webhook")
         self.assertEqual(webhook.url, "https://bot.example.com/telegram/webhook")
+
+
+class UpdatePriorityClassificationTests(unittest.TestCase):
+    def test_security_commands_are_privileged_without_aiogram_parsing(self) -> None:
+        privileged = (
+            "/ban 42 spam",
+            "/UNBAN@SmartGroupBot 42",
+            "/authadmin -100 42",
+            "/raidguard on",
+            "/mute 42",
+            "/settings",
+        )
+        for index, text in enumerate(privileged, start=1):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    telegram_update_is_privileged(
+                        {"update_id": index, "message": {"text": text}}
+                    )
+                )
+                self.assertEqual(
+                    telegram_update_priority(
+                        {"update_id": index, "message": {"text": text}}
+                    ),
+                    ExecutionPriority.NORMAL,
+                )
+                self.assertTrue(
+                    telegram_update_is_auth_candidate(
+                        {"update_id": index, "message": {"text": text}}
+                    )
+                )
+
+        self.assertFalse(
+            telegram_update_is_privileged(
+                {"update_id": 99, "message": {"text": "ordinary chat"}}
+            )
+        )
+        self.assertFalse(
+            telegram_update_is_privileged(
+                {"update_id": 100, "message": {"text": "/av TEST-001"}}
+            )
+        )
+        self.assertEqual(
+            telegram_update_priority(
+                {"update_id": 102, "message": {"text": "/addrule semantic no spam"}}
+            ),
+            ExecutionPriority.NORMAL,
+        )
+        self.assertTrue(
+            telegram_update_is_auth_candidate(
+                {"update_id": 102, "message": {"text": "/addrule semantic no spam"}}
+            )
+        )
+        self.assertEqual(
+            telegram_update_priority(
+                SimpleNamespace(
+                    update_id=101,
+                    message=SimpleNamespace(text="/ban 42"),
+                )
+            ),
+            ExecutionPriority.NORMAL,
+        )
+
+    def test_verification_membership_and_moderation_callbacks_are_prioritized(
+        self,
+    ) -> None:
+        updates = (
+            {"update_id": 1, "chat_member": {"chat": {"id": -100}}},
+            {
+                "update_id": 2,
+                "message": {"new_chat_members": [{"id": 42}]},
+            },
+            {"update_id": 3, "callback_query": {"data": "bsc:u:g:42"}},
+            {"update_id": 4, "callback_query": {"data": "mact:ban:7"}},
+            {"update_id": 5, "callback_query": {"data": "jv:a:7"}},
+            {"update_id": 6, "callback_query": {"data": "rgr"}},
+            {
+                "update_id": 7,
+                "message": {"text": "/start verify_n100"},
+            },
+        )
+        self.assertTrue(all(telegram_update_is_privileged(item) for item in updates))
+        self.assertEqual(
+            [telegram_update_priority(item) for item in updates],
+            [
+                ExecutionPriority.HIGH,
+                ExecutionPriority.HIGH,
+                ExecutionPriority.NORMAL,
+                ExecutionPriority.NORMAL,
+                ExecutionPriority.NORMAL,
+                ExecutionPriority.NORMAL,
+                ExecutionPriority.HIGH,
+            ],
+        )
+        member_callbacks = (
+            {"update_id": 8, "callback_query": {"data": "jv:v:7"}},
+            {"update_id": 9, "callback_query": {"data": "vban:vote:1"}},
+            {"update_id": 10, "callback_query": {"data": "ptv"}},
+            {"update_id": 11, "callback_query": {"data": "rgv"}},
+        )
+        self.assertTrue(
+            all(
+                telegram_update_priority(item) == ExecutionPriority.HIGH
+                for item in member_callbacks
+            )
+        )
+        update_delivery.mark_privileged_operator(
+            777,
+            group_id=-100,
+            ttl_seconds=60.0,
+        )
+        admin_callbacks = (
+            {
+                "update_id": 12,
+                "callback_query": {
+                    "data": "jv:r:7",
+                    "from": {"id": 777},
+                    "message": {"chat": {"id": -100}},
+                },
+            },
+            {
+                "update_id": 13,
+                "callback_query": {
+                    "data": "vban:ban:1",
+                    "from": {"id": 777},
+                    "message": {"chat": {"id": -100}},
+                },
+            },
+            {
+                "update_id": 14,
+                "callback_query": {
+                    "data": "vban:cancel:1",
+                    "from": {"id": 777},
+                    "message": {"chat": {"id": -100}},
+                },
+            },
+        )
+        self.assertTrue(
+            all(
+                telegram_update_priority(item) == ExecutionPriority.CRITICAL
+                for item in admin_callbacks
+            )
+        )
 
 
 class WebhookProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -1705,6 +1856,409 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             await server.disable_webhook_route()
             await bot.session.close()
 
+    async def test_privileged_lane_runs_while_ordinary_workers_and_queue_are_full(
+        self,
+    ) -> None:
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        ordinary_started = asyncio.Event()
+        release_ordinary = asyncio.Event()
+        privileged_started = asyncio.Event()
+        ordinary_calls = 0
+        observed_priorities: list[ExecutionPriority] = []
+
+        async def feed_update(*, update: dict, **_kwargs: object) -> None:
+            nonlocal ordinary_calls
+            if telegram_update_is_privileged(update):
+                observed_priorities.append(current_execution_priority())
+                privileged_started.set()
+                return
+            ordinary_calls += 1
+            if ordinary_calls == 1:
+                ordinary_started.set()
+                await release_ordinary.wait()
+
+        dispatcher.feed_raw_update = AsyncMock(side_effect=feed_update)
+        queue = _WebhookUpdateQueue(
+            dispatcher=dispatcher,
+            bot=bot,
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+            critical_queue_capacity=2,
+            security_queue_capacity=2,
+        )
+        operator_id = 8101
+        group_id = -1008101
+        update_delivery.mark_privileged_operator(operator_id, group_id=group_id)
+
+        def request(update_id: int, text: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": group_id},
+                            "from": {"id": operator_id},
+                        },
+                    }
+                )
+            )
+
+        ordinary_tasks: list[asyncio.Task] = []
+        try:
+            ordinary_tasks.append(
+                asyncio.create_task(queue.handle_verified(request(1, "slow")))
+            )
+            await asyncio.wait_for(ordinary_started.wait(), timeout=1.0)
+
+            # One ordinary worker plus its four reserved queue positions are
+            # occupied.  The priority lane must remain independently usable.
+            ordinary_tasks.extend(
+                asyncio.create_task(
+                    queue.handle_verified(request(update_id, "queued"))
+                )
+                for update_id in range(2, 6)
+            )
+            for _ in range(100):
+                if queue.health_snapshot()["ordinary_queue_size"] == 4:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(
+                queue.health_snapshot()["ordinary_queue_size"],
+                4,
+            )
+
+            privileged_task = asyncio.create_task(
+                queue.handle_verified(request(100, "/ban 42 spam"))
+            )
+            await asyncio.wait_for(privileged_started.wait(), timeout=0.5)
+            privileged_response = await asyncio.wait_for(
+                privileged_task,
+                timeout=0.5,
+            )
+            self.assertEqual(privileged_response.status, 200)
+            self.assertFalse(release_ordinary.is_set())
+            self.assertTrue(all(not task.done() for task in ordinary_tasks))
+            self.assertEqual(observed_priorities, [ExecutionPriority.CRITICAL])
+            snapshot = queue.health_snapshot()
+            self.assertEqual(snapshot["accepted_privileged_updates"], 1)
+            self.assertEqual(snapshot["completed_privileged_updates"], 1)
+            self.assertEqual(snapshot["critical_workers_alive"], 1)
+
+            release_ordinary.set()
+            responses = await asyncio.gather(*ordinary_tasks)
+            self.assertTrue(all(response.status == 200 for response in responses))
+        finally:
+            release_ordinary.set()
+            await asyncio.gather(*ordinary_tasks, return_exceptions=True)
+            await queue.stop()
+            await bot.session.close()
+
+    async def test_unknown_admin_candidate_uses_isolated_unprivileged_lane(
+        self,
+    ) -> None:
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        ordinary_started = asyncio.Event()
+        release_ordinary = asyncio.Event()
+        auth_started = asyncio.Event()
+        observed_priorities: list[ExecutionPriority] = []
+
+        async def feed_update(*, update: dict, **_kwargs: object) -> None:
+            if telegram_update_is_auth_candidate(update):
+                observed_priorities.append(current_execution_priority())
+                auth_started.set()
+                return
+            ordinary_started.set()
+            await release_ordinary.wait()
+
+        dispatcher.feed_raw_update = AsyncMock(side_effect=feed_update)
+        queue = _WebhookUpdateQueue(
+            dispatcher=dispatcher,
+            bot=bot,
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            auth_worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+            auth_queue_capacity=2,
+            critical_queue_capacity=2,
+            security_queue_capacity=2,
+        )
+
+        def request(update_id: int, text: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": -1009001},
+                            "from": {"id": 9001},
+                        },
+                    }
+                )
+            )
+
+        ordinary_tasks: list[asyncio.Task] = []
+        try:
+            ordinary_tasks.append(
+                asyncio.create_task(queue.handle_verified(request(1, "slow")))
+            )
+            await asyncio.wait_for(ordinary_started.wait(), timeout=0.5)
+            ordinary_tasks.extend(
+                asyncio.create_task(
+                    queue.handle_verified(request(update_id, "queued"))
+                )
+                for update_id in range(2, 6)
+            )
+            for _ in range(100):
+                if queue.health_snapshot()["ordinary_queue_size"] == 4:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(queue.health_snapshot()["ordinary_queue_size"], 4)
+
+            auth_task = asyncio.create_task(
+                queue.handle_verified(request(100, "/ban 42 spam"))
+            )
+            await asyncio.wait_for(auth_started.wait(), timeout=0.5)
+            response = await asyncio.wait_for(auth_task, timeout=0.5)
+            self.assertEqual(response.status, 200)
+            self.assertFalse(release_ordinary.is_set())
+            self.assertEqual(observed_priorities, [ExecutionPriority.HIGH])
+            snapshot = queue.health_snapshot()
+            self.assertEqual(snapshot["accepted_auth_updates"], 1)
+            self.assertEqual(snapshot["completed_auth_updates"], 1)
+            self.assertEqual(snapshot["accepted_privileged_updates"], 0)
+            self.assertEqual(snapshot["auth_workers_alive"], 1)
+        finally:
+            release_ordinary.set()
+            await asyncio.gather(*ordinary_tasks, return_exceptions=True)
+            await queue.stop()
+            await bot.session.close()
+
+    async def test_worker_cancellation_always_balances_queue_task_accounting(
+        self,
+    ) -> None:
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        started = asyncio.Event()
+
+        async def stuck(**_kwargs: object) -> None:
+            started.set()
+            await asyncio.Future()
+
+        dispatcher.feed_raw_update = AsyncMock(side_effect=stuck)
+        queue = _WebhookUpdateQueue(
+            dispatcher=dispatcher,
+            bot=bot,
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            auth_worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+        )
+        request = SimpleNamespace(
+            json=AsyncMock(
+                return_value={"update_id": 150, "message": {"text": "slow"}}
+            )
+        )
+        response_task = asyncio.create_task(queue.handle_verified(request))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            queue._stopped = True
+            worker = queue._ordinary_workers[0]
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            response = await asyncio.wait_for(response_task, timeout=0.5)
+            self.assertEqual(response.status, 503)
+            await asyncio.wait_for(queue.queue.join(), timeout=0.5)
+        finally:
+            if not response_task.done():
+                response_task.cancel()
+                await asyncio.gather(response_task, return_exceptions=True)
+            await queue.stop()
+            await bot.session.close()
+
+    async def test_ban_command_bypasses_a_full_membership_security_lane(
+        self,
+    ) -> None:
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        membership_started = asyncio.Event()
+        release_membership = asyncio.Event()
+        ban_started = asyncio.Event()
+        security_calls = 0
+        observed: list[ExecutionPriority] = []
+
+        async def feed_update(*, update: dict, **_kwargs: object) -> None:
+            nonlocal security_calls
+            priority = telegram_update_priority(update)
+            observed.append(current_execution_priority())
+            if priority <= ExecutionPriority.CRITICAL:
+                ban_started.set()
+                return
+            security_calls += 1
+            if security_calls == 1:
+                membership_started.set()
+                await release_membership.wait()
+
+        dispatcher.feed_raw_update = AsyncMock(side_effect=feed_update)
+        queue = _WebhookUpdateQueue(
+            dispatcher=dispatcher,
+            bot=bot,
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+            critical_queue_capacity=2,
+            security_queue_capacity=4,
+        )
+        operator_id = 8102
+        group_id = -1008102
+        update_delivery.mark_privileged_operator(operator_id, group_id=group_id)
+
+        def membership_request(update_id: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        "update_id": update_id,
+                        "chat_member": {"chat": {"id": -100}},
+                    }
+                )
+            )
+
+        def ban_request() -> SimpleNamespace:
+            return SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        "update_id": 999,
+                        "message": {
+                            "text": "/ban 42 raid",
+                            "chat": {"id": group_id},
+                            "from": {"id": operator_id},
+                        },
+                    }
+                )
+            )
+
+        security_tasks: list[asyncio.Task] = []
+        try:
+            security_tasks.append(
+                asyncio.create_task(
+                    queue.handle_verified(membership_request(301))
+                )
+            )
+            await asyncio.wait_for(membership_started.wait(), timeout=0.5)
+            security_tasks.extend(
+                asyncio.create_task(
+                    queue.handle_verified(membership_request(update_id))
+                )
+                for update_id in range(302, 306)
+            )
+            for _ in range(100):
+                if queue.health_snapshot()["security_queue_size"] == 4:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(queue.health_snapshot()["security_queue_size"], 4)
+
+            ban_task = asyncio.create_task(queue.handle_verified(ban_request()))
+            await asyncio.wait_for(ban_started.wait(), timeout=0.5)
+            ban_response = await asyncio.wait_for(ban_task, timeout=0.5)
+            self.assertEqual(ban_response.status, 200)
+            self.assertFalse(release_membership.is_set())
+            self.assertTrue(all(not task.done() for task in security_tasks))
+            self.assertIn(ExecutionPriority.HIGH, observed)
+            self.assertEqual(observed[-1], ExecutionPriority.CRITICAL)
+
+            release_membership.set()
+            responses = await asyncio.gather(*security_tasks)
+            self.assertTrue(all(response.status == 200 for response in responses))
+        finally:
+            release_membership.set()
+            await asyncio.gather(*security_tasks, return_exceptions=True)
+            await queue.stop()
+            await bot.session.close()
+
+    async def test_privileged_lane_preserves_fifo_order(self) -> None:
+        bot = Bot(token="42:TEST_TOKEN")
+        dispatcher = Dispatcher()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        order: list[int] = []
+
+        async def feed_update(*, update: dict, **_kwargs: object) -> None:
+            update_id = int(update["update_id"])
+            order.append(update_id)
+            if update_id == 201:
+                first_started.set()
+                await release_first.wait()
+
+        dispatcher.feed_raw_update = AsyncMock(side_effect=feed_update)
+        queue = _WebhookUpdateQueue(
+            dispatcher=dispatcher,
+            bot=bot,
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+            critical_queue_capacity=4,
+            security_queue_capacity=2,
+        )
+        operator_id = 8103
+        group_id = -1008103
+        update_delivery.mark_privileged_operator(operator_id, group_id=group_id)
+
+        def request(update_id: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        "update_id": update_id,
+                        "message": {
+                            "text": "/unban 42",
+                            "chat": {"id": group_id},
+                            "from": {"id": operator_id},
+                        },
+                    }
+                )
+            )
+
+        tasks: list[asyncio.Task] = []
+        try:
+            tasks.append(
+                asyncio.create_task(queue.handle_verified(request(201)))
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=0.5)
+            tasks.extend(
+                asyncio.create_task(queue.handle_verified(request(update_id)))
+                for update_id in (202, 203)
+            )
+            for _ in range(100):
+                if queue.health_snapshot()["critical_queue_size"] == 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(
+                queue.health_snapshot()["critical_queue_size"],
+                2,
+            )
+            release_first.set()
+            responses = await asyncio.gather(*tasks)
+            self.assertTrue(all(response.status == 200 for response in responses))
+            self.assertEqual(order, [201, 202, 203])
+        finally:
+            release_first.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await queue.stop()
+            await bot.session.close()
+
     async def test_webhook_handler_bounds_concurrent_updates(self) -> None:
         bot = Bot(token="42:TEST_TOKEN")
         dispatcher = Dispatcher()
@@ -1876,6 +2430,188 @@ class WebhookRouteTests(unittest.IsolatedAsyncioTestCase):
             await bot.session.close()
 
 
+class WebhookOrphanHealthTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _queue() -> _WebhookUpdateQueue:
+        return _WebhookUpdateQueue(
+            dispatcher=Dispatcher(),
+            bot=SimpleNamespace(),  # type: ignore[arg-type]
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+        )
+
+    async def test_untrusted_command_flood_cannot_consume_emergency_lane(self) -> None:
+        queue = self._queue()
+        user_id = 987654
+        scope = (-100, user_id)
+        update_delivery._TRUSTED_PRIVILEGED_OPERATORS.pop(scope, None)
+        classifications = [
+            queue._classification_for_update(
+                {
+                    "update_id": update_id,
+                    "message": {
+                        "text": "/ban 42",
+                        "from": {"id": user_id},
+                        "chat": {"id": -100},
+                    },
+                }
+            )
+            for update_id in range(1, 8)
+        ]
+        self.assertEqual(
+            [priority for priority, _auth in classifications],
+            [ExecutionPriority.NORMAL] * 7,
+        )
+        self.assertEqual(
+            [auth for _priority, auth in classifications],
+            [True, True, True, False, False, False, False],
+        )
+        self.assertEqual(queue._demoted_untrusted_auth_updates, 4)
+        update_delivery.mark_privileged_operator(user_id, group_id=-100)
+        self.assertEqual(
+            queue._priority_for_update(
+                {
+                    "update_id": 8,
+                    "message": {
+                        "text": "/ban 42",
+                        "from": {"id": user_id},
+                        "chat": {"id": -100},
+                    },
+                }
+            ),
+            ExecutionPriority.CRITICAL,
+        )
+        self.assertEqual(
+            queue._priority_for_update(
+                {
+                    "update_id": 9,
+                    "message": {
+                        "text": "/ban 42",
+                        "from": {"id": user_id},
+                        "chat": {"id": -200},
+                    },
+                }
+            ),
+            ExecutionPriority.NORMAL,
+        )
+
+    async def test_cached_priority_and_auth_classification_are_atomic(self) -> None:
+        queue = self._queue()
+        user_id = 987655
+        group_id = -300
+        update = {
+            "update_id": 100,
+            "message": {
+                "text": "/unban 42",
+                "from": {"id": user_id},
+                "chat": {"id": group_id},
+            },
+        }
+        update_delivery.unmark_privileged_operator(user_id, group_id=group_id)
+        self.assertEqual(
+            queue._classification_for_update(update),
+            (ExecutionPriority.NORMAL, True),
+        )
+        update_delivery.mark_privileged_operator(user_id, group_id=group_id)
+        self.assertEqual(
+            queue._classification_for_update(update),
+            (ExecutionPriority.NORMAL, True),
+        )
+
+        trusted_update = {**update, "update_id": 101}
+        self.assertEqual(
+            queue._classification_for_update(trusted_update),
+            (ExecutionPriority.CRITICAL, False),
+        )
+        update_delivery.unmark_privileged_operator(user_id, group_id=group_id)
+        self.assertEqual(
+            queue._classification_for_update(trusted_update),
+            (ExecutionPriority.CRITICAL, False),
+        )
+
+    async def test_auth_queue_pressure_is_reported_without_global_restart_issue(
+        self,
+    ) -> None:
+        queue = _WebhookUpdateQueue(
+            dispatcher=Dispatcher(),
+            bot=SimpleNamespace(),  # type: ignore[arg-type]
+            session_factory=None,
+            secret_token=WEBHOOK_SECRET,
+            worker_count=1,
+            auth_worker_count=1,
+            critical_worker_count=1,
+            security_worker_count=1,
+            auth_queue_capacity=1,
+        )
+        queued = verify_web_module._QueuedWebhookUpdate(
+            update={"update_id": 200},
+            update_id=200,
+            enqueued_at=time.monotonic(),
+            result=asyncio.get_running_loop().create_future(),
+            auth_candidate=True,
+        )
+        queue.queue.put_nowait(queued)
+        snapshot = queue.health_snapshot()
+        self.assertTrue(snapshot["auth_queue_saturated"])
+        self.assertIsNone(snapshot["issue"])
+        self.assertEqual(await queue._discard_queued_updates(), 1)
+
+    async def test_stale_orphan_sets_fatal_and_reports_age(self) -> None:
+        queue = self._queue()
+        release = asyncio.Event()
+        task = asyncio.create_task(release.wait())
+        await asyncio.sleep(0)
+        queue._track_orphan(task)
+        queue._orphaned_started_at[task] = (
+            time.monotonic()
+            - verify_web_module._WEBHOOK_ORPHAN_FATAL_AGE_SECONDS
+            - 1.0
+        )
+
+        self.assertIn("orphaned webhook update", queue.fatal_issue())
+        snapshot = queue.health_snapshot()
+        self.assertFalse(snapshot["ok"])
+        self.assertIn("orphaned webhook update", snapshot["issue"])
+        self.assertGreaterEqual(
+            snapshot["oldest_orphaned_update_age_seconds"],
+            verify_web_module._WEBHOOK_ORPHAN_FATAL_AGE_SECONDS,
+        )
+        self.assertIsNotNone(queue.fatal_issue())
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.2)
+        await asyncio.sleep(0)
+        self.assertEqual(queue._orphaned_started_at, {})
+
+    async def test_stale_late_finalizer_sets_fatal_and_reports_age(self) -> None:
+        queue = self._queue()
+        release = asyncio.Event()
+        task = asyncio.create_task(release.wait())
+        queue._late_finalizers[42] = task
+        queue._late_finalizer_started_at[42] = (
+            time.monotonic()
+            - verify_web_module._WEBHOOK_LATE_FINALIZER_FATAL_AGE_SECONDS
+            - 1.0
+        )
+
+        self.assertIn("late finalizer", queue.fatal_issue())
+        snapshot = queue.health_snapshot()
+        self.assertFalse(snapshot["ok"])
+        self.assertIn("late finalizer", snapshot["issue"])
+        self.assertGreaterEqual(
+            snapshot["oldest_late_finalizer_age_seconds"],
+            verify_web_module._WEBHOOK_LATE_FINALIZER_FATAL_AGE_SECONDS,
+        )
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.2)
+        queue._late_finalizers.clear()
+        queue._late_finalizer_started_at.clear()
+
+
 class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_bootstrap_validation_runs_before_database_initialization(self) -> None:
         from bot import __main__ as bot_main
@@ -1909,7 +2645,12 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         settings = _settings(webhook_url="", webhook_secret="")
         engine = SimpleNamespace(dispose=AsyncMock())
         session_factory = object()
-        runtime_config = SimpleNamespace(set_apply_callback=Mock())
+        runtime_config = SimpleNamespace(
+            set_apply_callback=Mock(),
+            config=SimpleNamespace(
+                logging=SimpleNamespace(model_dump=Mock(return_value={}))
+            ),
+        )
         llm = SimpleNamespace(reconfigure=Mock())
         memory = SimpleNamespace(reconfigure=Mock())
         bot = SimpleNamespace(
@@ -1940,6 +2681,7 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         verify_web = SimpleNamespace(
             start=AsyncMock(),
             stop=AsyncMock(),
+            quiesce_update_processor=AsyncMock(return_value=True),
             stop_update_processor=AsyncMock(),
             webhook_route_error=None,
             enable_webhook_route=Mock(),
@@ -1974,6 +2716,10 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.__main__.dp", new=_MainDispatcher()),
             patch("bot.__main__.create_bot", return_value=bot),
             patch("bot.__main__.restore_vote_ban_tasks", new=AsyncMock()),
+            patch(
+                "bot.__main__.warm_privileged_operator_cache",
+                new=AsyncMock(return_value=0),
+            ),
             patch(
                 "bot.__main__.TelegramCleanupScheduler",
                 return_value=telegram_cleanup,
@@ -2035,7 +2781,12 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             dispose=AsyncMock(side_effect=lambda: events.append("engine"))
         )
         session_factory = object()
-        runtime_config = SimpleNamespace(set_apply_callback=Mock())
+        runtime_config = SimpleNamespace(
+            set_apply_callback=Mock(),
+            config=SimpleNamespace(
+                logging=SimpleNamespace(model_dump=Mock(return_value={}))
+            ),
+        )
         llm = SimpleNamespace(reconfigure=Mock())
         memory = SimpleNamespace(reconfigure=Mock())
         bot = SimpleNamespace(
@@ -2072,6 +2823,9 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         verify_web = SimpleNamespace(
             start=AsyncMock(),
             stop=AsyncMock(side_effect=lambda: events.append("web-stop")),
+            quiesce_update_processor=AsyncMock(
+                side_effect=lambda: events.append("processor-quiesce") or True
+            ),
             stop_update_processor=AsyncMock(
                 side_effect=lambda: events.append("processor-stop")
             ),
@@ -2100,6 +2854,10 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.__main__.TelegramCleanupScheduler", return_value=cleanup),
             patch("bot.__main__.configure_telegram_cleanup_scheduler"),
             patch("bot.__main__.restore_vote_ban_tasks", new=AsyncMock()),
+            patch(
+                "bot.__main__.warm_privileged_operator_cache",
+                new=AsyncMock(return_value=0),
+            ),
             patch("bot.__main__.ProactiveTopicService", return_value=proactive),
             patch("bot.__main__.JoinVerificationSweeper", return_value=sweeper),
             patch("bot.__main__.PatrolService", return_value=patrol),
@@ -2143,7 +2901,11 @@ class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             verify_constructor.call_args.kwargs["webhook_dispatcher"],
             dispatcher,
         )
-        self.assertLess(events.index("processor-stop"), events.index("pending-flush"))
+        self.assertLess(
+            events.index("processor-quiesce"),
+            events.index("pending-flush"),
+        )
+        self.assertLess(events.index("pending-flush"), events.index("processor-stop"))
         self.assertLess(events.index("pending-flush"), events.index("cleanup-stop"))
         self.assertLess(events.index("cleanup-stop"), events.index("bot-close"))
         self.assertLess(events.index("bot-close"), events.index("engine"))

@@ -61,14 +61,18 @@ from bot.services.join_verification import (
     PreparedVerification,
     activate_prepared_join_verification,
     ban_member,
+    chat_member_is_present,
     claim_join_verification,
     complete_leased_join_verification,
     delete_verification_prompt,
     get_join_verification,
+    join_verification_lease_is_current,
     kick_member,
     lease_expired_join_verification,
     restrict_new_member,
     prepare_join_verification,
+    reconcile_moderation_ban_after_lost_lease,
+    reconcile_stale_verification_restriction,
     renew_prepared_join_verification,
     renew_join_verification_lease,
     shield_abort_prepared_join_verification,
@@ -89,8 +93,6 @@ log = logging.getLogger(__name__)
 # Suspects mentioned per challenge message: keeps each message far below the
 # 4096-char cap and within Telegram's per-message mention-notification limits.
 RAID_MENTIONS_PER_MESSAGE = 15
-# Gentle pacing between per-member Telegram calls (restrict).
-_PER_MEMBER_CALL_PAUSE = 0.05
 # Upper bound on remembered joins per group; a raid larger than this still
 # triggers long before the cap is reached.
 _MAX_TRACKED_JOINS = 4096
@@ -594,6 +596,7 @@ async def remove_raid_challenged_users(
     group_id: int,
     prompt_message_id: int,
     group_settings: dict | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> RaidRemovalResult:
     """Lease and kick pending raid suspects from one prompt crash-safely.
 
@@ -676,80 +679,152 @@ async def remove_raid_challenged_users(
         )
     await session.commit()
 
-    removed: list[int] = []
-    failed: list[int] = list(unclaimed_user_ids)
-    for snapshot, globally_banned in claimed:
-        user_id = int(snapshot["user_id"])
-        if not await is_group_authorized(session, group_id):
-            await session.rollback()
-            failed.extend(
-                int(item[0]["user_id"])
-                for item in claimed
-                if int(item[0]["user_id"]) not in removed
-                and int(item[0]["user_id"]) not in failed
-            )
-            break
-        renewed_lease = now_shanghai_naive() + timedelta(
-            seconds=TERMINAL_LEASE_SECONDS
+    if session_factory is not None:
+        work_session_factory = session_factory
+    elif getattr(session, "bind", None) is not None:
+        work_session_factory = async_sessionmaker(
+            bind=session.bind,
+            class_=type(session),
+            expire_on_commit=False,
+            autoflush=False,
         )
-        renewed = await renew_join_verification_lease(
-            session,
-            verification_id=int(snapshot["verification_id"]),
-            lease_until=snapshot["lease_until"],
-            new_lease_until=renewed_lease,
-            status=VERIFICATION_STATUS_ENFORCING,
-        )
-        if not renewed:
-            await session.rollback()
-            failed.append(user_id)
-            continue
-        await session.commit()
-        snapshot["lease_until"] = renewed_lease
-        # A global-ban registry row is policy, not proof that the per-group
-        # Telegram ban succeeded. It also decides whether this action is a
-        # permanent ban or a rejoinable removal.
-        async def preserve_ban() -> bool:
-            blocked = await verification_release_blocked_by_ban(
-                session,
-                group_id=group_id,
-                user_id=user_id,
-            )
-            await session.commit()
-            return blocked
+    else:
+        # Compatibility for isolated helper tests and non-SQLAlchemy adapters.
+        # Production handlers always inject a real factory, so concurrent work
+        # never shares one AsyncSession.
+        class _BorrowedSession:
+            async def __aenter__(self) -> AsyncSession:
+                return session
 
-        authorized = await is_group_authorized(session, group_id)
-        # End the read transaction before the Telegram removal call. A slow
-        # Telegram response must not pin a pooled DB connection or SQLite
-        # snapshot for the full network timeout.
-        await session.commit()
-        if not authorized:
-            failed.append(user_id)
-            continue
-        if globally_banned:
-            enforced = await ban_member(bot, group_id, user_id)
-        else:
-            enforced = await kick_member(
-                bot,
-                group_id,
-                user_id,
-                preserve_ban=preserve_ban,
+            async def __aexit__(self, *_args: object) -> None:
+                rollback = getattr(session, "rollback", None)
+                if callable(rollback):
+                    await rollback()
+
+        work_session_factory = _BorrowedSession
+    semaphore = asyncio.Semaphore(4)
+
+    async def remove_one(
+        snapshot: dict[str, object],
+        globally_banned: bool,
+    ) -> tuple[int, bool]:
+        del globally_banned  # refresh policy after the queue/lease wait below
+        user_id = int(snapshot["user_id"])
+        async with semaphore:
+            renewed_lease = now_shanghai_naive() + timedelta(
+                seconds=TERMINAL_LEASE_SECONDS
             )
-        if enforced:
-            removed.append(user_id)
-            completed = await complete_leased_join_verification(
-                session,
-                verification_id=int(snapshot["verification_id"]),
-                lease_until=snapshot["lease_until"],
-                status=VERIFICATION_STATUS_ENFORCING,
-            )
-            if completed:
-                await session.commit()
-            else:
-                await session.rollback()
-            continue
-        failed.append(user_id)
-        # Keep the removal intent durable. If Telegram did not confirm it, the
-        # sweeper must retry instead of exposing this as a passable challenge.
+            async with work_session_factory() as work_session:
+                if not await is_group_authorized(work_session, group_id):
+                    await work_session.rollback()
+                    return user_id, False
+                renewed = await renew_join_verification_lease(
+                    work_session,
+                    verification_id=int(snapshot["verification_id"]),
+                    lease_until=snapshot["lease_until"],
+                    new_lease_until=renewed_lease,
+                    status=VERIFICATION_STATUS_ENFORCING,
+                )
+                if not renewed:
+                    await work_session.rollback()
+                    return user_id, False
+                current_global_ban = await is_globally_banned(work_session, user_id)
+                lease_is_current = await join_verification_lease_is_current(
+                    work_session,
+                    verification_id=int(snapshot["verification_id"]),
+                    lease_until=renewed_lease,
+                    status=VERIFICATION_STATUS_ENFORCING,
+                )
+                await work_session.commit()
+                if not lease_is_current:
+                    return user_id, False
+
+            member_present = await chat_member_is_present(bot, group_id, user_id)
+            if member_present is None:
+                return user_id, False
+            if not member_present:
+                async with work_session_factory() as completion_session:
+                    completed = await complete_leased_join_verification(
+                        completion_session,
+                        verification_id=int(snapshot["verification_id"]),
+                        lease_until=renewed_lease,
+                        status=VERIFICATION_STATUS_ENFORCING,
+                    )
+                    if completed:
+                        await completion_session.commit()
+                    else:
+                        await completion_session.rollback()
+                return user_id, bool(completed)
+
+            async def preserve_ban() -> bool:
+                async with work_session_factory() as policy_session:
+                    return await verification_release_blocked_by_ban(
+                        policy_session,
+                        group_id=group_id,
+                        user_id=user_id,
+                    )
+
+            # No database session or application lock is held across these
+            # Telegram calls. Each member has a hard outer deadline, while the
+            # lower-level wrappers retain their cancellation-safe journals.
+            try:
+                async with asyncio.timeout(30.0):
+                    if current_global_ban:
+                        enforced = await ban_member(bot, group_id, user_id)
+                    else:
+                        enforced = await kick_member(
+                            bot,
+                            group_id,
+                            user_id,
+                            preserve_ban=preserve_ban,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "raid bulk removal failed | group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return user_id, False
+            if not enforced:
+                # Keep the removal intent durable. The sweeper retries after
+                # the renewed lease instead of exposing a passable challenge.
+                return user_id, False
+
+            async with work_session_factory() as completion_session:
+                completed = await complete_leased_join_verification(
+                    completion_session,
+                    verification_id=int(snapshot["verification_id"]),
+                    lease_until=renewed_lease,
+                    status=VERIFICATION_STATUS_ENFORCING,
+                )
+                if completed:
+                    await completion_session.commit()
+                else:
+                    await completion_session.rollback()
+            if not completed and current_global_ban:
+                async def current_policy_blocks_release() -> bool:
+                    async with work_session_factory() as policy_session:
+                        return await verification_release_blocked_by_ban(
+                            policy_session,
+                            group_id=group_id,
+                            user_id=user_id,
+                        )
+
+                await reconcile_moderation_ban_after_lost_lease(
+                    bot,
+                    group_id,
+                    user_id,
+                    current_policy_blocks_release,
+                )
+            return user_id, bool(completed)
+
+    results = await asyncio.gather(
+        *(remove_one(snapshot, globally_banned) for snapshot, globally_banned in claimed)
+    )
+    removed = [user_id for user_id, succeeded in results if succeeded]
+    failed = [*unclaimed_user_ids, *(user_id for user_id, succeeded in results if not succeeded)]
     return RaidRemovalResult(
         pending_count=len(records),
         removed_user_ids=tuple(removed),
@@ -1566,6 +1641,44 @@ class RaidGuardService:
         if verification_id is None:
             return False
 
+        member_present = await chat_member_is_present(self.bot, group_id, user_id)
+        if member_present is None:
+            return False
+        if not member_present:
+            async with self.session_factory() as session:
+                completed = await complete_leased_join_verification(
+                    session,
+                    verification_id=verification_id,
+                    lease_until=lease_until,
+                    status=VERIFICATION_STATUS_ENFORCING,
+                )
+                if completed:
+                    await session.commit()
+                else:
+                    await session.rollback()
+            return True
+
+        renewed_lease = now_shanghai_naive() + timedelta(
+            seconds=TERMINAL_LEASE_SECONDS
+        )
+        async with self.session_factory() as session:
+            renewed = await renew_join_verification_lease(
+                session,
+                verification_id=verification_id,
+                lease_until=lease_until,
+                new_lease_until=renewed_lease,
+                status=VERIFICATION_STATUS_ENFORCING,
+            )
+            if renewed:
+                await session.commit()
+            else:
+                await session.rollback()
+                # A manual unban/release is a higher-priority terminal intent.
+                # Consume this stale join event instead of falling through into
+                # normal verification and restricting the user again.
+                return True
+        lease_until = renewed_lease
+
         async def preserve_ban() -> bool:
             async with self.session_factory() as session:
                 return await verification_release_blocked_by_ban(
@@ -1595,6 +1708,13 @@ class RaidGuardService:
                 await session.commit()
             else:
                 await session.rollback()
+        if not completed:
+            await reconcile_stale_verification_restriction(
+                self.bot,
+                self.session_factory,
+                group_id,
+                user_id,
+            )
         return True
 
     async def _group_authorized(self, group_id: int) -> bool:
@@ -1735,12 +1855,20 @@ class RaidGuardService:
         ) -> bool:
             try:
                 async with self.session_factory() as session:
-                    return await shield_abort_prepared_join_verification(
+                    compensated = await shield_abort_prepared_join_verification(
                         self.bot,
                         session,
                         prepared=prepared,
                         restore_permissions=restore_permissions,
                     )
+                if not compensated and restore_permissions:
+                    return await reconcile_stale_verification_restriction(
+                        self.bot,
+                        self.session_factory,
+                        group_id,
+                        prepared.user_id,
+                    )
+                return compensated
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1750,6 +1878,27 @@ class RaidGuardService:
                     prepared.user_id,
                 )
                 return False
+
+        async def abort_many(
+            pairs: list[tuple[RaidSuspect, PreparedVerification]],
+            *,
+            restore_ids: set[int] | None = None,
+        ) -> None:
+            semaphore = asyncio.Semaphore(4)
+
+            async def abort_bounded(prepared: PreparedVerification) -> None:
+                async with semaphore:
+                    await abort_one(
+                        prepared,
+                        restore_permissions=(
+                            restore_ids is None
+                            or prepared.verification_id in restore_ids
+                        ),
+                    )
+
+            await asyncio.gather(
+                *(abort_bounded(prepared) for _suspect, prepared in pairs)
+            )
 
         async def activate_chunk(
             pairs: list[tuple[RaidSuspect, PreparedVerification]],
@@ -1776,6 +1925,7 @@ class RaidGuardService:
             pairs: list[tuple[RaidSuspect, PreparedVerification]],
         ) -> list[tuple[RaidSuspect, PreparedVerification]]:
             renewed_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
+            lost_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
             async with self.session_factory() as session:
                 for suspect, prepared in pairs:
                     renewed = await renew_prepared_join_verification(
@@ -1784,7 +1934,20 @@ class RaidGuardService:
                     )
                     if renewed is not None:
                         renewed_pairs.append((suspect, renewed))
+                    else:
+                        lost_pairs.append((suspect, prepared))
                 await session.commit()
+            await asyncio.gather(
+                *(
+                    reconcile_stale_verification_restriction(
+                        self.bot,
+                        self.session_factory,
+                        group_id,
+                        suspect.user_id,
+                    )
+                    for suspect, _prepared in lost_pairs
+                )
+            )
             return renewed_pairs
 
         enforced: list[RaidSuspect] = []
@@ -1823,33 +1986,95 @@ class RaidGuardService:
 
             muted_pairs: list[tuple[RaidSuspect, PreparedVerification]] = []
             try:
-                for suspect, prepared in prepared_pairs:
-                    if not await self._group_authorized(group_id):
-                        muted_ids = {
-                            item.verification_id for _member, item in muted_pairs
-                        }
-                        for _member, item in prepared_pairs:
-                            await abort_one(
-                                item,
-                                restore_permissions=item.verification_id in muted_ids,
-                            )
-                        return enforced
-                    if await restrict_new_member(self.bot, group_id, suspect.user_id):
-                        muted_pairs.append((suspect, prepared))
-                    else:
-                        log.warning(
-                            "[%s] raid mute failed; skipping user %s",
+                semaphore = asyncio.Semaphore(4)
+
+                async def mute_one(
+                    suspect: RaidSuspect,
+                    prepared: PreparedVerification,
+                ) -> tuple[RaidSuspect, PreparedVerification, bool, bool]:
+                    async with semaphore:
+                        if not await self._group_authorized(group_id):
+                            return suspect, prepared, False, False
+                        member_present = await chat_member_is_present(
+                            self.bot,
                             group_id,
                             suspect.user_id,
                         )
-                        await abort_one(prepared, restore_permissions=True)
-                    await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
+                        if member_present is None:
+                            return suspect, prepared, False, True
+                        if not member_present:
+                            await abort_one(prepared, restore_permissions=False)
+                            return suspect, prepared, False, True
+                        async with self.session_factory() as lease_session:
+                            renewed = await renew_prepared_join_verification(
+                                lease_session,
+                                prepared=prepared,
+                            )
+                            if renewed is None:
+                                await lease_session.rollback()
+                                return suspect, prepared, False, True
+                            await lease_session.commit()
+                        prepared = renewed
+                        try:
+                            async with asyncio.timeout(20.0):
+                                muted = await restrict_new_member(
+                                    self.bot,
+                                    group_id,
+                                    suspect.user_id,
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            muted = False
+                            log.exception(
+                                "[%s] raid mute failed | user=%s",
+                                group_id,
+                                suspect.user_id,
+                            )
+                        if not muted:
+                            log.warning(
+                                "[%s] raid mute failed; skipping user %s",
+                                group_id,
+                                suspect.user_id,
+                            )
+                            await abort_one(prepared, restore_permissions=True)
+                            return suspect, prepared, False, True
+                        async with self.session_factory() as lease_session:
+                            renewed = await renew_prepared_join_verification(
+                                lease_session,
+                                prepared=prepared,
+                            )
+                            if renewed is None:
+                                await lease_session.rollback()
+                                await reconcile_stale_verification_restriction(
+                                    self.bot,
+                                    self.session_factory,
+                                    group_id,
+                                    suspect.user_id,
+                                )
+                                return suspect, prepared, False, True
+                            await lease_session.commit()
+                        return suspect, renewed, True, True
+
+                mute_results = await asyncio.gather(
+                    *(mute_one(suspect, prepared) for suspect, prepared in prepared_pairs)
+                )
+                muted_pairs = [
+                    (suspect, prepared)
+                    for suspect, prepared, muted, _authorized in mute_results
+                    if muted
+                ]
+                if any(not authorized for *_prefix, authorized in mute_results):
+                    muted_ids = {
+                        prepared.verification_id for _suspect, prepared in muted_pairs
+                    }
+                    await abort_many(prepared_pairs, restore_ids=muted_ids)
+                    return enforced
             except asyncio.CancelledError:
-                for _suspect, prepared in prepared_pairs:
-                    # The mute may have reached Telegram before cancellation was
-                    # delivered locally. Recover every prepared member instead
-                    # of deleting an ambiguously applied side effect.
-                    await abort_one(prepared, restore_permissions=True)
+                # The mute may have reached Telegram before cancellation was
+                # delivered locally. Recover every prepared member instead of
+                # deleting an ambiguously applied side effect.
+                await abort_many(prepared_pairs)
                 raise
             if not muted_pairs:
                 continue
@@ -1858,8 +2083,7 @@ class RaidGuardService:
                 continue
 
             if not await self._group_authorized(group_id):
-                for _suspect, prepared in muted_pairs:
-                    await abort_one(prepared, restore_permissions=True)
+                await abort_many(muted_pairs)
                 return enforced
 
             chunk = [suspect for suspect, _prepared in muted_pairs]
@@ -1879,13 +2103,11 @@ class RaidGuardService:
                 )
                 prompt_message_id = int(getattr(sent, "message_id", 0) or 0)
             except asyncio.CancelledError:
-                for _suspect, prepared in muted_pairs:
-                    await abort_one(prepared, restore_permissions=True)
+                await abort_many(muted_pairs)
                 raise
             except Exception:
                 log.exception("[%s] raid challenge message failed", group_id)
-                for _suspect, prepared in muted_pairs:
-                    await abort_one(prepared, restore_permissions=True)
+                await abort_many(muted_pairs)
                 continue
 
             activation_task = asyncio.create_task(
@@ -1909,9 +2131,13 @@ class RaidGuardService:
                         "[%s] raid activation failed while cancellation was pending",
                         group_id,
                     )
-                for _suspect, prepared in muted_pairs:
-                    if prepared.verification_id not in activated_ids:
-                        await abort_one(prepared, restore_permissions=True)
+                await abort_many(
+                    [
+                        pair
+                        for pair in muted_pairs
+                        if pair[1].verification_id not in activated_ids
+                    ]
+                )
                 if not activated_ids and prompt_message_id:
                     await delete_verification_prompt(
                         self.bot, group_id, prompt_message_id
@@ -1919,8 +2145,7 @@ class RaidGuardService:
                 raise
             except Exception:
                 log.exception("[%s] raid challenge activation failed", group_id)
-                for _suspect, prepared in muted_pairs:
-                    await abort_one(prepared, restore_permissions=True)
+                await abort_many(muted_pairs)
                 if prompt_message_id:
                     await delete_verification_prompt(
                         self.bot, group_id, prompt_message_id
@@ -1932,9 +2157,13 @@ class RaidGuardService:
                 for suspect, prepared in muted_pairs
                 if prepared.verification_id in activated_ids
             ]
-            for _suspect, prepared in muted_pairs:
-                if prepared.verification_id not in activated_ids:
-                    await abort_one(prepared, restore_permissions=True)
+            await abort_many(
+                [
+                    pair
+                    for pair in muted_pairs
+                    if pair[1].verification_id not in activated_ids
+                ]
+            )
             if not activated_pairs:
                 if prompt_message_id:
                     await delete_verification_prompt(

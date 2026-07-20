@@ -10,14 +10,17 @@ import re
 import time
 import weakref
 from collections import Counter
+from contextlib import asynccontextmanager
+from contextvars import Context
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
 from bot.db.models import (
@@ -41,6 +44,7 @@ from bot.services.authz import (
 from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.ban_audit import record_ban_event
 from bot.services.call_admin import handle_call_admin, is_call_admin_trigger
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.vote_ban import (
     VOTE_BAN_ADMIN_RESOLUTION_BAN,
     VOTE_BAN_ADMIN_RESOLUTION_CANCEL,
@@ -57,6 +61,7 @@ from bot.services.vote_ban import (
     expire_overdue,
     finalize_vote_message,
     recover_stale_vote_enforcement,
+    reconcile_vote_ban_after_lost_generation,
     record_vote_ban_outcome,
     record_vote,
     schedule_vote_enforcement_recovery,
@@ -76,16 +81,29 @@ from bot.services.speech_style import (
 )
 from bot.services.llm import LLMService
 from bot.services.join_verification import (
+    UnbanRecovery,
+    activate_manual_unban_recovery,
     ban_member,
     begin_moderation_challenge,
+    complete_leased_join_verification,
     delete_join_verification,
+    join_verification_lease_is_current,
+    enforce_ban_with_policy_reconciliation,
     lease_join_verification_for_unban,
+    manual_unban_generation_is_active,
     moderation_challenge_ready,
+    reconcile_moderation_ban_after_lost_lease,
+    release_moderation_restriction_after_exemption,
     restore_member_permissions,
     unban_member,
     verification_release_blocked_by_ban,
+    verification_restriction_required,
 )
-from bot.services.join_screening import is_globally_banned
+from bot.services.join_screening import (
+    is_globally_banned,
+    is_join_screening_exempt,
+    moderation_rules_fingerprint,
+)
 from bot.services.bot_screening import (
     is_bot_whitelisted,
     record_bot_screening_pass,
@@ -94,9 +112,12 @@ from bot.services.bot_screening import (
 from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.member_identity import member_display_name
 from bot.services.moderation import ModerationService
+from bot.services.moderation import ModerationVerdict
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
 from bot.services.proactive import note_group_activity, record_group_activity
+from bot.services.privileged_tasks import submit_privileged_task
+from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills import SkillService
 from bot.services.skills.vote_ban import is_explicit_vote_ban_request
 from bot.services.sticker_library import sticker_library
@@ -176,6 +197,50 @@ def _moderation_user_lock(group_id: int, user_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _MODERATION_USER_LOCKS[key] = lock
     return lock
+
+
+@asynccontextmanager
+async def _bounded_moderation_user_lock(
+    group_id: int,
+    user_id: int,
+    *,
+    timeout_seconds: float = 2.0,
+):
+    lock = _moderation_user_lock(group_id, user_id)
+    try:
+        await asyncio.wait_for(
+            lock.acquire(),
+            timeout=max(0.01, float(timeout_seconds)),
+        )
+    except asyncio.TimeoutError:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+
+
+class _DetachedCallbackProxy:
+    """Deliver late callback outcomes after the spinner was acknowledged."""
+
+    def __init__(self, callback: CallbackQuery) -> None:
+        self.bot = callback.bot
+        self.message = callback.message
+        self.from_user = callback.from_user
+        self.data = callback.data
+
+    async def answer(self, text: str = "", **_kwargs: Any) -> None:
+        if not text:
+            return
+        message_answer = getattr(self.message, "answer", None)
+        if callable(message_answer):
+            await message_answer(text)
+            return
+        chat = getattr(self.message, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if chat_id:
+            await self.bot.send_message(chat_id, text)
 
 
 def _source_message_id(message: Message) -> int | None:
@@ -325,6 +390,51 @@ async def _fresh_group_authorized_for_moderation(
             group_id,
         )
         return False
+
+
+async def _claim_current_moderation_verdict(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+    verdict: ModerationVerdict,
+) -> bool:
+    """Linearize an old verdict against newer policy before side effects.
+
+    ``ModerationService.evaluate`` deliberately releases its DB transaction
+    before a potentially slow LLM call.  The verdict therefore carries the
+    exact enabled-rule fingerprint it saw.  Re-entering SQLite as a writer makes
+    authorization, exemptions, manual-unban generations and the rule snapshot
+    one atomic claim; a newer administrative mutation wins instead of being
+    overwritten by this stale worker.
+    """
+
+    await session.rollback()
+    await acquire_group_settings_write_intent(session, int(group_id))
+    if manual_unban_generation_is_active(int(group_id), int(user_id)):
+        await session.rollback()
+        return False
+    if not await is_group_authorized(session, int(group_id)):
+        await session.rollback()
+        return False
+    if await is_join_screening_exempt(session, int(user_id)):
+        await session.rollback()
+        return False
+    if await session.scalar(
+        select(ModerationExemption.id).where(
+            ModerationExemption.group_id == int(group_id),
+            ModerationExemption.user_id == int(user_id),
+        )
+    ) is not None:
+        await session.rollback()
+        return False
+    expected = str(getattr(verdict, "rules_fingerprint", "") or "")
+    if expected:
+        current = await moderation_rules_fingerprint(session, int(group_id))
+        if current != expected:
+            await session.rollback()
+            return False
+    return True
 
 
 @dataclass(slots=True)
@@ -657,6 +767,19 @@ async def _screen_bot_sender_message(
     if not await _fresh_group_authorized_for_moderation(session, group_id):
         return
 
+    if verdict.conclusive and not await _claim_current_moderation_verdict(
+        session,
+        group_id=group_id,
+        user_id=bot_id,
+        verdict=verdict,
+    ):
+        log.info(
+            "[%s] bot screening verdict discarded | reason=policy_changed bot=%s",
+            group_id,
+            bot_id,
+        )
+        return
+
     if not verdict.violated:
         if not verdict.conclusive:
             # Unparseable moderation output: neither punish nor credit a pass.
@@ -688,15 +811,21 @@ async def _screen_bot_sender_message(
     ban_now = rule_action == "ban" and moderation.is_high_confidence(verdict)
 
     await reset_bot_screening(session, group_id, bot_id)
-    if not ban_now:
-        # Release the SQLite write lock before waiting on the per-user
-        # moderation lock inside the counted-ban path; holding both in
-        # opposite order deadlocks against a concurrent message from the
-        # same bot.
-        await session.commit()
+    # Never wait for an application lock while holding SQLite's process-wide
+    # writer lock.  Other moderation paths take these resources in the
+    # opposite order, so publishing this small reset first removes the lock
+    # inversion and keeps privileged database work moving.
+    await session.commit()
 
     if ban_now:
         async with _moderation_user_lock(group_id, bot_id):
+            if not await _claim_current_moderation_verdict(
+                session,
+                group_id=group_id,
+                user_id=bot_id,
+                verdict=verdict,
+            ):
+                return
             violation = await moderation.record_violation(
                 session,
                 group_id,
@@ -714,7 +843,32 @@ async def _screen_bot_sender_message(
             if prior_ban_result is not True:
                 # Persist the event and compensation journal before Telegram.
                 # If the response is lost, recovery can safely unban.
-                await lease_join_verification_for_unban(session, group_id, bot_id)
+                warning = await session.scalar(
+                    select(UserWarning).where(
+                        UserWarning.group_id == group_id,
+                        UserWarning.user_id == bot_id,
+                    )
+                )
+                if warning is None:
+                    session.add(
+                        UserWarning(
+                            group_id=group_id,
+                            user_id=bot_id,
+                            count=0,
+                            is_banned=True,
+                        )
+                    )
+                else:
+                    warning.is_banned = True
+                recovery = await lease_join_verification_for_unban(
+                    session,
+                    group_id,
+                    bot_id,
+                    manual_unban=False,
+                )
+                if recovery is None:
+                    await session.rollback()
+                    return
                 await session.commit()
                 try:
                     await message.delete()
@@ -724,7 +878,52 @@ async def _screen_bot_sender_message(
                         group_id,
                         bot_id,
                     )
-                attempted_ban = await ban_member(message.bot, group_id, bot_id)
+                async def preserve_latest_ban() -> bool:
+                    await session.rollback()
+                    blocked = await verification_release_blocked_by_ban(
+                        session,
+                        group_id=group_id,
+                        user_id=bot_id,
+                    )
+                    await session.commit()
+                    return bool(blocked)
+
+                async def preserve_latest_restriction() -> bool:
+                    await session.rollback()
+                    required = await verification_restriction_required(
+                        session,
+                        group_id=group_id,
+                        user_id=bot_id,
+                    )
+                    await session.commit()
+                    return bool(required)
+
+                final_policy = await enforce_ban_with_policy_reconciliation(
+                    message.bot,
+                    group_id,
+                    bot_id,
+                    preserve_latest_ban,
+                    restriction_required=preserve_latest_restriction,
+                )
+                attempted_ban = final_policy is True
+                if attempted_ban:
+                    await session.rollback()
+                    claimed = await complete_leased_join_verification(
+                        session,
+                        verification_id=int(recovery.verification_id),
+                        lease_until=recovery.lease_until,
+                        status="unbanning",
+                    )
+                    if not claimed:
+                        await session.rollback()
+                        attempted_ban = False
+                        await reconcile_moderation_ban_after_lost_lease(
+                            message.bot,
+                            group_id,
+                            bot_id,
+                            preserve_latest_ban,
+                            restriction_required=preserve_latest_restriction,
+                        )
                 ban_enforced, result_changed = await _persist_violation_ban_result(
                     session,
                     violation,
@@ -755,11 +954,6 @@ async def _screen_bot_sender_message(
                                 )
                             else:
                                 warning.is_banned = True
-                            await delete_join_verification(
-                                session,
-                                group_id,
-                                bot_id,
-                            )
                         await record_ban_event(
                             session,
                             group_id=group_id,
@@ -824,8 +1018,7 @@ async def _screen_bot_sender_message(
     # flooding ad bot is auto-banned after warn_threshold hits instead of
     # producing an unbounded delete/notice loop.
     warn_threshold = max(1, int(settings.moderation.warn_threshold))
-    count, violation, ban_enforced, ban_failure_note = (
-        await _apply_counted_moderation_ban(
+    counted_outcome = await _apply_counted_moderation_ban(
             moderation=moderation,
             session=session,
             message=message,
@@ -834,8 +1027,11 @@ async def _screen_bot_sender_message(
             input_text=input_text,
             rule=rule,
             message_deleted=False,
+            verdict=verdict,
         )
-    )
+    if counted_outcome is None:
+        return
+    count, violation, ban_enforced, ban_failure_note = counted_outcome
     violation_id = int(violation.id)
     notice = _build_moderation_notice(
         warn_target=warn_target,
@@ -979,8 +1175,17 @@ async def _apply_counted_moderation_ban(
     input_text: str,
     rule: ModerationRule | None,
     message_deleted: bool,
-) -> tuple[int, Violation, bool, str]:
+    verdict: ModerationVerdict | None = None,
+) -> tuple[int, Violation, bool, str] | None:
     async with _moderation_user_lock(group_id, user_id):
+        if verdict is not None and not await _claim_current_moderation_verdict(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+            verdict=verdict,
+        ):
+            return None
+        recovery: UnbanRecovery | None = None
         source_message_id = _source_message_id(message)
         if source_message_id is None:
             # Compatibility for synthetic/manual Message objects that have no
@@ -1001,6 +1206,16 @@ async def _apply_counted_moderation_ban(
             violation.warning_count = int(count)
             violation.action_taken = "ban_applied" if should_ban else "ban_warning"
             await session.flush()
+            if should_ban:
+                recovery = await lease_join_verification_for_unban(
+                    session,
+                    group_id,
+                    user_id,
+                    manual_unban=False,
+                )
+                if recovery is None:
+                    await session.rollback()
+                    return None
             await session.commit()
         else:
             violation = await moderation.record_violation(
@@ -1025,6 +1240,16 @@ async def _apply_counted_moderation_ban(
                     "ban_applied" if should_ban else "ban_warning"
                 )
                 await session.flush()
+                if should_ban:
+                    recovery = await lease_join_verification_for_unban(
+                        session,
+                        group_id,
+                        user_id,
+                        manual_unban=False,
+                    )
+                    if recovery is None:
+                        await session.rollback()
+                        return None
                 await session.commit()
             else:
                 count = max(0, int(stored_count))
@@ -1032,6 +1257,19 @@ async def _apply_counted_moderation_ban(
                     str(getattr(violation, "action_taken", "") or "")
                 )
                 should_ban = action_base == "ban_applied"
+                if should_ban and _violation_nullable_bool(
+                    violation,
+                    "ban_enforced",
+                ) is not True:
+                    recovery = await lease_join_verification_for_unban(
+                        session,
+                        group_id,
+                        user_id,
+                        manual_unban=False,
+                    )
+                    if recovery is None:
+                        await session.rollback()
+                        return None
                 # The conflict-safe insert starts a transaction even on reuse.
                 # Release it before Telegram calls.
                 await session.commit()
@@ -1048,7 +1286,52 @@ async def _apply_counted_moderation_ban(
         ban_enforced = bool(prior_ban_result) if prior_ban_result is not None else False
         ban_failure_note = ""
         if should_ban and prior_ban_result is not True:
-            attempted_ban = await ban_member(message.bot, group_id, user_id)
+            async def preserve_latest_ban() -> bool:
+                await session.rollback()
+                blocked = await verification_release_blocked_by_ban(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+                await session.commit()
+                return bool(blocked)
+
+            async def preserve_latest_restriction() -> bool:
+                await session.rollback()
+                required = await verification_restriction_required(
+                    session,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+                await session.commit()
+                return bool(required)
+
+            final_policy = await enforce_ban_with_policy_reconciliation(
+                message.bot,
+                group_id,
+                user_id,
+                preserve_latest_ban,
+                restriction_required=preserve_latest_restriction,
+            )
+            attempted_ban = final_policy is True
+            if attempted_ban and recovery is not None:
+                await session.rollback()
+                claimed = await complete_leased_join_verification(
+                    session,
+                    verification_id=int(recovery.verification_id),
+                    lease_until=recovery.lease_until,
+                    status="unbanning",
+                )
+                if not claimed:
+                    await session.rollback()
+                    attempted_ban = False
+                    await reconcile_moderation_ban_after_lost_lease(
+                        message.bot,
+                        group_id,
+                        user_id,
+                        preserve_latest_ban,
+                        restriction_required=preserve_latest_restriction,
+                    )
             ban_enforced, result_changed = await _persist_violation_ban_result(
                 session,
                 violation,
@@ -1172,6 +1455,16 @@ async def _moderation_direct_ban(
                 await callback.answer("警告状态已变化，请重新点击", show_alert=True)
                 return
 
+        recovery = await lease_join_verification_for_unban(
+            session,
+            group_id,
+            target_id,
+            manual_unban=False,
+        )
+        if recovery is None:
+            await session.rollback()
+            await callback.answer("无法建立封禁恢复工单，请重试", show_alert=True)
+            return
         try:
             await session.commit()
         except Exception:
@@ -1180,9 +1473,64 @@ async def _moderation_direct_ban(
     else:
         # A previous Telegram attempt was unconfirmed. The durable local policy
         # and direct marker already exist; release this read before retrying.
+        recovery = await lease_join_verification_for_unban(
+            session,
+            group_id,
+            target_id,
+            manual_unban=False,
+        )
+        if recovery is None:
+            await session.rollback()
+            await callback.answer("无法建立封禁恢复工单，请重试", show_alert=True)
+            return
         await session.commit()
 
-    attempted_ban = await ban_member(callback.bot, group_id, target_id)
+    async def preserve_latest_ban() -> bool:
+        await session.rollback()
+        blocked = await verification_release_blocked_by_ban(
+            session,
+            group_id=group_id,
+            user_id=target_id,
+        )
+        await session.commit()
+        return bool(blocked)
+
+    async def preserve_latest_restriction() -> bool:
+        await session.rollback()
+        required = await verification_restriction_required(
+            session,
+            group_id=group_id,
+            user_id=target_id,
+        )
+        await session.commit()
+        return bool(required)
+
+    final_policy = await enforce_ban_with_policy_reconciliation(
+        callback.bot,
+        group_id,
+        target_id,
+        preserve_latest_ban,
+        restriction_required=preserve_latest_restriction,
+    )
+    attempted_ban = final_policy is True
+    if attempted_ban:
+        await session.rollback()
+        claimed = await complete_leased_join_verification(
+            session,
+            verification_id=int(recovery.verification_id),
+            lease_until=recovery.lease_until,
+            status="unbanning",
+        )
+        if not claimed:
+            await session.rollback()
+            attempted_ban = False
+            await reconcile_moderation_ban_after_lost_lease(
+                callback.bot,
+                group_id,
+                target_id,
+                preserve_latest_ban,
+                restriction_required=preserve_latest_restriction,
+            )
     ban_enforced, result_changed = await _persist_violation_ban_result(
         session,
         violation,
@@ -1228,7 +1576,6 @@ async def _moderation_direct_ban(
         return
 
     try:
-        await delete_join_verification(session, group_id, target_id)
         operator = callback.from_user
         if result_changed:
             await record_ban_event(
@@ -1412,7 +1759,11 @@ async def _moderation_undo_false_positive(
         # Commit the false-positive rollback together with a durable unban
         # journal before touching Telegram. A crash at any later point is
         # completed by the sweeper, while a newly-created ban policy wins.
-        await lease_join_verification_for_unban(session, group_id, target_id)
+        recovery = await lease_join_verification_for_unban(
+            session,
+            group_id,
+            target_id,
+        )
         try:
             await session.commit()
         except Exception:
@@ -1425,6 +1776,7 @@ async def _moderation_undo_false_positive(
             )
             await callback.answer("撤销状态保存失败，请稍后重试", show_alert=True)
             return None
+        activate_manual_unban_recovery(recovery)
 
         async def preserve_ban() -> bool:
             await session.rollback()
@@ -1499,26 +1851,46 @@ async def _moderation_add_permanent_exemption(
             ModerationExemption.user_id == violation.user_id,
         )
     )
-    if result.scalar_one_or_none() is not None:
-        await session.commit()
-        await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
-        return None
-
-    session.add(
-        ModerationExemption(
-            group_id=violation.group_id,
-            user_id=violation.user_id,
-            created_by=operator_id,
+    existing = result.scalar_one_or_none()
+    if existing is None:
+        session.add(
+            ModerationExemption(
+                group_id=violation.group_id,
+                user_id=violation.user_id,
+                created_by=operator_id,
+            )
         )
+    recovery = await lease_join_verification_for_unban(
+        session,
+        int(violation.group_id),
+        int(violation.user_id),
+        manual_unban=False,
     )
+    if recovery is None:
+        await session.rollback()
+        await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
+        return None
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
         await callback.answer("该用户已在当前群永久豁免 AI 审核", show_alert=True)
         return None
-    await callback.answer("已永久豁免该用户的当前群 AI 审核", show_alert=True)
-    return "exempt"
+    activate_manual_unban_recovery(recovery)
+    released = await release_moderation_restriction_after_exemption(
+        callback.bot,
+        session,
+        recovery,
+    )
+    if existing is not None:
+        text = "该用户已在当前群永久豁免 AI 审核"
+    else:
+        text = "已永久豁免该用户的当前群 AI 审核"
+    if not released:
+        text += "；旧限制正在由恢复任务继续校准"
+        request_current_update_retry()
+    await callback.answer(text, show_alert=True)
+    return "exempt" if existing is None else None
 
 
 @router.callback_query(F.data.startswith(f"{_MODERATION_ACTION_CALLBACK_PREFIX}:"))
@@ -1526,6 +1898,7 @@ async def on_moderation_action(
     callback: CallbackQuery,
     settings: Settings,
     session: AsyncSession | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     if session is None:
         await callback.answer("会话未就绪，请等待下一次审核通知", show_alert=True)
@@ -1561,6 +1934,68 @@ async def on_moderation_action(
         return
 
     group_id = int(chat.id)
+    if session_factory is not None:
+        try:
+            async with asyncio.timeout(2.0):
+                await callback.answer("审核操作已受理，正在后台复验权限并执行")
+        except Exception:
+            log.debug("moderation callback fast acknowledgement failed", exc_info=True)
+        deferred_callback = _DetachedCallbackProxy(callback)
+        # Raw callback data is attacker-controlled. Keep authoritative
+        # authorization in the HIGH update lane and only allocate a CRITICAL
+        # job after it succeeds; the background operation revalidates again
+        # immediately before the state transition.
+        if not await is_group_authorized(session, group_id):
+            await session.commit()
+            await deferred_callback.answer("当前群组未授权，不能执行审核操作")
+            return
+        await session.commit()
+        if not await is_group_admin_or_higher(
+            bot=callback.bot,
+            session=session,
+            settings=settings,
+            group_id=group_id,
+            user_id=int(user.id),
+        ):
+            await deferred_callback.answer("仅群管理员及以上权限可执行该操作")
+            return
+        in_transaction = getattr(session, "in_transaction", None)
+        if callable(in_transaction) and in_transaction():
+            await session.commit()
+        target_hint = violation_id
+        try:
+            violation_hint = await session.get(Violation, violation_id)
+            if violation_hint is not None and int(violation_hint.group_id) == group_id:
+                target_hint = int(violation_hint.user_id)
+        finally:
+            await session.commit()
+
+        async def operation() -> None:
+            async with session_factory() as work_session:
+                await on_moderation_action(
+                    deferred_callback,  # type: ignore[arg-type]
+                    settings,
+                    session=work_session,
+                    session_factory=None,
+                )
+
+        submission = submit_privileged_task(
+            key=f"moderation-action:{group_id}:{target_hint}",
+            label=f"moderation action {action} for {target_hint} in {group_id}",
+            operation=operation,
+            lane="critical",
+            priority=0,
+            timeout_seconds=120.0,
+        )
+        if not submission.accepted:
+            request_current_update_retry()
+            await deferred_callback.answer(
+                "审核任务队列正忙，本次操作会自动重试。"
+            )
+        elif not submission.created:
+            await deferred_callback.answer("该用户的审核操作正在执行，未重复提交。")
+        return
+
     if not await is_group_authorized(session, group_id):
         await session.commit()
         await callback.answer("当前群组未授权，不能执行审核操作", show_alert=True)
@@ -1583,7 +2018,10 @@ async def on_moderation_action(
     target_id = int(violation.user_id)
     await session.commit()
 
-    async with _moderation_user_lock(group_id, target_id):
+    async with _bounded_moderation_user_lock(group_id, target_id) as acquired:
+        if not acquired:
+            await callback.answer("该用户的另一项审核操作正在执行，请稍后重试", show_alert=True)
+            return
         violation = await session.get(Violation, violation_id, populate_existing=True)
         if violation is None or int(violation.group_id) != group_id:
             await session.commit()
@@ -1718,6 +2156,7 @@ async def _finalize_vote_enforcement(
     record: VoteBanSession,
     session_id: int,
     approvals: int,
+    recovery: UnbanRecovery,
 ) -> tuple[bool, bool]:
     """Run the Telegram ban and persist the outcome after a successful
     active→enforcing claim (threshold or admin resolution).
@@ -1729,10 +2168,33 @@ async def _finalize_vote_enforcement(
     lease_token = record.enforcing_started_at
     group_id = int(record.group_id)
     target_id = int(record.target_user_id)
+    owns_generation = bool(
+        record.status == "enforcing"
+        and lease_token is not None
+        and await join_verification_lease_is_current(
+            session,
+            verification_id=int(recovery.verification_id),
+            lease_until=recovery.lease_until,
+            status="unbanning",
+        )
+    )
     # ``refresh`` opened a new read transaction. Snapshot all values needed
     # by the idempotent Telegram side effect, then return the connection to
     # the pool before the Bot API timeout can elapse.
     await session.commit()
+    if not owns_generation:
+        if record.status == "enforcing" and session_factory is not None:
+            # A compatible newer ban generation may have replaced only the
+            # recovery token. Keep the durable vote from remaining stuck until
+            # restart; its recovery worker will retry after the normal lease.
+            cancel_vote_expiry(session_id)
+            schedule_vote_enforcement_recovery(
+                session_factory=session_factory,
+                bot=callback.bot,
+                settings=settings,
+                session_id=session_id,
+            )
+        return False, False
     cancel_vote_expiry(session_id)
     if session_factory is not None:
         schedule_vote_enforcement_recovery(
@@ -1749,16 +2211,17 @@ async def _finalize_vote_enforcement(
         target_user_id=target_id,
     )
     outcome_persisted = False
+    generation_lost = False
     try:
-        if banned:
-            await delete_join_verification(session, group_id, target_id)
         outcome_persisted = await record_vote_ban_outcome(
             session,
             record,
             approvals=approvals,
             banned=banned,
             lease_token=lease_token,
+            recovery=recovery,
         )
+        generation_lost = not outcome_persisted
     except Exception:
         await session.rollback()
         log.exception(
@@ -1766,6 +2229,21 @@ async def _finalize_vote_enforcement(
             group_id,
             session_id,
         )
+
+    if generation_lost:
+        try:
+            await reconcile_vote_ban_after_lost_generation(
+                callback.bot,
+                session,
+                group_id=group_id,
+                target_user_id=target_id,
+            )
+        except Exception:
+            log.exception(
+                "vote-ban superseded-state reconciliation failed | group=%s session=%s",
+                group_id,
+                session_id,
+            )
 
     if outcome_persisted:
         cancel_vote_enforcement_recovery(session_id)
@@ -1923,7 +2401,15 @@ async def on_vote_ban_action(
             await callback.answer("仅群管理员可执行该操作", show_alert=True)
             return
 
-    async with _moderation_user_lock(group_id, target_id):
+    moderation_lock = _moderation_user_lock(group_id, target_id)
+    try:
+        await asyncio.wait_for(moderation_lock.acquire(), timeout=1.5)
+    except TimeoutError:
+        if session.in_transaction():
+            await session.rollback()
+        await callback.answer("该操作正在处理中，请稍后重试")
+        return
+    try:
         record = await session.get(VoteBanSession, session_id, populate_existing=True)
         if record is None or record.status not in {"active", "enforcing"}:
             await session.commit()
@@ -2055,6 +2541,16 @@ async def on_vote_ban_action(
                 await session.rollback()
                 await callback.answer("投票已由其他操作结束", show_alert=True)
                 return
+            recovery = await lease_join_verification_for_unban(
+                session,
+                group_id,
+                target_id,
+                manual_unban=False,
+            )
+            if recovery is None:
+                await session.rollback()
+                await callback.answer("无法建立封禁恢复工单，请稍后重试", show_alert=True)
+                return
             approvals = await count_approvals(session, session_id)
             await session.commit()
             banned, outcome_persisted = await _finalize_vote_enforcement(
@@ -2065,6 +2561,7 @@ async def on_vote_ban_action(
                 record=record,
                 session_id=session_id,
                 approvals=approvals,
+                recovery=recovery,
             )
             if not outcome_persisted:
                 answer_text = (
@@ -2254,6 +2751,16 @@ async def on_vote_ban_action(
             await session.rollback()
             await callback.answer("投票已由其他操作结束", show_alert=True)
             return
+        recovery = await lease_join_verification_for_unban(
+            session,
+            group_id,
+            target_id,
+            manual_unban=False,
+        )
+        if recovery is None:
+            await session.rollback()
+            await callback.answer("无法建立封禁恢复工单，请稍后重试", show_alert=True)
+            return
         await session.commit()
         banned, outcome_persisted = await _finalize_vote_enforcement(
             callback,
@@ -2263,6 +2770,7 @@ async def on_vote_ban_action(
             record=record,
             session_id=session_id,
             approvals=approvals,
+            recovery=recovery,
         )
         if not outcome_persisted:
             answer_text = "投票结果已执行，状态正在自动同步"
@@ -2277,14 +2785,18 @@ async def on_vote_ban_action(
             record.threshold,
             banned,
         )
+    finally:
+        moderation_lock.release()
 
 
-async def _record_group_activity_cas(
+async def _persist_group_activity_cas(
     session: AsyncSession,
     *,
     group_id: int,
     title: str,
     settings: Settings,
+    activity_at: datetime | None = None,
+    best_effort_on_lock: bool = True,
 ) -> dict[str, Any]:
     """Persist activity without replacing a concurrently updated JSON document."""
 
@@ -2295,7 +2807,7 @@ async def _record_group_activity_cas(
     for _attempt in range(5):
         row = await session.get(Group, group_id, populate_existing=True)
         if row is None:
-            updated = record_group_activity({}, settings.bot)
+            updated = record_group_activity({}, settings.bot, at=activity_at)
             session.add(Group(id=group_id, title=title or "", settings=updated))
             try:
                 await session.commit()
@@ -2307,11 +2819,17 @@ async def _record_group_activity_cas(
                 await session.rollback()
                 if not is_database_locked_error(exc):
                     raise
+                if not best_effort_on_lock:
+                    raise
                 log.warning("[%s] skipped activity insert due sqlite lock", group_id)
                 return {}
 
         stored_settings = row.settings
-        updated = record_group_activity(dict(stored_settings or {}), settings.bot)
+        updated = record_group_activity(
+            dict(stored_settings or {}),
+            settings.bot,
+            at=activity_at,
+        )
         predicates = [Group.id == group_id]
         if stored_settings is None:
             predicates.append(Group.settings.is_(None))
@@ -2335,6 +2853,8 @@ async def _record_group_activity_cas(
             await session.rollback()
             if not is_database_locked_error(exc):
                 raise
+            if not best_effort_on_lock:
+                raise
             log.warning("[%s] skipped activity update due sqlite lock", group_id)
             return dict(stored_settings or {})
 
@@ -2342,6 +2862,132 @@ async def _record_group_activity_cas(
     await session.rollback()
     fresh = await session.get(Group, group_id, populate_existing=True)
     return dict(fresh.settings or {}) if fresh is not None else {}
+
+
+@dataclass(slots=True)
+class _PendingGroupActivityWrite:
+    session_factory: async_sessionmaker[AsyncSession]
+    title: str
+    settings: Settings
+    activity_at: datetime
+    version: int = 1
+    task: asyncio.Task[None] | None = None
+
+
+_GROUP_ACTIVITY_DEBOUNCE_SECONDS = 1.0
+_GROUP_ACTIVITY_PENDING: dict[int, _PendingGroupActivityWrite] = {}
+_GROUP_ACTIVITY_WRITE_SEMAPHORE = asyncio.Semaphore(1)
+
+
+async def _run_group_activity_writer(group_id: int) -> None:
+    retry_delay = 0.5
+    try:
+        await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
+        while True:
+            pending = _GROUP_ACTIVITY_PENDING.get(group_id)
+            if pending is None:
+                return
+            version = pending.version
+            try:
+                async with _GROUP_ACTIVITY_WRITE_SEMAPHORE:
+                    async with pending.session_factory() as write_session:
+                        await _persist_group_activity_cas(
+                            write_session,
+                            group_id=group_id,
+                            title=pending.title,
+                            settings=pending.settings,
+                            activity_at=pending.activity_at,
+                            best_effort_on_lock=False,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("[%s] deferred group activity flush failed", group_id)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30.0, retry_delay * 2.0)
+                continue
+
+            current = _GROUP_ACTIVITY_PENDING.get(group_id)
+            if current is pending and current.version == version:
+                _GROUP_ACTIVITY_PENDING.pop(group_id, None)
+                return
+            retry_delay = 0.5
+            await asyncio.sleep(_GROUP_ACTIVITY_DEBOUNCE_SECONDS)
+    finally:
+        current = _GROUP_ACTIVITY_PENDING.get(group_id)
+        if current is not None and current.task is asyncio.current_task():
+            current.task = None
+
+
+def _schedule_group_activity_write(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    group_id: int,
+    title: str,
+    settings: Settings,
+    activity_at: datetime,
+) -> None:
+    pending = _GROUP_ACTIVITY_PENDING.get(group_id)
+    if pending is None:
+        pending = _PendingGroupActivityWrite(
+            session_factory=session_factory,
+            title=title,
+            settings=settings,
+            activity_at=activity_at,
+        )
+        _GROUP_ACTIVITY_PENDING[group_id] = pending
+    else:
+        pending.session_factory = session_factory
+        pending.title = title or pending.title
+        pending.settings = settings
+        pending.activity_at = activity_at
+        pending.version += 1
+
+    if pending.task is None or pending.task.done():
+        pending.task = asyncio.create_task(
+            _run_group_activity_writer(group_id),
+            name=f"group-activity:{group_id}",
+            context=Context(),
+        )
+
+
+async def _record_group_activity_cas(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    title: str,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict[str, Any]:
+    """Return fresh settings and coalesce activity writes off the hot path."""
+
+    if session_factory is None:
+        # Compatibility for isolated callers/tests. Production supplies the
+        # application factory and never waits for this low-priority write.
+        return await _persist_group_activity_cas(
+            session,
+            group_id=group_id,
+            title=title,
+            settings=settings,
+        )
+
+    if session.in_transaction():
+        await session.commit()
+    row = await session.get(Group, group_id, populate_existing=True)
+    stored_settings = dict(row.settings or {}) if row is not None else {}
+    if session.in_transaction():
+        await session.commit()
+
+    activity_at = datetime.now().astimezone()
+    preview = record_group_activity(stored_settings, settings.bot, at=activity_at)
+    _schedule_group_activity_write(
+        session_factory=session_factory,
+        group_id=group_id,
+        title=title,
+        settings=settings,
+        activity_at=activity_at,
+    )
+    return preview
 
 
 async def _best_effort_commit(
@@ -2549,16 +3195,80 @@ class _ReplyDeliveryPlan:
 
 _PENDING_REPLY_LOCK = asyncio.Lock()
 _PENDING_REPLY_BATCHES: dict[tuple[int, int], _PendingReplyBatch] = {}
-_PENDING_REPLY_EXECUTION_SEMAPHORE = asyncio.Semaphore(4)
+_PENDING_REPLY_EXECUTION_CAPACITY = 4
+_PENDING_REPLY_EXECUTION_SEMAPHORE = asyncio.Semaphore(
+    _PENDING_REPLY_EXECUTION_CAPACITY
+)
 _PENDING_REPLY_DEFAULT_TIMEOUT_SECONDS = 45.0
 _PENDING_REPLY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 _PENDING_REPLY_MAX_SENDERS = 64
 _PENDING_REPLY_MAX_ITEMS_PER_SENDER = 20
-_PENDING_REPLY_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
+_PENDING_REPLY_ORPHAN_TASKS: set[asyncio.Future[Any]] = set()
+_PENDING_REPLY_ORPHAN_STARTED: dict[asyncio.Future[Any], float] = {}
+_PENDING_REPLY_ORPHAN_MAX_AGE_SECONDS = 120.0
+
+
+def _observe_pending_reply_orphan(task: asyncio.Future[Any]) -> None:
+    _PENDING_REPLY_ORPHAN_TASKS.discard(task)
+    _PENDING_REPLY_ORPHAN_STARTED.pop(task, None)
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _track_pending_reply_orphan(task: asyncio.Future[Any]) -> None:
+    if task.done():
+        _observe_pending_reply_orphan(task)
+        return
+    _PENDING_REPLY_ORPHAN_TASKS.add(task)
+    _PENDING_REPLY_ORPHAN_STARTED.setdefault(task, time.monotonic())
+    task.add_done_callback(_observe_pending_reply_orphan)
+
+
+def pending_reply_resource_health_snapshot() -> dict[str, Any]:
+    now = time.monotonic()
+    active_orphans = [
+        task for task in _PENDING_REPLY_ORPHAN_TASKS if not task.done()
+    ]
+    oldest_age = max(
+        (
+            now - _PENDING_REPLY_ORPHAN_STARTED.get(task, now)
+            for task in active_orphans
+        ),
+        default=0.0,
+    )
+    waiters = getattr(_PENDING_REPLY_EXECUTION_SEMAPHORE, "_waiters", None)
+    batches = tuple(_PENDING_REPLY_BATCHES.values())
+    orphan_count = len(active_orphans)
+    fatal = bool(
+        orphan_count >= _PENDING_REPLY_EXECUTION_CAPACITY
+        or oldest_age >= _PENDING_REPLY_ORPHAN_MAX_AGE_SECONDS
+    )
+    return {
+        "ok": not fatal,
+        "fatal": fatal,
+        "capacity": _PENDING_REPLY_EXECUTION_CAPACITY,
+        "available_permits": int(
+            getattr(_PENDING_REPLY_EXECUTION_SEMAPHORE, "_value", 0)
+        ),
+        "semaphore_waiters": len(waiters or ()),
+        "orphan_count": orphan_count,
+        "oldest_orphan_seconds": round(oldest_age, 3),
+        "batch_count": len(batches),
+        "processing_batches": sum(1 for batch in batches if batch.processing),
+        "queued_items": sum(len(batch.items) for batch in batches),
+    }
+
+
+register_resource_health_provider(
+    "pending_replies",
+    pending_reply_resource_health_snapshot,
+)
 
 
 class _PendingReplyDeadlineExceeded(asyncio.TimeoutError):
-    def __init__(self, task: asyncio.Task[Any]) -> None:
+    def __init__(self, task: asyncio.Future[Any]) -> None:
         super().__init__("pending reply deadline exceeded")
         self.task = task
 
@@ -2936,7 +3646,11 @@ def _schedule_memory_compaction(memory: Any, group_id: int) -> None:
             _MEMORY_COMPACT_RERUN.discard(group_id)
 
     try:
-        task = asyncio.create_task(_run(), name=f"memory-compact:{group_id}")
+        task = asyncio.create_task(
+            _run(),
+            name=f"memory-compact:{group_id}",
+            context=Context(),
+        )
     except RuntimeError:
         return
     # Keep a strong reference and only allow one compactor per group.
@@ -3606,6 +4320,8 @@ async def _process_pending_reply_batch(
                         "assistant",
                         stored_reply,
                         message_type="assistant_reply",
+                        defer_persistence=True,
+                        completions=_unique_pending_reply_completions(items),
                     )
                 _schedule_memory_compaction(memory, group_id)
             log.info(
@@ -3640,20 +4356,6 @@ async def _await_hard_deadline(awaitable: Any, *, timeout_seconds: float) -> Any
 
     task = asyncio.ensure_future(awaitable)
 
-    def _orphan_finished(done_task: asyncio.Future[Any]) -> None:
-        _PENDING_REPLY_ORPHAN_TASKS.discard(done_task)  # type: ignore[arg-type]
-        try:
-            done_task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    def _track_orphan() -> None:
-        if task.done():
-            _orphan_finished(task)
-            return
-        _PENDING_REPLY_ORPHAN_TASKS.add(task)  # type: ignore[arg-type]
-        task.add_done_callback(_orphan_finished)
-
     try:
         done, _ = await asyncio.wait(
             {task},
@@ -3665,12 +4367,12 @@ async def _await_hard_deadline(awaitable: Any, *, timeout_seconds: float) -> Any
         # Keep the real child visible to the common drain until it actually
         # exits; otherwise it can retain the reply semaphore or shared Bot/DB
         # resources after the worker that owned it has already disappeared.
-        _track_orphan()
+        _track_pending_reply_orphan(task)
         raise
     if task in done:
         return task.result()
     task.cancel()
-    _track_orphan()
+    _track_pending_reply_orphan(task)
     raise _PendingReplyDeadlineExceeded(task)
 
 
@@ -3745,6 +4447,20 @@ def _finish_pending_reply_items(
         receipt = item.update_completion
         if receipt is not None:
             receipt.finish(succeeded)
+
+
+def _unique_pending_reply_completions(
+    items: list[_PendingReplyItem],
+) -> tuple[UpdateCompletionReceipt, ...]:
+    completions: list[UpdateCompletionReceipt] = []
+    seen: set[int] = set()
+    for item in items:
+        completion = item.update_completion
+        if completion is None or id(completion) in seen:
+            continue
+        seen.add(id(completion))
+        completions.append(completion)
+    return tuple(completions)
 
 
 async def _process_pending_reply_batch_guarded(
@@ -3823,7 +4539,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
 
             if settings is not None and items:
                 outcome = await _process_pending_reply_batch_guarded(key, items, settings)
-                _finish_pending_reply_items(items, succeeded=outcome.succeeded)
+                final_succeeded = bool(outcome.succeeded)
                 orphan = outcome.orphan
                 if orphan is not None:
                     # Preserve per-sender single-flight even when a provider
@@ -3831,7 +4547,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                     # key until the old task really exits, while other senders
                     # continue through independent workers.
                     try:
-                        await asyncio.shield(orphan)
+                        final_succeeded = bool(await asyncio.shield(orphan)) or final_succeeded
                     except asyncio.CancelledError:
                         worker_task = asyncio.current_task()
                         if worker_task is not None and worker_task.cancelling():
@@ -3841,6 +4557,11 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                         # this is completion, not cancellation of the worker.
                     except Exception:
                         pass
+                # The durable receipt belongs to the real execution owner, not
+                # merely its timeout wrapper. Releasing it before a
+                # cancellation-resistant child exits permits replay and a
+                # duplicate reply while the original task is still live.
+                _finish_pending_reply_items(items, succeeded=final_succeeded)
             elif items:
                 _finish_pending_reply_items(items, succeeded=False)
             active_items = []
@@ -3905,6 +4626,7 @@ async def _enqueue_pending_reply(item: _PendingReplyItem, settings: Settings) ->
             state.task = asyncio.create_task(
                 _pending_reply_worker(key),
                 name=f"pending-reply:{item.group_id}:{item.user_id}",
+                context=Context(),
             )
 
     return queued_count, delay_seconds
@@ -3922,6 +4644,7 @@ async def flush_pending_inbound_batches() -> None:
                 state.task = asyncio.create_task(
                     _pending_reply_worker(key),
                     name=f"pending-reply:{key[0]}:{key[1]}",
+                    context=Context(),
                 )
             tasks.append(state.task)
             if state.settings is not None:
@@ -3960,6 +4683,19 @@ async def flush_pending_inbound_batches() -> None:
         if pending_compactors:
             await asyncio.wait(pending_compactors, timeout=1.0)
 
+    activity_tasks = {
+        state.task
+        for state in _GROUP_ACTIVITY_PENDING.values()
+        if state.task is not None and not state.task.done()
+    }
+    if activity_tasks:
+        _, pending_activity = await asyncio.wait(activity_tasks, timeout=3.0)
+        for task in pending_activity:
+            task.cancel()
+        if pending_activity:
+            await asyncio.wait(pending_activity, timeout=1.0)
+    _GROUP_ACTIVITY_PENDING.clear()
+
     orphan_tasks = {task for task in _PENDING_REPLY_ORPHAN_TASKS if not task.done()}
     for task in orphan_tasks:
         task.cancel()
@@ -3981,7 +4717,10 @@ async def flush_pending_inbound_batches() -> None:
     | F.contact
 )
 async def on_group_message(
-    message: Message, session: AsyncSession, settings: Settings
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     if not is_group(message):
         return
@@ -3996,12 +4735,14 @@ async def on_group_message(
     # persisted timestamp is committed immediately below; the in-process
     # revision closes the shorter pre-commit race during topic generation.
     note_group_activity(group_id)
-    group_settings = await _record_group_activity_cas(
-        session,
-        group_id=group_id,
-        title=message.chat.title or "",
-        settings=settings,
-    )
+    activity_kwargs: dict[str, Any] = {
+        "group_id": group_id,
+        "title": message.chat.title or "",
+        "settings": settings,
+    }
+    if session_factory is not None:
+        activity_kwargs["session_factory"] = session_factory
+    group_settings = await _record_group_activity_cas(session, **activity_kwargs)
 
     text, msg_type = extract_message_text(message)
     if not text:
@@ -4202,16 +4943,14 @@ async def on_group_message(
                 high_confidence = mod.is_high_confidence(verdict)
                 if not high_confidence and not sender_identity.is_chat:
                     if moderation_challenge_ready(settings):
-                        try:
-                            await message.delete()
-                            message_deleted = True
-                        except Exception:
-                            log.warning(
-                                "[%s] low-confidence message delete failed | user=%s",
-                                group_id,
-                                user_id,
-                            )
                         async with _moderation_user_lock(group_id, user_id):
+                            if not await _claim_current_moderation_verdict(
+                                session,
+                                group_id=group_id,
+                                user_id=user_id,
+                                verdict=verdict,
+                            ):
+                                return
                             challenge_violation = await mod.record_violation(
                                 session,
                                 group_id,
@@ -4223,6 +4962,15 @@ async def on_group_message(
                             )
                             await session.flush()
                             await session.commit()
+                            try:
+                                await message.delete()
+                                message_deleted = True
+                            except Exception:
+                                log.warning(
+                                    "[%s] low-confidence message delete failed | user=%s",
+                                    group_id,
+                                    user_id,
+                                )
                             await _refresh_violation_notice_state(
                                 session,
                                 challenge_violation,
@@ -4241,6 +4989,7 @@ async def on_group_message(
                                     display_name=display_name,
                                     bot_username=getattr(bot_me, "username", "") or "",
                                     reason=reason,
+                                    session_factory=session_factory,
                                 )
                                 if challenged:
                                     challenge_violation.notice_sent_at = (
@@ -4306,6 +5055,13 @@ async def on_group_message(
                     # to ban_chat_member always fails; use the dedicated Bot
                     # API method and avoid user-warning/callback workflows.
                     async with _moderation_user_lock(group_id, user_id):
+                        if not await _claim_current_moderation_verdict(
+                            session,
+                            group_id=group_id,
+                            user_id=user_id,
+                            verdict=verdict,
+                        ):
+                            return
                         source_message_id = _source_message_id(message)
                         violation = await mod.record_violation(
                             session,
@@ -4386,6 +5142,13 @@ async def on_group_message(
 
                 if action == "warn":
                     async with _moderation_user_lock(group_id, user_id):
+                        if not await _claim_current_moderation_verdict(
+                            session,
+                            group_id=group_id,
+                            user_id=user_id,
+                            verdict=verdict,
+                        ):
+                            return
                         violation = await mod.record_violation(
                             session,
                             group_id,
@@ -4428,6 +5191,13 @@ async def on_group_message(
 
                 if action == "delete":
                     async with _moderation_user_lock(group_id, user_id):
+                        if not await _claim_current_moderation_verdict(
+                            session,
+                            group_id=group_id,
+                            user_id=user_id,
+                            verdict=verdict,
+                        ):
+                            return
                         violation = await mod.record_violation(
                             session,
                             group_id,
@@ -4468,8 +5238,7 @@ async def on_group_message(
                     return
 
                 warn_threshold = max(1, settings.moderation.warn_threshold)
-                count, violation, ban_enforced, ban_failure_note = (
-                    await _apply_counted_moderation_ban(
+                counted_outcome = await _apply_counted_moderation_ban(
                         moderation=mod,
                         session=session,
                         message=message,
@@ -4478,8 +5247,11 @@ async def on_group_message(
                         input_text=input_text,
                         rule=rule,
                         message_deleted=message_deleted,
+                        verdict=verdict,
                     )
-                )
+                if counted_outcome is None:
+                    return
+                count, violation, ban_enforced, ban_failure_note = counted_outcome
                 violation_id = int(violation.id)
                 notice = _build_moderation_notice(
                     warn_target=warn_target,
@@ -4548,6 +5320,7 @@ async def on_group_message(
                 message_type=msg_type,
                 message_id=str(message.message_id),
                 created_at=message.date,
+                defer_persistence=True,
             )
             log.info(
                 "[%s]【结束】呼叫管理员 | user=%s | 总耗时=%dms",
@@ -4615,6 +5388,7 @@ async def on_group_message(
             message_type=msg_type,
             message_id=str(message.message_id),
             created_at=message.date,
+            defer_persistence=True,
         )
         _schedule_memory_compaction(memory, group_id)
     else:
@@ -4677,13 +5451,16 @@ async def on_group_message(
         memory_entry=memory_entry,
         update_completion=current_update_completion(),
     )
+    if pending_item.update_completion is not None:
+        # Register ownership before publishing the item. A zero-delay worker
+        # can otherwise finish between enqueue and ``defer()``, completing the
+        # durable receipt before this detached reply is visible to it.
+        pending_item.update_completion.defer()
     try:
         queued_count, queued_delay = await _enqueue_pending_reply(
             pending_item,
             settings,
         )
-        if pending_item.update_completion is not None:
-            pending_item.update_completion.defer()
     except _PendingReplyQueueFull:
         direct_overload = _is_strong_pending_reply_signal(pending_item)
         overload_handled = not direct_overload
@@ -4711,7 +5488,9 @@ async def on_group_message(
                     group_id,
                     user_id,
                 )
-        if pending_item.update_completion is not None and not overload_handled:
+        if pending_item.update_completion is not None:
+            pending_item.update_completion.finish(overload_handled)
+        if not overload_handled:
             # No reply work was accepted and even the visible overload fallback
             # failed. Let Telegram retry instead of acknowledging silent loss.
             raise

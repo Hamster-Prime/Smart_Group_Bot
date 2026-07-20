@@ -39,6 +39,8 @@ from bot.services.background_health import record_background_failure
 
 log = logging.getLogger(__name__)
 
+_PERMISSION_PASS_DEADLINE_SECONDS = 180.0
+
 GROUP_PERMISSIONS_SETTINGS_KEY = "default_permissions"
 GROUP_PERMISSIONS_SCHEMA_VERSION = 1
 DEFAULT_GROUP_TIMEZONE = "Asia/Shanghai"
@@ -593,7 +595,8 @@ class GroupPermissionService:
         consecutive_failures = 0
         while True:
             try:
-                await self.run_once(raise_on_total_failure=True)
+                async with asyncio.timeout(_PERMISSION_PASS_DEADLINE_SECONDS):
+                    await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.services.authz import is_group_admin_authorized, is_super_admin_user_id
+from bot.services.update_delivery import mark_privileged_operator
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ async def is_group_admin_or_higher(
         return False
 
     if is_super_admin_user_id(user_id, settings):
+        mark_privileged_operator(user_id)
         return True
 
     local_authorized = False
@@ -76,6 +78,7 @@ async def is_group_admin_or_higher(
             return False
 
     if local_authorized:
+        mark_privileged_operator(user_id, group_id=group_id)
         return True
 
     try:
@@ -91,7 +94,11 @@ async def is_group_admin_or_higher(
 
     status = getattr(member, "status", None)
     if status == ChatMemberStatus.CREATOR:
+        mark_privileged_operator(user_id, group_id=group_id)
         return True
     if status == ChatMemberStatus.ADMINISTRATOR:
-        return bool(getattr(member, "can_restrict_members", False))
+        allowed = bool(getattr(member, "can_restrict_members", False))
+        if allowed:
+            mark_privileged_operator(user_id, group_id=group_id)
+        return allowed
     return False

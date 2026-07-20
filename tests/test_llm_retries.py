@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 import unittest
 from enum import Enum
 from typing import Any
@@ -291,6 +293,27 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(flush, timeout=0.5)
         self.assertFalse(llm_module._LLM_ORPHAN_TASKS)
 
+    async def test_stream_cleanup_task_is_not_counted_as_request_orphan(self) -> None:
+        release = asyncio.Event()
+
+        async def slow_cleanup() -> None:
+            await release.wait()
+
+        task = asyncio.create_task(slow_cleanup())
+        llm_module._track_llm_cleanup_task(task)
+        llm_module._LLM_CLEANUP_STARTED[task] = (
+            asyncio.get_running_loop().time() - 600.0
+        )
+        snapshot = llm_module.llm_resource_health_snapshot()
+        self.assertFalse(snapshot["fatal"])
+        self.assertEqual(snapshot["orphan_count"], 0)
+        self.assertEqual(snapshot["cleanup_task_count"], 1)
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.2)
+        await asyncio.sleep(0)
+        self.assertFalse(llm_module._LLM_CLEANUP_TASKS)
+
     async def test_repeated_endpoint_failures_open_circuit(self) -> None:
         llm = self._make_llm()
         llm.main.retry_attempts = 1
@@ -393,6 +416,143 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "")
         mock_completion.assert_not_awaited()
+
+    async def test_slow_token_counter_does_not_block_event_loop(self) -> None:
+        llm = self._make_llm()
+        mock_completion = AsyncMock(return_value=_chat_resp(content="ok"))
+        release = threading.Event()
+
+        def slow_token_counter(**_kwargs: Any) -> int:
+            release.wait(timeout=0.5)
+            return 64
+
+        failsafe = threading.Timer(0.5, release.set)
+        failsafe.daemon = True
+        failsafe.start()
+        started = time.monotonic()
+        try:
+            with (
+                patch("bot.services.llm.litellm.acompletion", mock_completion),
+                patch(
+                    "bot.services.llm.litellm.token_counter",
+                    side_effect=slow_token_counter,
+                ),
+                patch(
+                    "bot.services.llm._LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS",
+                    0.02,
+                ),
+                patch(
+                    "bot.services.llm.litellm.get_model_info",
+                    return_value={"max_input_tokens": 8192},
+                ),
+            ):
+                generation = asyncio.create_task(llm.generate("sys", "hi"))
+                await asyncio.sleep(0.04)
+                elapsed_while_generation_running = time.monotonic() - started
+                result = await generation
+        finally:
+            release.set()
+            failsafe.cancel()
+            deadline = time.monotonic() + 1.0
+            while (
+                llm_module._tokenizer_stats_snapshot()["active"]
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+        self.assertLess(elapsed_while_generation_running, 0.3)
+        self.assertEqual(result, "ok")
+        mock_completion.assert_awaited_once()
+        self.assertEqual(llm_module._tokenizer_stats_snapshot()["active"], 0)
+
+    async def test_token_counter_threads_are_bounded_when_calls_ignore_timeout(self) -> None:
+        llm = self._make_llm()
+        release = threading.Event()
+        started_lock = threading.Lock()
+        started_calls = 0
+
+        def blocked_token_counter(**_kwargs: Any) -> int:
+            nonlocal started_calls
+            with started_lock:
+                started_calls += 1
+            release.wait(timeout=1.0)
+            return 64
+
+        before = llm_module._tokenizer_stats_snapshot()
+        mock_completion = AsyncMock(return_value=_chat_resp(content="ok"))
+        tasks: list[asyncio.Task[str]] = []
+        try:
+            with (
+                patch("bot.services.llm.litellm.acompletion", mock_completion),
+                patch(
+                    "bot.services.llm.litellm.token_counter",
+                    side_effect=blocked_token_counter,
+                ),
+                patch(
+                    "bot.services.llm._LLM_TOKENIZER_THREAD_TIMEOUT_SECONDS",
+                    0.03,
+                ),
+                patch(
+                    "bot.services.llm.litellm.get_model_info",
+                    return_value={"max_input_tokens": 8192},
+                ),
+            ):
+                tasks = [
+                    asyncio.create_task(llm.generate("sys", f"message-{idx}"))
+                    for idx in range(2)
+                ]
+                deadline = time.monotonic() + 0.5
+                while started_calls < 2 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                self.assertEqual(started_calls, 2)
+
+                third = await asyncio.wait_for(
+                    llm.generate("sys", "third"),
+                    timeout=0.2,
+                )
+                self.assertEqual(third, "ok")
+                self.assertEqual(started_calls, 2)
+                tokenizer_health = llm_module.llm_resource_health_snapshot()[
+                    "tokenizer"
+                ]
+                self.assertEqual(
+                    tokenizer_health["active"],
+                    llm_module._LLM_TOKENIZER_THREAD_CAPACITY,
+                )
+                self.assertGreaterEqual(
+                    tokenizer_health["saturated_total"],
+                    before["saturated_total"] + 1,
+                )
+                self.assertEqual(await asyncio.gather(*tasks), ["ok", "ok"])
+        finally:
+            release.set()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            deadline = time.monotonic() + 1.0
+            while (
+                llm_module._tokenizer_stats_snapshot()["active"]
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+        after = llm_module._tokenizer_stats_snapshot()
+        self.assertEqual(after["active"], 0)
+        self.assertGreaterEqual(
+            after["saturated_total"],
+            before["saturated_total"] + 1,
+        )
+        self.assertEqual(mock_completion.await_count, 3)
+
+    def test_sync_prompt_count_never_invokes_litellm_tokenizer(self) -> None:
+        llm = self._make_llm()
+
+        with patch("bot.services.llm.litellm.token_counter") as token_counter:
+            count = llm.count_prompt_tokens(
+                [{"role": "user", "content": "hello"}],
+            )
+
+        self.assertGreater(count, 0)
+        token_counter.assert_not_called()
 
     async def test_inexact_token_fallback_is_not_used_for_hard_rejection(self) -> None:
         llm = self._make_llm()

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import signal
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -14,6 +15,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.utils.backoff import Backoff, BackoffConfig
 
 from bot.config import Settings
+from bot.services.request_priority import ExecutionPriority
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +30,16 @@ _RESERVED_WEBHOOK_PATHS = {
 }
 _RESERVED_WEBHOOK_PREFIXES = ("/api/", "/settings-assets/")
 WEBHOOK_MAX_CONCURRENT_UPDATES = 8
+# Interactive administration and automatic membership enforcement have
+# separate lanes.  A join flood may consume the security lane, but it cannot
+# delay an operator's /ban, /unban or permission-management callback.
+WEBHOOK_CRITICAL_CONCURRENT_UPDATES = 4
+WEBHOOK_SECURITY_CONCURRENT_UPDATES = 4
+WEBHOOK_AUTH_CONCURRENT_UPDATES = 2
+WEBHOOK_CRITICAL_QUEUE_CAPACITY = 64
+WEBHOOK_SECURITY_QUEUE_CAPACITY = 128
+WEBHOOK_AUTH_QUEUE_CAPACITY = 64
+TELEGRAM_AUTH_CANDIDATE_BURST = 3
 _WEBHOOK_WATCH_INTERVAL_SECONDS = 15.0
 _WEBHOOK_FAILURE_THRESHOLD = 3
 _DELETE_WEBHOOK_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
@@ -41,12 +53,12 @@ _DISPATCHER_HOOK_TIMEOUT_SECONDS = 30.0
 _POLLING_UPDATE_DRAIN_TIMEOUT_SECONDS = 15.0
 _POLLING_UPDATE_CANCEL_GRACE_SECONDS = 2.0
 _POLLING_STOP_TIMEOUT_SECONDS = 15.0
-_POLLING_TIMEOUT_SECONDS = 30
-_POLLING_HTTP_TIMEOUT_SECONDS = 70
-_POLLING_REQUEST_TIMEOUT_SECONDS = 75.0
+_POLLING_TIMEOUT_SECONDS = 15
+_POLLING_HTTP_TIMEOUT_SECONDS = 30
+_POLLING_REQUEST_TIMEOUT_SECONDS = 35.0
 _POLLING_BACKOFF_CONFIG = BackoffConfig(
     min_delay=1.0,
-    max_delay=30.0,
+    max_delay=10.0,
     factor=1.7,
     jitter=0.2,
 )
@@ -54,6 +66,382 @@ _CONTROL_CANCELLATION_GRACE_SECONDS = 0.05
 
 _CONTROL_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
 _POLLING_SHUTDOWN = object()
+_TRUSTED_PRIVILEGED_OPERATOR_TTL_SECONDS = 15 * 60.0
+_TRUSTED_PRIVILEGED_OPERATORS: dict[tuple[int, int], float] = {}
+
+_PRIVILEGED_COMMANDS = frozenset(
+    {
+        # Group and delegated-administrator authorization.
+        "authgroup",
+        "unauthgroup",
+        "authlist",
+        "authadmin",
+        "unauthadmin",
+        "adminlist",
+        # Enforcement and emergency controls.
+        "ban",
+        "unban",
+        "banlist",
+        "voteban",
+        "raid",
+        "raidguard",
+        "mute",
+        "unmute",
+        # Moderation-policy and warning controls.
+        "rules",
+        "clearwarnings",
+        "clearwarning",
+        "clearwarns",
+        "clearwarn",
+        "warnings",
+        "aiexempt",
+        "unaiexempt",
+        # The settings entry point performs permission checks and is the
+        # recovery surface for incorrectly configured enforcement policies.
+        "settings",
+    }
+)
+_SECURITY_COMMANDS = frozenset(
+    {
+        # Rule generation may execute multiple model/tool rounds. It remains
+        # above ordinary chat but cannot occupy the emergency ban/unban lane.
+        "addrule",
+    }
+)
+_ADMIN_CALLBACK_PREFIXES = (
+    "bsc:",  # local/global ban and unban scope
+    "mact:",  # moderation action
+    "rul:",  # moderation-rule pages
+    "rud:",  # moderation-rule deletion
+    "atl:",  # authorized-group pages
+    "adl:",  # delegated-admin pages
+    "wpl:",  # warning pages
+)
+_ADMIN_CALLBACK_EXACT = frozenset(
+    {
+        "rgr",  # remove raid-challenged users
+    }
+)
+_SECURITY_CALLBACK_EXACT = frozenset(
+    {
+        "ptv",  # patrol member self-verification
+        "rgv",  # raid member self-verification
+    }
+)
+_MESSAGE_CONTAINER_KEYS = (
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+)
+
+
+def _telegram_command_name(text: Any) -> str:
+    """Return a normalized Bot API command without allocating a parser."""
+
+    if not isinstance(text, str):
+        return ""
+    stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return ""
+    token = stripped.split(None, 1)[0][1:]
+    if not token:
+        return ""
+    return token.split("@", 1)[0].casefold()
+
+
+def _telegram_field(container: Any, name: str) -> Any:
+    if isinstance(container, dict):
+        return container.get(name)
+    return getattr(container, name, None)
+
+
+def mark_privileged_operator(
+    user_id: int,
+    *,
+    group_id: int = 0,
+    ttl_seconds: float = _TRUSTED_PRIVILEGED_OPERATOR_TTL_SECONDS,
+) -> None:
+    """Trust an operator only in the scope that was actually authorized.
+
+    ``group_id=0`` is reserved for the configured super administrator. Group
+    and Telegram administrators must be cached with their concrete chat so a
+    grant in one group cannot consume the emergency lane in every other group.
+    """
+
+    normalized = int(user_id or 0)
+    if normalized <= 0:
+        return
+    scope = int(group_id or 0)
+    key = (scope, normalized)
+    now = time.monotonic()
+    _TRUSTED_PRIVILEGED_OPERATORS[key] = now + max(1.0, float(ttl_seconds))
+    if len(_TRUSTED_PRIVILEGED_OPERATORS) > 4096:
+        for candidate, expires_at in tuple(_TRUSTED_PRIVILEGED_OPERATORS.items()):
+            if expires_at <= now:
+                _TRUSTED_PRIVILEGED_OPERATORS.pop(candidate, None)
+        overflow = len(_TRUSTED_PRIVILEGED_OPERATORS) - 4096
+        if overflow > 0:
+            for candidate, _expires_at in sorted(
+                _TRUSTED_PRIVILEGED_OPERATORS.items(),
+                key=lambda item: item[1],
+            )[:overflow]:
+                _TRUSTED_PRIVILEGED_OPERATORS.pop(candidate, None)
+
+
+def privileged_operator_is_trusted(user_id: int, *, group_id: int = 0) -> bool:
+    normalized = int(user_id or 0)
+    scope = int(group_id or 0)
+    now = time.monotonic()
+    for key in ((scope, normalized), (0, normalized)):
+        expires_at = _TRUSTED_PRIVILEGED_OPERATORS.get(key, 0.0)
+        if expires_at > now:
+            return True
+        if normalized:
+            _TRUSTED_PRIVILEGED_OPERATORS.pop(key, None)
+    return False
+
+
+def unmark_privileged_operator(user_id: int, *, group_id: int = 0) -> None:
+    _TRUSTED_PRIVILEGED_OPERATORS.pop(
+        (int(group_id or 0), int(user_id or 0)),
+        None,
+    )
+
+
+def clear_privileged_operator_group(group_id: int) -> None:
+    scope = int(group_id or 0)
+    for key in tuple(_TRUSTED_PRIVILEGED_OPERATORS):
+        if key[0] == scope:
+            _TRUSTED_PRIVILEGED_OPERATORS.pop(key, None)
+
+
+def telegram_update_sender_id(update: Any) -> int:
+    callback = _telegram_field(update, "callback_query")
+    sender = _telegram_field(callback, "from") or _telegram_field(
+        callback, "from_user"
+    )
+    for key in _MESSAGE_CONTAINER_KEYS:
+        if sender is not None:
+            break
+        message = _telegram_field(update, key)
+        sender = _telegram_field(message, "from") or _telegram_field(
+            message, "from_user"
+        )
+    if sender is None:
+        membership = _telegram_field(update, "chat_member") or _telegram_field(
+            update, "my_chat_member"
+        )
+        sender = _telegram_field(membership, "from") or _telegram_field(
+            membership, "from_user"
+        )
+    try:
+        return int(_telegram_field(sender, "id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def telegram_update_chat_id(update: Any) -> int:
+    callback = _telegram_field(update, "callback_query")
+    callback_message = _telegram_field(callback, "message")
+    chat = _telegram_field(callback_message, "chat")
+    for key in _MESSAGE_CONTAINER_KEYS:
+        if chat is not None:
+            break
+        message = _telegram_field(update, key)
+        chat = _telegram_field(message, "chat")
+    if chat is None:
+        membership = _telegram_field(update, "chat_member") or _telegram_field(
+            update, "my_chat_member"
+        )
+        chat = _telegram_field(membership, "chat")
+    try:
+        return int(_telegram_field(chat, "id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def telegram_message_is_privileged_candidate(message: Any) -> bool:
+    """Whether a message text names an authorization-sensitive command.
+
+    This predicate intentionally does not grant queue priority. It lets outer
+    middleware avoid expensive profile LLM work before the command handler has
+    authoritatively authenticated an otherwise unknown sender.
+    """
+
+    text = _telegram_field(message, "text")
+    if not isinstance(text, str):
+        text = _telegram_field(message, "caption")
+    command = _telegram_command_name(text)
+    return command in _PRIVILEGED_COMMANDS or command in _SECURITY_COMMANDS
+
+
+def telegram_update_priority(update: Any) -> ExecutionPriority:
+    """Cheaply classify a raw Telegram update before aiogram parsing.
+
+    Classification reads only shallow Bot API fields from either a raw mapping
+    or an aiogram model.  It runs before database access, so even a saturated
+    normal lane can still admit security and permission work.
+    """
+
+    if update is None:
+        return ExecutionPriority.NORMAL
+
+    # Membership changes drive join verification, raid protection and admin
+    # cache invalidation.  They are security work even when no command exists.
+    if any(
+        _telegram_field(update, key) is not None
+        for key in ("chat_member", "my_chat_member", "chat_join_request")
+    ):
+        return ExecutionPriority.HIGH
+
+    callback = _telegram_field(update, "callback_query")
+    data = _telegram_field(callback, "data")
+    if isinstance(data, str):
+        normalized = data.casefold()
+        trusted_operator = privileged_operator_is_trusted(
+            telegram_update_sender_id(update),
+            group_id=telegram_update_chat_id(update),
+        )
+        if normalized in _ADMIN_CALLBACK_EXACT or normalized.startswith(
+            _ADMIN_CALLBACK_PREFIXES
+        ):
+            return (
+                ExecutionPriority.CRITICAL
+                if trusted_operator
+                else ExecutionPriority.NORMAL
+            )
+        if normalized in _SECURITY_CALLBACK_EXACT:
+            return ExecutionPriority.HIGH
+        callback_parts = normalized.split(":", 2)
+        if len(callback_parts) >= 2 and callback_parts[0] == "jv":
+            # Starting/self-service verification is untrusted member traffic;
+            # approve/reject are administrator decisions and retain the
+            # operator-only lane. Handlers still perform authoritative checks.
+            return (
+                ExecutionPriority.CRITICAL
+                if callback_parts[1] in {"a", "r"} and trusted_operator
+                else (
+                    ExecutionPriority.HIGH
+                    if callback_parts[1] not in {"a", "r"}
+                    else ExecutionPriority.NORMAL
+                )
+            )
+        if len(callback_parts) >= 2 and callback_parts[0] == "vban":
+            # Ordinary votes can be distributed across many users and must not
+            # consume the emergency management lane. Admin cancel/direct-ban
+            # actions remain critical and are re-authorized in the handler.
+            return (
+                ExecutionPriority.CRITICAL
+                if callback_parts[1] in {"cancel", "ban"} and trusted_operator
+                else (
+                    ExecutionPriority.HIGH
+                    if callback_parts[1] not in {"cancel", "ban"}
+                    else ExecutionPriority.NORMAL
+                )
+            )
+
+    for key in _MESSAGE_CONTAINER_KEYS:
+        message = _telegram_field(update, key)
+        if message is None:
+            continue
+        if (
+            _telegram_field(message, "new_chat_members")
+            or _telegram_field(message, "left_chat_member") is not None
+        ):
+            return ExecutionPriority.HIGH
+        text = _telegram_field(message, "text")
+        if not isinstance(text, str):
+            text = _telegram_field(message, "caption")
+        command = _telegram_command_name(text)
+        if command in _PRIVILEGED_COMMANDS:
+            return (
+                ExecutionPriority.CRITICAL
+                if privileged_operator_is_trusted(
+                    telegram_update_sender_id(update),
+                    group_id=telegram_update_chat_id(update),
+                )
+                else ExecutionPriority.NORMAL
+            )
+        if command in _SECURITY_COMMANDS:
+            return (
+                ExecutionPriority.HIGH
+                if privileged_operator_is_trusted(
+                    telegram_update_sender_id(update),
+                    group_id=telegram_update_chat_id(update),
+                )
+                else ExecutionPriority.NORMAL
+            )
+        # Private /start links are the first interactive step of join
+        # verification and must not wait behind ordinary group chatter.
+        if command == "start" and isinstance(text, str):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2 and parts[1].casefold().startswith("verify"):
+                return ExecutionPriority.HIGH
+    return ExecutionPriority.NORMAL
+
+
+def telegram_update_is_auth_candidate(
+    update: Any,
+    *,
+    priority: ExecutionPriority | None = None,
+) -> bool:
+    """Return whether an untrusted update needs fast authorization handling.
+
+    These messages are *not* privileged yet.  They use an isolated, tightly
+    bounded worker lane so a first-time real Telegram administrator does not
+    wait behind ordinary chat, while command spam cannot consume the trusted
+    operator or automatic-security reserves.
+    """
+
+    selected_priority = (
+        telegram_update_priority(update) if priority is None else priority
+    )
+    if selected_priority < ExecutionPriority.NORMAL:
+        return False
+    callback = _telegram_field(update, "callback_query")
+    data = _telegram_field(callback, "data")
+    if isinstance(data, str):
+        normalized = data.casefold()
+        if normalized in _ADMIN_CALLBACK_EXACT or normalized.startswith(
+            _ADMIN_CALLBACK_PREFIXES
+        ):
+            return True
+        parts = normalized.split(":", 2)
+        if len(parts) >= 2 and (
+            parts[0] == "jv" and parts[1] in {"a", "r"}
+            or parts[0] == "vban" and parts[1] in {"cancel", "ban"}
+        ):
+            return True
+    return any(
+        telegram_message_is_privileged_candidate(_telegram_field(update, key))
+        for key in _MESSAGE_CONTAINER_KEYS
+    )
+
+
+def telegram_update_is_privileged(update: Any) -> bool:
+    """Compatibility predicate for callers that only need two classes."""
+
+    if telegram_update_priority(update) < ExecutionPriority.NORMAL:
+        return True
+    callback = _telegram_field(update, "callback_query")
+    data = _telegram_field(callback, "data")
+    if isinstance(data, str):
+        normalized = data.casefold()
+        if normalized in _ADMIN_CALLBACK_EXACT or normalized.startswith(
+            _ADMIN_CALLBACK_PREFIXES
+        ):
+            return True
+        parts = normalized.split(":", 2)
+        if len(parts) >= 2 and (
+            parts[0] == "jv" and parts[1] in {"a", "r"}
+            or parts[0] == "vban" and parts[1] in {"cancel", "ban"}
+        ):
+            return True
+    return any(
+        telegram_message_is_privileged_candidate(_telegram_field(update, key))
+        for key in _MESSAGE_CONTAINER_KEYS
+    )
 
 _RouteHook = Callable[[], Awaitable[None] | None]
 _HealthCheck = Callable[[], str | None]
@@ -304,6 +692,10 @@ async def run_update_delivery(
 ) -> str:
     """Run one dispatcher lifecycle across webhook and polling transports."""
 
+    mark_privileged_operator(
+        int(settings.super_admin_id or 0),
+        ttl_seconds=365 * 24 * 60 * 60.0,
+    )
     allowed_updates = dispatcher.resolve_used_update_types()
     if durable_update_ingest is None:
         if start_update_processor is not None or stop_update_processor is not None:
@@ -687,9 +1079,38 @@ async def _run_durable_polling(
             network_backoff.reset()
             network_failed = False
 
+        batch = [
+            (index, item, _polling_update_id(item))
+            for index, item in enumerate(updates)
+        ]
+        # Persist and publish interactive/security updates before ordinary
+        # chatter from the same getUpdates batch.  Telegram's offset is still
+        # advanced only through the contiguous original-order prefix below, so
+        # this latency optimization does not weaken the durable ACK boundary.
+        fast_auth_positions: set[int] = set()
+        auth_counts: dict[tuple[int, int], int] = {}
+        for position, item, _update_id in batch:
+            if not telegram_update_is_auth_candidate(item):
+                continue
+            scope = (
+                telegram_update_chat_id(item),
+                telegram_update_sender_id(item),
+            )
+            count = auth_counts.get(scope, 0)
+            if count < TELEGRAM_AUTH_CANDIDATE_BURST:
+                fast_auth_positions.add(position)
+            auth_counts[scope] = count + 1
+
+        def persistence_order(entry: tuple[int, Any, int]) -> tuple[int, int, int]:
+            priority = telegram_update_priority(entry[1])
+            auth_rank = 0 if entry[0] in fast_auth_positions else 1
+            return int(priority), auth_rank, entry[0]
+
+        ordered_batch = sorted(batch, key=persistence_order)
+        persisted_positions: set[int] = set()
+        next_ack_position = 0
         batch_persisted = True
-        for item in updates:
-            update_id = _polling_update_id(item)
+        for position, item, update_id in ordered_batch:
             try:
                 persisted_id = await durable_update_ingest(item)
                 if int(persisted_id) != update_id:
@@ -712,11 +1133,15 @@ async def _run_durable_polling(
                 await persistence_backoff.asleep()
                 break
 
-            # Supplying this value on the next request is Telegram's ACK. A
-            # crash before that request merely produces a harmless duplicate,
-            # which the inbox primary key absorbs.
-            next_offset = update_id + 1
-            offset = next_offset if offset is None else max(offset, next_offset)
+            persisted_positions.add(position)
+            while next_ack_position in persisted_positions:
+                contiguous_update_id = batch[next_ack_position][2]
+                # Supplying this value on the next request is Telegram's ACK. A
+                # crash before that request merely produces a harmless
+                # duplicate, which the inbox primary key absorbs.
+                next_offset = contiguous_update_id + 1
+                offset = next_offset if offset is None else max(offset, next_offset)
+                next_ack_position += 1
 
         if batch_persisted:
             persistence_backoff.reset()
@@ -1132,8 +1557,16 @@ async def _wait_for_shutdown_signal() -> None:
 
 
 __all__ = [
+    "WEBHOOK_AUTH_CONCURRENT_UPDATES",
+    "WEBHOOK_AUTH_QUEUE_CAPACITY",
+    "WEBHOOK_CRITICAL_CONCURRENT_UPDATES",
+    "WEBHOOK_CRITICAL_QUEUE_CAPACITY",
     "WEBHOOK_MAX_CONCURRENT_UPDATES",
+    "WEBHOOK_SECURITY_CONCURRENT_UPDATES",
+    "WEBHOOK_SECURITY_QUEUE_CAPACITY",
+    "TELEGRAM_AUTH_CANDIDATE_BURST",
     "WebhookConfig",
     "resolve_webhook_config",
     "run_update_delivery",
+    "telegram_update_is_auth_candidate",
 ]

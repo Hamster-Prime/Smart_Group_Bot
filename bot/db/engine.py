@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+from typing import Any
 from urllib.parse import unquote
 
 from sqlalchemy import event, text
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
 
 from bot.db.models import Base
 from bot.db.sqlite_session import SQLiteSafeAsyncSession
+from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
 
@@ -879,10 +881,16 @@ async def _sqlite_ensure_vote_ban_open_index(conn) -> None:
     )
     row = result.first()
     if row is not None:
-        # Rebuild unconditionally.  Token-presence checks cannot distinguish
-        # the canonical partial unique index from a superficially similar but
-        # weaker index such as UNIQUE(group_id, target_user_id, status), which
-        # permits one active and one enforcing row for the same target.
+        # Skip the former unconditional DROP/CREATE on every process start.
+        # Compare normalized SQL so a superficially similar but weaker index
+        # (for example one that also includes ``status``) is still repaired.
+        existing_sql = "".join(str(row[0] or "").lower().split())
+        canonical_sql = "".join(_SQLITE_VOTE_BAN_INDEX_SQL.lower().split()).replace(
+            "ifnotexists",
+            "",
+        )
+        if existing_sql == canonical_sql:
+            return
         await conn.execute(text("DROP INDEX ix_vote_ban_open_target"))
         log.info("Migrated: rebuilt canonical vote-ban open-session index")
 
@@ -1097,11 +1105,23 @@ async def init_db(
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         _warn_about_sqlite_shadow_paths(sqlite_path)
 
-    engine = create_async_engine(
-        parsed_url,
-        echo=False,
-        connect_args={"timeout": _SQLITE_TIMEOUT_SECONDS} if is_sqlite else {},
-    )
+    engine_kwargs: dict[str, Any] = {
+        "echo": False,
+        "connect_args": {"timeout": _SQLITE_TIMEOUT_SECONDS} if is_sqlite else {},
+    }
+    if is_sqlite and str(parsed_url.database or "") not in {"", ":memory:"}:
+        # Reserved critical/security update workers need read connections even
+        # when ordinary handlers are busy. Writers remain serialized by the
+        # priority-aware process lock, so extra connections do not create extra
+        # concurrent SQLite writers.
+        engine_kwargs.update(
+            pool_size=16,
+            max_overflow=16,
+            # Critical workers must fail fast into durable retry/self-heal
+            # instead of sitting behind ordinary connection holders for 30s.
+            pool_timeout=1.0,
+        )
+    engine = create_async_engine(parsed_url, **engine_kwargs)
 
     if is_sqlite:
         @event.listens_for(engine.sync_engine, "connect")
@@ -1112,6 +1132,11 @@ async def init_db(
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
                 cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA journal_size_limit=67108864")
+                # This value is per connection. The enlarged pool protects
+                # critical/security readers from ordinary-worker starvation,
+                # so keep each cache modest to avoid a large aggregate RSS.
+                cursor.execute("PRAGMA cache_size=-2048")
             finally:
                 cursor.close()
             if sqlite_path is not None:
@@ -1123,6 +1148,27 @@ async def init_db(
             # release.  Add those columns before ``create_all`` attempts to
             # create the indexes on an already-existing table.
             if await _sqlite_table_exists(conn, "webhook_inbox_updates"):
+                await _sqlite_ensure_column(
+                    conn,
+                    "webhook_inbox_updates",
+                    "priority",
+                    "priority INTEGER NOT NULL DEFAULT 100",
+                )
+                await _sqlite_ensure_column(
+                    conn,
+                    "webhook_inbox_updates",
+                    "auth_candidate",
+                    "auth_candidate BOOLEAN NOT NULL DEFAULT 0",
+                )
+                # Repair intermediate/manual schemas where the column existed
+                # but allowed NULL. Recovery partitions use exact boolean
+                # predicates, so leaving NULL would make a durable row invisible.
+                await conn.execute(
+                    text(
+                        "UPDATE webhook_inbox_updates "
+                        "SET auth_candidate = 0 WHERE auth_candidate IS NULL"
+                    )
+                )
                 await _sqlite_ensure_column(
                     conn,
                     "webhook_inbox_updates",
@@ -1284,6 +1330,24 @@ async def init_db(
                 "resolver_display VARCHAR(255) NOT NULL DEFAULT ''",
             )
             await _sqlite_ensure_vote_ban_open_index(conn)
+            # Hot-path/recovery indexes added after the initial schema shipped.
+            # ``create_all`` does not add indexes to an existing SQLite table,
+            # so keep these idempotent upgrade statements here.
+            for index_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_moderation_rules_group_enabled_id "
+                "ON moderation_rules (group_id, enabled, id)",
+                "CREATE INDEX IF NOT EXISTS ix_violations_group_user_ban "
+                "ON violations (group_id, user_id, ban_enforced)",
+                "CREATE INDEX IF NOT EXISTS ix_ban_audit_group_id_desc "
+                "ON ban_audit_events (group_id, id)",
+                "CREATE INDEX IF NOT EXISTS ix_join_verifications_status_deadline "
+                "ON join_verifications (status, deadline_at)",
+                "CREATE INDEX IF NOT EXISTS ix_vote_ban_status_deadline "
+                "ON vote_ban_sessions (status, deadline_at)",
+                "CREATE INDEX IF NOT EXISTS ix_message_vectors_group_row "
+                "ON message_vectors (group_id, id)",
+            ):
+                await conn.execute(text(index_sql))
             await _sqlite_ensure_column(
                 conn,
                 "keyword_replies",
@@ -1295,6 +1359,18 @@ async def init_db(
                 "scheduled_messages",
                 "buttons",
                 "buttons JSON NOT NULL DEFAULT '[]'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "webhook_inbox_updates",
+                "priority",
+                "priority INTEGER NOT NULL DEFAULT 100",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "webhook_inbox_updates",
+                "auth_candidate",
+                "auth_candidate BOOLEAN NOT NULL DEFAULT 0",
             )
             await _sqlite_ensure_column(
                 conn,
@@ -1316,6 +1392,8 @@ async def init_db(
                 table="webhook_inbox_updates",
                 name="ix_webhook_inbox_recovery",
                 columns=(
+                    "priority",
+                    "auth_candidate",
                     "completed_at",
                     "dead_lettered_at",
                     "next_attempt_at",
@@ -1330,11 +1408,28 @@ async def init_db(
                     text(
                         "CREATE INDEX ix_webhook_inbox_recovery "
                         "ON webhook_inbox_updates "
-                        "(completed_at, dead_lettered_at, next_attempt_at, "
-                        "lease_until)"
+                        "(priority, auth_candidate, completed_at, dead_lettered_at, "
+                        "next_attempt_at, lease_until)"
                     )
                 )
-            await _sqlite_migrate_telegram_delete_jobs(conn)
+            for index_name, column_name in (
+                ("ix_webhook_inbox_completed_retention", "completed_at"),
+                ("ix_webhook_inbox_dead_letter_retention", "dead_lettered_at"),
+            ):
+                if not await _sqlite_named_index_matches(
+                    conn,
+                    table="webhook_inbox_updates",
+                    name=index_name,
+                    columns=(column_name,),
+                    unique=False,
+                ):
+                    await conn.execute(text(f"DROP INDEX IF EXISTS {index_name}"))
+                    await conn.execute(
+                        text(
+                            f"CREATE INDEX {index_name} "
+                            f"ON webhook_inbox_updates ({column_name})"
+                        )
+                    )
             await _sqlite_validate_foreign_keys(conn)
 
     if sqlite_path is not None:
@@ -1346,6 +1441,30 @@ async def init_db(
         expire_on_commit=False,
         autoflush=False,
     )
+
+    def database_pool_health_snapshot() -> dict[str, Any]:
+        pool = engine.sync_engine.pool
+        checked_out_fn = getattr(pool, "checkedout", None)
+        size_fn = getattr(pool, "size", None)
+        overflow_fn = getattr(pool, "overflow", None)
+        checked_out = int(checked_out_fn()) if callable(checked_out_fn) else 0
+        base_size = int(size_fn()) if callable(size_fn) else 0
+        overflow = int(overflow_fn()) if callable(overflow_fn) else 0
+        max_overflow = max(0, int(getattr(pool, "_max_overflow", 0) or 0))
+        capacity = max(1, base_size + max_overflow)
+        ratio = checked_out / capacity
+        return {
+            "ok": ratio < 0.80,
+            "fatal": ratio >= 0.95,
+            "checked_out": checked_out,
+            "pool_size": base_size,
+            "overflow": overflow,
+            "max_overflow": max_overflow,
+            "capacity": capacity,
+            "utilization": round(ratio, 4),
+        }
+
+    register_resource_health_provider("database_pool", database_pool_health_snapshot)
     log.info(
         "Database initialized: %s",
         engine.url.render_as_string(hide_password=True),

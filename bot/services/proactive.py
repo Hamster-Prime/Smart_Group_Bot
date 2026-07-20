@@ -26,6 +26,8 @@ from bot.utils.telegram import configured_auto_delete_seconds, send_chat_message
 
 log = logging.getLogger(__name__)
 
+_PROACTIVE_PASS_DEADLINE_SECONDS = 300.0
+
 _TASKS_KEY = "scheduled_tasks"
 _COOLDOWN_TOPIC_TASK = "cooldown_topic"
 _DEFAULT_TASK_BRIEF = "群里已经安静了一阵，请结合群记忆，自然抛出一个大家可能感兴趣、容易接话的话题。"
@@ -328,7 +330,8 @@ class ProactiveTopicService:
         consecutive_failures = 0
         while True:
             try:
-                await self.run_once(raise_on_total_failure=True)
+                async with asyncio.timeout(_PROACTIVE_PASS_DEADLINE_SECONDS):
+                    await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -127,7 +127,7 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         )
         ban = AsyncMock(return_value=True)
         results: list[tuple[int, int, bool]] = []
-        with patch("bot.handlers.group.ban_member", new=ban):
+        with patch("bot.services.join_verification.ban_member", new=ban):
             for _ in range(2):
                 async with self.session_factory() as session:
                     count, violation, enforced, _ = (
@@ -184,7 +184,7 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         )
         ban = AsyncMock(side_effect=[False, True])
         results: list[bool] = []
-        with patch("bot.handlers.group.ban_member", new=ban):
+        with patch("bot.services.join_verification.ban_member", new=ban):
             for _ in range(3):
                 async with self.session_factory() as session:
                     _count, _violation, enforced, _note = (

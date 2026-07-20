@@ -13,12 +13,13 @@ from sqlalchemy import select, update
 
 from bot.db.engine import init_db
 from bot.db.models import WebhookInboxUpdate
+from bot.services.request_priority import ExecutionPriority
+from bot.services.update_completion import current_update_completion
 from bot.services.verify_web import (
     VerifyWebServer,
     _QueuedWebhookUpdate,
     _WebhookUpdateQueue,
 )
-from bot.services.update_completion import current_update_completion
 from bot.utils.timezone import now_shanghai_naive
 
 
@@ -85,6 +86,36 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await queue._ensure_durable_update(1001, payload))
         self.assertIsNone(await queue._claim_durable_update(1001))
 
+    async def test_recovery_routes_auth_candidates_to_the_isolated_lane(self) -> None:
+        queue = self._queue()
+        await queue._ensure_durable_update(
+            1010,
+            {"update_id": 1010, "message": {"text": "ordinary"}},
+        )
+        await queue._ensure_durable_update(
+            1011,
+            {"update_id": 1011, "message": {"text": "/ban 42"}},
+        )
+        auth_row = await self._row(1011)
+        assert auth_row is not None
+        self.assertEqual(auth_row.priority, int(ExecutionPriority.NORMAL))
+        self.assertTrue(auth_row.auth_candidate)
+
+        self.assertEqual(await queue._recover_durable_once(), 2)
+        snapshot = queue.health_snapshot()
+        self.assertEqual(snapshot["ordinary_queue_size"], 1)
+        self.assertEqual(snapshot["auth_queue_size"], 1)
+        auth = queue.queue.items(
+            priority=ExecutionPriority.NORMAL,
+            auth_candidate=True,
+        )
+        ordinary = queue.queue.items(priority=ExecutionPriority.NORMAL)
+        self.assertEqual([item.update_id for item in auth], [1011])
+        self.assertEqual([item.update_id for item in ordinary], [1010])
+
+        self.assertEqual(await queue._discard_queued_updates(), 2)
+        await queue.stop()
+
     async def test_overlapping_restart_waits_for_live_lease_then_reclaims(self) -> None:
         first = self._queue()
         payload = {"update_id": 1002, "message": {"text": "recover"}}
@@ -145,7 +176,7 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         publish_started = asyncio.Event()
         release = asyncio.Event()
 
-        async def slow_publish(_update_id: int) -> bool:
+        async def slow_publish(_update_id: int, **_kwargs: object) -> bool:
             publish_started.set()
             await release.wait()
             return True
@@ -433,7 +464,7 @@ class WebhookInboxPersistenceTests(unittest.IsolatedAsyncioTestCase):
         dispatcher.feed_raw_update = AsyncMock(side_effect=capture)
         server = VerifyWebServer(
             bot=self.bot,
-            settings=SimpleNamespace(),
+            settings=SimpleNamespace(super_admin_id=0),
             session_factory=self.session_factory,
             webhook_dispatcher=dispatcher,
             webhook_path="/telegram/webhook",

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -242,6 +243,7 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
                 if state.task and not state.task.done():
                     state.task.cancel()
             group._PENDING_REPLY_BATCHES.clear()
+        group._PENDING_REPLY_ORPHAN_STARTED.clear()
 
     async def asyncTearDown(self) -> None:
         async with group._PENDING_REPLY_LOCK:
@@ -263,6 +265,7 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
         if orphan_tasks:
             await asyncio.gather(*orphan_tasks, return_exceptions=True)
         group._PENDING_REPLY_ORPHAN_TASKS.clear()
+        group._PENDING_REPLY_ORPHAN_STARTED.clear()
 
     async def test_same_sender_batches_never_overlap(self) -> None:
         first_started = asyncio.Event()
@@ -520,6 +523,33 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertFalse(group._PENDING_REPLY_ORPHAN_TASKS)
 
+    async def test_pending_reply_health_marks_exhausted_or_stale_orphans_fatal(self) -> None:
+        tasks = [asyncio.create_task(asyncio.sleep(60)) for _ in range(4)]
+        try:
+            started = time.monotonic() - 121.0
+            group._PENDING_REPLY_ORPHAN_TASKS.update(tasks)
+            group._PENDING_REPLY_ORPHAN_STARTED.update(
+                {task: started for task in tasks}
+            )
+            group._PENDING_REPLY_BATCHES[(1, 2)] = group._PendingReplyBatch(
+                items=[_item("queued")],
+                processing=True,
+            )
+
+            snapshot = group.pending_reply_resource_health_snapshot()
+
+            self.assertTrue(snapshot["fatal"])
+            self.assertEqual(snapshot["capacity"], 4)
+            self.assertEqual(snapshot["orphan_count"], 4)
+            self.assertGreaterEqual(snapshot["oldest_orphan_seconds"], 120.0)
+            self.assertEqual(snapshot["batch_count"], 1)
+            self.assertEqual(snapshot["processing_batches"], 1)
+            self.assertEqual(snapshot["queued_items"], 1)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_failure_notifies_direct_item_even_if_later_item_is_indirect(self) -> None:
         direct_message = SimpleNamespace(message_id=10)
         later_message = SimpleNamespace(message_id=11)
@@ -643,6 +673,18 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroupActivityCASTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        tasks = [
+            state.task
+            for state in group._GROUP_ACTIVITY_PENDING.values()
+            if state.task is not None and not state.task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        group._GROUP_ACTIVITY_PENDING.clear()
+
     async def test_retry_merges_activity_into_concurrently_changed_settings(self) -> None:
         rows = [
             SimpleNamespace(settings={"private": "old"}),
@@ -675,6 +717,53 @@ class GroupActivityCASTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.execute.await_count, 2)
         session.rollback.assert_awaited_once()
         session.commit.assert_awaited_once()
+
+    async def test_production_activity_writes_are_coalesced_off_hot_path(self) -> None:
+        read_session = SimpleNamespace(
+            in_transaction=Mock(side_effect=[True, True, False, True, True, False]),
+            get=AsyncMock(
+                return_value=SimpleNamespace(settings={"mute_all_replies": True})
+            ),
+            commit=AsyncMock(),
+        )
+
+        class _WriteContext:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        factory = Mock(side_effect=lambda: _WriteContext())
+        persist = AsyncMock(return_value={})
+        settings = SimpleNamespace(bot=BotConfig())
+
+        with (
+            patch.object(group, "_GROUP_ACTIVITY_DEBOUNCE_SECONDS", 0.01),
+            patch.object(group, "_persist_group_activity_cas", new=persist),
+        ):
+            first = await group._record_group_activity_cas(
+                read_session,
+                group_id=-10001,
+                title="group",
+                settings=settings,
+                session_factory=factory,
+            )
+            second = await group._record_group_activity_cas(
+                read_session,
+                group_id=-10001,
+                title="group-renamed",
+                settings=settings,
+                session_factory=factory,
+            )
+            task = group._GROUP_ACTIVITY_PENDING[-10001].task
+            self.assertIsNotNone(task)
+            await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertTrue(first["mute_all_replies"])
+        self.assertTrue(second["mute_all_replies"])
+        persist.assert_awaited_once()
+        self.assertEqual(persist.await_args.kwargs["title"], "group-renamed")
 
 
 if __name__ == "__main__":

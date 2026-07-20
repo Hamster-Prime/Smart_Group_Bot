@@ -89,6 +89,105 @@ class DurablePollingLoopTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(runner, timeout=0.5)
 
+    async def test_privileged_item_is_persisted_first_without_skipping_ack_prefix(
+        self,
+    ) -> None:
+        poll_calls: list[int | None] = []
+        ingest_order: list[int] = []
+        second_poll = asyncio.Event()
+
+        async def get_updates(**kwargs: object) -> list[object]:
+            poll_calls.append(kwargs.get("offset"))  # type: ignore[arg-type]
+            if len(poll_calls) == 1:
+                return [
+                    SimpleNamespace(
+                        update_id=510,
+                        message=SimpleNamespace(text="ordinary"),
+                    ),
+                    SimpleNamespace(
+                        update_id=511,
+                        message=SimpleNamespace(text="/ban 42"),
+                    ),
+                ]
+            second_poll.set()
+            await asyncio.Future()
+            return []
+
+        async def ingest(update: object) -> int:
+            update_id = int(getattr(update, "update_id"))
+            ingest_order.append(update_id)
+            return update_id
+
+        runner = asyncio.create_task(
+            update_delivery._run_durable_polling(
+                bot=SimpleNamespace(get_updates=get_updates),
+                allowed_updates=["message", "callback_query", "chat_member"],
+                durable_update_ingest=ingest,
+            )
+        )
+        try:
+            await asyncio.wait_for(second_poll.wait(), timeout=0.5)
+            self.assertEqual(ingest_order, [511, 510])
+            # Offset advances only after original update 510 is durable, then
+            # safely covers the already-durable critical update 511 as well.
+            self.assertEqual(poll_calls, [None, 512])
+        finally:
+            runner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, timeout=0.5)
+
+    async def test_prioritized_persistence_never_acks_across_an_ordinary_gap(
+        self,
+    ) -> None:
+        poll_calls: list[int | None] = []
+        ingest_order: list[int] = []
+        second_poll = asyncio.Event()
+
+        async def get_updates(**kwargs: object) -> list[object]:
+            poll_calls.append(kwargs.get("offset"))  # type: ignore[arg-type]
+            if len(poll_calls) == 1:
+                return [
+                    SimpleNamespace(
+                        update_id=610,
+                        message=SimpleNamespace(text="ordinary"),
+                    ),
+                    SimpleNamespace(
+                        update_id=611,
+                        message=SimpleNamespace(text="/unban 42"),
+                    ),
+                ]
+            second_poll.set()
+            await asyncio.Future()
+            return []
+
+        async def ingest(update: object) -> int:
+            update_id = int(getattr(update, "update_id"))
+            ingest_order.append(update_id)
+            if update_id == 610:
+                raise RuntimeError("ordinary persistence failed")
+            return update_id
+
+        runner = asyncio.create_task(
+            update_delivery._run_durable_polling(
+                bot=SimpleNamespace(get_updates=get_updates),
+                allowed_updates=["message"],
+                durable_update_ingest=ingest,
+            )
+        )
+        try:
+            with patch.object(
+                update_delivery.Backoff,
+                "asleep",
+                new=AsyncMock(),
+            ):
+                await asyncio.wait_for(second_poll.wait(), timeout=0.5)
+            self.assertEqual(ingest_order, [611, 610])
+            self.assertEqual(poll_calls, [None, None])
+        finally:
+            runner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, timeout=0.5)
+
     async def test_persistence_failure_repolls_same_update_without_ack(self) -> None:
         calls: list[int | None] = []
         third_poll = asyncio.Event()

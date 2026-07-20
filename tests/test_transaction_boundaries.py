@@ -46,6 +46,21 @@ class VoteBanTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(vote_ban, "finalize_vote_message", new=AsyncMock()),
             patch.object(vote_ban, "cancel_vote_expiry"),
+            patch.object(
+                vote_ban,
+                "lease_join_verification_for_unban",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        verification_id=99,
+                        lease_until=now_shanghai_naive() + timedelta(minutes=5),
+                    )
+                ),
+            ),
+            patch.object(
+                vote_ban,
+                "join_verification_lease_is_current",
+                new=AsyncMock(return_value=True),
+            ),
         ):
             status = await vote_ban.recover_stale_vote_enforcement(
                 bot=SimpleNamespace(),
@@ -115,13 +130,25 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
             commit=AsyncMock(side_effect=lambda: events.append("commit")),
         )
         current = SimpleNamespace(
+            id=7,
+            group_id=-100,
+            user_id=88,
             kind=join_verification.VERIFICATION_KIND_MODERATION,
             status=join_verification.VERIFICATION_STATUS_PENDING,
+            deadline_at=object(),
+            lease_until=None,
         )
 
         async def restrict_after_release(*_args, **_kwargs) -> bool:
             events.append("restrict")
-            self.assertEqual(events, ["commit", "commit", "restrict"])
+            self.assertEqual(
+                events,
+                ["commit", "commit", "check", "commit", "restrict"],
+            )
+            return True
+
+        async def generation_check(*_args, **_kwargs) -> bool:
+            events.append("check")
             return True
 
         with (
@@ -140,6 +167,11 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
                 "restrict_new_member",
                 new=AsyncMock(side_effect=restrict_after_release),
             ),
+            patch.object(
+                join_verification,
+                "_join_verification_generation_is_current",
+                new=AsyncMock(side_effect=generation_check),
+            ),
         ):
             started = await join_verification._begin_moderation_challenge_locked(
                 bot=SimpleNamespace(),
@@ -153,6 +185,215 @@ class PrivateVerificationTransactionBoundaryTests(unittest.IsolatedAsyncioTestCa
             )
 
         self.assertTrue(started)
+        self.assertEqual(
+            events,
+            [
+                "commit",
+                "commit",
+                "check",
+                "commit",
+                "restrict",
+                "check",
+                "commit",
+            ],
+        )
+
+    async def test_duplicate_moderation_mute_losing_generation_reconciles(self) -> None:
+        current = SimpleNamespace(
+            id=8,
+            group_id=-100,
+            user_id=88,
+            kind=join_verification.VERIFICATION_KIND_MODERATION,
+            status=join_verification.VERIFICATION_STATUS_PENDING,
+            deadline_at=now_shanghai_naive() + timedelta(minutes=2),
+            lease_until=None,
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        reconcile = AsyncMock(return_value=True)
+
+        with (
+            patch.object(join_verification, "moderation_challenge_ready", return_value=True),
+            patch.object(
+                join_verification,
+                "get_join_verification",
+                new=AsyncMock(return_value=current),
+            ),
+            patch.object(
+                join_verification,
+                "_join_verification_generation_is_current",
+                new=AsyncMock(side_effect=[True, False]),
+            ) as generation_check,
+            patch.object(
+                join_verification,
+                "restrict_new_member",
+                new=AsyncMock(return_value=True),
+            ) as restrict,
+            patch.object(
+                join_verification,
+                "_reconcile_moderation_challenge_restriction",
+                new=reconcile,
+            ),
+        ):
+            handled = await join_verification._begin_moderation_challenge_locked(
+                bot=SimpleNamespace(),
+                session=session,
+                settings=SimpleNamespace(),
+                group_id=-100,
+                user_id=88,
+                display_name="member",
+                bot_username="bot",
+                reason="test",
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(generation_check.await_count, 2)
+        restrict.assert_awaited_once()
+        reconcile.assert_awaited_once()
+
+    async def test_moderation_mute_losing_generation_reconciles_before_prompt(self) -> None:
+        now = now_shanghai_naive()
+        prepared = join_verification.PreparedVerification(
+            verification_id=17,
+            group_id=-100,
+            user_id=89,
+            kind=join_verification.VERIFICATION_KIND_MODERATION,
+            lease_until=now + timedelta(minutes=1),
+            prompt_message_id=0,
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock())
+        reconcile = AsyncMock(return_value=True)
+
+        with (
+            patch.object(join_verification, "moderation_challenge_ready", return_value=True),
+            patch.object(
+                join_verification,
+                "get_join_verification",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                join_verification,
+                "prepare_join_verification",
+                new=AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                join_verification,
+                "_join_verification_generation_is_current",
+                new=AsyncMock(side_effect=[True, False]),
+            ),
+            patch.object(
+                join_verification,
+                "restrict_new_member",
+                new=AsyncMock(return_value=True),
+            ) as restrict,
+            patch.object(
+                join_verification,
+                "abort_prepared_join_verification",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(
+                join_verification,
+                "_reconcile_moderation_challenge_restriction",
+                new=reconcile,
+            ),
+            patch.object(join_verification, "verification_provider", return_value="turnstile"),
+        ):
+            handled = await join_verification._begin_moderation_challenge_locked(
+                bot=bot,
+                session=session,
+                settings=SimpleNamespace(
+                    moderation=SimpleNamespace(challenge_timeout_seconds=120)
+                ),
+                group_id=-100,
+                user_id=89,
+                display_name="member",
+                bot_username="bot",
+                reason="test",
+            )
+
+        self.assertTrue(handled)
+        restrict.assert_awaited_once_with(bot, -100, 89)
+        reconcile.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+
+    async def test_moderation_activation_lost_after_prompt_reconciles_and_cleans_prompt(self) -> None:
+        now = now_shanghai_naive()
+        prepared = join_verification.PreparedVerification(
+            verification_id=18,
+            group_id=-100,
+            user_id=90,
+            kind=join_verification.VERIFICATION_KIND_MODERATION,
+            lease_until=now + timedelta(minutes=1),
+            prompt_message_id=0,
+        )
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=901))
+        )
+        reconcile = AsyncMock(return_value=True)
+        cleanup_prompt = AsyncMock(return_value=True)
+
+        with (
+            patch.object(join_verification, "moderation_challenge_ready", return_value=True),
+            patch.object(
+                join_verification,
+                "get_join_verification",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                join_verification,
+                "prepare_join_verification",
+                new=AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                join_verification,
+                "_join_verification_generation_is_current",
+                new=AsyncMock(side_effect=[True, True]),
+            ),
+            patch.object(
+                join_verification,
+                "restrict_new_member",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                join_verification,
+                "commit_prepared_join_verification",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(
+                join_verification,
+                "abort_prepared_join_verification",
+                new=AsyncMock(return_value=False),
+            ) as abort,
+            patch.object(
+                join_verification,
+                "_reconcile_moderation_challenge_restriction",
+                new=reconcile,
+            ),
+            patch.object(
+                join_verification,
+                "delete_verification_prompt",
+                new=cleanup_prompt,
+            ),
+            patch.object(join_verification, "verification_provider", return_value="turnstile"),
+        ):
+            handled = await join_verification._begin_moderation_challenge_locked(
+                bot=bot,
+                session=session,
+                settings=SimpleNamespace(
+                    moderation=SimpleNamespace(challenge_timeout_seconds=120)
+                ),
+                group_id=-100,
+                user_id=90,
+                display_name="member",
+                bot_username="bot",
+                reason="test",
+            )
+
+        self.assertTrue(handled)
+        abort.assert_awaited_once()
+        cleanup_prompt.assert_awaited_once_with(bot, -100, 901)
+        reconcile.assert_awaited_once()
 
 
 class ModerationNoticeTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):

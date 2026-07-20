@@ -35,12 +35,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import Settings
-from bot.db.models import Group, GroupMember, MessageVector, ModerationRule, PatrolRun
+from bot.db.models import (
+    Admin,
+    Group,
+    GroupMember,
+    MessageVector,
+    ModerationExemption,
+    ModerationRule,
+    PatrolRun,
+)
 from bot.services.background_health import record_background_failure
 from bot.services.authz import is_group_authorized, list_authorized_groups
+from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
     build_join_profile_text,
     is_globally_banned,
+    is_join_screening_exempt,
     mark_profile_screened,
     moderation_rules_fingerprint,
     profile_screen_signature,
@@ -53,7 +63,9 @@ from bot.services.join_verification import (
     activate_prepared_join_verification,
     delete_verification_prompt,
     get_join_verification,
+    manual_unban_generation_is_active,
     prepare_join_verification,
+    reconcile_stale_verification_restriction,
     renew_prepared_join_verification,
     restrict_new_member,
     shield_abort_prepared_join_verification,
@@ -67,11 +79,16 @@ from bot.utils.timezone import now_shanghai_naive
 
 log = logging.getLogger(__name__)
 
+_PATROL_PASS_DEADLINE_SECONDS = 30 * 60.0
+
 # Violators mentioned per warning message: keeps each message far below the
 # 4096-char cap and within Telegram's per-message mention-notification limits.
 PATROL_MENTIONS_PER_MESSAGE = 15
 # Gentle pacing between per-member Telegram calls (getChat / restrict).
 _PER_MEMBER_CALL_PAUSE = 0.05
+_PATROL_RUN_CONCURRENCY = 2
+_PATROL_RUN_ADMISSION_TIMEOUT_SECONDS = 2.0
+_PATROL_RUN_DEADLINE_SECONDS = 600.0
 
 _ROSTER_CACHE_MAX = 65536
 # (group_id, user_id) -> (full_name, username) already persisted this process.
@@ -417,6 +434,7 @@ class PatrolViolator:
     full_name: str
     username: str
     reason: str
+    rules_fingerprint: str = ""
 
 
 def _mention(violator: PatrolViolator) -> str:
@@ -476,11 +494,15 @@ async def _tg_call(coro_factory, *, retries: int = 2):
     """Run one Telegram call, honoring flood-control waits."""
     for attempt in range(retries + 1):
         try:
-            return await coro_factory()
+            async with asyncio.timeout(10.0):
+                return await coro_factory()
         except TelegramRetryAfter as exc:
             if attempt >= retries:
                 raise
-            await asyncio.sleep(max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2)
+            wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
+            if wait_s > 10.0:
+                raise
+            await asyncio.sleep(wait_s)
     return None
 
 
@@ -499,10 +521,19 @@ class PatrolService:
         self.session_factory = session_factory
         self._group_locks: dict[int, asyncio.Lock] = {}
         self._manual_tasks: set[asyncio.Task] = set()
+        self._manual_tasks_by_group: dict[int, asyncio.Task[Any]] = {}
+        self._pending_group_ids: set[int] = set()
+        self._run_slots = asyncio.Semaphore(_PATROL_RUN_CONCURRENCY)
 
     def is_running(self, group_id: int) -> bool:
-        lock = self._group_locks.get(int(group_id))
-        return bool(lock is not None and lock.locked())
+        normalized = int(group_id)
+        lock = self._group_locks.get(normalized)
+        manual = self._manual_tasks_by_group.get(normalized)
+        return bool(
+            normalized in self._pending_group_ids
+            or (lock is not None and lock.locked())
+            or (manual is not None and not manual.done())
+        )
 
     async def shutdown(self, *, timeout_seconds: float = 2.0) -> None:
         """Cancel manual runs without waiting forever for a stuck dependency."""
@@ -532,7 +563,8 @@ class PatrolService:
         consecutive_failures = 0
         while True:
             try:
-                await self.run_once(raise_on_total_failure=True)
+                async with asyncio.timeout(_PATROL_PASS_DEADLINE_SECONDS):
+                    await self.run_once(raise_on_total_failure=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -605,12 +637,21 @@ class PatrolService:
         group_id = int(group_id)
         if self.is_running(group_id):
             return {"started": False, "status": "already_running"}
+        if sum(not task.done() for task in self._manual_tasks) >= 8:
+            return {"started": False, "status": "busy"}
         task = asyncio.create_task(
             self._manual_patrol(group_id),
             name=f"manual-patrol:{group_id}",
         )
         self._manual_tasks.add(task)
-        task.add_done_callback(self._manual_tasks.discard)
+        self._manual_tasks_by_group[group_id] = task
+
+        def _finished(done: asyncio.Task[Any]) -> None:
+            self._manual_tasks.discard(done)
+            if self._manual_tasks_by_group.get(group_id) is done:
+                self._manual_tasks_by_group.pop(group_id, None)
+
+        task.add_done_callback(_finished)
         return {"started": True, "status": "started"}
 
     async def _manual_patrol(self, group_id: int) -> None:
@@ -623,10 +664,47 @@ class PatrolService:
     async def run_group_patrol(self, group_id: int) -> dict[str, Any]:
         group_id = int(group_id)
         lock = self._group_locks.setdefault(group_id, asyncio.Lock())
-        if lock.locked():
+        current = asyncio.current_task()
+        manual = self._manual_tasks_by_group.get(group_id)
+        if manual is not None and manual is not current and not manual.done():
             return {"status": "already_running"}
-        async with lock:
-            return await self._run_group_patrol_locked(group_id)
+        # This reservation happens before the first await, making the same-group
+        # check atomic within one event loop.  The old lock.locked() check raced
+        # while two callers were both waiting for a global run slot.
+        if group_id in self._pending_group_ids or lock.locked():
+            return {"status": "already_running"}
+        self._pending_group_ids.add(group_id)
+        acquired = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PATROL_RUN_DEADLINE_SECONDS
+        try:
+            try:
+                async with asyncio.timeout(
+                    min(
+                        _PATROL_RUN_ADMISSION_TIMEOUT_SECONDS,
+                        max(0.01, deadline - loop.time()),
+                    )
+                ):
+                    await self._run_slots.acquire()
+                    acquired = True
+            except TimeoutError:
+                log.warning("[%s] patrol admission timed out", group_id)
+                return {"status": "busy"}
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return {"status": "timeout"}
+            async with lock:
+                try:
+                    async with asyncio.timeout(remaining):
+                        return await self._run_group_patrol_locked(group_id)
+                except TimeoutError:
+                    log.error("[%s] patrol total deadline exceeded", group_id)
+                    return {"status": "timeout"}
+        finally:
+            if acquired:
+                self._run_slots.release()
+            self._pending_group_ids.discard(group_id)
 
     async def _run_group_patrol_locked(self, group_id: int) -> dict[str, Any]:
         settings = self.settings
@@ -671,7 +749,10 @@ class PatrolService:
             if seeded:
                 log.info("[%s] patrol roster seeded from history | +%d", group_id, seeded)
 
-            batch_size = max(10, int(getattr(settings, "patrol_batch_size", 500)))
+            batch_size = min(
+                100,
+                max(10, int(getattr(settings, "patrol_batch_size", 500))),
+            )
             batch_pause = max(
                 0.0, float(getattr(settings, "patrol_batch_pause_seconds", 5.0))
             )
@@ -846,6 +927,7 @@ class PatrolService:
                             full_name=full_name,
                             username=username,
                             reason=reason or "资料命中群规",
+                            rules_fingerprint=rules_fp,
                         )
                     )
                 elif conclusive:
@@ -873,12 +955,20 @@ class PatrolService:
         ) -> bool:
             try:
                 async with self.session_factory() as session:
-                    return await shield_abort_prepared_join_verification(
+                    recovered = await shield_abort_prepared_join_verification(
                         self.bot,
                         session,
                         prepared=prepared,
                         restore_permissions=restore_permissions,
                     )
+                if not recovered and restore_permissions:
+                    return await reconcile_stale_verification_restriction(
+                        self.bot,
+                        self.session_factory,
+                        prepared.group_id,
+                        prepared.user_id,
+                    )
+                return recovered
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -914,6 +1004,7 @@ class PatrolService:
             pairs: list[tuple[PatrolViolator, PreparedVerification]],
         ) -> list[tuple[PatrolViolator, PreparedVerification]]:
             renewed_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
+            stale_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
             async with self.session_factory() as session:
                 for violator, prepared in pairs:
                     renewed = await renew_prepared_join_verification(
@@ -922,8 +1013,72 @@ class PatrolService:
                     )
                     if renewed is not None:
                         renewed_pairs.append((violator, renewed))
+                    else:
+                        stale_pairs.append((violator, prepared))
                 await session.commit()
+            for _violator, prepared in stale_pairs:
+                await reconcile_stale_verification_restriction(
+                    self.bot,
+                    self.session_factory,
+                    prepared.group_id,
+                    prepared.user_id,
+                )
             return renewed_pairs
+
+        async def policy_allows_candidate(
+            session: AsyncSession,
+            violator: PatrolViolator,
+        ) -> bool:
+            user_id = int(violator.user_id)
+            if manual_unban_generation_is_active(group_id, user_id):
+                return False
+            if not await is_group_authorized(session, group_id):
+                return False
+            if await is_join_screening_exempt(session, user_id):
+                return False
+            if await is_globally_banned(session, user_id):
+                return False
+            if await session.scalar(
+                select(ModerationExemption.id).where(
+                    ModerationExemption.group_id == int(group_id),
+                    ModerationExemption.user_id == user_id,
+                )
+            ) is not None:
+                return False
+            if await session.scalar(
+                select(Admin.id).where(
+                    Admin.group_id == int(group_id),
+                    Admin.user_id == user_id,
+                )
+            ) is not None:
+                return False
+            expected_rules = str(violator.rules_fingerprint or "")
+            if expected_rules and (
+                await moderation_rules_fingerprint(session, int(group_id))
+            ) != expected_rules:
+                return False
+            return True
+
+        async def renew_if_still_enforceable(
+            violator: PatrolViolator,
+            prepared: PreparedVerification,
+        ) -> PreparedVerification | None:
+            async with self.session_factory() as session:
+                # SQLite has one writer. Taking write intent makes the policy
+                # checks and exact lease renewal atomic with /unban/exemptions.
+                await acquire_group_settings_write_intent(session, group_id)
+                if not await policy_allows_candidate(session, violator):
+                    await session.rollback()
+                    return None
+                renewed = await renew_prepared_join_verification(
+                    session,
+                    prepared=prepared,
+                )
+                if renewed is None:
+                    await session.rollback()
+                    return None
+                await session.commit()
+                return renewed
 
         enforced: list[PatrolViolator] = []
         for start in range(0, len(violators), PATROL_MENTIONS_PER_MESSAGE):
@@ -933,12 +1088,12 @@ class PatrolService:
             deadline = now_shanghai_naive() + timedelta(seconds=timeout_seconds)
             prepared_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
             try:
-                async with self.session_factory() as session:
-                    for violator in candidates:
-                        if not await is_group_authorized(session, group_id):
+                for violator in candidates:
+                    async with self.session_factory() as session:
+                        await acquire_group_settings_write_intent(session, group_id)
+                        if not await policy_allows_candidate(session, violator):
                             await session.rollback()
-                            prepared_pairs.clear()
-                            break
+                            continue
                         prepared = await prepare_join_verification(
                             session,
                             group_id=group_id,
@@ -952,7 +1107,7 @@ class PatrolService:
                         )
                         if prepared is not None:
                             prepared_pairs.append((violator, prepared))
-                    await session.commit()
+                        await session.commit()
             except Exception:
                 log.exception("[%s] patrol preparation persistence failed", group_id)
                 continue
@@ -961,7 +1116,7 @@ class PatrolService:
 
             muted_pairs: list[tuple[PatrolViolator, PreparedVerification]] = []
             try:
-                for violator, prepared in prepared_pairs:
+                for index, (violator, prepared) in enumerate(prepared_pairs):
                     if not await self._group_authorized(group_id):
                         muted_ids = {
                             item.verification_id for _member, item in muted_pairs
@@ -972,15 +1127,20 @@ class PatrolService:
                                 restore_permissions=item.verification_id in muted_ids,
                             )
                         return enforced
+                    renewed = await renew_if_still_enforceable(violator, prepared)
+                    if renewed is None:
+                        await abort_one(prepared, restore_permissions=False)
+                        continue
+                    prepared_pairs[index] = (violator, renewed)
                     if await restrict_new_member(self.bot, group_id, violator.user_id):
-                        muted_pairs.append((violator, prepared))
+                        muted_pairs.append((violator, renewed))
                     else:
                         log.warning(
                             "[%s] patrol mute failed; skipping user %s",
                             group_id,
                             violator.user_id,
                         )
-                        await abort_one(prepared, restore_permissions=True)
+                        await abort_one(renewed, restore_permissions=True)
                     await asyncio.sleep(_PER_MEMBER_CALL_PAUSE)
             except asyncio.CancelledError:
                 for _violator, prepared in prepared_pairs:
