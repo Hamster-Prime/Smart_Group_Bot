@@ -136,9 +136,14 @@ async def _ack_security_callback(
     *,
     show_alert: bool = False,
 ) -> None:
+    async def _answer() -> None:
+        # CallbackQuery.answer() returns a TelegramMethod (awaitable, not a
+        # coroutine); create_task requires a genuine coroutine.
+        await callback.answer(text, show_alert=show_alert)
+
     with privileged_request_scope():
         task = asyncio.create_task(
-            callback.answer(text, show_alert=show_alert),
+            _answer(),
             name="security-callback-ack",
         )
     done, _pending = await asyncio.wait({task}, timeout=2.0)
