@@ -499,6 +499,37 @@ class _TelegramRecoveryResult:
     error: Exception | None = None
     group_unreachable: bool = False
     operator_action_required: bool = False
+    final_banned: bool | None = None
+    final_restricted: bool | None = None
+
+    @property
+    def retryable(self) -> bool:
+        return bool(
+            not self.ok
+            and not self.group_unreachable
+            and not self.operator_action_required
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BanEnforcementResult:
+    """Authoritative outcome of applying a durable ban policy to Telegram.
+
+    ``final_banned`` preserves the existing tri-state contract: ``True`` means
+    the latest policy is enforced as a ban, ``False`` means a newer release
+    policy won and was reflected remotely, and ``None`` means enforcement did
+    not reach a confirmed terminal state. When it is ``False``,
+    ``final_restricted`` distinguishes a still-required verification mute from
+    a full permission restore. ``retryable`` distinguishes a transient or
+    ambiguous failure from a deterministic Telegram rejection.
+    """
+
+    final_banned: bool | None
+    final_restricted: bool | None = None
+    retryable: bool = False
+    group_unreachable: bool = False
+    operator_action_required: bool = False
+    error: Exception | None = None
 
 
 _LAST_KICK_RECOVERY_RESULT: ContextVar[_TelegramRecoveryResult | None] = ContextVar(
@@ -529,6 +560,32 @@ _DETERMINISTIC_GROUP_API_ERRORS = (
     TelegramNotFound,
     TelegramUnauthorizedError,
 )
+# Telegram refuses these targets regardless of retries; unlike the operator
+# markers they need a target change (demote/transfer), not a rights change.
+_UNBANNABLE_TARGET_ERROR_MARKERS = (
+    "can't remove chat owner",
+    "can't restrict chat owner",
+    "user is an administrator of the chat",
+    "user admin invalid",
+)
+
+
+def telegram_ban_failure_is_deterministic(exc: BaseException) -> bool:
+    """Whether a ban/restrict rejection cannot succeed by retrying as-is."""
+
+    if isinstance(
+        exc,
+        (TelegramForbiddenError, TelegramNotFound, TelegramUnauthorizedError),
+    ):
+        return True
+    if telegram_group_is_unreachable_error(exc):
+        return True
+    if telegram_group_requires_operator_action(exc):
+        return True
+    if not isinstance(exc, _DETERMINISTIC_GROUP_API_ERRORS):
+        return False
+    detail = " ".join(str(exc).replace("_", " ").lower().split())
+    return any(marker in detail for marker in _UNBANNABLE_TARGET_ERROR_MARKERS)
 
 
 def telegram_group_is_unreachable_error(exc: BaseException) -> bool:
@@ -553,6 +610,59 @@ def telegram_group_requires_operator_action(exc: BaseException) -> bool:
         return False
     detail = " ".join(str(exc).replace("_", " ").lower().split())
     return any(marker in detail for marker in _OPERATOR_ACTION_ERROR_MARKERS)
+
+
+def _chat_member_status_value(member: object) -> str:
+    raw_status = getattr(member, "status", "")
+    return str(getattr(raw_status, "value", raw_status) or "").strip().lower()
+
+
+def _telegram_ban_failure_result(exc: Exception) -> _TelegramRecoveryResult:
+    group_unreachable = telegram_group_is_unreachable_error(exc)
+    operator_action_required = telegram_group_requires_operator_action(exc)
+    if isinstance(exc, TelegramNotFound):
+        group_unreachable = True
+    elif isinstance(exc, (TelegramForbiddenError, TelegramUnauthorizedError)):
+        operator_action_required = not group_unreachable
+    if not operator_action_required and isinstance(
+        exc,
+        _DETERMINISTIC_GROUP_API_ERRORS,
+    ):
+        detail = " ".join(str(exc).replace("_", " ").lower().split())
+        operator_action_required = any(
+            marker in detail for marker in _UNBANNABLE_TARGET_ERROR_MARKERS
+        )
+    return _TelegramRecoveryResult(
+        ok=False,
+        error=exc,
+        group_unreachable=group_unreachable,
+        operator_action_required=operator_action_required,
+    )
+
+
+def _ban_enforcement_failure(
+    failure: _TelegramRecoveryResult,
+) -> BanEnforcementResult:
+    return BanEnforcementResult(
+        final_banned=None,
+        final_restricted=failure.final_restricted,
+        retryable=failure.retryable,
+        group_unreachable=failure.group_unreachable,
+        operator_action_required=failure.operator_action_required,
+        error=failure.error,
+    )
+
+
+def _telegram_recovery_from_ban_enforcement(
+    result: BanEnforcementResult,
+) -> _TelegramRecoveryResult:
+    return _TelegramRecoveryResult(
+        ok=result.final_banned is True,
+        error=result.error,
+        group_unreachable=result.group_unreachable,
+        operator_action_required=result.operator_action_required,
+        final_banned=result.final_banned,
+    )
 
 
 def _record_manual_unban_generation(
@@ -2434,7 +2544,12 @@ async def extend_pending_verification_deadlines(
     return extended
 
 
-async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+async def restrict_new_member_result(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> _TelegramRecoveryResult:
+    failure = _TelegramRecoveryResult(ok=False)
     try:
         restricted = await _bounded_telegram_call(
             bot.restrict_chat_member(
@@ -2444,16 +2559,33 @@ async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
             ),
             timeout_seconds=10.0,
         )
-        return restricted is not False
-    except Exception:
-        log.exception("join verification restrict failed | chat=%s user=%s", chat_id, user_id)
+        if restricted is not False:
+            return _TelegramRecoveryResult(ok=True)
+    except Exception as exc:
+        failure = _telegram_ban_failure_result(exc)
+        if failure.group_unreachable or failure.operator_action_required:
+            log.error(
+                "join verification restrict rejected deterministically | "
+                "chat=%s user=%s unreachable=%s operator_action=%s error=%s",
+                chat_id,
+                user_id,
+                failure.group_unreachable,
+                failure.operator_action_required,
+                exc,
+            )
+        else:
+            log.exception(
+                "join verification restrict failed | chat=%s user=%s",
+                chat_id,
+                user_id,
+            )
     try:
         member = await _bounded_telegram_call(
             bot.get_chat_member(chat_id, user_id),
             timeout_seconds=4.0,
         )
         if (
-            str(getattr(member, "status", "") or "") == "restricted"
+            _chat_member_status_value(member) == "restricted"
             and not bool(getattr(member, "can_send_messages", False))
         ):
             log.info(
@@ -2462,15 +2594,23 @@ async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
                 chat_id,
                 user_id,
             )
-            return True
-    except Exception:
+            return _TelegramRecoveryResult(ok=True)
+    except Exception as exc:
+        probe_failure = _telegram_ban_failure_result(exc)
+        if probe_failure.group_unreachable or probe_failure.operator_action_required:
+            failure = probe_failure
         log.debug(
             "join verification restrict status check failed | chat=%s user=%s",
             chat_id,
             user_id,
             exc_info=True,
         )
-    return False
+    return failure
+
+
+async def restrict_new_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    result = await restrict_new_member_result(bot, chat_id, user_id)
+    return result.ok
 
 
 async def _restore_member_permissions_result(
@@ -2479,6 +2619,7 @@ async def _restore_member_permissions_result(
     user_id: int,
 ) -> _TelegramRecoveryResult:
     last_error: Exception | None = None
+    failure = _TelegramRecoveryResult(ok=False)
     for attempt in range(1, 4):
         try:
             restored = await _bounded_telegram_call(
@@ -2494,25 +2635,19 @@ async def _restore_member_permissions_result(
                 return _TelegramRecoveryResult(ok=True)
         except Exception as exc:
             last_error = exc
-            group_unreachable = telegram_group_is_unreachable_error(exc)
-            operator_action_required = telegram_group_requires_operator_action(exc)
+            failure = _telegram_ban_failure_result(exc)
             log.warning(
                 "join verification restore request failed | chat=%s user=%s "
                 "attempt=%s/3 unreachable=%s operator_action=%s error=%s",
                 chat_id,
                 user_id,
                 attempt,
-                group_unreachable,
-                operator_action_required,
+                failure.group_unreachable,
+                failure.operator_action_required,
                 exc,
             )
-            if group_unreachable or operator_action_required:
-                return _TelegramRecoveryResult(
-                    ok=False,
-                    error=exc,
-                    group_unreachable=group_unreachable,
-                    operator_action_required=operator_action_required,
-                )
+            if failure.group_unreachable:
+                return failure
 
         # Telegram may apply the permission update even when the HTTP response
         # is lost. Confirm the actual member state before retrying or reporting
@@ -2522,7 +2657,7 @@ async def _restore_member_permissions_result(
                 bot.get_chat_member(chat_id, user_id),
                 timeout_seconds=4.0,
             )
-            status = str(getattr(member, "status", "") or "")
+            status = _chat_member_status_value(member)
             if status in {"member", "administrator", "creator", "left"} or (
                 status == "restricted"
                 and bool(getattr(member, "can_send_messages", False))
@@ -2534,21 +2669,20 @@ async def _restore_member_permissions_result(
                 )
                 return _TelegramRecoveryResult(ok=True)
         except Exception as exc:
-            group_unreachable = telegram_group_is_unreachable_error(exc)
-            operator_action_required = telegram_group_requires_operator_action(exc)
-            if group_unreachable or operator_action_required:
-                return _TelegramRecoveryResult(
-                    ok=False,
-                    error=exc,
-                    group_unreachable=group_unreachable,
-                    operator_action_required=operator_action_required,
-                )
+            probe_failure = _telegram_ban_failure_result(exc)
+            if probe_failure.group_unreachable:
+                return probe_failure
+            if probe_failure.operator_action_required:
+                failure = probe_failure
             log.debug(
                 "join verification restore status check failed | chat=%s user=%s",
                 chat_id,
                 user_id,
                 exc_info=True,
             )
+
+        if failure.operator_action_required:
+            return failure
 
         if attempt < 3:
             await asyncio.sleep(0.35 * attempt)
@@ -2559,6 +2693,8 @@ async def _restore_member_permissions_result(
         user_id,
         last_error or "Telegram returned false",
     )
+    if failure.error is not None:
+        return failure
     return _TelegramRecoveryResult(ok=False, error=last_error)
 
 
@@ -2595,7 +2731,7 @@ async def chat_member_is_present(
             exc_info=True,
         )
         return None
-    status = str(getattr(member, "status", "") or "").lower()
+    status = _chat_member_status_value(member)
     return status not in {"left", "kicked"}
 
 
@@ -2683,6 +2819,26 @@ async def _ensure_kick_unbanned_result(
 ) -> _TelegramRecoveryResult:
     """Idempotently lift a Telegram ban unless current policy preserves it."""
 
+    async def finish_confirmed_unban() -> _TelegramRecoveryResult:
+        if preserve_ban is not None:
+            try:
+                if await preserve_ban():
+                    # A durable ban created while the temporary kick was being
+                    # released wins the race.
+                    result = await ban_member_result(bot, chat_id, user_id)
+                    return _telegram_recovery_from_ban_enforcement(result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception(
+                    "kick unban post-check failed | chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return _TelegramRecoveryResult(ok=False, error=exc)
+        return _TelegramRecoveryResult(ok=True)
+
+    failure = _TelegramRecoveryResult(ok=False)
     for attempt in range(1, 4):
         if preserve_ban is not None:
             try:
@@ -2693,14 +2849,14 @@ async def _ensure_kick_unbanned_result(
                         user_id,
                     )
                     return _TelegramRecoveryResult(ok=True)
-            except Exception:
+            except Exception as exc:
                 log.exception(
                     "unban policy check failed | chat=%s user=%s",
                     chat_id,
                     user_id,
                 )
                 # Failing open here could lift a newly-created durable ban.
-                return _TelegramRecoveryResult(ok=False)
+                return _TelegramRecoveryResult(ok=False, error=exc)
         try:
             unbanned = await _bounded_telegram_call(
                 bot.unban_chat_member(
@@ -2711,49 +2867,58 @@ async def _ensure_kick_unbanned_result(
                 timeout_seconds=4.0,
             )
             if unbanned is not False:
-                if preserve_ban is not None:
-                    try:
-                        if await preserve_ban():
-                            # A durable ban created while the temporary kick
-                            # was being released wins the race.
-                            return _TelegramRecoveryResult(
-                                ok=await ban_member(bot, chat_id, user_id)
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        log.exception(
-                            "kick unban post-check failed | chat=%s user=%s",
-                            chat_id,
-                            user_id,
-                        )
-                        return _TelegramRecoveryResult(ok=False)
-                return _TelegramRecoveryResult(ok=True)
+                return await finish_confirmed_unban()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            group_unreachable = telegram_group_is_unreachable_error(exc)
-            operator_action_required = telegram_group_requires_operator_action(exc)
+            failure = _telegram_ban_failure_result(exc)
             log.warning(
                 "join verification unban cleanup failed | chat=%s user=%s "
                 "attempt=%s/3 unreachable=%s operator_action=%s error=%s",
                 chat_id,
                 user_id,
                 attempt,
-                group_unreachable,
-                operator_action_required,
+                failure.group_unreachable,
+                failure.operator_action_required,
                 exc,
             )
-            if group_unreachable or operator_action_required:
-                return _TelegramRecoveryResult(
-                    ok=False,
-                    error=exc,
-                    group_unreachable=group_unreachable,
-                    operator_action_required=operator_action_required,
+            if failure.group_unreachable:
+                return failure
+
+        # A response may be lost after Telegram applies the unban, and owner /
+        # administrator targets can reject the mutation despite already being
+        # in a released state. Confirm the actual membership before retrying.
+        try:
+            member = await _bounded_telegram_call(
+                bot.get_chat_member(chat_id, user_id),
+                timeout_seconds=4.0,
+            )
+            if _chat_member_status_value(member) != "kicked":
+                log.info(
+                    "kick unban confirmed after ambiguous response | "
+                    "chat=%s user=%s",
+                    chat_id,
+                    user_id,
                 )
+                return await finish_confirmed_unban()
+        except Exception as exc:
+            probe_failure = _telegram_ban_failure_result(exc)
+            if probe_failure.group_unreachable:
+                return probe_failure
+            if probe_failure.operator_action_required:
+                failure = probe_failure
+            log.debug(
+                "kick unban status check failed | chat=%s user=%s",
+                chat_id,
+                user_id,
+                exc_info=True,
+            )
+
+        if failure.operator_action_required:
+            return failure
         if attempt < 3:
             await asyncio.sleep(0.25 * attempt)
-    return _TelegramRecoveryResult(ok=False)
+    return failure
 
 
 async def _ensure_kick_unbanned(
@@ -2820,15 +2985,19 @@ async def _kick_member_result(
         await _wait_for_kick_cleanup_result(cleanup)
         raise
     except Exception as exc:
-        log.exception("member kick ban failed | chat=%s user=%s", chat_id, user_id)
-        failure = _TelegramRecoveryResult(
-            ok=False,
-            error=exc,
-            group_unreachable=telegram_group_is_unreachable_error(exc),
-            operator_action_required=telegram_group_requires_operator_action(exc),
-        )
+        failure = _telegram_ban_failure_result(exc)
         if failure.group_unreachable or failure.operator_action_required:
+            log.error(
+                "member kick rejected deterministically | chat=%s user=%s "
+                "unreachable=%s operator_action=%s error=%s",
+                chat_id,
+                user_id,
+                failure.group_unreachable,
+                failure.operator_action_required,
+                exc,
+            )
             return failure
+        log.exception("member kick ban failed | chat=%s user=%s", chat_id, user_id)
         cleanup = asyncio.create_task(
             _ensure_kick_unbanned_result(bot, chat_id, user_id, preserve_ban),
             name=f"kick-unban:{chat_id}:{user_id}",
@@ -2916,16 +3085,38 @@ async def unban_member(
     return unbanned
 
 
-async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Permanently ban a member and revoke their view of prior chat history."""
+async def ban_member_result(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> BanEnforcementResult:
+    """Ban a member and retain whether an unconfirmed failure is retryable."""
+
+    failure = _TelegramRecoveryResult(ok=False)
     try:
         banned = await _bounded_telegram_call(
             bot.ban_chat_member(chat_id, user_id, revoke_messages=True),
             timeout_seconds=10.0,
         )
-        return banned is not False
-    except Exception:
-        log.exception("member ban failed | chat=%s user=%s", chat_id, user_id)
+        if banned is not False:
+            return BanEnforcementResult(final_banned=True)
+    except Exception as exc:
+        failure = _telegram_ban_failure_result(exc)
+        if failure.group_unreachable or failure.operator_action_required:
+            # Still probe the remote state: Telegram may have applied the ban
+            # before returning an error, and an already-kicked target is a
+            # successful terminal outcome.
+            log.error(
+                "member ban rejected deterministically | chat=%s user=%s "
+                "unreachable=%s operator_action=%s error=%s",
+                chat_id,
+                user_id,
+                failure.group_unreachable,
+                failure.operator_action_required,
+                exc,
+            )
+        else:
+            log.exception("member ban failed | chat=%s user=%s", chat_id, user_id)
     # The HTTP response can be lost after Telegram applies the ban. Confirm the
     # remote state before rolling back the durable local ban/releasing the work
     # item, otherwise a banned member could be left with a fresh pending prompt.
@@ -2934,22 +3125,64 @@ async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
             bot.get_chat_member(chat_id, user_id),
             timeout_seconds=4.0,
         )
-        if str(getattr(member, "status", "") or "") == "kicked":
+        if _chat_member_status_value(member) == "kicked":
             log.info(
                 "member ban confirmed after ambiguous response | "
                 "chat=%s user=%s",
                 chat_id,
                 user_id,
             )
-            return True
-    except Exception:
+            return BanEnforcementResult(final_banned=True)
+    except Exception as exc:
+        probe_failure = _telegram_ban_failure_result(exc)
+        if probe_failure.group_unreachable or probe_failure.operator_action_required:
+            failure = probe_failure
         log.debug(
             "moderation challenge ban status check failed | chat=%s user=%s",
             chat_id,
             user_id,
             exc_info=True,
         )
-    return False
+    return _ban_enforcement_failure(failure)
+
+
+async def ban_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Permanently ban a member and revoke their view of prior chat history."""
+
+    result = await ban_member_result(bot, chat_id, user_id)
+    return result.final_banned is True
+
+
+async def enforce_ban_with_policy_reconciliation_result(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    preserve_ban: Callable[[], Awaitable[bool]],
+    restriction_required: Callable[[], Awaitable[bool]] | None = None,
+) -> BanEnforcementResult:
+    """Make Telegram match the latest durable ban/restriction policy."""
+
+    reconciliation = await reconcile_moderation_ban_after_lost_lease_result(
+        bot,
+        int(chat_id),
+        int(user_id),
+        preserve_ban,
+        restriction_required=restriction_required,
+    )
+    if not reconciliation.ok:
+        return _ban_enforcement_failure(reconciliation)
+    if reconciliation.final_banned is None:
+        log.error(
+            "moderation reconciliation completed without a final ban state | "
+            "chat=%s user=%s",
+            chat_id,
+            user_id,
+        )
+        return BanEnforcementResult(final_banned=None, retryable=True)
+    return BanEnforcementResult(
+        final_banned=reconciliation.final_banned,
+        final_restricted=reconciliation.final_restricted,
+    )
 
 
 async def enforce_ban_with_policy_reconciliation(
@@ -2967,40 +3200,14 @@ async def enforce_ban_with_policy_reconciliation(
     ambiguous and the durable caller must retry.
     """
 
-    if not await ban_member(bot, int(chat_id), int(user_id)):
-        return None
-    try:
-        still_blocked = bool(await preserve_ban())
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception(
-            "post-ban policy check failed | chat=%s user=%s",
-            chat_id,
-            user_id,
-        )
-        return None
-    if still_blocked:
-        return True
-    if not await reconcile_moderation_ban_after_lost_lease(
+    result = await enforce_ban_with_policy_reconciliation_result(
         bot,
-        int(chat_id),
-        int(user_id),
+        chat_id,
+        user_id,
         preserve_ban,
-        restriction_required=restriction_required,
-    ):
-        return None
-    try:
-        return bool(await preserve_ban())
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception(
-            "post-reconciliation policy check failed | chat=%s user=%s",
-            chat_id,
-            user_id,
-        )
-        return None
+        restriction_required,
+    )
+    return result.final_banned
 
 
 async def reconcile_stale_verification_restriction(
@@ -3154,7 +3361,7 @@ async def reconcile_stale_verification_restriction(
     return True
 
 
-async def reconcile_moderation_ban_after_lost_lease(
+async def reconcile_moderation_ban_after_lost_lease_result(
     bot: Bot,
     chat_id: int,
     user_id: int,
@@ -3162,7 +3369,7 @@ async def reconcile_moderation_ban_after_lost_lease(
     *,
     restriction_required: Callable[[], Awaitable[bool]] | None = None,
     failure_observer: Callable[[_TelegramRecoveryResult], None] | None = None,
-) -> bool:
+) -> _TelegramRecoveryResult:
     """Reconcile a successful Telegram ban whose durable generation was lost.
 
     A manual group/global unban may delete both the local policy and the
@@ -3172,61 +3379,135 @@ async def reconcile_moderation_ban_after_lost_lease(
     Policy reads fail closed; a policy created during cleanup is re-enforced.
     """
 
-    async def policy_blocks_release() -> bool:
+    async def checked_intent(
+        stage: str,
+    ) -> tuple[bool | None, bool | None, Exception | None]:
         try:
-            return bool(await preserve_ban())
+            blocked = bool(await preserve_ban())
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception(
                 "moderation ban reconciliation policy check failed | "
-                "chat=%s user=%s",
+                "stage=%s chat=%s user=%s",
+                stage,
                 chat_id,
                 user_id,
             )
-            return True
+            return None, None, exc
+        if blocked:
+            return True, None, None
+        if restriction_required is None:
+            return False, False, None
+        try:
+            restricted = bool(await restriction_required())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception(
+                "moderation ban reconciliation challenge check failed | "
+                "stage=%s chat=%s user=%s",
+                stage,
+                chat_id,
+                user_id,
+            )
+            return None, None, exc
+        return False, restricted, None
 
-    async def reconcile() -> bool:
-        if await policy_blocks_release():
-            # The durable policy is authoritative. This also repairs a manual
-            # unban that reached Telegram but crashed before its DB CAS commit.
-            return await ban_member(bot, chat_id, user_id)
-        unban_result = await _ensure_kick_unbanned_result(
-            bot,
-            chat_id,
-            user_id,
-            policy_blocks_release,
-        )
-        if not unban_result.ok:
-            if failure_observer is not None:
-                failure_observer(unban_result)
-            return False
-        # A new durable ban created after the unban check wins and must be
-        # reflected back to Telegram instead of being lifted by this cleanup.
-        if await policy_blocks_release():
-            return await ban_member(bot, chat_id, user_id)
-        if restriction_required is not None:
-            try:
-                if await restriction_required():
-                    return await restrict_new_member(bot, chat_id, user_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception(
-                    "moderation ban reconciliation challenge check failed | "
-                    "chat=%s user=%s",
+    async def reconcile() -> _TelegramRecoveryResult:
+        # Durable ban and verification intent may both change while Telegram is
+        # in flight. Every remote mutation is followed by a fresh policy read;
+        # if the desired state changed, the next iteration applies the opposite
+        # mutation. Bounding the loop turns policy flapping into a retryable
+        # outcome instead of holding a worker forever.
+        for attempt in range(1, 6):
+            blocked, restricted, policy_error = await checked_intent(
+                f"pre-mutation-{attempt}"
+            )
+            if blocked is None:
+                return _TelegramRecoveryResult(ok=False, error=policy_error)
+
+            if blocked:
+                ban_result = await ban_member_result(bot, chat_id, user_id)
+                if ban_result.final_banned is not True:
+                    return _telegram_recovery_from_ban_enforcement(ban_result)
+                blocked, _restricted, policy_error = await checked_intent(
+                    f"post-ban-{attempt}"
+                )
+                if blocked is None:
+                    return _TelegramRecoveryResult(ok=False, error=policy_error)
+                if blocked:
+                    return _TelegramRecoveryResult(
+                        ok=True,
+                        final_banned=True,
+                        final_restricted=None,
+                    )
+                continue
+
+            unban_result = await _ensure_kick_unbanned_result(
+                bot,
+                chat_id,
+                user_id,
+                None,
+            )
+            if not unban_result.ok:
+                return unban_result
+
+            blocked, restricted, policy_error = await checked_intent(
+                f"post-unban-{attempt}"
+            )
+            if blocked is None:
+                return _TelegramRecoveryResult(ok=False, error=policy_error)
+            if blocked:
+                continue
+
+            if restricted:
+                restriction_result = await restrict_new_member_result(
+                    bot,
                     chat_id,
                     user_id,
                 )
-                return False
-        restore_result = await _restore_member_permissions_result(
-            bot,
+                if not restriction_result.ok:
+                    return restriction_result
+                blocked, restricted, policy_error = await checked_intent(
+                    f"post-restrict-{attempt}"
+                )
+                if blocked is None:
+                    return _TelegramRecoveryResult(ok=False, error=policy_error)
+                if not blocked and restricted:
+                    return _TelegramRecoveryResult(
+                        ok=True,
+                        final_banned=False,
+                        final_restricted=True,
+                    )
+                continue
+
+            restore_result = await _restore_member_permissions_result(
+                bot,
+                chat_id,
+                user_id,
+            )
+            if not restore_result.ok:
+                return restore_result
+            blocked, restricted, policy_error = await checked_intent(
+                f"post-restore-{attempt}"
+            )
+            if blocked is None:
+                return _TelegramRecoveryResult(ok=False, error=policy_error)
+            if not blocked and not restricted:
+                return _TelegramRecoveryResult(
+                    ok=True,
+                    final_banned=False,
+                    final_restricted=False,
+                )
+
+        log.warning(
+            "moderation policy kept changing during reconciliation; "
+            "durable retry required | chat=%s user=%s",
             chat_id,
             user_id,
         )
-        if not restore_result.ok and failure_observer is not None:
-            failure_observer(restore_result)
-        return restore_result.ok
+        return _TelegramRecoveryResult(ok=False)
 
     task = asyncio.create_task(
         reconcile(),
@@ -3235,10 +3516,33 @@ async def reconcile_moderation_ban_after_lost_lease(
     _KICK_CLEANUP_TASKS.add(task)
     task.add_done_callback(_KICK_CLEANUP_TASKS.discard)
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
     except asyncio.CancelledError:
-        await _wait_for_kick_cleanup(task)
+        await _wait_for_kick_cleanup_result(task)
         raise
+    if not result.ok and failure_observer is not None:
+        failure_observer(result)
+    return result
+
+
+async def reconcile_moderation_ban_after_lost_lease(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    preserve_ban: Callable[[], Awaitable[bool]],
+    *,
+    restriction_required: Callable[[], Awaitable[bool]] | None = None,
+    failure_observer: Callable[[_TelegramRecoveryResult], None] | None = None,
+) -> bool:
+    result = await reconcile_moderation_ban_after_lost_lease_result(
+        bot,
+        chat_id,
+        user_id,
+        preserve_ban,
+        restriction_required=restriction_required,
+        failure_observer=failure_observer,
+    )
+    return result.ok
 
 
 async def release_moderation_restriction_after_exemption(
@@ -3923,8 +4227,7 @@ async def warn_if_bot_cannot_verify(
             all_ok = False
             continue
 
-        raw_status = getattr(member, "status", "")
-        status = str(getattr(raw_status, "value", raw_status) or "").lower()
+        status = _chat_member_status_value(member)
         if status in {"left", "kicked"}:
             changed, _ = await quarantine_unreachable_authorized_group(
                 session_factory,
@@ -4312,18 +4615,25 @@ class JoinVerificationSweeper:
                 # The registry is policy, not proof that Telegram enforcement
                 # succeeded in this group. Re-apply the idempotent ban so the
                 # remote state and mandatory revoke_messages flag are confirmed.
-                enforced = await ban_member(
+                enforcement = await ban_member_result(
                     self.bot,
                     record.group_id,
                     record.user_id,
                 )
-                if not enforced:
-                    await self._release_enforcement(record)
+                if enforcement.final_banned is not True:
+                    deferred = await self._defer_terminal_record(
+                        record,
+                        status=VERIFICATION_STATUS_ENFORCING,
+                        failure=_telegram_recovery_from_ban_enforcement(
+                            enforcement
+                        ),
+                    )
                     log.warning(
-                        "global-ban verification enforcement failed; requeued | "
-                        "group=%s user=%s",
+                        "global-ban verification enforcement failed; deferred | "
+                        "group=%s user=%s deferred=%s",
                         record.group_id,
                         record.user_id,
+                        deferred,
                     )
                     return
                 completed = await self._complete_enforcement(record)
@@ -4331,14 +4641,25 @@ class JoinVerificationSweeper:
                     await self._reconcile_lost_moderation_ban(record)
                 return
             if record.kind == VERIFICATION_KIND_MODERATION:
-                enforced = await ban_member(self.bot, record.group_id, record.user_id)
-                if not enforced:
-                    released = await self._release_enforcement(record)
+                enforcement = await ban_member_result(
+                    self.bot,
+                    record.group_id,
+                    record.user_id,
+                )
+                if enforcement.final_banned is not True:
+                    deferred = await self._defer_terminal_record(
+                        record,
+                        status=VERIFICATION_STATUS_ENFORCING,
+                        failure=_telegram_recovery_from_ban_enforcement(
+                            enforcement
+                        ),
+                    )
                     log.warning(
-                        "moderation verification timeout ban failed | group=%s user=%s requeued=%s",
+                        "moderation verification timeout ban failed | "
+                        "group=%s user=%s deferred=%s",
                         record.group_id,
                         record.user_id,
-                        released,
+                        deferred,
                     )
                     return
                 if not await self._complete_enforcement(record, mark_banned=True):
@@ -4624,6 +4945,14 @@ class JoinVerificationSweeper:
                     user_id=int(record.user_id),
                 )
 
+        async def restriction_required() -> bool:
+            async with self.session_factory() as session:
+                return await verification_restriction_required(
+                    session,
+                    group_id=int(record.group_id),
+                    user_id=int(record.user_id),
+                )
+
         recovery_failure: _TelegramRecoveryResult | None = None
 
         def observe_failure(result: _TelegramRecoveryResult) -> None:
@@ -4635,6 +4964,7 @@ class JoinVerificationSweeper:
             int(record.group_id),
             int(record.user_id),
             preserve_ban,
+            restriction_required=restriction_required,
             failure_observer=observe_failure,
         )
         if not reconciled:
@@ -4725,7 +5055,7 @@ class JoinVerificationSweeper:
                         int(record.group_id),
                         int(record.user_id),
                     )
-                    if str(getattr(member, "status", "") or "") not in {
+                    if _chat_member_status_value(member) not in {
                         "left",
                         "kicked",
                     }:
@@ -4958,11 +5288,20 @@ class JoinVerificationSweeper:
                     user_id=int(record.user_id),
                 )
 
+        async def restriction_required() -> bool:
+            async with self.session_factory() as session:
+                return await verification_restriction_required(
+                    session,
+                    group_id=int(record.group_id),
+                    user_id=int(record.user_id),
+                )
+
         return await reconcile_moderation_ban_after_lost_lease(
             self.bot,
             int(record.group_id),
             int(record.user_id),
             preserve_ban,
+            restriction_required=restriction_required,
         )
 
     async def _release_enforcement(self, record: JoinVerification) -> bool:

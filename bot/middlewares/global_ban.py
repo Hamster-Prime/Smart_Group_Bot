@@ -13,7 +13,7 @@ from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
-    enforce_ban_with_policy_reconciliation,
+    enforce_ban_with_policy_reconciliation_result,
     reconcile_moderation_ban_after_lost_lease,
     verification_restriction_required,
 )
@@ -201,20 +201,37 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
                     await policy_session.commit()
                     return required
 
-            final_banned = await enforce_ban_with_policy_reconciliation(
+            enforcement = await enforce_ban_with_policy_reconciliation_result(
                 event.bot,
                 int(chat.id),
                 int(user.id),
                 preserve_ban,
                 restriction_required,
             )
+            final_banned = enforcement.final_banned
             if final_banned is None:
-                log.warning(
-                    "[%s] durable ban enforcement was not confirmed | user=%s",
-                    chat.id,
-                    user.id,
-                )
-                request_current_update_retry()
+                if not enforcement.retryable:
+                    # Missing rights, an unbannable target, or an unreachable
+                    # group is deterministic: replaying the update cannot help
+                    # and would needlessly demote webhook to polling. The
+                    # durable policy stays and can be enforced after the group
+                    # setup changes.
+                    log.warning(
+                        "[%s] durable ban cannot be enforced until group setup "
+                        "changes; completing update without retry | user=%s "
+                        "unreachable=%s operator_action=%s",
+                        chat.id,
+                        user.id,
+                        enforcement.group_unreachable,
+                        enforcement.operator_action_required,
+                    )
+                else:
+                    log.warning(
+                        "[%s] durable ban enforcement was not confirmed | user=%s",
+                        chat.id,
+                        user.id,
+                    )
+                    request_current_update_retry()
             elif final_banned and locally_banned:
                 try:
                     confirmed = await _confirm_pending_local_bans(

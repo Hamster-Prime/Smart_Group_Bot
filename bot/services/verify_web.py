@@ -3462,7 +3462,10 @@ class VerifyWebServer:
             model_dump = getattr(update, "model_dump", None)
             if not callable(model_dump):
                 raise TypeError("unsupported Telegram update object")
-            payload = model_dump(mode="json", exclude_none=True)
+            # exclude_unset drops aiogram's Default(...) sentinel fields (e.g.
+            # LinkPreviewOptions.is_disabled), which exclude_none keeps and
+            # pydantic cannot serialize; incoming updates only carry set fields.
+            payload = model_dump(mode="json", exclude_none=True, exclude_unset=True)
         if not isinstance(payload, dict):
             raise TypeError("Telegram update serialization did not return an object")
         return await self._webhook_processor.accept_durable_update(payload)

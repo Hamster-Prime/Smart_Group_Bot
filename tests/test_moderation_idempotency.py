@@ -19,6 +19,7 @@ from bot.db.models import (
     Violation,
 )
 from bot.handlers import group
+from bot.services.join_verification import BanEnforcementResult
 from bot.services.moderation import ModerationService
 
 
@@ -125,12 +126,15 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(),
             delete=AsyncMock(),
         )
-        ban = AsyncMock(return_value=True)
+        ban = AsyncMock(return_value=BanEnforcementResult(final_banned=True))
         results: list[tuple[int, int, bool]] = []
-        with patch("bot.services.join_verification.ban_member", new=ban):
+        with patch(
+            "bot.handlers.group.enforce_ban_with_policy_reconciliation_result",
+            new=ban,
+        ):
             for _ in range(2):
                 async with self.session_factory() as session:
-                    count, violation, enforced, _ = (
+                    count, violation, enforced, _, _retryable = (
                         await group._apply_counted_moderation_ban(
                             moderation=self.service,
                             session=session,
@@ -182,12 +186,20 @@ class ModerationIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(),
             delete=AsyncMock(),
         )
-        ban = AsyncMock(side_effect=[False, True])
+        ban = AsyncMock(
+            side_effect=[
+                BanEnforcementResult(final_banned=None, retryable=True),
+                BanEnforcementResult(final_banned=True),
+            ]
+        )
         results: list[bool] = []
-        with patch("bot.services.join_verification.ban_member", new=ban):
+        with patch(
+            "bot.handlers.group.enforce_ban_with_policy_reconciliation_result",
+            new=ban,
+        ):
             for _ in range(3):
                 async with self.session_factory() as session:
-                    _count, _violation, enforced, _note = (
+                    _count, _violation, enforced, _note, _retryable = (
                         await group._apply_counted_moderation_ban(
                             moderation=self.service,
                             session=session,

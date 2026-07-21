@@ -87,14 +87,14 @@ from bot.services.join_verification import (
     begin_moderation_challenge,
     complete_leased_join_verification,
     delete_join_verification,
+    enforce_ban_with_policy_reconciliation_result,
     join_verification_lease_is_current,
-    enforce_ban_with_policy_reconciliation,
     lease_join_verification_for_unban,
     manual_unban_generation_is_active,
     moderation_challenge_ready,
-    reconcile_moderation_ban_after_lost_lease,
     release_moderation_restriction_after_exemption,
     restore_member_permissions,
+    telegram_ban_failure_is_deterministic,
     unban_member,
     verification_release_blocked_by_ban,
     verification_restriction_required,
@@ -840,6 +840,8 @@ async def _screen_bot_sender_message(
                 violation,
                 "ban_enforced",
             )
+            ban_retryable = False
+            ban_terminal_failure = False
             if prior_ban_result is not True:
                 # Persist the event and compensation journal before Telegram.
                 # If the response is lost, recovery can safely unban.
@@ -898,14 +900,19 @@ async def _screen_bot_sender_message(
                     await session.commit()
                     return bool(required)
 
-                final_policy = await enforce_ban_with_policy_reconciliation(
+                enforcement = await enforce_ban_with_policy_reconciliation_result(
                     message.bot,
                     group_id,
                     bot_id,
                     preserve_latest_ban,
                     restriction_required=preserve_latest_restriction,
                 )
-                attempted_ban = final_policy is True
+                attempted_ban = enforcement.final_banned is True
+                ban_retryable = enforcement.retryable
+                ban_terminal_failure = (
+                    enforcement.final_banned is None and not enforcement.retryable
+                )
+                ban_policy_released = enforcement.final_banned is False
                 if attempted_ban:
                     await session.rollback()
                     claimed = await complete_leased_join_verification(
@@ -917,18 +924,30 @@ async def _screen_bot_sender_message(
                     if not claimed:
                         await session.rollback()
                         attempted_ban = False
-                        await reconcile_moderation_ban_after_lost_lease(
-                            message.bot,
-                            group_id,
-                            bot_id,
-                            preserve_latest_ban,
-                            restriction_required=preserve_latest_restriction,
+                        enforcement = (
+                            await enforce_ban_with_policy_reconciliation_result(
+                                message.bot,
+                                group_id,
+                                bot_id,
+                                preserve_latest_ban,
+                                restriction_required=preserve_latest_restriction,
+                            )
                         )
-                ban_enforced, result_changed = await _persist_violation_ban_result(
-                    session,
-                    violation,
-                    enforced=attempted_ban,
-                )
+                        attempted_ban = enforcement.final_banned is True
+                        ban_retryable = enforcement.retryable
+                        ban_terminal_failure = (
+                            enforcement.final_banned is None
+                            and not enforcement.retryable
+                        )
+                        ban_policy_released = enforcement.final_banned is False
+                if ban_policy_released:
+                    ban_enforced, result_changed = False, False
+                else:
+                    ban_enforced, result_changed = await _persist_violation_ban_result(
+                        session,
+                        violation,
+                        enforced=attempted_ban,
+                    )
                 violation.action_taken = (
                     "bot_ban" if ban_enforced else "bot_delete"
                 )
@@ -976,6 +995,7 @@ async def _screen_bot_sender_message(
                     await session.commit()
                 except Exception:
                     await session.rollback()
+                    ban_retryable = True
                     log.exception(
                         "bot-screening ban state/audit write failed | group=%s bot=%s",
                         group_id,
@@ -991,7 +1011,7 @@ async def _screen_bot_sender_message(
                 hit_action="ban" if ban_enforced else "delete",
                 should_ban=ban_enforced,
             )
-            if not ban_enforced:
+            if not ban_enforced and (ban_retryable or ban_terminal_failure):
                 notice += "\n⚠️ Telegram 封禁该 bot 失败，请管理员手动处理。"
             await _send_moderation_notice_once_locked(
                 session=session,
@@ -1003,7 +1023,7 @@ async def _screen_bot_sender_message(
                     "moderation",
                 ),
             )
-            if not ban_enforced:
+            if ban_retryable:
                 request_current_update_retry()
         log.info(
             "[%s]【结束】bot审核拦截 | bot=%s | 动作=ban | 封禁=%s | 总耗时=%dms",
@@ -1031,7 +1051,7 @@ async def _screen_bot_sender_message(
         )
     if counted_outcome is None:
         return
-    count, violation, ban_enforced, ban_failure_note = counted_outcome
+    count, violation, ban_enforced, ban_failure_note, ban_retryable = counted_outcome
     violation_id = int(violation.id)
     notice = _build_moderation_notice(
         warn_target=warn_target,
@@ -1054,7 +1074,7 @@ async def _screen_bot_sender_message(
             ),
             reply_markup=_build_moderation_action_keyboard(violation_id),
         )
-    if ban_failure_note:
+    if ban_retryable:
         request_current_update_retry()
     log.info(
         "[%s]【结束】bot审核拦截 | bot=%s | 动作=%s | 封禁=%s | 警告=%s/%s | 总耗时=%dms",
@@ -1176,7 +1196,7 @@ async def _apply_counted_moderation_ban(
     rule: ModerationRule | None,
     message_deleted: bool,
     verdict: ModerationVerdict | None = None,
-) -> tuple[int, Violation, bool, str] | None:
+) -> tuple[int, Violation, bool, str, bool] | None:
     async with _moderation_user_lock(group_id, user_id):
         if verdict is not None and not await _claim_current_moderation_verdict(
             session,
@@ -1285,6 +1305,7 @@ async def _apply_counted_moderation_ban(
         prior_ban_result = _violation_nullable_bool(violation, "ban_enforced")
         ban_enforced = bool(prior_ban_result) if prior_ban_result is not None else False
         ban_failure_note = ""
+        ban_retryable = False
         if should_ban and prior_ban_result is not True:
             async def preserve_latest_ban() -> bool:
                 await session.rollback()
@@ -1306,14 +1327,19 @@ async def _apply_counted_moderation_ban(
                 await session.commit()
                 return bool(required)
 
-            final_policy = await enforce_ban_with_policy_reconciliation(
+            enforcement = await enforce_ban_with_policy_reconciliation_result(
                 message.bot,
                 group_id,
                 user_id,
                 preserve_latest_ban,
                 restriction_required=preserve_latest_restriction,
             )
-            attempted_ban = final_policy is True
+            attempted_ban = enforcement.final_banned is True
+            failure_retryable = enforcement.retryable
+            failure_group_unreachable = enforcement.group_unreachable
+            failure_operator_action = enforcement.operator_action_required
+            failure_present = enforcement.final_banned is None
+            ban_policy_released = enforcement.final_banned is False
             if attempted_ban and recovery is not None:
                 await session.rollback()
                 claimed = await complete_leased_join_verification(
@@ -1325,19 +1351,30 @@ async def _apply_counted_moderation_ban(
                 if not claimed:
                     await session.rollback()
                     attempted_ban = False
-                    await reconcile_moderation_ban_after_lost_lease(
-                        message.bot,
-                        group_id,
-                        user_id,
-                        preserve_latest_ban,
-                        restriction_required=preserve_latest_restriction,
+                    enforcement = (
+                        await enforce_ban_with_policy_reconciliation_result(
+                            message.bot,
+                            group_id,
+                            user_id,
+                            preserve_latest_ban,
+                            restriction_required=preserve_latest_restriction,
+                        )
                     )
-            ban_enforced, result_changed = await _persist_violation_ban_result(
-                session,
-                violation,
-                enforced=attempted_ban,
-            )
-            if not ban_enforced:
+                    attempted_ban = enforcement.final_banned is True
+                    failure_retryable = enforcement.retryable
+                    failure_group_unreachable = enforcement.group_unreachable
+                    failure_operator_action = enforcement.operator_action_required
+                    failure_present = enforcement.final_banned is None
+                    ban_policy_released = enforcement.final_banned is False
+            if ban_policy_released:
+                ban_enforced, result_changed = False, False
+            else:
+                ban_enforced, result_changed = await _persist_violation_ban_result(
+                    session,
+                    violation,
+                    enforced=attempted_ban,
+                )
+            if not ban_enforced and failure_present:
                 log.error(
                     "[%s] moderation automatic ban unconfirmed; durable policy retained | "
                     "user=%s violation=%s",
@@ -1345,9 +1382,20 @@ async def _apply_counted_moderation_ban(
                     user_id,
                     violation_id,
                 )
-                ban_failure_note = (
-                    "\n⚠️ Telegram 自动封禁结果未确认，已保留封禁状态等待重试。"
-                )
+                if failure_group_unreachable:
+                    ban_failure_note = (
+                        "\n⚠️ Telegram 群不可达或 bot 已不在群中，请检查群授权和成员状态。"
+                    )
+                elif failure_operator_action:
+                    ban_failure_note = (
+                        "\n⚠️ Telegram 拒绝了自动封禁（bot 缺少「封禁用户」权限或"
+                        "对方是管理员），请管理员修正后手动处理。"
+                    )
+                elif failure_retryable:
+                    ban_retryable = True
+                    ban_failure_note = (
+                        "\n⚠️ Telegram 自动封禁结果未确认，已保留封禁状态等待重试。"
+                    )
             try:
                 if result_changed and callable(getattr(session, "add", None)):
                     await record_ban_event(
@@ -1372,6 +1420,7 @@ async def _apply_counted_moderation_ban(
                 await session.commit()
             except Exception:
                 await session.rollback()
+                ban_retryable = True
                 log.exception(
                     "moderation ban audit failed | group=%s user=%s violation=%s",
                     group_id,
@@ -1379,10 +1428,11 @@ async def _apply_counted_moderation_ban(
                     violation_id,
                 )
         elif should_ban and not ban_enforced:
+            ban_retryable = True
             ban_failure_note = (
                 "\n⚠️ Telegram 自动封禁结果未确认，已保留封禁状态等待重试。"
             )
-        return count, violation, ban_enforced, ban_failure_note
+        return count, violation, ban_enforced, ban_failure_note, ban_retryable
 
 
 async def _moderation_direct_ban(
@@ -1464,7 +1514,7 @@ async def _moderation_direct_ban(
         if recovery is None:
             await session.rollback()
             await callback.answer("无法建立封禁恢复工单，请重试", show_alert=True)
-            return
+            return "retry"
         try:
             await session.commit()
         except Exception:
@@ -1482,7 +1532,7 @@ async def _moderation_direct_ban(
         if recovery is None:
             await session.rollback()
             await callback.answer("无法建立封禁恢复工单，请重试", show_alert=True)
-            return
+            return "retry"
         await session.commit()
 
     async def preserve_latest_ban() -> bool:
@@ -1505,14 +1555,19 @@ async def _moderation_direct_ban(
         await session.commit()
         return bool(required)
 
-    final_policy = await enforce_ban_with_policy_reconciliation(
+    enforcement = await enforce_ban_with_policy_reconciliation_result(
         callback.bot,
         group_id,
         target_id,
         preserve_latest_ban,
         restriction_required=preserve_latest_restriction,
     )
-    attempted_ban = final_policy is True
+    attempted_ban = enforcement.final_banned is True
+    failure_present = enforcement.final_banned is None
+    failure_retryable = enforcement.retryable
+    failure_group_unreachable = enforcement.group_unreachable
+    failure_operator_action = enforcement.operator_action_required
+    ban_policy_released = enforcement.final_banned is False
     if attempted_ban:
         await session.rollback()
         claimed = await complete_leased_join_verification(
@@ -1524,18 +1579,27 @@ async def _moderation_direct_ban(
         if not claimed:
             await session.rollback()
             attempted_ban = False
-            await reconcile_moderation_ban_after_lost_lease(
+            enforcement = await enforce_ban_with_policy_reconciliation_result(
                 callback.bot,
                 group_id,
                 target_id,
                 preserve_latest_ban,
                 restriction_required=preserve_latest_restriction,
             )
-    ban_enforced, result_changed = await _persist_violation_ban_result(
-        session,
-        violation,
-        enforced=attempted_ban,
-    )
+            attempted_ban = enforcement.final_banned is True
+            failure_present = enforcement.final_banned is None
+            failure_retryable = enforcement.retryable
+            failure_group_unreachable = enforcement.group_unreachable
+            failure_operator_action = enforcement.operator_action_required
+            ban_policy_released = enforcement.final_banned is False
+    if ban_policy_released:
+        ban_enforced, result_changed = False, False
+    else:
+        ban_enforced, result_changed = await _persist_violation_ban_result(
+            session,
+            violation,
+            enforced=attempted_ban,
+        )
     if not ban_enforced:
         # The local policy was committed before Telegram. A timeout plus failed
         # status confirmation is ambiguous, so rolling it back could strand a
@@ -1568,11 +1632,37 @@ async def _moderation_direct_ban(
         except Exception:
             await session.rollback()
             log.exception("moderation direct-ban failure audit write failed")
-        request_current_update_retry()
-        await callback.answer(
-            "Telegram 封禁结果未确认，已保留本群封禁状态等待重试",
-            show_alert=True,
-        )
+            request_current_update_retry()
+            await callback.answer(
+                "封禁结果保存失败，已安排后台重试",
+                show_alert=True,
+            )
+            return "retry"
+        if not failure_present:
+            await callback.answer(
+                "封禁状态已由更新的策略接管，无需重试",
+                show_alert=True,
+            )
+        elif failure_group_unreachable:
+            await callback.answer(
+                "Telegram 群不可达或 bot 已不在群中，请检查群授权后重试",
+                show_alert=True,
+            )
+        elif failure_operator_action:
+            await callback.answer(
+                "Telegram 拒绝了封禁：bot 缺少「封禁用户」权限或对方是管理员，"
+                "请修正后重试",
+                show_alert=True,
+            )
+        elif failure_retryable:
+            request_current_update_retry()
+            await callback.answer(
+                "Telegram 封禁结果未确认，已保留本群封禁状态等待重试",
+                show_alert=True,
+            )
+            return "retry"
+        else:
+            await callback.answer("Telegram 封禁未生效，请管理员手动处理", show_alert=True)
         return
 
     try:
@@ -1603,7 +1693,7 @@ async def _moderation_direct_ban(
         )
         request_current_update_retry()
         await callback.answer("用户已被 Telegram 封禁，但状态保存失败", show_alert=True)
-        return
+        return "retry"
 
     await callback.answer("已在当前群直接封禁该用户", show_alert=True)
     return "ban"
@@ -1764,6 +1854,10 @@ async def _moderation_undo_false_positive(
             group_id,
             target_id,
         )
+        if recovery is None:
+            await session.rollback()
+            await callback.answer("无法建立撤销恢复工单，请稍后重试", show_alert=True)
+            return "retry"
         try:
             await session.commit()
         except Exception:
@@ -1775,7 +1869,7 @@ async def _moderation_undo_false_positive(
                 violation_id,
             )
             await callback.answer("撤销状态保存失败，请稍后重试", show_alert=True)
-            return None
+            return "retry"
         activate_manual_unban_recovery(recovery)
 
         async def preserve_ban() -> bool:
@@ -1824,7 +1918,7 @@ async def _moderation_undo_false_positive(
                 violation_id,
             )
             await callback.answer("撤销状态保存失败，请稍后重试", show_alert=True)
-            return None
+            return "retry"
     suffix = "，并已解除自动封禁" if restored else ""
     if release_deferred:
         suffix = "，解封已交由后台继续重试"
@@ -1869,7 +1963,7 @@ async def _moderation_add_permanent_exemption(
     if recovery is None:
         await session.rollback()
         await callback.answer("无法建立豁免恢复工单，请重试", show_alert=True)
-        return None
+        return "retry"
     try:
         await session.commit()
     except IntegrityError:
@@ -1899,6 +1993,7 @@ async def on_moderation_action(
     settings: Settings,
     session: AsyncSession | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    _outcome_sink: list[str | None] | None = None,
 ) -> None:
     if session is None:
         await callback.answer("会话未就绪，请等待下一次审核通知", show_alert=True)
@@ -1971,13 +2066,17 @@ async def on_moderation_action(
             await session.commit()
 
         async def operation() -> None:
+            outcomes: list[str | None] = []
             async with session_factory() as work_session:
                 await on_moderation_action(
                     deferred_callback,  # type: ignore[arg-type]
                     settings,
                     session=work_session,
                     session_factory=None,
+                    _outcome_sink=outcomes,
                 )
+                if outcomes and outcomes[-1] == "retry":
+                    raise RuntimeError("moderation action requires durable retry")
 
         submission = submit_privileged_task(
             key=f"moderation-action:{group_id}:{target_hint}",
@@ -2068,10 +2167,13 @@ async def on_moderation_action(
                 violation_id,
             )
             await callback.answer("审核操作失败，请稍后重试", show_alert=True)
-            outcome = None
+            request_current_update_retry()
+            outcome = "retry"
 
-        if outcome:
+        if outcome and outcome != "retry":
             await _apply_moderation_outcome_notice(callback, settings, outcome=outcome)
+        if _outcome_sink is not None:
+            _outcome_sink.append(outcome)
 
 
 async def _delete_callback_message(callback: CallbackQuery) -> bool:
@@ -5114,6 +5216,7 @@ async def on_group_message(
                         )
                         if prior_ban_result is not True:
                             attempted_ban = False
+                            ban_retryable = True
                             ban_sender_chat = getattr(
                                 message.chat,
                                 "ban_sender_chat",
@@ -5123,7 +5226,10 @@ async def on_group_message(
                                 try:
                                     ban_result = await ban_sender_chat(user_id)
                                     attempted_ban = ban_result is not False
-                                except Exception:
+                                except Exception as exc:
+                                    ban_retryable = not (
+                                        telegram_ban_failure_is_deterministic(exc)
+                                    )
                                     log.exception(
                                         "[%s] sender-chat ban failed | sender_chat=%s",
                                         group_id,
@@ -5151,6 +5257,7 @@ async def on_group_message(
                             await session.commit()
                         else:
                             ban_enforced = bool(prior_ban_result)
+                            ban_retryable = False
                         notice = _build_moderation_notice(
                             warn_target=warn_target,
                             reason=reason,
@@ -5168,7 +5275,7 @@ async def on_group_message(
                                 "moderation",
                             ),
                         )
-                        if not ban_enforced:
+                        if not ban_enforced and ban_retryable:
                             request_current_update_retry()
                     return
 
@@ -5283,7 +5390,13 @@ async def on_group_message(
                     )
                 if counted_outcome is None:
                     return
-                count, violation, ban_enforced, ban_failure_note = counted_outcome
+                (
+                    count,
+                    violation,
+                    ban_enforced,
+                    ban_failure_note,
+                    ban_retryable,
+                ) = counted_outcome
                 violation_id = int(violation.id)
                 notice = _build_moderation_notice(
                     warn_target=warn_target,
@@ -5306,7 +5419,7 @@ async def on_group_message(
                         ),
                         reply_markup=_build_moderation_action_keyboard(violation_id),
                     )
-                if ban_failure_note:
+                if ban_retryable:
                     request_current_update_retry()
                 log.info(
                     "[%s]【结束】审核拦截 | 动作=ban | 封禁=%s | 警告=%s/%s | 已回复=是 | 总耗时=%dms",

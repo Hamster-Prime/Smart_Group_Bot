@@ -532,6 +532,75 @@ class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivilegedMembershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_reconciliation_row_creates_durable_owner(self) -> None:
+        session = _FakeSession()
+        recovery = UnbanRecovery(
+            verification_id=91,
+            group_id=-100,
+            user_id=77,
+            lease_until=datetime(2026, 1, 1),
+        )
+        with (
+            patch(
+                "bot.handlers.membership.get_join_verification",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "bot.handlers.membership.lease_join_verification_for_unban",
+                new=AsyncMock(return_value=recovery),
+            ) as lease,
+        ):
+            owned = await membership._ensure_moderation_recovery_owner(
+                session,
+                group_id=-100,
+                user_id=77,
+            )
+
+        self.assertTrue(owned)
+        lease.assert_awaited_once_with(
+            session,
+            -100,
+            77,
+            manual_unban=False,
+        )
+        session.commit.assert_awaited_once()
+
+    async def test_nonretryable_reconciliation_uses_durable_owner(self) -> None:
+        session = _FakeSession()
+        with (
+            patch(
+                "bot.handlers.membership._complete_terminal_verification",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.membership.reconcile_moderation_ban_after_lost_lease_result",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(ok=False, retryable=False)
+                ),
+            ),
+            patch(
+                "bot.handlers.membership._ensure_moderation_recovery_owner",
+                new=AsyncMock(return_value=True),
+            ) as ensure_owner,
+        ):
+            completed = (
+                await membership._complete_moderation_enforcement_or_reconcile(
+                    SimpleNamespace(),
+                    session,
+                    group_id=-100,
+                    user_id=77,
+                    verification_id=91,
+                    lease_until=datetime(2026, 1, 1),
+                )
+            )
+
+        self.assertFalse(completed)
+        ensure_owner.assert_awaited_once_with(
+            session,
+            group_id=-100,
+            user_id=77,
+        )
+
     async def test_verification_admin_callback_acks_then_uses_critical_job(self) -> None:
         callback = SimpleNamespace(
             data=build_verification_callback_data(

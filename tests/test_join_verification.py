@@ -8,7 +8,12 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
+from aiogram.enums import ChatMemberStatus
 from sqlalchemy import select
 
 from bot.handlers import membership
@@ -33,6 +38,7 @@ from bot.services.join_verification import (
     VERIFICATION_STATUS_UNBANNING,
     abort_prepared_join_verification,
     ban_member,
+    ban_member_result,
     begin_moderation_challenge,
     build_group_prompt_keyboard,
     build_mini_app_url,
@@ -41,6 +47,7 @@ from bot.services.join_verification import (
     build_verification_callback_data,
     chat_member_is_present,
     claim_join_verification,
+    enforce_ban_with_policy_reconciliation_result,
     activate_prepared_join_verification,
     complete_leased_join_verification,
     clear_turnstile_configuration_unavailable,
@@ -466,6 +473,23 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await restore_member_permissions(bot, -100, 42))
         bot.get_chat_member.assert_awaited_once_with(-100, 42)
 
+    async def test_restore_owner_rejection_confirms_released_state(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: can't restrict chat owner",
+                )
+            ),
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(status="creator")
+            ),
+        )
+
+        self.assertTrue(await restore_member_permissions(bot, -100, 43))
+        bot.get_chat_member.assert_awaited_once_with(-100, 43)
+
     async def test_false_bot_api_results_are_treated_as_failures(self) -> None:
         bot = SimpleNamespace(
             restrict_chat_member=AsyncMock(return_value=False),
@@ -495,6 +519,400 @@ class TelegramEnforcementHelperTests(unittest.IsolatedAsyncioTestCase):
             revoke_messages=True,
         )
         bot.get_chat_member.assert_awaited_once_with(-100, 44)
+
+    async def test_ban_rights_rejection_is_nonretryable_operator_action(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message=(
+                        "Bad Request: not enough rights to "
+                        "restrict/unrestrict chat member"
+                    ),
+                )
+            ),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+
+        result = await ban_member_result(bot, -100, 45)
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+        self.assertFalse(result.group_unreachable)
+
+    async def test_ban_owner_rejection_is_nonretryable_operator_action(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: can't remove chat owner",
+                )
+            ),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="creator")),
+        )
+
+        result = await ban_member_result(bot, -100, 46)
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+
+    async def test_ban_unreachable_group_is_nonretryable(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramForbiddenError(
+                    method=method,
+                    message="Forbidden: bot was kicked from the supergroup chat",
+                )
+            ),
+            get_chat_member=AsyncMock(
+                side_effect=TelegramForbiddenError(
+                    method=method,
+                    message="Forbidden: bot was kicked from the supergroup chat",
+                )
+            ),
+        )
+
+        result = await ban_member_result(bot, -100, 47)
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.group_unreachable)
+        self.assertFalse(result.operator_action_required)
+
+    async def test_ban_transient_failure_remains_retryable(self) -> None:
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=RuntimeError("boom")),
+            get_chat_member=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+
+        result = await ban_member_result(bot, -100, 48)
+        self.assertIsNone(result.final_banned)
+        self.assertTrue(result.retryable)
+        self.assertFalse(result.operator_action_required)
+        self.assertFalse(result.group_unreachable)
+
+    async def test_ban_rights_rejection_confirmed_remote_ban_is_success(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: not enough rights to restrict/unrestrict chat member",
+                )
+            ),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="kicked")),
+        )
+
+        result = await ban_member_result(bot, -100, 49)
+        self.assertIs(result.final_banned, True)
+        self.assertFalse(result.retryable)
+        self.assertFalse(result.operator_action_required)
+
+    async def test_reconciliation_child_propagates_deterministic_failure(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message=(
+                        "Bad Request: not enough rights to "
+                        "restrict/unrestrict chat member"
+                    ),
+                )
+            ),
+            unban_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+        preserve_ban = AsyncMock(side_effect=[False, True, True])
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            50,
+            preserve_ban,
+        )
+
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+
+    async def test_post_unban_reban_propagates_deterministic_failure(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message=(
+                        "Bad Request: not enough rights to "
+                        "restrict/unrestrict chat member"
+                    ),
+                )
+            ),
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+        preserve_ban = AsyncMock(side_effect=[False, False, True, True])
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            51,
+            preserve_ban,
+        )
+
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+
+    async def test_restriction_reconciliation_propagates_rights_failure(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message=(
+                        "Bad Request: not enough rights to "
+                        "restrict/unrestrict chat member"
+                    ),
+                )
+            ),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+        preserve_ban = AsyncMock(side_effect=[False, False, False, False, False])
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            52,
+            preserve_ban,
+            AsyncMock(return_value=True),
+        )
+
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+
+    async def test_ban_created_after_reconciliation_is_reapplied(self) -> None:
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+            restrict_chat_member=AsyncMock(return_value=True),
+        )
+        # The policy is released for the unban, then a new durable ban appears
+        # before the post-mutation confirmation and must be applied remotely.
+        preserve_ban = AsyncMock(side_effect=[False, True, True, True])
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            53,
+            preserve_ban,
+        )
+
+        self.assertIs(result.final_banned, True)
+        self.assertEqual(bot.ban_chat_member.await_count, 1)
+        bot.unban_chat_member.assert_awaited_once_with(-100, 53, only_if_banned=True)
+
+    async def test_policy_read_failure_after_ban_remains_retryable(self) -> None:
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+        )
+        preserve_ban = AsyncMock(
+            side_effect=[True, RuntimeError("database unavailable")]
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            54,
+            preserve_ban,
+        )
+
+        self.assertIsNone(result.final_banned)
+        self.assertTrue(result.retryable)
+        bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            54,
+            revoke_messages=True,
+        )
+
+    async def test_release_committed_during_ban_is_reconciled_remotely(self) -> None:
+        policy = {"blocked": True}
+
+        async def ban_and_release(*_args, **_kwargs):
+            policy["blocked"] = False
+            return True
+
+        async def preserve_ban() -> bool:
+            return policy["blocked"]
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=ban_and_release),
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(return_value=True),
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            55,
+            preserve_ban,
+        )
+
+        self.assertIs(result.final_banned, False)
+        self.assertIs(result.final_restricted, False)
+        bot.ban_chat_member.assert_awaited_once()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            55,
+            only_if_banned=True,
+        )
+
+    async def test_restriction_removed_during_restrict_is_restored(self) -> None:
+        policy = {"restricted": True}
+
+        async def mutate_permissions(*_args, **_kwargs):
+            if policy["restricted"]:
+                policy["restricted"] = False
+            return True
+
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(side_effect=mutate_permissions),
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            56,
+            AsyncMock(return_value=False),
+            AsyncMock(side_effect=lambda: policy["restricted"]),
+        )
+
+        self.assertIs(result.final_banned, False)
+        self.assertIs(result.final_restricted, False)
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+
+    async def test_restriction_created_during_restore_is_reapplied(self) -> None:
+        policy = {"restricted": False}
+        permission_calls = 0
+
+        async def mutate_permissions(*_args, **_kwargs):
+            nonlocal permission_calls
+            permission_calls += 1
+            if permission_calls == 1:
+                policy["restricted"] = True
+            return True
+
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(side_effect=mutate_permissions),
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            60,
+            AsyncMock(return_value=False),
+            AsyncMock(side_effect=lambda: policy["restricted"]),
+        )
+
+        self.assertIs(result.final_banned, False)
+        self.assertIs(result.final_restricted, True)
+        self.assertEqual(bot.restrict_chat_member.await_count, 2)
+
+    async def test_unban_owner_rejection_confirms_released_state(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message="Bad Request: can't remove chat owner",
+                )
+            ),
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(status="creator")
+            ),
+            restrict_chat_member=AsyncMock(return_value=True),
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            57,
+            AsyncMock(return_value=False),
+        )
+
+        self.assertIs(result.final_banned, False)
+        self.assertFalse(result.retryable)
+        bot.get_chat_member.assert_awaited_once_with(-100, 57)
+
+    async def test_unban_rights_rejection_while_still_kicked_is_terminal(self) -> None:
+        method = SimpleNamespace()
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=method,
+                    message=(
+                        "Bad Request: not enough rights to "
+                        "restrict/unrestrict chat member"
+                    ),
+                )
+            ),
+            get_chat_member=AsyncMock(
+                return_value=SimpleNamespace(status=ChatMemberStatus.KICKED)
+            ),
+        )
+
+        result = await enforce_ban_with_policy_reconciliation_result(
+            bot,
+            -100,
+            58,
+            AsyncMock(return_value=False),
+        )
+
+        self.assertIsNone(result.final_banned)
+        self.assertFalse(result.retryable)
+        self.assertTrue(result.operator_action_required)
+
+    async def test_reconciliation_cancellation_waits_for_cleanup(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def preserve_ban() -> bool:
+            started.set()
+            await release.wait()
+            return False
+
+        bot = SimpleNamespace(
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(return_value=True),
+        )
+        task = asyncio.create_task(
+            reconcile_moderation_ban_after_lost_lease(
+                bot,
+                -100,
+                59,
+                preserve_ban,
+            )
+        )
+        await started.wait()
+        task.cancel()
+        release.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            59,
+            only_if_banned=True,
+        )
 
     async def test_kick_preserves_existing_durable_ban_policy(self) -> None:
         bot = SimpleNamespace(

@@ -20,6 +20,7 @@ from bot.services.request_priority import (
     ExecutionPriority,
     execution_priority_scope,
 )
+from bot.services.join_verification import BanEnforcementResult
 
 
 class _NoAutoflush:
@@ -217,6 +218,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(unban_generation_patcher.stop)
         self.session = SimpleNamespace(
             commit=AsyncMock(),
+            rollback=AsyncMock(),
             execute=AsyncMock(),
             get=AsyncMock(return_value=None),
             no_autoflush=_NoAutoflush(),
@@ -465,6 +467,87 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "handled")
         add_ban.assert_not_awaited()
         self.handler.assert_awaited_once()
+
+    async def test_new_verification_restriction_keeps_message_blocked(self) -> None:
+        patches = self._patch_screening(verdict=(True, "广告昵称", True))
+        event = _event()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
+                new=AsyncMock(
+                    return_value=BanEnforcementResult(
+                        final_banned=False,
+                        final_restricted=True,
+                    )
+                ),
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                event,
+                {"settings": _settings()},
+            )
+
+        self.assertIsNone(result)
+        self.handler.assert_not_awaited()
+        event.delete.assert_awaited_once()
+
+    async def test_completion_loss_keeps_new_restriction_blocked(self) -> None:
+        patches = self._patch_screening(verdict=(True, "广告昵称", True))
+        event = _event()
+        enforcement = AsyncMock(
+            side_effect=[
+                BanEnforcementResult(final_banned=True),
+                BanEnforcementResult(
+                    final_banned=False,
+                    final_restricted=True,
+                ),
+            ]
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
+                new=enforcement,
+            ),
+            patch(
+                "bot.middlewares.profile_screen.complete_leased_join_verification",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.middlewares.profile_screen.answer_with_auto_delete",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                event,
+                {"settings": _settings()},
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(enforcement.await_count, 2)
+        self.handler.assert_not_awaited()
+        event.delete.assert_awaited_once()
 
     async def test_violation_never_bans_when_policy_persistence_fails(self) -> None:
         entered = asyncio.Event()

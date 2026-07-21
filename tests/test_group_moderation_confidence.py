@@ -3,7 +3,10 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramBadRequest
+
 from bot.handlers import group
+from bot.services.join_verification import BanEnforcementResult
 from bot.services.moderation import ModerationVerdict
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
@@ -79,7 +82,11 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         group_row = SimpleNamespace(settings={"mute_all_replies": True})
 
         async def enforce_ban(bot, group_id, user_id, *_args, **_kwargs):
-            return bool(await group.ban_member(bot, group_id, user_id))
+            enforced = bool(await group.ban_member(bot, group_id, user_id))
+            return BanEnforcementResult(
+                final_banned=True if enforced else None,
+                retryable=not enforced,
+            )
 
         patches = [
             patch(
@@ -108,7 +115,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "bot.handlers.group.enforce_ban_with_policy_reconciliation",
+                "bot.handlers.group.enforce_ban_with_policy_reconciliation_result",
                 new=AsyncMock(side_effect=enforce_ban),
             ),
             patch(
@@ -414,6 +421,58 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         for call in moderation.record_violation.await_args_list:
             self.assertEqual(call.kwargs["source_message_id"], 777)
 
+    async def test_sender_chat_rights_rejection_does_not_retry_update(self) -> None:
+        rule = SimpleNamespace(
+            id=14,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止频道广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="频道广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.7,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=325, notice_sent_at=None)
+            ),
+        )
+        message = _message()
+        message.sender_chat = SimpleNamespace(
+            id=-1009876543211,
+            username="channel",
+            title="Channel",
+        )
+        message.from_user.is_bot = True
+        message.chat.ban_sender_chat = AsyncMock(
+            side_effect=TelegramBadRequest(
+                method=SimpleNamespace(),
+                message="Bad Request: not enough rights to ban sender chat",
+            )
+        )
+        receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(receipt)
+        try:
+            await self._run(
+                moderation,
+                message=message,
+                answer=patch(
+                    "bot.handlers.group.answer_with_auto_delete",
+                    new=AsyncMock(),
+                ),
+            )
+        finally:
+            reset_update_completion(token)
+
+        message.chat.ban_sender_chat.assert_awaited_once_with(-1009876543211)
+        self.assertFalse(receipt.deferred)
+
     async def test_super_admin_is_automatically_exempt_from_moderation(self) -> None:
         message = _message()
         message.from_user.id = 1
@@ -572,6 +631,50 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("封禁结果未确认", answer.await_args.args[1])
         self.assertTrue(receipt.deferred)
         self.assertFalse(await receipt.wait())
+
+    async def test_newer_release_policy_does_not_retry_old_auto_ban(self) -> None:
+        rule = SimpleNamespace(
+            id=12,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.99,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            add_warning=AsyncMock(return_value=(3, True)),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=657)),
+        )
+        answer = AsyncMock()
+        receipt = UpdateCompletionReceipt()
+        token = bind_update_completion(receipt)
+        try:
+            await self._run(
+                moderation,
+                answer=patch(
+                    "bot.handlers.group.answer_with_auto_delete",
+                    new=answer,
+                ),
+                released=patch(
+                    "bot.handlers.group.enforce_ban_with_policy_reconciliation_result",
+                    new=AsyncMock(
+                        return_value=BanEnforcementResult(final_banned=False)
+                    ),
+                ),
+            )
+        finally:
+            reset_update_completion(token)
+
+        self.assertFalse(receipt.deferred)
+        self.assertNotIn("封禁结果未确认", answer.await_args.args[1])
 
     async def test_invalid_confidence_never_falls_back_to_direct_action(self) -> None:
         verdict = ModerationVerdict(

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,7 @@ from bot.db.sqlite_session import (
 )
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
+from bot.services.join_verification import BanEnforcementResult
 from bot.services.request_priority import ExecutionPriority, execution_priority_scope
 from bot.services.join_screening import profile_screen_signature
 from bot.services.request_priority import ExecutionPriority, execution_priority_scope
@@ -417,7 +418,7 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((chat_id, user_id), (-100, 42))
             self.assertTrue(callable(preserve_ban))
             self.assertTrue(callable(restriction_required))
-            return True
+            return BanEnforcementResult(final_banned=True)
 
         with (
             patch(
@@ -429,7 +430,7 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "bot.middlewares.global_ban.enforce_ban_with_policy_reconciliation",
+                "bot.middlewares.global_ban.enforce_ban_with_policy_reconciliation_result",
                 side_effect=enforce,
             ) as ban_mock,
         ):
@@ -443,6 +444,62 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
         event.delete.assert_awaited_once()
         ban_mock.assert_awaited_once()
         self.assertEqual(ban_mock.await_args.args[:3], (event.bot, -100, 42))
+
+    async def _run_unconfirmed_ban(
+        self,
+        *,
+        retryable: bool,
+    ) -> Mock:
+        middleware = GlobalBanEnforcementMiddleware(
+            lambda: _TrackedContext(SimpleNamespace(active=0), object())
+        )
+        retry = Mock(return_value=True)
+        with (
+            patch(
+                "bot.middlewares.global_ban.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.middlewares.global_ban.is_globally_banned",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.middlewares.global_ban.enforce_ban_with_policy_reconciliation_result",
+                new=AsyncMock(
+                    return_value=BanEnforcementResult(
+                        final_banned=None,
+                        retryable=retryable,
+                        operator_action_required=not retryable,
+                    )
+                ),
+            ),
+            patch(
+                "bot.middlewares.global_ban.request_current_update_retry",
+                new=retry,
+            ),
+        ):
+            result = await middleware(
+                AsyncMock(return_value="handled"),
+                self._event(),
+                {"settings": Settings(_env_file=None)},
+            )
+        self.assertIsNone(result)
+        return retry
+
+    async def test_unconfirmed_ban_requests_durable_retry_for_transient_failure(
+        self,
+    ) -> None:
+        retry = await self._run_unconfirmed_ban(retryable=True)
+        retry.assert_called_once()
+
+    async def test_deterministic_rights_failure_completes_update_without_retry(
+        self,
+    ) -> None:
+        # A group where the bot lacks "Ban users" produces the same failure on
+        # every replay; retrying would trip the webhook failure threshold and
+        # demote the transport for all groups.
+        retry = await self._run_unconfirmed_ban(retryable=False)
+        retry.assert_not_called()
 
     async def test_profile_cache_session_is_closed_before_downstream_handler(self) -> None:
         state = SimpleNamespace(active=0)

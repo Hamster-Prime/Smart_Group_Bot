@@ -27,7 +27,7 @@ from bot.services.join_screening import (
 )
 from bot.services.join_verification import (
     complete_leased_join_verification,
-    enforce_ban_with_policy_reconciliation,
+    enforce_ban_with_policy_reconciliation_result,
     lease_join_verification_for_unban,
     manual_unban_generation_is_active,
     verification_release_blocked_by_ban,
@@ -388,14 +388,32 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 user.id,
                 reason or "-",
             )
-            final_banned = await enforce_ban_with_policy_reconciliation(
+            enforcement = await enforce_ban_with_policy_reconciliation_result(
                 event.bot,
                 int(chat.id),
                 int(user.id),
                 preserve_ban,
                 restriction_required,
             )
+            final_banned = enforcement.final_banned
             if final_banned is None:
+                if not enforcement.retryable:
+                    # Deterministic Telegram rejection (missing rights,
+                    # unbannable target, or unreachable group): replaying the
+                    # update cannot succeed and would trip the transport
+                    # failure threshold.
+                    # Keep deleting messages; enforcement resumes once an
+                    # operator fixes the group setup.
+                    log.error(
+                        "[%s] profile screening ban needs group setup change; "
+                        "completing update without retry | user=%s "
+                        "unreachable=%s operator_action=%s",
+                        chat.id,
+                        user.id,
+                        enforcement.group_unreachable,
+                        enforcement.operator_action_required,
+                    )
+                    return "unenforced"
                 log.error(
                     "[%s] profile screening ban unconfirmed; durable global policy retained | "
                     "user=%s",
@@ -405,7 +423,11 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 request_current_update_retry()
                 return "retry"
             if not final_banned:
-                return "released"
+                return (
+                    "restricted"
+                    if enforcement.final_restricted is True
+                    else "released"
+                )
             if ban_recovery is not None:
                 async with self.session_factory() as completion_session:
                     completed = await complete_leased_join_verification(
@@ -418,18 +440,27 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                         await completion_session.commit()
                     else:
                         await completion_session.rollback()
-                        final_banned = await enforce_ban_with_policy_reconciliation(
-                            event.bot,
-                            int(chat.id),
-                            int(user.id),
-                            preserve_ban,
-                            restriction_required,
+                        enforcement = (
+                            await enforce_ban_with_policy_reconciliation_result(
+                                event.bot,
+                                int(chat.id),
+                                int(user.id),
+                                preserve_ban,
+                                restriction_required,
+                            )
                         )
+                        final_banned = enforcement.final_banned
                         if final_banned is not True:
                             if final_banned is None:
+                                if not enforcement.retryable:
+                                    return "unenforced"
                                 request_current_update_retry()
                                 return "retry"
-                            return "released"
+                            return (
+                                "restricted"
+                                if enforcement.final_restricted is True
+                                else "released"
+                            )
             shown = html.escape(full_name or (f"@{username}" if username else str(user.id)))
             notice = (
                 f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"

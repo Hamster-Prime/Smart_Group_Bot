@@ -79,6 +79,7 @@ from bot.services.join_verification import (
     verification_deadline_passed,
     verification_provider,
     verification_release_blocked_by_ban,
+    verification_restriction_required,
     verification_service_ready,
     verification_timeout_seconds_for_kind,
 )
@@ -812,11 +813,20 @@ async def remove_raid_challenged_users(
                             user_id=user_id,
                         )
 
+                async def current_restriction_required() -> bool:
+                    async with work_session_factory() as policy_session:
+                        return await verification_restriction_required(
+                            policy_session,
+                            group_id=group_id,
+                            user_id=user_id,
+                        )
+
                 await reconcile_moderation_ban_after_lost_lease(
                     bot,
                     group_id,
                     user_id,
                     current_policy_blocks_release,
+                    restriction_required=current_restriction_required,
                 )
             return user_id, bool(completed)
 

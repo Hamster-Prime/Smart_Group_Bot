@@ -52,7 +52,9 @@ from bot.services.join_verification import (
     VERIFICATION_STATUS_PREPARING,
     VERIFICATION_STATUS_RELEASING,
     VERIFICATION_STATUS_UNBANNING,
+    BanEnforcementResult,
     ban_member,
+    ban_member_result,
     build_group_prompt_keyboard,
     build_group_prompt_text,
     build_private_deep_link,
@@ -62,7 +64,7 @@ from bot.services.join_verification import (
     commit_prepared_join_verification,
     delete_join_verification,
     delete_verification_prompt,
-    enforce_ban_with_policy_reconciliation,
+    enforce_ban_with_policy_reconciliation_result,
     extend_pending_verification_deadlines,
     get_join_verification,
     join_verification_ready,
@@ -75,7 +77,7 @@ from bot.services.join_verification import (
     mark_group_banned,
     parse_verification_callback_data,
     prepare_join_verification,
-    reconcile_moderation_ban_after_lost_lease,
+    reconcile_moderation_ban_after_lost_lease_result,
     reconcile_stale_verification_restriction,
     refresh_pending_join_verification,
     renew_join_verification_lease,
@@ -325,29 +327,40 @@ async def _ban_and_notify(
     reason: str,
     preserve_ban: Callable[[], Awaitable[bool]] | None = None,
     restriction_required: Callable[[], Awaitable[bool]] | None = None,
-) -> bool:
+) -> BanEnforcementResult:
     if preserve_ban is None:
-        final_banned: bool | None = (
-            True
-            if await ban_member(event.bot, int(event.chat.id), int(user_id))
-            else None
+        enforcement = await ban_member_result(
+            event.bot,
+            int(event.chat.id),
+            int(user_id),
         )
     else:
-        final_banned = await enforce_ban_with_policy_reconciliation(
+        enforcement = await enforce_ban_with_policy_reconciliation_result(
             event.bot,
             int(event.chat.id),
             int(user_id),
             preserve_ban,
             restriction_required,
         )
-    if final_banned is not True:
-        log.error(
-            "join screening ban not retained by latest policy | group=%s user=%s state=%s",
-            event.chat.id,
-            user_id,
-            final_banned,
-        )
-        return False
+    if enforcement.final_banned is not True:
+        if enforcement.final_banned is False:
+            log.info(
+                "join screening ban cancelled by latest release policy | "
+                "group=%s user=%s",
+                event.chat.id,
+                user_id,
+            )
+        else:
+            log.error(
+                "join screening ban not confirmed | group=%s user=%s "
+                "retryable=%s unreachable=%s operator_action=%s",
+                event.chat.id,
+                user_id,
+                enforcement.retryable,
+                enforcement.group_unreachable,
+                enforcement.operator_action_required,
+            )
+        return enforcement
     shown = html.escape(display_name or str(user_id))
     reason_text = html.escape(reason or "入群资料命中群规")
     try:
@@ -365,7 +378,7 @@ async def _ban_and_notify(
         )
     except Exception:
         log.exception("join screening notice failed | group=%s", event.chat.id)
-    return True
+    return enforcement
 
 
 def _invalidate_admin_cache(event: ChatMemberUpdated) -> None:
@@ -866,7 +879,7 @@ async def _enforce_pending_moderation_challenge(
             await session.commit()
             return required
 
-        enforced = await _ban_and_notify(
+        enforcement = await _ban_and_notify(
             event,
             settings,
             user_id=record.user_id,
@@ -875,7 +888,26 @@ async def _enforce_pending_moderation_challenge(
             preserve_ban=preserve_timeout_ban,
             restriction_required=timeout_restriction_required,
         )
-        if not enforced:
+        if (
+            enforcement.final_banned is False
+            and enforcement.final_restricted is not True
+        ):
+            await _complete_terminal_verification(
+                session,
+                verification_id=int(record.id),
+                lease_until=lease_until,
+                status=VERIFICATION_STATUS_ENFORCING,
+            )
+            return
+        if enforcement.final_banned is False:
+            log.info(
+                "moderation timeout release kept a newer verification "
+                "restriction | group=%s user=%s",
+                record.group_id,
+                record.user_id,
+            )
+            return
+        if enforcement.final_banned is not True:
             deferred = await _defer_terminal_verification(
                 session,
                 verification_id=int(record.id),
@@ -1080,6 +1112,57 @@ async def _complete_terminal_verification(
     return True
 
 
+async def _ensure_moderation_recovery_owner(
+    session: AsyncSession,
+    *,
+    group_id: int,
+    user_id: int,
+) -> bool:
+    """Ensure failed reconciliation remains owned by a durable terminal row."""
+
+    try:
+        await session.rollback()
+        current = await get_join_verification(session, group_id, user_id)
+        if current is not None:
+            status = str(current.status or VERIFICATION_STATUS_PENDING)
+            await session.commit()
+            return status in {
+                VERIFICATION_STATUS_ENFORCING,
+                VERIFICATION_STATUS_RELEASING,
+                VERIFICATION_STATUS_UNBANNING,
+            }
+
+        recovery = await lease_join_verification_for_unban(
+            session,
+            group_id,
+            user_id,
+            manual_unban=False,
+        )
+        if recovery is None:
+            await session.rollback()
+            return False
+        await session.commit()
+        log.warning(
+            "created durable moderation reconciliation recovery | "
+            "group=%s user=%s verification=%s",
+            group_id,
+            user_id,
+            recovery.verification_id,
+        )
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        await session.rollback()
+        log.exception(
+            "failed to establish moderation reconciliation recovery | "
+            "group=%s user=%s",
+            group_id,
+            user_id,
+        )
+        return False
+
+
 async def _complete_moderation_enforcement_or_reconcile(
     bot: object,
     session: AsyncSession,
@@ -1104,12 +1187,23 @@ async def _complete_moderation_enforcement_or_reconcile(
         await session.commit()
         return blocked
 
-    async def reconcile() -> bool:
-        return await reconcile_moderation_ban_after_lost_lease(
+    async def restriction_required() -> bool:
+        await session.rollback()
+        required = await verification_restriction_required(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+        await session.commit()
+        return bool(required)
+
+    async def reconcile():
+        return await reconcile_moderation_ban_after_lost_lease_result(
             bot,
             group_id,
             user_id,
             preserve_ban,
+            restriction_required=restriction_required,
         )
 
     try:
@@ -1120,13 +1214,33 @@ async def _complete_moderation_enforcement_or_reconcile(
             status=VERIFICATION_STATUS_ENFORCING,
         )
     except asyncio.CancelledError:
-        await reconcile()
+        reconciliation = await reconcile()
+        if not reconciliation.ok:
+            await _ensure_moderation_recovery_owner(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+            )
         raise
     except Exception:
-        await reconcile()
+        reconciliation = await reconcile()
+        if not reconciliation.ok:
+            await _ensure_moderation_recovery_owner(
+                session,
+                group_id=group_id,
+                user_id=user_id,
+            )
         raise
     if not completed:
-        await reconcile()
+        reconciliation = await reconcile()
+        if not reconciliation.ok and not await _ensure_moderation_recovery_owner(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        ):
+            raise RuntimeError(
+                "moderation enforcement reconciliation has no durable owner"
+            )
     return completed
 
 
@@ -1947,7 +2061,7 @@ async def _process_member_join(
             group_id,
             user_id,
         )
-        enforced = await _ban_and_notify(
+        enforcement = await _ban_and_notify(
             event,
             settings,
             user_id=user_id,
@@ -1960,6 +2074,8 @@ async def _process_member_join(
             preserve_ban=current_ban_policy,
             restriction_required=current_restriction_required,
         )
+        if enforcement.retryable:
+            raise RuntimeError("join ban enforcement requires durable retry")
         return
 
     if manual_unban_generation_is_active(group_id, user_id):
@@ -2249,7 +2365,7 @@ async def _process_member_join(
         await session.commit()
         return required
 
-    enforced = await _ban_and_notify(
+    enforcement = await _ban_and_notify(
         event,
         settings,
         user_id=user_id,
@@ -2258,7 +2374,9 @@ async def _process_member_join(
         preserve_ban=current_profile_ban_policy,
         restriction_required=current_profile_restriction_required,
     )
-    if not enforced:
+    if enforcement.final_banned is not True:
+        if enforcement.retryable:
+            raise RuntimeError("profile join ban enforcement requires durable retry")
         return
     completed = await complete_leased_join_verification(
         session,
@@ -2270,13 +2388,22 @@ async def _process_member_join(
         await session.commit()
         return
     await session.rollback()
-    await enforce_ban_with_policy_reconciliation(
+    reconciliation = await enforce_ban_with_policy_reconciliation_result(
         event.bot,
         group_id,
         user_id,
         current_profile_ban_policy,
         current_profile_restriction_required,
     )
+    if (
+        reconciliation.final_banned is None
+        and not await _ensure_moderation_recovery_owner(
+            session,
+            group_id=group_id,
+            user_id=user_id,
+        )
+    ):
+        raise RuntimeError("profile join ban reconciliation has no durable owner")
 
 
 def _member_status_value(member: object) -> str:

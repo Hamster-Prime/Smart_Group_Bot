@@ -44,6 +44,57 @@ class DurablePollingLoopTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await bot.session.close()
 
+    async def test_polling_ingest_serializes_updates_with_default_sentinels(
+        self,
+    ) -> None:
+        # Telegram messages carrying link previews validate into models whose
+        # unset fields hold aiogram Default(...) sentinels. exclude_none does
+        # not drop those and pydantic cannot serialize them; a regression here
+        # wedges the polling offset behind one poison update forever.
+        bot = Bot(token="42:TEST_TOKEN")
+        server = VerifyWebServer(
+            bot=bot,
+            settings=Settings(_env_file=None),
+            session_factory=lambda: None,  # type: ignore[arg-type]
+            webhook_dispatcher=Dispatcher(),
+            webhook_path="/telegram/webhook",
+            webhook_secret=WEBHOOK_SECRET,
+        )
+        server.build_app()
+        processor = server._webhook_processor
+        assert processor is not None
+        update = Update.model_validate(
+            {
+                "update_id": 528251683,
+                "message": {
+                    "message_id": 5,
+                    "date": 1784524483,
+                    "chat": {"id": -100123, "type": "supergroup", "title": "t"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "x"},
+                    "text": "https://example.com",
+                    "link_preview_options": {"url": "https://example.com"},
+                },
+            }
+        )
+        accept = AsyncMock(return_value=528251683)
+        try:
+            with patch.object(processor, "accept_durable_update", new=accept):
+                accepted_id = await server.accept_polling_update(update)
+            self.assertEqual(accepted_id, 528251683)
+            payload = accept.await_args.args[0]
+            self.assertEqual(
+                payload["message"]["link_preview_options"],
+                {"url": "https://example.com"},
+            )
+            # The durable inbox replays payloads through model_validate; the
+            # serialized form must survive the round trip.
+            self.assertEqual(
+                Update.model_validate(payload).update_id,
+                528251683,
+            )
+        finally:
+            await bot.session.close()
+
     async def test_offset_is_not_sent_until_update_is_durably_persisted(self) -> None:
         persist_started = asyncio.Event()
         allow_persist = asyncio.Event()
