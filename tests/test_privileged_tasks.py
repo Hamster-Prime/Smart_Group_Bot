@@ -666,6 +666,53 @@ class PrivilegedMembershipTests(unittest.IsolatedAsyncioTestCase):
             session_factory,
         )
 
+    async def test_verification_admin_denial_is_private_callback_alert(self) -> None:
+        callback = SimpleNamespace(
+            data=build_verification_callback_data(
+                VERIFICATION_CALLBACK_APPROVE,
+                77,
+            ),
+            from_user=SimpleNamespace(id=9),
+            message=SimpleNamespace(
+                message_id=701,
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                answer=AsyncMock(),
+            ),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        handler = AsyncMock()
+        with (
+            patch(
+                "bot.handlers.membership.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.membership._handle_verification_admin_callback",
+                new=handler,
+            ),
+            patch("bot.handlers.membership.submit_privileged_task") as submit,
+        ):
+            await membership.on_verification_callback(
+                callback,
+                session=_FakeSession(),
+                settings=Settings(_env_file=None),
+                session_factory=_FakeSessionFactory(),
+            )
+
+        callback.answer.assert_awaited_once_with(
+            "仅群管理员及以上权限可操作",
+            show_alert=True,
+        )
+        callback.message.answer.assert_not_awaited()
+        callback.bot.send_message.assert_not_awaited()
+        submit.assert_not_called()
+        handler.assert_not_awaited()
+
     async def test_raid_remove_callback_acks_before_background_submission(self) -> None:
         callback = SimpleNamespace(
             from_user=SimpleNamespace(id=1),
@@ -713,6 +760,48 @@ class PrivilegedMembershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("正在验证权限", callback.answer.await_args_list[0].args[0])
         remove.assert_not_awaited()
         self.assertEqual(submit.call_args.kwargs["lane"], "critical_bulk")
+
+    async def test_raid_remove_denial_is_private_callback_alert(self) -> None:
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=9),
+            message=SimpleNamespace(
+                message_id=700,
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                answer=AsyncMock(),
+            ),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        with (
+            patch(
+                "bot.handlers.membership.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.membership.remove_raid_challenged_users",
+                new=AsyncMock(),
+            ) as remove,
+            patch("bot.handlers.membership.submit_privileged_task") as submit,
+        ):
+            await membership.on_raid_remove_callback(
+                callback,
+                session=_FakeSession(),
+                settings=Settings(_env_file=None),
+                session_factory=_FakeSessionFactory(),
+            )
+
+        callback.answer.assert_awaited_once_with(
+            "仅群管理员可一键移除追溯用户",
+            show_alert=True,
+        )
+        callback.message.answer.assert_not_awaited()
+        callback.bot.send_message.assert_not_awaited()
+        submit.assert_not_called()
+        remove.assert_not_awaited()
 
     async def test_queued_raid_remove_revalidates_operator_before_execution(self) -> None:
         callback = SimpleNamespace(
@@ -763,7 +852,7 @@ class PrivilegedMembershipTests(unittest.IsolatedAsyncioTestCase):
 
         remove.assert_not_awaited()
         operator_auth.assert_awaited_once()
-        self.assertIn("权限已失效", callback.message.answer.await_args.args[0])
+        callback.message.answer.assert_not_awaited()
 
     async def test_member_join_uses_reserved_security_lane(self) -> None:
         event = SimpleNamespace(
@@ -865,7 +954,7 @@ class PrivilegedModerationTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-100, type="supergroup"),
                 answer=AsyncMock(),
             ),
-            bot=SimpleNamespace(),
+            bot=SimpleNamespace(send_message=AsyncMock()),
             answer=AsyncMock(),
         )
 
@@ -890,8 +979,12 @@ class PrivilegedModerationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         submit.assert_not_called()
-        self.assertIn("已受理", callback.answer.await_args.args[0])
-        self.assertIn("仅群管理员", callback.message.answer.await_args.args[0])
+        callback.answer.assert_awaited_once_with(
+            "仅群管理员及以上权限可执行该操作",
+            show_alert=True,
+        )
+        callback.message.answer.assert_not_awaited()
+        callback.bot.send_message.assert_not_awaited()
 
     async def test_authorized_moderation_callback_uses_critical_job(self) -> None:
         callback = self._callback()

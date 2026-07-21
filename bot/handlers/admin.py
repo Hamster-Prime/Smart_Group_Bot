@@ -521,7 +521,9 @@ async def _callback_user_can_manage_rules(
     if not msg or not msg.chat or msg.chat.type not in ("group", "supergroup"):
         await callback.answer("消息已失效", show_alert=True)
         return False
-    if not await ensure_group_authorized(msg, session, settings):
+    authorized = await is_group_authorized(session, int(msg.chat.id))
+    await session.commit()
+    if not authorized:
         await callback.answer("当前群组未授权", show_alert=True)
         return False
 
@@ -2936,7 +2938,9 @@ async def on_adminlist_paging(
     if session is None:
         await callback.answer("会话未就绪，请重新 /adminlist", show_alert=True)
         return
-    if not await ensure_group_authorized(msg, session, settings):
+    authorized = await is_group_authorized(session, int(msg.chat.id))
+    await session.commit()
+    if not authorized:
         await callback.answer("当前群组未授权", show_alert=True)
         return
     if not await _callback_user_is_super_admin(callback, settings):

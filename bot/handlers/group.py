@@ -2030,19 +2030,16 @@ async def on_moderation_action(
 
     group_id = int(chat.id)
     if session_factory is not None:
-        try:
-            async with asyncio.timeout(2.0):
-                await callback.answer("审核操作已受理，正在后台复验权限并执行")
-        except Exception:
-            log.debug("moderation callback fast acknowledgement failed", exc_info=True)
-        deferred_callback = _DetachedCallbackProxy(callback)
         # Raw callback data is attacker-controlled. Keep authoritative
         # authorization in the HIGH update lane and only allocate a CRITICAL
-        # job after it succeeds; the background operation revalidates again
-        # immediately before the state transition.
+        # job after it succeeds. Keep the callback unanswered until then so a
+        # denial remains a private Telegram alert instead of a group message.
         if not await is_group_authorized(session, group_id):
             await session.commit()
-            await deferred_callback.answer("当前群组未授权，不能执行审核操作")
+            await callback.answer(
+                "当前群组未授权，不能执行审核操作",
+                show_alert=True,
+            )
             return
         await session.commit()
         if not await is_group_admin_or_higher(
@@ -2052,7 +2049,10 @@ async def on_moderation_action(
             group_id=group_id,
             user_id=int(user.id),
         ):
-            await deferred_callback.answer("仅群管理员及以上权限可执行该操作")
+            await callback.answer(
+                "仅群管理员及以上权限可执行该操作",
+                show_alert=True,
+            )
             return
         in_transaction = getattr(session, "in_transaction", None)
         if callable(in_transaction) and in_transaction():
@@ -2065,7 +2065,11 @@ async def on_moderation_action(
         finally:
             await session.commit()
 
+        deferred_callback = _DetachedCallbackProxy(callback)
+        callback_acknowledged = asyncio.Event()
+
         async def operation() -> None:
+            await callback_acknowledged.wait()
             outcomes: list[str | None] = []
             async with session_factory() as work_session:
                 await on_moderation_action(
@@ -2086,18 +2090,38 @@ async def on_moderation_action(
             priority=0,
             timeout_seconds=120.0,
         )
-        if not submission.accepted:
-            request_current_update_retry()
-            await deferred_callback.answer(
-                "审核任务队列正忙，本次操作会自动重试。"
-            )
-        elif not submission.created:
-            await deferred_callback.answer("该用户的审核操作正在执行，未重复提交。")
+        try:
+            if not submission.accepted:
+                request_current_update_retry()
+                await callback.answer(
+                    "审核任务队列正忙，本次操作会自动重试。",
+                    show_alert=True,
+                )
+            elif not submission.created:
+                await callback.answer(
+                    "该用户的审核操作正在执行，未重复提交。",
+                    show_alert=True,
+                )
+            else:
+                await callback.answer("审核操作已受理，正在后台复验权限并执行")
+        finally:
+            callback_acknowledged.set()
         return
 
     if not await is_group_authorized(session, group_id):
         await session.commit()
-        await callback.answer("当前群组未授权，不能执行审核操作", show_alert=True)
+        if isinstance(callback, _DetachedCallbackProxy):
+            log.warning(
+                "moderation action cancelled after group authorization changed | "
+                "group=%s violation=%s",
+                group_id,
+                violation_id,
+            )
+        else:
+            await callback.answer(
+                "当前群组未授权，不能执行审核操作",
+                show_alert=True,
+            )
         return
     if not await is_group_admin_or_higher(
         bot=callback.bot,
@@ -2106,7 +2130,19 @@ async def on_moderation_action(
         group_id=group_id,
         user_id=int(user.id),
     ):
-        await callback.answer("仅群管理员及以上权限可执行该操作", show_alert=True)
+        if isinstance(callback, _DetachedCallbackProxy):
+            log.warning(
+                "moderation action cancelled after operator permission changed | "
+                "group=%s operator=%s violation=%s",
+                group_id,
+                user.id,
+                violation_id,
+            )
+        else:
+            await callback.answer(
+                "仅群管理员及以上权限可执行该操作",
+                show_alert=True,
+            )
         return
 
     violation = await session.get(Violation, violation_id)

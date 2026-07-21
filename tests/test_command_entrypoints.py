@@ -156,6 +156,122 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             show_alert=True,
         )
 
+    async def test_av_unauthorized_group_callback_uses_alert_only(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup", title="test"),
+            answer=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            data="avs:legacy-token:0",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        with patch(
+            "bot.handlers.commands.is_group_authorized",
+            new=AsyncMock(return_value=False),
+        ):
+            await commands.on_av_search_paging(
+                callback,
+                settings=_settings(),
+                session=session,
+            )
+
+        callback.answer.assert_awaited_once_with(
+            "当前群组未授权",
+            show_alert=True,
+        )
+        message.answer.assert_not_awaited()
+
+    async def test_memory_unauthorized_group_callback_uses_alert_only(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            answer=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        with patch(
+            "bot.handlers.commands.is_group_authorized",
+            new=AsyncMock(return_value=False),
+        ):
+            allowed = await commands._callback_user_can_manage_memories(
+                callback,
+                session,
+                _settings(),
+            )
+
+        self.assertFalse(allowed)
+        callback.answer.assert_awaited_once_with(
+            "当前群组未授权",
+            show_alert=True,
+        )
+        message.answer.assert_not_awaited()
+
+    async def test_rule_unauthorized_group_callback_uses_alert_only(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            answer=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        with patch(
+            "bot.handlers.admin.is_group_authorized",
+            new=AsyncMock(return_value=False),
+        ):
+            allowed = await admin._callback_user_can_manage_rules(
+                callback,
+                session,
+                _settings(),
+            )
+
+        self.assertFalse(allowed)
+        callback.answer.assert_awaited_once_with(
+            "当前群组未授权",
+            show_alert=True,
+        )
+        message.answer.assert_not_awaited()
+
+    async def test_adminlist_unauthorized_group_callback_uses_alert_only(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            answer=AsyncMock(),
+        )
+        callback = SimpleNamespace(
+            data="adl:-10001:0",
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        with patch(
+            "bot.handlers.admin.is_group_authorized",
+            new=AsyncMock(return_value=False),
+        ):
+            await admin.on_adminlist_paging(
+                callback,
+                settings=_settings(),
+                session=session,
+            )
+
+        callback.answer.assert_awaited_once_with(
+            "当前群组未授权",
+            show_alert=True,
+        )
+        message.answer.assert_not_awaited()
+
     async def test_help_uses_shared_command_catalog_text(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),

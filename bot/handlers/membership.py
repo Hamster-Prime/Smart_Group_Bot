@@ -168,23 +168,6 @@ async def _ack_security_callback(
     task.add_done_callback(consume)
 
 
-async def _publish_security_callback_result(
-    callback: CallbackQuery,
-    text: str,
-) -> None:
-    message = callback.message
-    try:
-        if message is not None and hasattr(message, "answer"):
-            await message.answer(text)
-        else:
-            chat = getattr(message, "chat", None)
-            chat_id = int(getattr(chat, "id", 0) or 0)
-            if chat_id:
-                await callback.bot.send_message(chat_id, text)
-    except Exception:
-        log.debug("security callback result delivery failed", exc_info=True)
-
-
 async def _publish_raid_removal_result(
     callback: CallbackQuery,
     *,
@@ -1650,11 +1633,10 @@ async def on_verification_callback(
         )
         return
 
-    # Release Telegram's spinner and the reserved update worker before any
-    # lease transition, permission restore, kick, or ban. Authorization itself
-    # stays in the HIGH admission lane: untrusted callback data must never be
-    # able to allocate a CRITICAL background job.
-    await _ack_security_callback(callback, "正在验证权限并执行…")
+    # Keep the callback unanswered until authorization is known. Otherwise a
+    # denial can no longer be shown privately and has to spill into the group.
+    # Untrusted callback data still stays in the HIGH admission lane and cannot
+    # allocate a CRITICAL job before this check succeeds.
     message = callback.message
     chat = getattr(message, "chat", None)
     operator = callback.from_user
@@ -1668,11 +1650,15 @@ async def on_verification_callback(
         or group_id == 0
     ):
         await session.commit()
-        await _publish_security_callback_result(callback, "验证操作消息已失效")
+        await _ack_security_callback(
+            callback,
+            "验证操作消息已失效",
+            show_alert=True,
+        )
         return
     if not await is_group_authorized(session, group_id):
         await session.commit()
-        await _publish_security_callback_result(callback, "当前群组未授权")
+        await _ack_security_callback(callback, "当前群组未授权", show_alert=True)
         return
     await session.commit()
     if not await is_group_admin_or_higher(
@@ -1682,16 +1668,20 @@ async def on_verification_callback(
         group_id=group_id,
         user_id=int(operator.id),
     ):
-        await _publish_security_callback_result(
+        await _ack_security_callback(
             callback,
             "仅群管理员及以上权限可操作",
+            show_alert=True,
         )
         return
     in_transaction = getattr(session, "in_transaction", None)
     if callable(in_transaction) and in_transaction():
         await session.commit()
 
+    callback_acknowledged = asyncio.Event()
+
     async def operation() -> None:
+        await callback_acknowledged.wait()
         async with session_factory() as work_session:
             await _handle_verification_admin_callback(
                 callback,
@@ -1715,29 +1705,36 @@ async def on_verification_callback(
         priority=0,
         timeout_seconds=120.0,
     )
-    if submission.accepted:
-        if not submission.created and message is not None and hasattr(message, "answer"):
-            try:
-                await message.answer("该验证权限操作正在执行，未重复提交。")
-            except Exception:
-                pass
-        return
+    try:
+        if submission.accepted and submission.created:
+            await _ack_security_callback(callback, "正在验证权限并执行…")
+            return
+        if submission.accepted:
+            await _ack_security_callback(
+                callback,
+                "该验证权限操作正在执行，未重复提交。",
+                show_alert=True,
+            )
+            return
 
-    # Saturation must not silently drop a permission decision, but it also must
-    # not move a minutes-long Telegram operation back into the HIGH update
-    # worker. Keep the durable inbox row retryable instead.
-    log.error(
-        "verification admin queue rejected task; scheduling durable retry | "
-        "group=%s user=%s reason=%s",
-        group_id,
-        target_user_id,
-        submission.reason,
-    )
-    request_current_update_retry()
-    await _publish_security_callback_result(
-        callback,
-        "权限任务队列正忙，本次操作会自动重试。",
-    )
+        # Saturation must not silently drop a permission decision, but it also
+        # must not move a minutes-long Telegram operation back into the HIGH
+        # update worker. Keep the durable inbox row retryable instead.
+        log.error(
+            "verification admin queue rejected task; scheduling durable retry | "
+            "group=%s user=%s reason=%s",
+            group_id,
+            target_user_id,
+            submission.reason,
+        )
+        request_current_update_retry()
+        await _ack_security_callback(
+            callback,
+            "权限任务队列正忙，本次操作会自动重试。",
+            show_alert=True,
+        )
+    finally:
+        callback_acknowledged.set()
 
 
 async def _handle_shared_challenge_callback(
@@ -1823,18 +1820,11 @@ async def on_raid_remove_callback(
     if operator is None:
         await callback.answer("无法识别操作者", show_alert=True)
         return
-    # Stop Telegram's callback spinner before authorization or bulk work. The
-    # acknowledgement discloses no privileged result and is safe for any user.
-    await _ack_security_callback(callback, "正在验证权限并提交任务…")
     group_id = int(chat.id)
     authorized = await is_group_authorized(session, group_id)
     await session.commit()
     if not authorized:
         await _ack_security_callback(callback, "当前群组未授权", show_alert=True)
-        try:
-            await message.answer("当前群组未授权，未执行批量移除。")
-        except Exception:
-            pass
         return
     if not await is_group_admin_or_higher(
         bot=callback.bot,
@@ -1848,17 +1838,15 @@ async def on_raid_remove_callback(
             "仅群管理员可一键移除追溯用户",
             show_alert=True,
         )
-        try:
-            await message.answer("仅群管理员可一键移除追溯用户。")
-        except Exception:
-            pass
         return
 
     await session.commit()
     if session_factory is not None:
         prompt_message_id = int(message.message_id)
+        callback_acknowledged = asyncio.Event()
 
         async def operation() -> None:
+            await callback_acknowledged.wait()
             async with session_factory() as work_session:
                 still_authorized = await is_group_authorized(work_session, group_id)
                 await work_session.commit()
@@ -1874,12 +1862,13 @@ async def on_raid_remove_callback(
                 )
                 await work_session.commit()
                 if not still_operator:
-                    try:
-                        await message.answer(
-                            "爆破防护批量移除已取消：执行前复验发现群授权或操作者权限已失效。"
-                        )
-                    except Exception:
-                        pass
+                    log.warning(
+                        "raid bulk-remove cancelled after authorization changed | "
+                        "group=%s operator=%s prompt=%s",
+                        group_id,
+                        operator.id,
+                        prompt_message_id,
+                    )
                     return
                 result = await remove_raid_challenged_users(
                     bot=callback.bot,
@@ -1905,16 +1894,23 @@ async def on_raid_remove_callback(
             priority=10,
             timeout_seconds=180.0,
         )
-        if not submission.accepted:
-            try:
-                await message.answer("权限任务队列正忙，本次未受理，请再次点击。")
-            except Exception:
-                pass
-        elif not submission.created:
-            try:
-                await message.answer("该批移除任务正在执行，未重复提交。")
-            except Exception:
-                pass
+        try:
+            if not submission.accepted:
+                await _ack_security_callback(
+                    callback,
+                    "权限任务队列正忙，本次未受理，请再次点击。",
+                    show_alert=True,
+                )
+            elif not submission.created:
+                await _ack_security_callback(
+                    callback,
+                    "该批移除任务正在执行，未重复提交。",
+                    show_alert=True,
+                )
+            else:
+                await _ack_security_callback(callback, "正在验证权限并提交任务…")
+        finally:
+            callback_acknowledged.set()
         return
 
     result = await remove_raid_challenged_users(

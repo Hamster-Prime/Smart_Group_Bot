@@ -435,7 +435,7 @@ class AdminTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         async def answer_after_release(*_args, **_kwargs) -> None:
             events.append("answer")
-            self.assertEqual(events, ["commit", "answer"])
+            self.assertEqual(events, ["commit", "commit", "answer"])
 
         callback = SimpleNamespace(
             from_user=SimpleNamespace(id=9),
@@ -447,7 +447,7 @@ class AdminTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 admin,
-                "ensure_group_authorized",
+                "is_group_authorized",
                 new=AsyncMock(return_value=True),
             ),
             patch.object(
@@ -544,7 +544,7 @@ class AdminTransactionBoundaryTests(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(chat=SimpleNamespace(id=-100, type="supergroup")),
             answer=AsyncMock(),
         )
-        with patch.object(admin, "ensure_group_authorized", new=AsyncMock()) as authorized:
+        with patch.object(admin, "is_group_authorized", new=AsyncMock()) as authorized:
             await admin.on_adminlist_paging(
                 callback,
                 settings=SimpleNamespace(),

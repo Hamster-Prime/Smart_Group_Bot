@@ -27,6 +27,7 @@ from bot.services.authz import (
     ensure_group_authorized,
     ensure_super_admin,
     is_group_admin_authorized,
+    is_group_authorized,
     is_super_admin_user_id,
 )
 from bot.services import memory_holder
@@ -230,7 +231,9 @@ async def _callback_user_can_manage_memories(
     if not msg or not msg.chat or msg.chat.type not in ("group", "supergroup"):
         await callback.answer("消息已失效", show_alert=True)
         return False
-    if not await ensure_group_authorized(msg, session, settings):
+    authorized = await is_group_authorized(session, int(msg.chat.id))
+    await session.commit()
+    if not authorized:
         await callback.answer("当前群组未授权", show_alert=True)
         return False
 
@@ -240,10 +243,32 @@ async def _callback_user_can_manage_memories(
     if not user:
         await callback.answer("无法识别操作者", show_alert=True)
         return False
-    if await is_group_admin_authorized(session, msg.chat.id, user.id):
+    locally_authorized = await is_group_admin_authorized(
+        session,
+        msg.chat.id,
+        user.id,
+    )
+    await session.commit()
+    if locally_authorized:
         return True
 
     await callback.answer("仅群管理员可操作该列表", show_alert=True)
+    return False
+
+
+async def _ensure_callback_group_authorized(
+    callback: CallbackQuery,
+    message: Message,
+    session: AsyncSession,
+) -> bool:
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", "") not in {"group", "supergroup"}:
+        return True
+    authorized = await is_group_authorized(session, int(chat.id))
+    await session.commit()
+    if authorized:
+        return True
+    await callback.answer("当前群组未授权", show_alert=True)
     return False
 
 
@@ -1236,8 +1261,7 @@ async def on_av_search_paging(
     if not msg:
         await callback.answer("消息已失效", show_alert=True)
         return
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer()
+    if not await _ensure_callback_group_authorized(callback, msg, session):
         return
     if not await _ensure_av_callback_scope(callback, msg, session, settings):
         return
@@ -1282,8 +1306,7 @@ async def on_av_detail_select(
     if not msg:
         await callback.answer("消息已失效", show_alert=True)
         return
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer()
+    if not await _ensure_callback_group_authorized(callback, msg, session):
         return
     if not await _ensure_av_callback_scope(callback, msg, session, settings):
         return
@@ -1348,8 +1371,7 @@ async def on_av_seed_paging(
     if not msg:
         await callback.answer("消息已失效", show_alert=True)
         return
-    if not await ensure_group_authorized(msg, session, settings):
-        await callback.answer()
+    if not await _ensure_callback_group_authorized(callback, msg, session):
         return
     if not await _ensure_av_callback_scope(callback, msg, session, settings):
         return
