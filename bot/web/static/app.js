@@ -2270,6 +2270,34 @@
     return true;
   }
 
+  // This control also has data-group-key. Keep input and blur/change on the
+  // typed path so the generic group handler never replaces the array with text.
+  function handleGroupTemplateButtonsControl(target) {
+    if (!target.matches("[data-template-buttons]")) return false;
+    const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
+    if (!group || state.groupSaving.has(String(group.id))) return true;
+    try {
+      const buttons = parseTemplateButtonsText(target.value);
+      group.settings[target.dataset.groupKey] = buttons;
+      state.groupTemplateButtonDrafts.set(String(group.id), {
+        raw: target.value,
+        error: "",
+        buttons: clone(buttons),
+      });
+      target.setCustomValidity("");
+    } catch (error) {
+      const message = error.message || "内联按钮格式无效";
+      state.groupTemplateButtonDrafts.set(String(group.id), {
+        raw: target.value,
+        error: message,
+        buttons: clone(group.settings[target.dataset.groupKey]),
+      });
+      target.setCustomValidity(message);
+    }
+    updateGroupCardState(target, group);
+    return true;
+  }
+
   content.addEventListener("input", event => {
     const target = event.target;
     const resourceForm = target.closest(RESOURCE_DRAFT_FORM_SELECTOR);
@@ -2278,30 +2306,7 @@
       captureResourceFormDraft(resourceForm);
     }
     if (handlePermissionControl(target)) return;
-    if (target.matches("[data-template-buttons]")) {
-      const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
-      if (!group || state.groupSaving.has(String(group.id))) return;
-      try {
-        const buttons = parseTemplateButtonsText(target.value);
-        group.settings[target.dataset.groupKey] = buttons;
-        state.groupTemplateButtonDrafts.set(String(group.id), {
-          raw: target.value,
-          error: "",
-          buttons: clone(buttons),
-        });
-        target.setCustomValidity("");
-      } catch (error) {
-        const message = error.message || "内联按钮格式无效";
-        state.groupTemplateButtonDrafts.set(String(group.id), {
-          raw: target.value,
-          error: message,
-          buttons: clone(group.settings[target.dataset.groupKey]),
-        });
-        target.setCustomValidity(message);
-      }
-      updateGroupCardState(target, group);
-      return;
-    }
+    if (handleGroupTemplateButtonsControl(target)) return;
     if (target.matches("[data-auto-delete-seconds]")) {
       const category = target.dataset.autoDeleteSeconds;
       const overrides = { ...(state.config.bot.auto_delete_category_seconds || {}) };
@@ -2365,6 +2370,7 @@
       captureResourceFormDraft(resourceForm);
     }
     if (handlePermissionControl(target)) return;
+    if (handleGroupTemplateButtonsControl(target)) return;
     if (target.matches("[data-call-admin-target]")) {
       const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
       if (!group || state.groupSaving.has(String(group.id))) return;
