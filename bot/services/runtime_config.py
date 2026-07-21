@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import logging
 import os
+import re
 import tomllib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -42,6 +43,11 @@ _STATIC_SECRET_PATHS = (
     "tts.app_key",
     "tts.access_key",
     "sub2api.api_key",
+    "movie_info.tmdb_read_access_token",
+    "movie_info.imdb_api_key",
+    "movie_info.imdb_aws_access_key_id",
+    "movie_info.imdb_aws_secret_access_key",
+    "movie_info.imdb_aws_session_token",
 )
 
 
@@ -426,6 +432,54 @@ class Sub2APISettingsConfig(StrictModel):
     check_timeout_sec: float = Field(default=45.0, ge=1.0, le=600.0)
 
 
+class MovieInfoSettingsConfig(StrictModel):
+    enabled: bool = False
+    http_timeout_sec: float = Field(default=6.0, ge=1.0, le=6.0)
+    max_results: int = Field(default=6, ge=1, le=20)
+    default_language: str = Field(default="zh-CN", max_length=32)
+    default_region: str = Field(default="CN", max_length=16)
+    tmdb_read_access_token: str = Field(default="", max_length=2048)
+    imdb_data_set_id: str = Field(default="", max_length=255)
+    imdb_revision_id: str = Field(default="", max_length=255)
+    imdb_asset_id: str = Field(default="", max_length=255)
+    imdb_api_key: str = Field(default="", max_length=2048)
+    imdb_aws_access_key_id: str = Field(default="", max_length=255)
+    imdb_aws_secret_access_key: str = Field(default="", max_length=2048)
+    imdb_aws_session_token: str = Field(default="", max_length=4096)
+
+    @field_validator(
+        "tmdb_read_access_token",
+        "imdb_data_set_id",
+        "imdb_revision_id",
+        "imdb_asset_id",
+        "imdb_api_key",
+        "imdb_aws_access_key_id",
+        "imdb_aws_secret_access_key",
+        "imdb_aws_session_token",
+        mode="before",
+    )
+    @classmethod
+    def _strip_provider_value(cls, value: object) -> str:
+        return str(value or "").strip()
+
+    @field_validator("default_language", mode="before")
+    @classmethod
+    def _normalize_language(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z]{2})?", text):
+            raise ValueError("影片默认语言必须类似 zh-CN 或 en")
+        language, *region = text.split("-", 1)
+        return language.lower() + (f"-{region[0].upper()}" if region else "")
+
+    @field_validator("default_region", mode="before")
+    @classmethod
+    def _normalize_region(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z]{2}", text):
+            raise ValueError("影片默认地区必须是两字母代码")
+        return text.upper()
+
+
 class AVSettingsConfig(StrictModel):
     enabled: bool = True
     http_timeout_sec: float = Field(default=15.0, ge=1.0, le=300.0)
@@ -494,6 +548,7 @@ class RuntimeConfig(StrictModel):
     tts: TTSSettingsConfig = Field(default_factory=TTSSettingsConfig)
     music: MusicSettingsConfig = Field(default_factory=MusicSettingsConfig)
     sub2api: Sub2APISettingsConfig = Field(default_factory=Sub2APISettingsConfig)
+    movie_info: MovieInfoSettingsConfig = Field(default_factory=MovieInfoSettingsConfig)
     av: AVSettingsConfig = Field(default_factory=AVSettingsConfig)
     stickers: StickerSettingsConfig = Field(default_factory=StickerSettingsConfig)
     logging: LoggingSettingsConfig = Field(default_factory=LoggingSettingsConfig)
@@ -540,6 +595,19 @@ class RuntimeConfig(StrictModel):
             "tts.app_key": self.tts.app_key,
             "tts.access_key": self.tts.access_key,
             "sub2api.api_key": self.sub2api.api_key,
+            "movie_info.tmdb_read_access_token": (
+                self.movie_info.tmdb_read_access_token
+            ),
+            "movie_info.imdb_api_key": self.movie_info.imdb_api_key,
+            "movie_info.imdb_aws_access_key_id": (
+                self.movie_info.imdb_aws_access_key_id
+            ),
+            "movie_info.imdb_aws_secret_access_key": (
+                self.movie_info.imdb_aws_secret_access_key
+            ),
+            "movie_info.imdb_aws_session_token": (
+                self.movie_info.imdb_aws_session_token
+            ),
         }
         values.update(
             {
@@ -560,6 +628,21 @@ class RuntimeConfig(StrictModel):
         clone.tts.app_key = secrets.get("tts.app_key", "")
         clone.tts.access_key = secrets.get("tts.access_key", "")
         clone.sub2api.api_key = secrets.get("sub2api.api_key", "")
+        clone.movie_info.tmdb_read_access_token = secrets.get(
+            "movie_info.tmdb_read_access_token", ""
+        ).strip()
+        clone.movie_info.imdb_api_key = secrets.get(
+            "movie_info.imdb_api_key", ""
+        ).strip()
+        clone.movie_info.imdb_aws_access_key_id = secrets.get(
+            "movie_info.imdb_aws_access_key_id", ""
+        ).strip()
+        clone.movie_info.imdb_aws_secret_access_key = secrets.get(
+            "movie_info.imdb_aws_secret_access_key", ""
+        ).strip()
+        clone.movie_info.imdb_aws_session_token = secrets.get(
+            "movie_info.imdb_aws_session_token", ""
+        ).strip()
         for provider in clone.models.providers:
             provider.api_key = secrets.get(f"providers.{provider.name}.api_key", "")
         return clone
@@ -810,6 +893,45 @@ class RuntimeConfig(StrictModel):
         settings.sub2api_api_key = self.sub2api.api_key
         settings.sub2api_http_timeout_sec = self.sub2api.http_timeout_sec
         settings.sub2api_check_timeout_sec = self.sub2api.check_timeout_sec
+        movie_info = self.movie_info
+        if movie_info.enabled:
+            tmdb_ready = bool(movie_info.tmdb_read_access_token)
+            imdb_ready = all(
+                (
+                    movie_info.imdb_data_set_id,
+                    movie_info.imdb_revision_id,
+                    movie_info.imdb_asset_id,
+                    movie_info.imdb_api_key,
+                    movie_info.imdb_aws_access_key_id,
+                    movie_info.imdb_aws_secret_access_key,
+                )
+            )
+            if not (tmdb_ready or imdb_ready):
+                raise ValueError(
+                    "启用影片信息查询前，需配置 TMDB Read Access Token，"
+                    "或完整的 IMDb AWS Data Exchange 凭据"
+                )
+        settings.movie_info_enabled = movie_info.enabled
+        settings.movie_info_http_timeout_sec = movie_info.http_timeout_sec
+        settings.movie_info_max_results = movie_info.max_results
+        settings.movie_info_default_language = movie_info.default_language
+        settings.movie_info_default_region = movie_info.default_region
+        settings.movie_info_tmdb_read_access_token = (
+            movie_info.tmdb_read_access_token
+        )
+        settings.movie_info_imdb_data_set_id = movie_info.imdb_data_set_id
+        settings.movie_info_imdb_revision_id = movie_info.imdb_revision_id
+        settings.movie_info_imdb_asset_id = movie_info.imdb_asset_id
+        settings.movie_info_imdb_api_key = movie_info.imdb_api_key
+        settings.movie_info_imdb_aws_access_key_id = (
+            movie_info.imdb_aws_access_key_id
+        )
+        settings.movie_info_imdb_aws_secret_access_key = (
+            movie_info.imdb_aws_secret_access_key
+        )
+        settings.movie_info_imdb_aws_session_token = (
+            movie_info.imdb_aws_session_token
+        )
         settings.av_enabled = self.av.enabled
         settings.av_http_timeout_sec = self.av.http_timeout_sec
         settings.av_max_results = self.av.max_results
@@ -1462,6 +1584,23 @@ def build_legacy_runtime_config(
             api_key=settings.sub2api_api_key,
             http_timeout_sec=settings.sub2api_http_timeout_sec,
             check_timeout_sec=settings.sub2api_check_timeout_sec,
+        ),
+        movie_info=MovieInfoSettingsConfig(
+            enabled=settings.movie_info_enabled,
+            http_timeout_sec=settings.movie_info_http_timeout_sec,
+            max_results=settings.movie_info_max_results,
+            default_language=settings.movie_info_default_language,
+            default_region=settings.movie_info_default_region,
+            tmdb_read_access_token=settings.movie_info_tmdb_read_access_token,
+            imdb_data_set_id=settings.movie_info_imdb_data_set_id,
+            imdb_revision_id=settings.movie_info_imdb_revision_id,
+            imdb_asset_id=settings.movie_info_imdb_asset_id,
+            imdb_api_key=settings.movie_info_imdb_api_key,
+            imdb_aws_access_key_id=settings.movie_info_imdb_aws_access_key_id,
+            imdb_aws_secret_access_key=(
+                settings.movie_info_imdb_aws_secret_access_key
+            ),
+            imdb_aws_session_token=settings.movie_info_imdb_aws_session_token,
         ),
         av=AVSettingsConfig(
             enabled=settings.av_enabled,

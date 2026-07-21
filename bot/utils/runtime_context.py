@@ -89,6 +89,7 @@ def build_bot_runtime_profile_context(
         "bilibili_search": "B站搜索、视频详情、热门与排行榜",
         "weibo_search": "微博热搜、搜索与链接内容提取",
         "sub2api_query": "本站模型网关查询：可用模型列表与指定模型测活（问模型能不能用时优先用它，不要联网搜索）",
+        "movie_info": "影片实时信息查询：TMDB/IMDb 元数据、独立评分与上映状态",
         "doubao_tts": "文字转语音",
         "vote_ban": "明确请求且回复目标消息时发起民主投票封禁（受用户额度限制）",
     }
@@ -167,6 +168,11 @@ def build_bot_runtime_profile_context(
     if "doubao_tts" in normalized_skills:
         tts_model = str(getattr(settings, "doubao_tts_model", "") or "").strip() or "(provider default)"
         lines.append(f"tts_model: {tts_model}")
+    if "movie_info" in normalized_skills:
+        lines.append(
+            "movie_info_routing: 查询电影的当前元数据、TMDB/IMDb 评分或上映状态时，"
+            "优先调用 movie_info；仅在结果不足时再用通用联网搜索。"
+        )
 
     lines.append(build_command_guide_context())
     lines.append(

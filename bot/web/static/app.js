@@ -25,7 +25,7 @@
     { id: "bot", label: "Bot", icon: "bot", subtitle: "消息、上下文与主动发言" },
     { id: "safety", label: "审核验证", icon: "shield-check", subtitle: "内容审核与入群验证" },
     { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸" },
-    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "Sub2API 接入" },
+    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息与 Sub2API 接入" },
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转" },
     { id: "prompts", label: "Prompts", icon: "file-code-2", subtitle: "模型系统提示词" },
     { id: "groups", label: "群组", icon: "users", subtitle: "逐群行为覆盖" },
@@ -883,6 +883,24 @@
     return `
       ${pageHead("外部服务", "管理第三方业务服务的连接与超时。")}
       <div class="section-stack">
+        <section class="settings-section">
+          ${sectionHead("影片信息（IMDb / TMDB）", "按需查询影片搜索结果、详情与实时评分。仅在已取得适用于 Bot 用途的供应商授权后启用；IMDb 官方实时 API 需要 AWS Data Exchange 商业订阅。")}
+          <div class="field-grid three">
+            ${toggle("movie_info.enabled", "启用影片信息查询", "配置至少一个可用数据源后供影片信息技能调用")}
+            ${field("movie_info.http_timeout_sec", "单请求超时（秒）", { type: "number", min: 1, max: 6, step: 0.1, required: true, hint: "最多 6 秒，以保证 ID 映射的两段请求不超过技能总预算" })}
+            ${field("movie_info.max_results", "最大结果数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+            ${field("movie_info.default_language", "默认语言", { maxlength: 6, placeholder: "zh-CN", required: true })}
+            ${field("movie_info.default_region", "默认地区", { maxlength: 2, placeholder: "CN", required: true })}
+            ${secretField("movie_info.tmdb_read_access_token", "TMDB Read Access Token", "使用请求头鉴权；空白不会覆盖已保存的密钥")}
+            ${field("movie_info.imdb_data_set_id", "IMDb Data Set ID", { maxlength: 255 })}
+            ${field("movie_info.imdb_revision_id", "IMDb Revision ID", { maxlength: 255 })}
+            ${field("movie_info.imdb_asset_id", "IMDb Asset ID", { maxlength: 255 })}
+            ${secretField("movie_info.imdb_api_key", "IMDb API Key", "空白不会覆盖已保存的密钥")}
+            ${secretField("movie_info.imdb_aws_access_key_id", "IMDb AWS Access Key ID", "空白不会覆盖已保存的密钥")}
+            ${secretField("movie_info.imdb_aws_secret_access_key", "IMDb AWS Secret Access Key", "空白不会覆盖已保存的密钥")}
+            ${secretField("movie_info.imdb_aws_session_token", "IMDb AWS Session Token", "临时凭据可留空；空白不会覆盖已保存的密钥")}
+          </div>
+        </section>
         <section class="settings-section">
           ${sectionHead("Sub2API")}
           <div class="field-grid three">
@@ -2190,6 +2208,11 @@
     payload.tts.app_key = "";
     payload.tts.access_key = "";
     payload.sub2api.api_key = "";
+    payload.movie_info.tmdb_read_access_token = "";
+    payload.movie_info.imdb_api_key = "";
+    payload.movie_info.imdb_aws_access_key_id = "";
+    payload.movie_info.imdb_aws_secret_access_key = "";
+    payload.movie_info.imdb_aws_session_token = "";
     for (const provider of payload.models.providers) provider.api_key = "";
     return payload;
   }

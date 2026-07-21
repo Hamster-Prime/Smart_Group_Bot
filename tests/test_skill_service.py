@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from bot.services.skills import service as skill_service_module
 from bot.services.skills.base import SkillContext, SkillRunResult
@@ -163,6 +164,18 @@ class _AmbiguousPlannedSkillService(_PlannedSkillService):
 
 
 class SkillServiceTTSPromptTests(unittest.TestCase):
+    def test_movie_info_skill_is_registered_only_when_available(self) -> None:
+        available_skill = SimpleNamespace(name="movie_info", available=True)
+        unavailable_skill = SimpleNamespace(name="movie_info", available=False)
+
+        with patch.object(skill_service_module, "MovieInfoSkill", return_value=available_skill):
+            available_service = SkillService(_llm_stub(), settings=None)
+        with patch.object(skill_service_module, "MovieInfoSkill", return_value=unavailable_skill):
+            unavailable_service = SkillService(_llm_stub(), settings=None)
+
+        self.assertIn("movie_info", available_service.available_skill_names())
+        self.assertNotIn("movie_info", unavailable_service.available_skill_names())
+
     def test_vote_ban_skill_is_registered_when_runtime_settings_exist(self) -> None:
         service = SkillService(_llm_stub(), settings=_tts_settings())
         self.assertIn("vote_ban", service.available_skill_names())
@@ -200,6 +213,89 @@ class SkillServiceTTSPromptTests(unittest.TestCase):
 
 
 class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_movie_info_summary_triggers_source_aware_followup(self) -> None:
+        service = _PlannedSkillService([])
+        recent_tool_results = [
+            {
+                "name": "movie_info",
+                "arguments": {"action": "details", "query": "星际穿越"},
+                "result": SkillRunResult(
+                    ok=True,
+                    skill="movie_info",
+                    summary="已查询《星际穿越》的电影信息",
+                    payload={"entry": {"title": "星际穿越"}},
+                ),
+            }
+        ]
+
+        self.assertTrue(
+            service._is_intermediate_tool_reply(
+                "已查询《星际穿越》的电影信息",
+                recent_tool_results=recent_tool_results,
+                last_success_summary="已查询《星际穿越》的电影信息",
+            )
+        )
+        self.assertTrue(
+            service._is_intermediate_tool_reply(
+                "找到 3 部相关电影",
+                recent_tool_results=recent_tool_results,
+                last_success_summary="找到 3 部相关电影",
+            )
+        )
+        prompt = service._build_tool_followup_prompt(recent_tool_results)
+        self.assertIn("ratings.tmdb", prompt)
+        self.assertIn("ratings.imdb", prompt)
+        self.assertIn("provider_errors", prompt)
+        self.assertIn("fetched_at", prompt)
+        self.assertIn("payload.attribution", prompt)
+        self.assertIn("payload.imdb_disclaimer", prompt)
+
+    async def test_movie_info_fallback_labels_ratings_and_attribution(self) -> None:
+        service = _PlannedSkillService([])
+        recent_tool_results = [
+            {
+                "name": "movie_info",
+                "arguments": {"action": "details", "query": "星际穿越"},
+                "result": SkillRunResult(
+                    ok=True,
+                    skill="movie_info",
+                    summary="已获取影片详情",
+                    payload={
+                        "fetched_at": "2026-07-21T10:00:00Z",
+                        "provider_errors": {"imdb": "not_configured"},
+                        "attribution": "This product uses the TMDB API.",
+                        "imdb_disclaimer": "IMDb data is subject to its license agreement.",
+                        "entry": {
+                            "title": "星际穿越",
+                            "year": 2014,
+                            "release_date": "2014-11-07",
+                            "status": "Released",
+                            "ratings": {
+                                "tmdb": {"score": 8.5, "vote_count": 36000},
+                                "imdb": {"score": 8.7, "vote_count": 2300000},
+                            },
+                            "urls": {
+                                "tmdb": "https://www.themoviedb.org/movie/157336",
+                                "imdb": "https://www.imdb.com/title/tt0816692/",
+                            },
+                        },
+                    },
+                ),
+            }
+        ]
+
+        text = service._build_tool_fallback_text(
+            recent_tool_results=recent_tool_results,
+            default_text="查询失败",
+        )
+
+        self.assertIn("TMDB 评分：8.5/10", text)
+        self.assertIn("IMDb 评分：8.7/10", text)
+        self.assertIn("部分来源未返回：IMDB（not_configured）", text)
+        self.assertIn("查询时间：2026-07-21T10:00:00Z", text)
+        self.assertIn("This product uses the TMDB API.", text)
+        self.assertIn("IMDb data is subject to its license agreement.", text)
+
     async def test_ambiguous_side_effect_is_terminal_and_not_retried(self) -> None:
         service = _AmbiguousPlannedSkillService(
             [

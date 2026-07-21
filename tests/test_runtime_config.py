@@ -53,11 +53,18 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.reply_batch_timeout_seconds, 45.0)
         self.assertEqual(self.settings.vote_ban_trigger_limit, 3)
         self.assertEqual(self.settings.vote_ban_trigger_window_seconds, 3600)
+        self.assertFalse(self.manager.config.movie_info.enabled)
+        self.assertEqual(self.manager.config.movie_info.http_timeout_sec, 6.0)
+        self.assertEqual(self.manager.config.movie_info.max_results, 6)
+        self.assertEqual(self.manager.config.movie_info.default_language, "zh-CN")
+        self.assertEqual(self.manager.config.movie_info.default_region, "CN")
+        self.assertFalse(self.settings.movie_info_enabled)
         async with self.session_factory() as session:
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertIsNotNone(row)
             self.assertEqual(row.revision, 1)
             self.assertEqual(row.payload["models"]["providers"][0]["api_key"], "")
+            self.assertEqual(row.payload["movie_info"]["tmdb_read_access_token"], "")
 
     async def test_first_start_imports_call_vote_and_auto_delete_settings(self) -> None:
         legacy = Settings(_env_file=None)
@@ -96,6 +103,49 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             {"call_admin": "button"},
         )
         self.assertFalse(imported.bot.drop_pending_updates)
+
+    async def test_legacy_movie_info_settings_are_imported(self) -> None:
+        legacy = Settings(
+            _env_file=None,
+            movie_info_enabled=True,
+            movie_info_http_timeout_sec=5.5,
+            movie_info_max_results=9,
+            movie_info_default_language="en-US",
+            movie_info_default_region="US",
+            movie_info_tmdb_read_access_token="legacy-tmdb-token",
+            movie_info_imdb_data_set_id="legacy-data-set",
+            movie_info_imdb_revision_id="legacy-revision",
+            movie_info_imdb_asset_id="legacy-asset",
+            movie_info_imdb_api_key="legacy-imdb-key",
+            movie_info_imdb_aws_access_key_id="legacy-access-key-id",
+            movie_info_imdb_aws_secret_access_key="legacy-secret-key",
+            movie_info_imdb_aws_session_token="legacy-session-token",
+        )
+
+        imported = build_legacy_runtime_config(
+            "/tmp/nonexistent-smart-group-bot.toml",
+            settings=legacy,
+            raw_env={},
+        )
+
+        self.assertTrue(imported.movie_info.enabled)
+        self.assertEqual(imported.movie_info.http_timeout_sec, 5.5)
+        self.assertEqual(imported.movie_info.max_results, 9)
+        self.assertEqual(imported.movie_info.default_language, "en-US")
+        self.assertEqual(imported.movie_info.default_region, "US")
+        self.assertEqual(imported.movie_info.imdb_data_set_id, "legacy-data-set")
+        self.assertEqual(imported.movie_info.imdb_revision_id, "legacy-revision")
+        self.assertEqual(imported.movie_info.imdb_asset_id, "legacy-asset")
+        self.assertEqual(
+            imported.extract_secrets(),
+            {
+                "movie_info.tmdb_read_access_token": "legacy-tmdb-token",
+                "movie_info.imdb_api_key": "legacy-imdb-key",
+                "movie_info.imdb_aws_access_key_id": "legacy-access-key-id",
+                "movie_info.imdb_aws_secret_access_key": "legacy-secret-key",
+                "movie_info.imdb_aws_session_token": "legacy-session-token",
+            },
+        )
 
     async def test_deprecated_drop_pending_setting_is_normalized_on_save(self) -> None:
         payload = self.manager.config.public_payload()
@@ -216,6 +266,121 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             result = await session.execute(select(RuntimeConfigSecret))
             self.assertEqual(result.scalars().all(), [])
+
+    async def test_movie_info_settings_apply_and_secrets_are_masked(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["movie_info"].update(
+            {
+                "enabled": True,
+                "http_timeout_sec": 5.5,
+                "max_results": 8,
+                "default_language": "ja-JP",
+                "default_region": "JP",
+                "imdb_data_set_id": "dataset-1",
+                "imdb_revision_id": "revision-2",
+                "imdb_asset_id": "asset-3",
+            }
+        )
+        secrets = {
+            "movie_info.tmdb_read_access_token": "tmdb-token",
+            "movie_info.imdb_api_key": "imdb-api-key",
+            "movie_info.imdb_aws_access_key_id": "aws-access-key-id",
+            "movie_info.imdb_aws_secret_access_key": "aws-secret-access-key",
+            "movie_info.imdb_aws_session_token": "aws-session-token",
+        }
+
+        await self.manager.save(
+            payload,
+            expected_revision=1,
+            updated_by=42,
+            secret_changes={
+                path: {"action": "replace", "value": value}
+                for path, value in secrets.items()
+            },
+        )
+
+        self.assertTrue(self.settings.movie_info_enabled)
+        self.assertEqual(self.settings.movie_info_http_timeout_sec, 5.5)
+        self.assertEqual(self.settings.movie_info_max_results, 8)
+        self.assertEqual(self.settings.movie_info_default_language, "ja-JP")
+        self.assertEqual(self.settings.movie_info_default_region, "JP")
+        self.assertEqual(self.settings.movie_info_imdb_data_set_id, "dataset-1")
+        self.assertEqual(self.settings.movie_info_imdb_revision_id, "revision-2")
+        self.assertEqual(self.settings.movie_info_imdb_asset_id, "asset-3")
+        self.assertEqual(
+            self.settings.movie_info_tmdb_read_access_token,
+            "tmdb-token",
+        )
+        self.assertEqual(self.settings.movie_info_imdb_api_key, "imdb-api-key")
+        self.assertEqual(
+            self.settings.movie_info_imdb_aws_access_key_id,
+            "aws-access-key-id",
+        )
+        self.assertEqual(
+            self.settings.movie_info_imdb_aws_secret_access_key,
+            "aws-secret-access-key",
+        )
+        self.assertEqual(
+            self.settings.movie_info_imdb_aws_session_token,
+            "aws-session-token",
+        )
+
+        document = self.manager.api_document()
+        self.assertTrue(set(secrets).issubset(document["configured_secrets"]))
+        for path in (
+            "tmdb_read_access_token",
+            "imdb_api_key",
+            "imdb_aws_access_key_id",
+            "imdb_aws_secret_access_key",
+            "imdb_aws_session_token",
+        ):
+            self.assertEqual(document["config"]["movie_info"][path], "")
+
+        async with self.session_factory() as session:
+            config_row = await session.get(RuntimeConfigRecord, 1)
+            self.assertEqual(
+                config_row.payload["movie_info"]["imdb_data_set_id"],
+                "dataset-1",
+            )
+            self.assertEqual(config_row.payload["movie_info"]["imdb_api_key"], "")
+            rows = (await session.execute(select(RuntimeConfigSecret))).scalars().all()
+            encrypted = {row.name: row.ciphertext for row in rows}
+        for path, value in secrets.items():
+            self.assertIn(path, encrypted)
+            self.assertNotIn(value, encrypted[path])
+
+    async def test_movie_info_cannot_be_enabled_without_a_complete_provider(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["movie_info"]["enabled"] = True
+
+        with self.assertRaisesRegex(ValueError, "需配置 TMDB Read Access Token"):
+            await self.manager.save(
+                payload,
+                expected_revision=1,
+                updated_by=42,
+            )
+
+        self.assertFalse(self.settings.movie_info_enabled)
+        self.assertEqual(self.manager.revision, 1)
+
+    async def test_movie_info_locale_is_normalized_and_validated(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["movie_info"]["default_language"] = "EN-us"
+        payload["movie_info"]["default_region"] = "us"
+
+        await self.manager.save(payload, expected_revision=1, updated_by=42)
+
+        self.assertEqual(self.settings.movie_info_default_language, "en-US")
+        self.assertEqual(self.settings.movie_info_default_region, "US")
+
+        invalid = self.manager.config.public_payload()
+        invalid["movie_info"]["default_region"] = "USA"
+        with self.assertRaisesRegex(ValueError, "两字母代码"):
+            await self.manager.save(
+                invalid,
+                expected_revision=2,
+                updated_by=42,
+            )
 
     async def test_revision_conflict_does_not_mutate_live_settings(self) -> None:
         payload = self.manager.config.public_payload()

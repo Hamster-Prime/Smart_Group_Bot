@@ -89,6 +89,37 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         self.assertIn('dirtyLabel: "有草稿"', source)
         self.assertIn('marker.setAttribute("role", "status");', source)
 
+    def test_movie_info_settings_and_secret_stripping_are_wired(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        integrations = source.split("function renderIntegrations", 1)[1].split(
+            "function renderLogging", 1
+        )[0]
+        strip_secrets = source.split("function stripSecrets", 1)[1].split(
+            "function validateConfig", 1
+        )[0]
+
+        for path in (
+            "movie_info.enabled",
+            "movie_info.http_timeout_sec",
+            "movie_info.max_results",
+            "movie_info.default_language",
+            "movie_info.default_region",
+            "movie_info.imdb_data_set_id",
+            "movie_info.imdb_revision_id",
+            "movie_info.imdb_asset_id",
+        ):
+            self.assertIn(f'"{path}"', integrations)
+
+        for path in (
+            "movie_info.tmdb_read_access_token",
+            "movie_info.imdb_api_key",
+            "movie_info.imdb_aws_access_key_id",
+            "movie_info.imdb_aws_secret_access_key",
+            "movie_info.imdb_aws_session_token",
+        ):
+            self.assertIn(f'secretField("{path}"', integrations)
+            self.assertIn(f'payload.{path} = "";', strip_secrets)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,9 +161,14 @@ Mini App 群组页可读取并完整编辑 Telegram 当前 `ChatPermissions` 全
 | `music_search` | GD Studio 音乐 API：搜索、点播、歌词、专辑封面 |
 | `bilibili_search` | B站视频/UP主搜索、热门、排行榜 |
 | `weibo_search` | 微博热搜、内容搜索、Feed 流 |
+| `movie_info` | TMDB / 官方 IMDb 电影搜索、详情、独立评分和上映状态（需配置） |
 | `sub2api_query` | Sub2API 网关查询：模型列表、模型测活（需配置） |
 | `doubao_tts` | 豆包 TTS 语音合成（需配置） |
 | `vote_ban` | 明确请求且回复目标消息时发起民主投票；与命令共用用户额度 |
+
+`movie_info` 的供应商凭证在设置中心配置，只有至少一个合规可用的供应商才会注册。IMDb 实时接口仅指官方 AWS Data Exchange GraphQL API，需要相应商业订阅与许可；不会抓取 IMDb 网页。TMDB 也必须先取得适用于当前用途的 API 授权，尤其是 AI / chatbot 或商业场景，不应仅凭普通 developer key 默认上线。
+
+凭据申请、授权范围与接口字段以官方文档为准：[IMDb API Getting Access](https://developer.imdb.com/documentation/api-documentation/getting-access/)、[IMDb API Calling](https://developer.imdb.com/documentation/api-documentation/calling-the-api/)、[TMDB Application Authentication](https://developer.themoviedb.org/docs/authentication-application)、[TMDB API Terms of Use](https://www.themoviedb.org/api-terms-of-use)。
 
 ### 贴纸系统
 
@@ -371,6 +376,7 @@ Smart_Group_Bot/
 │   │       ├── music_search.py
 │   │       ├── bilibili_search.py
 │   │       ├── weibo_search.py
+│   │       ├── movie_info.py
 │   │       ├── sub2api_query.py
 │   │       └── doubao_tts.py
 │   ├── db/

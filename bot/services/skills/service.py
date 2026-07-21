@@ -17,6 +17,7 @@ from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, Ski
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
+from bot.services.skills.movie_info import MovieInfoSkill
 from bot.services.skills.music_search import MusicSearchSkill
 from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.send_sticker import SendStickerSkill
@@ -126,6 +127,10 @@ _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "sub2api_query": re.compile(
         r"^(?:查到\s*\d+\s*个可用模型|模型\s*\S+\s*(?:可用|不可用).*)[。！？!?\. ]*$"
     ),
+    "movie_info": re.compile(
+        r"^(?:(?:找到|查到)\s*\d+\s*(?:部|条|个)\s*.*?(?:电影|影片|影视|结果)|"
+        r"(?:已|成功)?(?:获取|查询|查到).*?(?:电影|影片|影视).*?(?:详情|信息|结果))[。！？!?\. ]*$"
+    ),
 }
 _INFO_FOLLOWUP_SKILLS = frozenset(
     {
@@ -135,6 +140,7 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
         "bilibili_search",
         "weibo_search",
         "sub2api_query",
+        "movie_info",
     }
 )
 _PLATFORM_LINK_SKILLS = frozenset({"bilibili_search", "weibo_search"})
@@ -183,6 +189,9 @@ class SkillService:
         self._register(WebFetchSkill())
         self._register(BilibiliSearchSkill())
         self._register(WeiboSearchSkill())
+        movie_info_skill = MovieInfoSkill(settings)
+        if movie_info_skill.available:
+            self._register(movie_info_skill)
         if settings is not None:
             self._register(VoteBanSkill(settings))
         sub2api_skill = Sub2ApiQuerySkill(settings)
@@ -719,6 +728,20 @@ class SkillService:
                 "and answer the user's actual request in Chinese now.\n"
                 "When listing models, show the model ids so the user can pick one to test."
             )
+        if result.skill == "movie_info":
+            return (
+                "[TOOL_FOLLOWUP]\n"
+                "You already have current movie information from the configured providers.\n"
+                "Do not stop at the raw tool summary. Read entry/results and answer the user's actual request in Chinese now.\n"
+                "Read ratings.tmdb and ratings.imdb independently. Clearly label every score as TMDB or IMDb; "
+                "never merge them or present one provider's score as the other's.\n"
+                "Read provider_errors and mention a partial provider failure when it affects the answer.\n"
+                "For region-specific release questions, read entry.regional_release instead of inferring from the global date.\n"
+                "Use fetched_at as the data freshness timestamp and do not imply the data is newer than it.\n"
+                "When TMDB data is used, preserve the short source attribution from payload.attribution.\n"
+                "When IMDb data is used, preserve payload.imdb_disclaimer when it is present.\n"
+                "Do not call websearch again when the movie_info payload already answers the request."
+            )
         if result.skill in {"bilibili_search", "weibo_search"}:
             return (
                 "[TOOL_FOLLOWUP]\n"
@@ -825,6 +848,176 @@ class SkillService:
         if final_url:
             lines.append(final_url)
         return "\n\n".join(lines).strip()
+
+    @staticmethod
+    def _render_movie_info_fallback(payload: dict[str, Any]) -> str:
+        def rating_text(item: dict[str, Any], provider: str, label: str) -> str:
+            ratings = item.get("ratings")
+            if not isinstance(ratings, dict):
+                return ""
+            rating = ratings.get(provider)
+            if not isinstance(rating, dict) or rating.get("score") is None:
+                return ""
+            score = clean_text(str(rating.get("score")), max_len=16).strip()
+            votes = rating.get("vote_count")
+            votes_text = clean_text(str(votes), max_len=24).strip() if votes is not None else ""
+            suffix = f"（{votes_text} 票）" if votes_text else ""
+            return f"{label}：{score}/10{suffix}"
+
+        def item_lines(item: dict[str, Any], *, include_details: bool) -> list[str]:
+            title = clean_multiline_text(str(item.get("title") or ""), max_len=160).strip()
+            year = clean_text(str(item.get("year") or ""), max_len=8).strip()
+            heading = title or "未命名影片"
+            if year:
+                heading = f"{heading} ({year})"
+
+            lines = [heading]
+            if include_details:
+                original_title = clean_multiline_text(
+                    str(item.get("original_title") or ""),
+                    max_len=160,
+                ).strip()
+                if original_title and original_title != title:
+                    lines.append(f"原名：{original_title}")
+
+                facts: list[str] = []
+                release_date = clean_text(str(item.get("release_date") or ""), max_len=24).strip()
+                status = clean_multiline_text(str(item.get("status") or ""), max_len=40).strip()
+                runtime = item.get("runtime_minutes")
+                if release_date:
+                    facts.append(f"上映：{release_date}")
+                if status:
+                    facts.append(f"状态：{status}")
+                if runtime is not None:
+                    runtime_text = clean_text(str(runtime), max_len=12).strip()
+                    if runtime_text:
+                        facts.append(f"片长：{runtime_text} 分钟")
+                if facts:
+                    lines.append("；".join(facts))
+
+                regional = item.get("regional_release")
+                if isinstance(regional, dict) and regional.get("date"):
+                    shown_region = clean_text(
+                        str(regional.get("region") or ""), max_len=8
+                    ).strip()
+                    shown_date = clean_text(
+                        str(regional.get("date") or ""), max_len=24
+                    ).strip()
+                    shown_status = clean_text(
+                        str(regional.get("status") or ""), max_len=24
+                    ).strip()
+                    shown_certification = clean_text(
+                        str(regional.get("certification") or ""), max_len=32
+                    ).strip()
+                    regional_parts = [shown_date]
+                    if shown_status:
+                        regional_parts.append(shown_status)
+                    if shown_certification:
+                        regional_parts.append(f"分级 {shown_certification}")
+                    lines.append(
+                        f"{shown_region or '指定地区'}上映：" + "；".join(regional_parts)
+                    )
+
+                genres = item.get("genres")
+                if isinstance(genres, list):
+                    genre_text = "、".join(
+                        clean_text(str(value), max_len=32).strip()
+                        for value in genres[:6]
+                        if clean_text(str(value), max_len=32).strip()
+                    )
+                    if genre_text:
+                        lines.append(f"类型：{genre_text}")
+
+                overview = clean_multiline_text(
+                    str(item.get("overview") or ""),
+                    max_len=520,
+                ).strip()
+                if overview:
+                    lines.append(overview)
+
+            rating_parts = [
+                value
+                for value in (
+                    rating_text(item, "tmdb", "TMDB 评分"),
+                    rating_text(item, "imdb", "IMDb 评分"),
+                )
+                if value
+            ]
+            if rating_parts:
+                lines.append("；".join(rating_parts))
+
+            urls = item.get("urls")
+            if isinstance(urls, dict):
+                for provider, label in (("tmdb", "TMDB"), ("imdb", "IMDb")):
+                    url = clean_text(str(urls.get(provider) or ""), max_len=220).strip()
+                    if url:
+                        lines.append(f"{label}：{url}")
+            return lines
+
+        entry = payload.get("entry")
+        rows = payload.get("results")
+        blocks: list[str] = []
+        if isinstance(entry, dict):
+            blocks.append("\n".join(item_lines(entry, include_details=True)))
+        elif isinstance(rows, list):
+            for index, row in enumerate(rows[:3], start=1):
+                if not isinstance(row, dict):
+                    continue
+                rendered = item_lines(row, include_details=False)
+                if rendered:
+                    rendered[0] = f"{index}. {rendered[0]}"
+                    blocks.append("\n".join(rendered))
+
+        if not blocks:
+            return ""
+
+        provider_errors = payload.get("provider_errors")
+        if isinstance(provider_errors, dict) and provider_errors:
+            errors: list[str] = []
+            for provider, raw_error in provider_errors.items():
+                shown_provider = clean_text(str(provider), max_len=24).strip().upper()
+                shown_error = clean_multiline_text(str(raw_error), max_len=120).strip()
+                if shown_provider:
+                    errors.append(
+                        f"{shown_provider}（{shown_error}）" if shown_error else shown_provider
+                    )
+            if errors:
+                blocks.append("部分来源未返回：" + "；".join(errors))
+
+        fetched_at = clean_text(str(payload.get("fetched_at") or ""), max_len=48).strip()
+        if fetched_at:
+            blocks.append(f"查询时间：{fetched_at}")
+
+        attribution = payload.get("attribution")
+        if isinstance(attribution, str):
+            shown_attribution = clean_multiline_text(attribution, max_len=240).strip()
+            if shown_attribution:
+                blocks.append(shown_attribution)
+        elif isinstance(attribution, list):
+            shown_attribution = "；".join(
+                clean_multiline_text(str(value), max_len=120).strip()
+                for value in attribution
+                if clean_multiline_text(str(value), max_len=120).strip()
+            )
+            if shown_attribution:
+                blocks.append(shown_attribution)
+        elif isinstance(attribution, dict):
+            shown_attribution = "；".join(
+                clean_multiline_text(str(value), max_len=120).strip()
+                for value in attribution.values()
+                if clean_multiline_text(str(value), max_len=120).strip()
+            )
+            if shown_attribution:
+                blocks.append(shown_attribution)
+
+        imdb_disclaimer = clean_multiline_text(
+            str(payload.get("imdb_disclaimer") or ""),
+            max_len=500,
+        ).strip()
+        if imdb_disclaimer:
+            blocks.append(imdb_disclaimer)
+
+        return "\n\n".join(blocks).strip()
 
     @staticmethod
     def _payload_result_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1074,6 +1267,7 @@ class SkillService:
                     "websearch",
                     "bilibili_search",
                     "weibo_search",
+                    "movie_info",
                 }
             ),
         )
@@ -1082,6 +1276,12 @@ class SkillService:
 
         result = latest["result"]
         payload = result.payload if isinstance(result.payload, dict) else {}
+        if result.skill == "movie_info":
+            rendered = cls._render_movie_info_fallback(payload)
+            if rendered:
+                return rendered
+            if result.summary:
+                return result.summary
         if payload.get("entry"):
             rendered = cls._render_entry_fallback(payload)
             if rendered:

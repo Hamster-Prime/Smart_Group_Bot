@@ -55,14 +55,26 @@ class RuntimeContextTests(unittest.TestCase):
                 doubao_tts_model="seed-tts-2.0",
                 bot=SimpleNamespace(),
             ),
-            skill_names=["websearch", "music_search", "webfetch", "doubao_tts", "websearch"],
+            skill_names=[
+                "websearch",
+                "music_search",
+                "webfetch",
+                "movie_info",
+                "doubao_tts",
+                "websearch",
+            ],
         )
 
         self.assertIn("[BOT_RUNTIME_PROFILE]", text)
-        self.assertIn("registered_skills: websearch, music_search, webfetch, doubao_tts", text)
+        self.assertIn(
+            "registered_skills: websearch, music_search, webfetch, movie_info, doubao_tts",
+            text,
+        )
         self.assertIn("联网搜索实时信息", text)
         self.assertIn("音乐搜索、歌曲发送、播放链接、封面与歌词", text)
         self.assertIn("抓取网页正文", text)
+        self.assertIn("影片实时信息查询：TMDB/IMDb 元数据、独立评分与上映状态", text)
+        self.assertIn("优先调用 movie_info", text)
         self.assertIn("文字转语音", text)
         self.assertIn("main_reply_model: openai/gpt-4.1", text)
         self.assertIn("decision_model: openai/gpt-4.1-mini", text)

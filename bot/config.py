@@ -257,6 +257,20 @@ class Settings(BaseSettings):
     sub2api_http_timeout_sec: float = 15.0
     sub2api_check_timeout_sec: float = 45.0
 
+    movie_info_enabled: bool = False
+    movie_info_http_timeout_sec: float = 6.0
+    movie_info_max_results: int = 6
+    movie_info_default_language: str = "zh-CN"
+    movie_info_default_region: str = "CN"
+    movie_info_tmdb_read_access_token: str = ""
+    movie_info_imdb_data_set_id: str = ""
+    movie_info_imdb_revision_id: str = ""
+    movie_info_imdb_asset_id: str = ""
+    movie_info_imdb_api_key: str = ""
+    movie_info_imdb_aws_access_key_id: str = ""
+    movie_info_imdb_aws_secret_access_key: str = ""
+    movie_info_imdb_aws_session_token: str = ""
+
     av_enabled: bool = True
     av_http_timeout_sec: float = 15.0
     av_max_results: int = 18
