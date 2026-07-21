@@ -17,6 +17,7 @@ from bot.services.join_verification import (
     reconcile_moderation_ban_after_lost_lease,
     verification_restriction_required,
 )
+from bot.services.recent_messages import delete_messages_since_join
 from bot.services.update_completion import request_current_update_retry
 
 log = logging.getLogger(__name__)
@@ -183,6 +184,17 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
             await event.delete()
         except Exception:
             pass
+        # A banned rejoin may have raced several messages in before this one;
+        # sweep the residue from the same fresh-join window.
+        try:
+            await delete_messages_since_join(event.bot, int(chat.id), int(user.id))
+        except Exception:
+            log.debug(
+                "banned-user residue sweep failed | chat=%s user=%s",
+                chat.id,
+                user.id,
+                exc_info=True,
+            )
         try:
             async def preserve_ban() -> bool:
                 return await _durable_ban_policy_exists(

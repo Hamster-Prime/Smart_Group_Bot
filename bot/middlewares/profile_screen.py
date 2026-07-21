@@ -35,6 +35,7 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
+from bot.services.recent_messages import delete_messages_since_join
 from bot.services.request_priority import is_privileged_execution
 from bot.services.update_delivery import telegram_message_is_privileged_candidate
 from bot.services.update_completion import request_current_update_retry
@@ -461,6 +462,9 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                 if enforcement.final_restricted is True
                                 else "released"
                             )
+            # A just-joined violator may have messages beyond this one that
+            # revoke_messages will not remove for other members.
+            await delete_messages_since_join(event.bot, int(chat.id), int(user.id))
             shown = html.escape(full_name or (f"@{username}" if username else str(user.id)))
             notice = (
                 f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"

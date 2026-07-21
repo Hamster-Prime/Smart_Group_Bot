@@ -70,6 +70,7 @@ from bot.services.authz import (
 )
 from bot.services.background_health import record_background_failure
 from bot.services.join_screening import is_globally_banned
+from bot.services.recent_messages import delete_messages_since_join
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -4051,6 +4052,9 @@ async def _begin_moderation_challenge_locked(
             )
             return bool(superseded)
         restriction_applied = True
+        # A challenged sender who joined moments ago may have other raced-in
+        # messages besides the one the caller deleted.
+        await delete_messages_since_join(bot, group_id, user_id)
         generation_current = await _join_verification_generation_is_current(
             session,
             verification_id=prepared.verification_id,

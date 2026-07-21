@@ -2051,6 +2051,56 @@ class JoinTriggersVerificationTests(_DbTestCase):
                 await membership.on_member_join(event, session=session, settings=settings)
             await session.commit()
 
+    async def test_clean_join_mutes_before_profile_screening(self) -> None:
+        from bot.handlers import membership
+
+        event = _join_event(user_id=909)
+        fake_moderation = SimpleNamespace(
+            check_rules=AsyncMock(return_value=(False, "", None))
+        )
+
+        async def restrict_chat_member(*_args, **_kwargs):
+            permissions = _kwargs.get("permissions")
+            if permissions is not None and not permissions.can_send_messages:
+                fake_moderation.check_rules.assert_not_awaited()
+                event.bot.get_chat.assert_not_awaited()
+            return True
+
+        event.bot.restrict_chat_member = AsyncMock(side_effect=restrict_chat_member)
+        async with self.session_factory() as session:
+            with (
+                patch("bot.handlers.membership.ModerationService", return_value=fake_moderation),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+            ):
+                await membership.on_member_join(event, session=session, settings=_settings())
+            await session.commit()
+
+        event.bot.restrict_chat_member.assert_awaited_once()
+        fake_moderation.check_rules.assert_awaited_once()
+
+    async def test_join_racing_messages_are_swept_after_mute(self) -> None:
+        from bot.services.recent_messages import (
+            clear_recent_member_messages,
+            record_group_message,
+        )
+
+        clear_recent_member_messages()
+        self.addCleanup(clear_recent_member_messages)
+        event = _join_event(user_id=908)
+        event.bot.delete_messages = AsyncMock(return_value=True)
+        # Simulate messages the member raced in before the join update was
+        # processed: the gate middleware records them, the join flow marks the
+        # join, and the post-restrict sweep must retract them.
+        record_group_message(-100, 908, 501)
+        record_group_message(-100, 908, 502)
+        await self._run_join(event, _settings())
+
+        event.bot.restrict_chat_member.assert_awaited_once()
+        event.bot.delete_messages.assert_awaited_once_with(
+            chat_id=-100,
+            message_ids=[501, 502],
+        )
+
     async def test_clean_join_gets_restricted_and_deep_link_prompt(self) -> None:
         event = _join_event(user_id=910)
         await self._run_join(event, _settings())
@@ -2251,13 +2301,23 @@ class JoinTriggersVerificationTests(_DbTestCase):
         async with self.session_factory() as session:
             self.assertIsNotNone(await get_join_verification(session, -100, 913))
 
-    async def test_violating_join_is_banned_without_verification(self) -> None:
+    async def test_violating_join_is_muted_before_screening_then_banned(self) -> None:
         from bot.handlers import membership
 
         event = _join_event(user_id=914)
         fake_moderation = SimpleNamespace(
             check_rules=AsyncMock(return_value=(True, "昵称含广告", None))
         )
+
+        # The mute must land before the screening LLM sees the profile: the
+        # screening window previously left the member free to post.
+        async def restrict_chat_member(*_args, **_kwargs):
+            permissions = _kwargs.get("permissions")
+            if permissions is not None and not permissions.can_send_messages:
+                fake_moderation.check_rules.assert_not_awaited()
+            return True
+
+        event.bot.restrict_chat_member = AsyncMock(side_effect=restrict_chat_member)
         async with self.session_factory() as session:
             with (
                 patch("bot.handlers.membership.ModerationService", return_value=fake_moderation),
@@ -2271,7 +2331,10 @@ class JoinTriggersVerificationTests(_DbTestCase):
                 914,
                 revoke_messages=True,
             )
-            event.bot.restrict_chat_member.assert_not_awaited()
+            first_restrict = event.bot.restrict_chat_member.await_args_list[0]
+            self.assertFalse(first_restrict.kwargs["permissions"].can_send_messages)
+            # The absorbed challenge's live prompt must not survive the ban.
+            event.bot.delete_message.assert_awaited_once_with(-100, 777)
             self.assertIsNone(await get_join_verification(session, -100, 914))
 
     async def test_banned_rejoin_is_banned_without_verification(self) -> None:

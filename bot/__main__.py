@@ -18,6 +18,7 @@ from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
+from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
 from bot.services import memory_holder
 from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
@@ -344,6 +345,9 @@ async def main() -> None:
 
     dp.update.outer_middleware(DurableInboxUpdateDedupMiddleware(session_factory))
     dp.message.outer_middleware(GlobalBanEnforcementMiddleware(session_factory))
+    # A member racing the join-verification mute must not get messages through
+    # (or consume profile-screening LLM capacity) before the challenge exists.
+    dp.message.outer_middleware(PendingVerificationGateMiddleware(session_factory))
     # Outer so it also covers matched commands (/help), videos, and empty-text
     # media that the group handler bypasses.
     dp.message.outer_middleware(ProfileScreenEnforcementMiddleware(session_factory))

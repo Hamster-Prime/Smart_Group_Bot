@@ -83,6 +83,7 @@ from bot.services.join_verification import (
     verification_service_ready,
     verification_timeout_seconds_for_kind,
 )
+from bot.services.recent_messages import delete_messages_since_join
 from bot.utils.timezone import (
     now_shanghai_naive,
     to_shanghai_datetime,
@@ -2050,6 +2051,13 @@ class RaidGuardService:
                             )
                             await abort_one(prepared, restore_permissions=True)
                             return suspect, prepared, False, True
+                        # A raid joiner may have raced messages in before this
+                        # mute; none of them passed any check.
+                        await delete_messages_since_join(
+                            self.bot,
+                            group_id,
+                            suspect.user_id,
+                        )
                         async with self.session_factory() as lease_session:
                             renewed = await renew_prepared_join_verification(
                                 lease_session,

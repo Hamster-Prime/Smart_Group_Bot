@@ -104,6 +104,11 @@ from bot.services.raid_guard import (
     remove_raid_challenged_users,
 )
 from bot.services.privileged_tasks import submit_privileged_task
+from bot.services.recent_messages import (
+    clear_member_join_marker,
+    delete_messages_since_join,
+    mark_member_join,
+)
 from bot.services.request_priority import privileged_request_scope
 from bot.services.update_completion import request_current_update_retry
 from bot.services.update_delivery import unmark_privileged_operator
@@ -344,6 +349,9 @@ async def _ban_and_notify(
                 enforcement.operator_action_required,
             )
         return enforcement
+    # revoke_messages only hides history from the banned account itself; the
+    # spam they raced in before the ban stays visible to everyone else.
+    await delete_messages_since_join(event.bot, int(event.chat.id), int(user_id))
     shown = html.escape(display_name or str(user_id))
     reason_text = html.escape(reason or "入群资料命中群规")
     try:
@@ -496,6 +504,9 @@ async def _start_join_verification(
                 return
             if not await restrict_new_member(event.bot, group_id, user_id):
                 return
+            # Anything posted between the join and this mute skipped
+            # verification entirely; retract it before the fresh prompt.
+            await delete_messages_since_join(event.bot, group_id, user_id)
             current = await get_join_verification(session, group_id, user_id)
             current_owned = bool(
                 current is not None
@@ -620,6 +631,9 @@ async def _start_join_verification(
                 prepared=prepared,
             )
             return
+        # Anything posted between the join and this mute skipped verification
+        # entirely; retract it before the challenge prompt appears.
+        await delete_messages_since_join(event.bot, group_id, user_id)
 
         renewed = await renew_prepared_join_verification(session, prepared=prepared)
         if renewed is None:
@@ -922,6 +936,11 @@ async def _enforce_pending_moderation_challenge(
     restricted = await restrict_new_member(event.bot, record.group_id, record.user_id)
     if not restricted:
         return
+    await delete_messages_since_join(
+        event.bot,
+        int(record.group_id),
+        int(record.user_id),
+    )
     current = await get_join_verification(session, record.group_id, record.user_id)
     if current is None:
         recovery = await prepare_join_verification(
@@ -1971,6 +1990,10 @@ async def _process_member_join(
     user = event.new_chat_member.user
     if user.is_bot:
         return
+    # Anchor the residue-sweep window before any queued/network wait so a
+    # later verification mute or screening ban can retract exactly the
+    # messages this membership raced in.
+    mark_member_join(int(event.chat.id), int(user.id))
     if require_current_membership and not await _join_member_still_present(
         event,
         int(user.id),
@@ -2179,6 +2202,12 @@ async def _process_member_join(
             return True
         return False
 
+    # Mute first, screen second: the challenge and its full restriction must
+    # exist before the slow bio/LLM screening below, otherwise the member
+    # keeps the chat's default permissions for the whole screening window and
+    # can post freely before any verdict lands.
+    verification_started = await _maybe_start_verification()
+
     async def _admit_member() -> None:
         if require_current_membership and not await _join_member_still_present(
             event,
@@ -2188,7 +2217,7 @@ async def _process_member_join(
             return
         # Verification (when enabled) owns the admission moment: the welcome
         # is sent after the challenge passes instead of on the raw join.
-        if await _maybe_start_verification():
+        if verification_started or await _maybe_start_verification():
             return
         await send_group_welcome(
             event.bot,
@@ -2374,6 +2403,15 @@ async def _process_member_join(
         if enforcement.retryable:
             raise RuntimeError("profile join ban enforcement requires durable retry")
         return
+    # Verification now starts before screening, so the absorbed record may
+    # still have a live challenge prompt in the group. The member is banned;
+    # retire that keyboard.
+    if int(recovery.prompt_message_id or 0) > 0:
+        await delete_verification_prompt(
+            event.bot,
+            group_id,
+            int(recovery.prompt_message_id),
+        )
     completed = await complete_leased_join_verification(
         session,
         verification_id=int(recovery.verification_id),
@@ -2517,6 +2555,9 @@ async def on_member_join(
     if user is None or bool(getattr(user, "is_bot", False)):
         return
     _invalidate_admin_cache(event)
+    # The queued security job may start seconds from now; the sweep window
+    # must open at update receipt or the raced-in messages predate it.
+    mark_member_join(int(event.chat.id), int(user.id))
     await session.commit()
 
     pair = (int(event.chat.id), int(user.id))
@@ -2610,6 +2651,9 @@ async def on_member_leave(
     user = getattr(getattr(event, "new_chat_member", None), "user", None)
     if user is None:
         return
+    # A rejoin must open a fresh sweep window; messages sent while this
+    # membership was legitimately verified are not residue.
+    clear_member_join_marker(int(event.chat.id), int(user.id))
     try:
         await mark_group_member_left(session, event.chat.id, user.id)
     except Exception:
