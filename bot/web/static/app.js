@@ -150,6 +150,8 @@
     groupResources: new Map(),
     groupTelegramAdmins: new Map(),
     groupTemplateButtonDrafts: new Map(),
+    groupCardOpen: new Map(),
+    groupSectionOpen: new Map(),
     resourceFormDrafts: new Map(),
     resourceFormBaselines: new Map(),
     permissionFields: PERMISSION_FIELD_FALLBACK,
@@ -261,6 +263,11 @@
 
   function anyResourceFormDirty() {
     return state.resourceFormDrafts.size > 0;
+  }
+
+  function groupResourceDraftDirty(groupId) {
+    const target = String(groupId);
+    return [...state.resourceFormDrafts.keys()].some(key => String(key).split(":", 2)[1] === target);
   }
 
   function restartChanges() {
@@ -1203,153 +1210,312 @@
       </div>`;
   }
 
+  function groupCardIsOpen(group) {
+    const key = String(group.id);
+    return state.groupCardOpen.has(key) ? state.groupCardOpen.get(key) : state.groups.length === 1;
+  }
+
+  function groupSectionStateKey(groupId, sectionKey) {
+    return `${String(groupId)}:${String(sectionKey)}`;
+  }
+
+  function groupSectionIsOpen(group, sectionKey, defaultOpen = false) {
+    const key = groupSectionStateKey(group.id, sectionKey);
+    return state.groupSectionOpen.has(key) ? state.groupSectionOpen.get(key) : defaultOpen;
+  }
+
+  function groupSectionDirty(group, settingKeys = []) {
+    const baseline = state.groupBaselines.get(String(group.id)) || {};
+    if (settingKeys.includes("welcome_buttons") && state.groupTemplateButtonDrafts.get(String(group.id))?.error) {
+      return true;
+    }
+    return settingKeys.some(key => !sameValue(group.settings[key], baseline[key]));
+  }
+
+  function updateRenderedGroupSectionDirty(section, dirty, label = "已修改") {
+    if (!section) return;
+    section.classList.toggle("dirty", dirty);
+    const meta = section.querySelector(".group-section-meta");
+    let badge = meta?.querySelector("[data-group-section-dirty]");
+    if (dirty && !badge && meta) {
+      badge = document.createElement("span");
+      badge.className = "badge warning";
+      badge.dataset.groupSectionDirty = "";
+      const chevron = meta.querySelector(".group-section-chevron");
+      if (chevron) chevron.before(badge);
+      else meta.append(badge);
+    }
+    if (badge) badge.textContent = label;
+    if (!dirty && badge) badge.remove();
+  }
+
+  function renderGroupSettingsSection(group, {
+    key,
+    title,
+    description,
+    iconName,
+    itemLabel,
+    settingKeys = [],
+    content: sectionContent,
+    defaultOpen = false,
+    additionalDirty = false,
+    dirtyLabel = "已修改",
+  }) {
+    const sectionId = `group-${group.id}-section-${key}`;
+    const dirty = additionalDirty || groupSectionDirty(group, settingKeys);
+    return `
+      <details class="group-settings-section${dirty ? " dirty" : ""}" data-group-settings-section data-group-id="${attr(group.id)}" data-group-section="${attr(key)}" data-group-setting-keys="${attr(settingKeys.join(","))}"${groupSectionIsOpen(group, key, defaultOpen) ? " open" : ""}>
+        <summary id="${attr(sectionId)}-summary" aria-controls="${attr(sectionId)}-body">
+          <span class="group-section-icon">${icon(iconName)}</span>
+          <span class="group-section-copy">
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(description)}</small>
+          </span>
+          <span class="group-section-meta">
+            <span class="group-section-count">${escapeHtml(itemLabel)}</span>
+            ${dirty ? `<span class="badge warning" data-group-section-dirty>${escapeHtml(dirtyLabel)}</span>` : ""}
+            ${icon("chevron-down", "group-section-chevron")}
+          </span>
+        </summary>
+        <div id="${attr(sectionId)}-body" class="group-settings-section-body" role="region" aria-labelledby="${attr(sectionId)}-summary">
+          ${sectionContent}
+        </div>
+      </details>`;
+  }
+
   function renderGroupCard(group) {
     const dirty = groupDirty(group);
     const saving = state.groupSaving.has(String(group.id));
     const searchText = `${group.title || ""} ${group.id}`.toLowerCase();
+    const cardOpen = groupCardIsOpen(group);
+    const cardId = `group-${group.id}-settings`;
     return `
       <article class="item-card group-card" data-group-card data-search="${attr(searchText)}">
         <div class="item-card-header">
-          <div class="item-card-title">
-            ${icon("users")}
-            <div class="group-title-block"><strong>${escapeHtml(group.title || "未命名群组")}</strong><small>${escapeHtml(group.id)}</small></div>
-          </div>
+          <button class="group-card-toggle" id="${attr(cardId)}-toggle" type="button" data-action="toggle-group-card" data-group-id="${attr(group.id)}" aria-expanded="${cardOpen}" aria-controls="${attr(cardId)}-body">
+            <span class="item-card-title">
+              ${icon("users")}
+              <span class="group-title-block"><strong>${escapeHtml(group.title || "未命名群组")}</strong><small>${escapeHtml(group.id)}</small></span>
+            </span>
+            ${icon("chevron-down", "group-card-chevron")}
+          </button>
           <div class="item-actions">
-            ${dirty ? `<span class="group-save-state">未保存</span>` : ""}
+            ${dirty ? `<span class="group-save-state" role="status">未保存</span>` : ""}
             <button class="secondary-button" type="button" data-action="save-group" data-group-id="${attr(group.id)}"${dirty && !saving ? "" : " disabled"}>
               ${saving ? `<span class="spinner spinner-small"></span>` : icon("save")}
               <span>${saving ? "保存中" : "保存"}</span>
             </button>
           </div>
         </div>
-        <div class="item-card-body">
-          <div class="group-settings-grid">
-            ${groupToggle(group, "av_enabled", "允许 AV 检索", "", saving)}
-            ${groupToggle(group, "mute_all_replies", "暂停全部回复", "", saving)}
-            ${groupToggle(group, "at_reply_mode", "仅 @ 时回复", "", saving)}
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-join-verification-enabled">入群验证</label>
-              <select id="group-${attr(group.id)}-join-verification-enabled" data-group-id="${attr(group.id)}" data-group-key="join_verification_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.join_verification_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.join_verification_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.join_verification_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-              <span class="field-hint">验证服务在下方单独选择</span>
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-join-verification-provider">入群验证服务</label>
-              <select id="group-${attr(group.id)}-join-verification-provider" data-group-id="${attr(group.id)}" data-group-key="join_verification_provider" data-kind="nullable-string"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.join_verification_provider == null ? " selected" : ""}>继承全局默认</option>
-                <option value="turnstile"${group.settings.join_verification_provider === "turnstile" ? " selected" : ""}>Cloudflare Turnstile</option>
-                <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
-                <option value="turnstile_hcaptcha"${group.settings.join_verification_provider === "turnstile_hcaptcha" ? " selected" : ""}>Turnstile + hCaptcha（双重验证）</option>
-              </select>
-            </div>
-            <div class="field welcome-message">
-              <label class="field-label" for="group-${attr(group.id)}-welcome">入群欢迎语</label>
-              <textarea id="group-${attr(group.id)}-welcome" data-group-id="${attr(group.id)}" data-group-key="welcome_message" data-kind="string" maxlength="4000" placeholder="留空不发送欢迎语；支持换行和 Markdown；{name} 为名称，{mention} 为可点击提及"${saving ? " disabled" : ""}>${escapeHtml(group.settings.welcome_message)}</textarea>
-              <span class="field-hint">开启入群验证时在验证通过后发送；支持 **粗体**、*斜体*、[文字](链接) 等 Markdown</span>
-            </div>
-            <div class="field welcome-buttons">
-              <label class="field-label" for="group-${attr(group.id)}-welcome-buttons">欢迎语内联按钮</label>
-              <textarea id="group-${attr(group.id)}-welcome-buttons" data-template-buttons data-group-id="${attr(group.id)}" data-group-key="welcome_buttons" maxlength="30000" placeholder="每行：按钮名 | 操作 | 内容 | 行号&#10;官网 | url | https://example.com | 1&#10;复制群规 | copy | 群规文本 | 1&#10;管理员删除 | dismiss | | 2"${saving ? " disabled" : ""}>${escapeHtml(groupTemplateButtonsText(group))}</textarea>
-              <span class="field-hint">操作：url 跳转、copy 复制、share 分享、dismiss 管理员删除；相同行号横向排列。内容中的 |、换行和反斜杠分别写成 \\|、\\n、\\\\</span>
-            </div>
-            ${renderGroupPermissions(group, saving)}
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-patrol-enabled">自动巡检</label>
-              <select id="group-${attr(group.id)}-patrol-enabled" data-group-id="${attr(group.id)}" data-group-key="patrol_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.patrol_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.patrol_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.patrol_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-              <button class="secondary-button patrol-trigger" type="button" data-action="trigger-patrol" data-group-id="${attr(group.id)}"${saving ? " disabled" : ""}>
-                ${icon("radar")}<span>立即巡检</span>
-              </button>
-              <span class="field-hint">巡检时间等参数在「审核验证」页配置</span>
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-raid-guard-enabled">爆破防护</label>
-              <select id="group-${attr(group.id)}-raid-guard-enabled" data-group-id="${attr(group.id)}" data-group-key="raid_guard_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.raid_guard_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.raid_guard_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.raid_guard_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-              <span class="field-hint">锁群阈值与超时可在下方逐群覆盖</span>
-            </div>
-            ${RAID_GUARD_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">爆破防护 · ${escapeHtml(label)}</label>
-              <input id="group-${attr(group.id)}-${key.replaceAll("_", "-")}" type="number" min="${min}" max="${max}" step="1" data-group-id="${attr(group.id)}" data-group-key="${key}" data-kind="nullable-int" value="${attr(group.settings[key] == null ? "" : group.settings[key])}" placeholder="继承全局默认"${saving ? " disabled" : ""}>
-            </div>`).join("")}
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-call-admin-enabled">呼叫管理员（@admin）</label>
-              <select id="group-${attr(group.id)}-call-admin-enabled" data-group-id="${attr(group.id)}" data-group-key="call_admin_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.call_admin_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.call_admin_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.call_admin_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-              <span class="field-hint">群成员发送 @admin 时 @ 下方勾选的管理员；可回复消息举报</span>
-            </div>
-            <div class="field call-admin-targets">
-              <label class="field-label">呼叫目标管理员</label>
-              ${renderCallAdminTargets(group, saving)}
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-vote-ban-enabled">民主投票封禁</label>
-              <select id="group-${attr(group.id)}-vote-ban-enabled" data-group-id="${attr(group.id)}" data-group-key="vote_ban_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.vote_ban_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.vote_ban_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.vote_ban_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-              <span class="field-hint">命令和 Bot 技能共享下方单用户额度；票数达标即封禁被回复用户</span>
-            </div>
-            ${VOTE_BAN_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">民主投票 · ${escapeHtml(label)}</label>
-              <input id="group-${attr(group.id)}-${key.replaceAll("_", "-")}" type="number" min="${min}" max="${max}" step="1" data-group-id="${attr(group.id)}" data-group-key="${key}" data-kind="nullable-int" value="${attr(group.settings[key] == null ? "" : group.settings[key])}" placeholder="继承全局默认"${saving ? " disabled" : ""}>
-            </div>`).join("")}
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-proactive">主动发言</label>
-              <select id="group-${attr(group.id)}-proactive" data-group-id="${attr(group.id)}" data-group-key="proactive_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
-                <option value=""${group.settings.proactive_enabled == null ? " selected" : ""}>继承全局默认</option>
-                <option value="true"${group.settings.proactive_enabled === true ? " selected" : ""}>开启</option>
-                <option value="false"${group.settings.proactive_enabled === false ? " selected" : ""}>关闭</option>
-              </select>
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-tts">语音模式</label>
-              <select id="group-${attr(group.id)}-tts" data-group-id="${attr(group.id)}" data-group-key="tts_mode" data-kind="string"${saving ? " disabled" : ""}>
-                <option value="off"${group.settings.tts_mode === "off" ? " selected" : ""}>关闭</option>
-                <option value="on"${group.settings.tts_mode === "on" ? " selected" : ""}>允许按需语音</option>
-                <option value="always"${group.settings.tts_mode === "always" ? " selected" : ""}>始终发送语音</option>
-              </select>
-            </div>
-            <div class="field proactive-brief">
-              <label class="field-label" for="group-${attr(group.id)}-brief">主动任务简述</label>
-              <textarea id="group-${attr(group.id)}-brief" data-group-id="${attr(group.id)}" data-group-key="proactive_task_brief" data-kind="string" maxlength="240" placeholder="留空使用默认主动话题策略"${saving ? " disabled" : ""}>${escapeHtml(group.settings.proactive_task_brief)}</textarea>
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-mimic-id">风格目标用户 ID</label>
-              <input id="group-${attr(group.id)}-mimic-id" type="number" min="0" step="1" data-group-id="${attr(group.id)}" data-group-key="mimic_target_user_id" data-kind="nonnegative-int" value="${attr(group.settings.mimic_target_user_id)}"${saving ? " disabled" : ""}>
-              <span class="field-hint">更换或清除 ID 会重置已有名称、画像、计数和样本</span>
-            </div>
-            <div class="field">
-              <label class="field-label" for="group-${attr(group.id)}-mimic-name">风格目标名称</label>
-              <input id="group-${attr(group.id)}-mimic-name" type="text" maxlength="80" data-group-id="${attr(group.id)}" data-group-key="mimic_target_user_name" data-kind="string" value="${attr(group.settings.mimic_target_user_name)}"${saving ? " disabled" : ""}>
-            </div>
-            <div class="field mimic-profile">
-              <label class="field-label" for="group-${attr(group.id)}-mimic-profile">说话风格画像</label>
-              <textarea id="group-${attr(group.id)}-mimic-profile" data-group-id="${attr(group.id)}" data-group-key="mimic_profile_text" data-kind="string" maxlength="1200" placeholder="可手动编辑，也会由采样自动更新"${saving ? " disabled" : ""}>${escapeHtml(group.settings.mimic_profile_text)}</textarea>
-              <span class="field-hint">已采样 ${escapeHtml(group.settings.mimic_sample_count)} 条，最近蒸馏点 ${escapeHtml(group.settings.mimic_distilled_at_count)} 条</span>
+        <div class="item-card-body" id="${attr(cardId)}-body" role="region" aria-labelledby="${attr(cardId)}-toggle" data-group-card-body${cardOpen ? "" : " hidden"}>
+          <div class="group-settings-toolbar">
+            <div><strong>设置分类</strong><small>按需展开，修改状态会在分类标题中提示</small></div>
+            <div class="group-settings-toolbar-actions">
+              <button class="text-button" type="button" data-action="set-group-sections" data-group-id="${attr(group.id)}" data-open="true">全部展开</button>
+              <button class="text-button" type="button" data-action="set-group-sections" data-group-id="${attr(group.id)}" data-open="false">全部收起</button>
             </div>
           </div>
-          <div class="subsection group-resource-panel" data-group-resource-panel="${attr(group.id)}">
-            <div class="subsection-head">
-              <strong>群规、永久记忆与成员策略</strong>
-              <button class="secondary-button" type="button" data-action="load-group-resources" data-group-id="${attr(group.id)}">${icon("list-tree")}管理</button>
-            </div>
-            ${renderGroupResources(group)}
+          <div class="group-settings-sections">
+            ${renderGroupSettingsSection(group, {
+              key: "reply-media",
+              title: "回复与媒体",
+              description: "回复触发、内容检索与语音输出",
+              iconName: "message-circle",
+              itemLabel: "4 项",
+              settingKeys: ["mute_all_replies", "at_reply_mode", "av_enabled", "tts_mode"],
+              defaultOpen: true,
+              content: `
+                <div class="group-settings-grid">
+                  ${groupToggle(group, "mute_all_replies", "暂停全部回复", "临时停止本群中的所有 Bot 回复", saving)}
+                  ${groupToggle(group, "at_reply_mode", "仅 @ 时回复", "只在明确提及 Bot 时响应", saving)}
+                  ${groupToggle(group, "av_enabled", "允许 AV 检索", "允许本群使用 AV 内容检索能力", saving)}
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-tts">语音模式</label>
+                    <select id="group-${attr(group.id)}-tts" data-group-id="${attr(group.id)}" data-group-key="tts_mode" data-kind="string"${saving ? " disabled" : ""}>
+                      <option value="off"${group.settings.tts_mode === "off" ? " selected" : ""}>关闭</option>
+                      <option value="on"${group.settings.tts_mode === "on" ? " selected" : ""}>允许按需语音</option>
+                      <option value="always"${group.settings.tts_mode === "always" ? " selected" : ""}>始终发送语音</option>
+                    </select>
+                  </div>
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "onboarding",
+              title: "入群与欢迎",
+              description: "新成员验证、欢迎语与内联按钮",
+              iconName: "users",
+              itemLabel: "4 项",
+              settingKeys: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
+              content: `
+                <div class="group-settings-grid">
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-join-verification-enabled">入群验证</label>
+                    <select id="group-${attr(group.id)}-join-verification-enabled" data-group-id="${attr(group.id)}" data-group-key="join_verification_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.join_verification_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.join_verification_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.join_verification_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">验证服务可在右侧单独选择</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-join-verification-provider">入群验证服务</label>
+                    <select id="group-${attr(group.id)}-join-verification-provider" data-group-id="${attr(group.id)}" data-group-key="join_verification_provider" data-kind="nullable-string"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.join_verification_provider == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="turnstile"${group.settings.join_verification_provider === "turnstile" ? " selected" : ""}>Cloudflare Turnstile</option>
+                      <option value="hcaptcha"${group.settings.join_verification_provider === "hcaptcha" ? " selected" : ""}>hCaptcha</option>
+                      <option value="turnstile_hcaptcha"${group.settings.join_verification_provider === "turnstile_hcaptcha" ? " selected" : ""}>Turnstile + hCaptcha（双重验证）</option>
+                    </select>
+                  </div>
+                  <div class="field welcome-message">
+                    <label class="field-label" for="group-${attr(group.id)}-welcome">入群欢迎语</label>
+                    <textarea id="group-${attr(group.id)}-welcome" data-group-id="${attr(group.id)}" data-group-key="welcome_message" data-kind="string" maxlength="4000" placeholder="留空不发送欢迎语；支持换行和 Markdown；{name} 为名称，{mention} 为可点击提及"${saving ? " disabled" : ""}>${escapeHtml(group.settings.welcome_message)}</textarea>
+                    <span class="field-hint">开启入群验证时在验证通过后发送；支持 **粗体**、*斜体*、[文字](链接) 等 Markdown</span>
+                  </div>
+                  <div class="field welcome-buttons">
+                    <label class="field-label" for="group-${attr(group.id)}-welcome-buttons">欢迎语内联按钮</label>
+                    <textarea id="group-${attr(group.id)}-welcome-buttons" data-template-buttons data-group-id="${attr(group.id)}" data-group-key="welcome_buttons" maxlength="30000" placeholder="每行：按钮名 | 操作 | 内容 | 行号&#10;官网 | url | https://example.com | 1&#10;复制群规 | copy | 群规文本 | 1&#10;管理员删除 | dismiss | | 2"${saving ? " disabled" : ""}>${escapeHtml(groupTemplateButtonsText(group))}</textarea>
+                    <span class="field-hint">操作：url 跳转、copy 复制、share 分享、dismiss 管理员删除；相同行号横向排列。内容中的 |、换行和反斜杠分别写成 \\|、\\n、\\\\</span>
+                  </div>
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "permissions",
+              title: "成员权限与时段",
+              description: "默认群权限与按时段覆盖的夜间模式",
+              iconName: "key-round",
+              itemLabel: "权限编辑器",
+              settingKeys: ["default_permissions"],
+              content: `<div class="group-settings-grid">${renderGroupPermissions(group, saving)}</div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "safety",
+              title: "巡检与爆破防护",
+              description: "成员巡检、入群爆破检测与锁群参数",
+              iconName: "shield-check",
+              itemLabel: "7 项",
+              settingKeys: ["patrol_enabled", "raid_guard_enabled", ...RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => key)],
+              content: `
+                <div class="group-settings-grid">
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-patrol-enabled">自动巡检</label>
+                    <select id="group-${attr(group.id)}-patrol-enabled" data-group-id="${attr(group.id)}" data-group-key="patrol_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.patrol_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.patrol_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.patrol_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <button class="secondary-button patrol-trigger" type="button" data-action="trigger-patrol" data-group-id="${attr(group.id)}"${saving ? " disabled" : ""}>
+                      ${icon("radar")}<span>立即巡检</span>
+                    </button>
+                    <span class="field-hint">巡检时间等参数在「审核验证」页配置</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-raid-guard-enabled">爆破防护</label>
+                    <select id="group-${attr(group.id)}-raid-guard-enabled" data-group-id="${attr(group.id)}" data-group-key="raid_guard_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.raid_guard_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.raid_guard_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.raid_guard_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">锁群阈值与超时可在下方逐群覆盖</span>
+                  </div>
+                  ${RAID_GUARD_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">${escapeHtml(label)}</label>
+                    <input id="group-${attr(group.id)}-${key.replaceAll("_", "-")}" type="number" min="${min}" max="${max}" step="1" data-group-id="${attr(group.id)}" data-group-key="${key}" data-kind="nullable-int" value="${attr(group.settings[key] == null ? "" : group.settings[key])}" placeholder="继承全局默认"${saving ? " disabled" : ""}>
+                  </div>`).join("")}
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "management",
+              title: "管理员与投票",
+              description: "呼叫管理员与民主投票封禁策略",
+              iconName: "users",
+              itemLabel: "7 项",
+              settingKeys: ["call_admin_enabled", "call_admin_targets", "vote_ban_enabled", ...VOTE_BAN_GROUP_INT_FIELDS.map(({ key }) => key)],
+              content: `
+                <div class="group-settings-grid">
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-call-admin-enabled">呼叫管理员（@admin）</label>
+                    <select id="group-${attr(group.id)}-call-admin-enabled" data-group-id="${attr(group.id)}" data-group-key="call_admin_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.call_admin_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.call_admin_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.call_admin_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">群成员发送 @admin 时 @ 下方勾选的管理员；可回复消息举报</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-vote-ban-enabled">民主投票封禁</label>
+                    <select id="group-${attr(group.id)}-vote-ban-enabled" data-group-id="${attr(group.id)}" data-group-key="vote_ban_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.vote_ban_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.vote_ban_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.vote_ban_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">命令和 Bot 技能共享下方单用户额度；票数达标即封禁被回复用户</span>
+                  </div>
+                  <div class="field call-admin-targets">
+                    <label class="field-label">呼叫目标管理员</label>
+                    ${renderCallAdminTargets(group, saving)}
+                  </div>
+                  ${VOTE_BAN_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">${escapeHtml(label)}</label>
+                    <input id="group-${attr(group.id)}-${key.replaceAll("_", "-")}" type="number" min="${min}" max="${max}" step="1" data-group-id="${attr(group.id)}" data-group-key="${key}" data-kind="nullable-int" value="${attr(group.settings[key] == null ? "" : group.settings[key])}" placeholder="继承全局默认"${saving ? " disabled" : ""}>
+                  </div>`).join("")}
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "proactive-style",
+              title: "主动发言与风格",
+              description: "主动话题任务与群内说话风格学习",
+              iconName: "message-circle",
+              itemLabel: "5 项",
+              settingKeys: ["proactive_enabled", "proactive_task_brief", "mimic_target_user_id", "mimic_target_user_name", "mimic_profile_text"],
+              content: `
+                <div class="group-settings-grid">
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-proactive">主动发言</label>
+                    <select id="group-${attr(group.id)}-proactive" data-group-id="${attr(group.id)}" data-group-key="proactive_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.proactive_enabled == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.proactive_enabled === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.proactive_enabled === false ? " selected" : ""}>关闭</option>
+                    </select>
+                  </div>
+                  <div class="field proactive-brief">
+                    <label class="field-label" for="group-${attr(group.id)}-brief">主动任务简述</label>
+                    <textarea id="group-${attr(group.id)}-brief" data-group-id="${attr(group.id)}" data-group-key="proactive_task_brief" data-kind="string" maxlength="240" placeholder="留空使用默认主动话题策略"${saving ? " disabled" : ""}>${escapeHtml(group.settings.proactive_task_brief)}</textarea>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-mimic-id">风格目标用户 ID</label>
+                    <input id="group-${attr(group.id)}-mimic-id" type="number" min="0" step="1" data-group-id="${attr(group.id)}" data-group-key="mimic_target_user_id" data-kind="nonnegative-int" value="${attr(group.settings.mimic_target_user_id)}"${saving ? " disabled" : ""}>
+                    <span class="field-hint">更换或清除 ID 会重置已有名称、画像、计数和样本</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-mimic-name">风格目标名称</label>
+                    <input id="group-${attr(group.id)}-mimic-name" type="text" maxlength="80" data-group-id="${attr(group.id)}" data-group-key="mimic_target_user_name" data-kind="string" value="${attr(group.settings.mimic_target_user_name)}"${saving ? " disabled" : ""}>
+                  </div>
+                  <div class="field mimic-profile">
+                    <label class="field-label" for="group-${attr(group.id)}-mimic-profile">说话风格画像</label>
+                    <textarea id="group-${attr(group.id)}-mimic-profile" data-group-id="${attr(group.id)}" data-group-key="mimic_profile_text" data-kind="string" maxlength="1200" placeholder="可手动编辑，也会由采样自动更新"${saving ? " disabled" : ""}>${escapeHtml(group.settings.mimic_profile_text)}</textarea>
+                    <span class="field-hint">已采样 ${escapeHtml(group.settings.mimic_sample_count)} 条，最近蒸馏点 ${escapeHtml(group.settings.mimic_distilled_at_count)} 条</span>
+                  </div>
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "resources",
+              title: "群规、记忆与自动化",
+              description: "关键词回复、定时消息、群规、记忆与成员名单",
+              iconName: "list-tree",
+              itemLabel: "8 类数据",
+              additionalDirty: groupResourceDraftDirty(group.id),
+              dirtyLabel: "有草稿",
+              content: `
+                <div class="group-resource-panel" data-group-resource-panel="${attr(group.id)}">
+                  <div class="subsection-head">
+                    <span class="field-hint">按需加载群管理数据，不影响上方群设置的独立保存。</span>
+                    <button class="secondary-button" type="button" data-action="load-group-resources" data-group-id="${attr(group.id)}">${icon("list-tree")}管理</button>
+                  </div>
+                  ${renderGroupResources(group)}
+                </div>`,
+            })}
           </div>
         </div>
       </article>`;
@@ -1645,6 +1811,11 @@
     if (baseline && sameValue(current, baseline)) state.resourceFormDrafts.delete(key);
     else if (baseline) state.resourceFormDrafts.set(key, current);
     else state.resourceFormBaselines.set(key, current);
+    updateRenderedGroupSectionDirty(
+      form.closest('[data-group-section="resources"]'),
+      groupResourceDraftDirty(form.dataset.groupId),
+      "有草稿",
+    );
   }
 
   function captureResourceFormDrafts() {
@@ -1667,6 +1838,11 @@
     if (!key) return;
     state.resourceFormBaselines.set(key, resourceFormSnapshot(form));
     state.resourceFormDrafts.delete(key);
+    updateRenderedGroupSectionDirty(
+      form.closest('[data-group-section="resources"]'),
+      groupResourceDraftDirty(form.dataset.groupId),
+      "有草稿",
+    );
   }
 
   function clearResourceFormDrafts() {
@@ -1681,6 +1857,68 @@
     });
   }
 
+  function setGroupCardDisclosure(card, open) {
+    if (!card) return;
+    const toggle = card.querySelector('[data-action="toggle-group-card"]');
+    const body = card.querySelector("[data-group-card-body]");
+    const groupId = String(toggle?.dataset.groupId || "");
+    if (!toggle || !body || !groupId) return;
+    state.groupCardOpen.set(groupId, open);
+    toggle.setAttribute("aria-expanded", String(open));
+    body.hidden = !open;
+  }
+
+  function setGroupSectionsDisclosure(card, open) {
+    if (!card) return;
+    card.querySelectorAll("[data-group-settings-section]").forEach(section => {
+      section.open = open;
+      state.groupSectionOpen.set(
+        groupSectionStateKey(section.dataset.groupId, section.dataset.groupSection),
+        open,
+      );
+    });
+  }
+
+  function revealGroupSection(groupId, sectionKey) {
+    const toggle = content.querySelector(
+      `[data-action="toggle-group-card"][data-group-id="${CSS.escape(String(groupId))}"]`,
+    );
+    const card = toggle?.closest("[data-group-card]");
+    setGroupCardDisclosure(card, true);
+    const section = [...(card?.querySelectorAll("[data-group-settings-section]") || [])]
+      .find(item => item.dataset.groupSection === String(sectionKey));
+    if (!section) return;
+    section.open = true;
+    state.groupSectionOpen.set(groupSectionStateKey(groupId, sectionKey), true);
+  }
+
+  function revealGroupControl(control) {
+    const card = control.closest("[data-group-card]");
+    setGroupCardDisclosure(card, true);
+    const section = control.closest("[data-group-settings-section]");
+    if (!section) return;
+    section.open = true;
+    state.groupSectionOpen.set(
+      groupSectionStateKey(section.dataset.groupId, section.dataset.groupSection),
+      true,
+    );
+  }
+
+  function captureGroupDisclosureStates() {
+    content.querySelectorAll('[data-action="toggle-group-card"]').forEach(toggle => {
+      state.groupCardOpen.set(
+        String(toggle.dataset.groupId),
+        toggle.getAttribute("aria-expanded") === "true",
+      );
+    });
+    content.querySelectorAll("[data-group-settings-section]").forEach(section => {
+      state.groupSectionOpen.set(
+        groupSectionStateKey(section.dataset.groupId, section.dataset.groupSection),
+        section.open,
+      );
+    });
+  }
+
   function applyGroupSearchFilter() {
     const query = state.groupSearch.trim().toLowerCase();
     content.querySelectorAll("[data-group-card]").forEach(card => {
@@ -1690,6 +1928,7 @@
 
   function renderContent({ resetScroll = false } = {}) {
     if (!state.config) return;
+    captureGroupDisclosureStates();
     captureResourceFormDrafts();
     const renderers = {
       overview: renderOverview,
@@ -1785,6 +2024,7 @@
   }
 
   async function loadAll({ keepTab = true } = {}) {
+    captureGroupDisclosureStates();
     captureResourceFormDrafts();
     state.loading = true;
     updateChrome();
@@ -2077,7 +2317,12 @@
       control => String(control.dataset.groupId) === String(groupId) && !control.checkValidity(),
     );
     if (invalid) {
-      invalid.reportValidity();
+      revealGroupControl(invalid);
+      window.requestAnimationFrame(() => {
+        invalid.focus({ preventScroll: true });
+        invalid.reportValidity();
+        invalid.scrollIntoView({ block: "center", behavior: "auto" });
+      });
       showToast("请修正群组设置中标记的字段", "error", 5000);
       return;
     }
@@ -2085,11 +2330,13 @@
     if (permissionConfig) {
       const emptyDays = permissionConfig.windows.find(window => !Array.isArray(window.days) || !window.days.length);
       if (emptyDays) {
+        revealGroupSection(group.id, "permissions");
         showToast(`权限时段「${emptyDays.name || emptyDays.id}」至少选择一个星期`, "error", 6000);
         return;
       }
       const emptyOverrides = permissionConfig.windows.find(window => !Object.keys(window.overrides || {}).length);
       if (emptyOverrides) {
+        revealGroupSection(group.id, "permissions");
         showToast(`权限时段「${emptyOverrides.name || emptyOverrides.id}」至少覆盖一项权限`, "error", 6000);
         return;
       }
@@ -2228,9 +2475,16 @@
       marker = document.createElement("span");
       marker.className = "group-save-state";
       marker.textContent = "未保存";
+      marker.setAttribute("role", "status");
       headerActions.prepend(marker);
     } else if (!dirty && marker) {
       marker.remove();
+    }
+    const section = target.closest("[data-group-settings-section]");
+    if (section) {
+      const settingKeys = String(section.dataset.groupSettingKeys || "").split(",").filter(Boolean);
+      const sectionDirty = groupSectionDirty(group, settingKeys);
+      updateRenderedGroupSectionDirty(section, sectionDirty);
     }
   }
 
@@ -2456,6 +2710,16 @@
     const action = button.dataset.action;
     if (action === "retry-load") {
       loadAll();
+      return;
+    }
+    if (action === "toggle-group-card") {
+      const card = button.closest("[data-group-card]");
+      setGroupCardDisclosure(card, button.getAttribute("aria-expanded") !== "true");
+      return;
+    }
+    if (action === "set-group-sections") {
+      const card = button.closest("[data-group-card]");
+      setGroupSectionsDisclosure(card, button.dataset.open === "true");
       return;
     }
     if (action === "list-page") {
