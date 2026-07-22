@@ -63,6 +63,7 @@ from bot.services.join_verification import (
     ban_member,
     chat_member_is_present,
     claim_join_verification,
+    close_private_challenge_message,
     complete_leased_join_verification,
     delete_verification_prompt,
     get_join_verification,
@@ -673,6 +674,9 @@ async def remove_raid_challenged_users(
                     "reason": str(record.reason or ""),
                     "display_name": str(record.display_name or ""),
                     "prompt_message_id": int(record.prompt_message_id or 0),
+                    "private_message_id": int(
+                        getattr(record, "private_message_id", 0) or 0
+                    ),
                     "verification_id": int(record.id),
                     "lease_until": lease_until,
                 },
@@ -756,6 +760,12 @@ async def remove_raid_challenged_users(
                         await completion_session.commit()
                     else:
                         await completion_session.rollback()
+                if completed:
+                    await close_private_challenge_message(
+                        bot,
+                        user_id,
+                        int(snapshot.get("private_message_id") or 0),
+                    )
                 return user_id, bool(completed)
 
             async def preserve_ban() -> bool:
@@ -828,6 +838,12 @@ async def remove_raid_challenged_users(
                     user_id,
                     current_policy_blocks_release,
                     restriction_required=current_restriction_required,
+                )
+            if completed:
+                await close_private_challenge_message(
+                    bot,
+                    user_id,
+                    int(snapshot.get("private_message_id") or 0),
                 )
             return user_id, bool(completed)
 

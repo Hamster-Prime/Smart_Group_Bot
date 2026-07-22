@@ -580,6 +580,12 @@ class JoinVerification(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     display_name: Mapped[str] = mapped_column(String(255), default="")
     prompt_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Latest private-chat challenge message (chat id == user_id). Terminal
+    # transitions rewrite/delete it so a stale WebApp button cannot keep
+    # reopening the challenge page after the record is consumed.
+    private_message_id: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0"
+    )
     deadline_at: Mapped[datetime] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

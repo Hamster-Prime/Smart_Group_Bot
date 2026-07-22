@@ -682,8 +682,54 @@ class VerifyWebTests(unittest.IsolatedAsyncioTestCase):
         ) as verify_mock:
             resp = await self._submit(105)
         self.assertEqual(resp.status, 404)
-        # No pending record: reject before spending a siteverify call.
+        # No pending record: reject before spending a siteverify call. The
+        # terminal marker lets the page retire its widget instead of letting
+        # the member keep solving challenges into a dead record.
+        body = await resp.json()
+        self.assertTrue(body.get("terminal"))
         verify_mock.assert_not_awaited()
+
+    async def test_status_precheck_reports_pending_and_terminal(self) -> None:
+        verification_id = await self._seed(user_id=150)
+        resp = await self.client.post(
+            "/verify/status",
+            json={
+                "verification_id": verification_id,
+                "init_data": _signed_init_data(150),
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertTrue((await resp.json())["pending"])
+
+        async with self.session_factory() as session:
+            await delete_join_verification(session, -100, 150)
+            await session.commit()
+        resp = await self.client.post(
+            "/verify/status",
+            json={
+                "verification_id": verification_id,
+                "init_data": _signed_init_data(150),
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertFalse((await resp.json())["pending"])
+
+    async def test_status_precheck_rejects_forged_init_data(self) -> None:
+        await self._seed(user_id=151)
+        resp = await self.client.post(
+            "/verify/status",
+            json={
+                "verification_id": 0,
+                "init_data": _signed_init_data(151, bot_token="43:OTHER"),
+            },
+        )
+        self.assertEqual(resp.status, 403)
+
+    async def test_challenge_page_contains_status_precheck(self) -> None:
+        resp = await self.client.get("/verify")
+        body = await resp.text()
+        self.assertIn("/verify/status", body)
+        self.assertIn("closeChallenge", body)
 
     async def test_expired_record_gets_404(self) -> None:
         await self._seed(user_id=106, minutes=-2)

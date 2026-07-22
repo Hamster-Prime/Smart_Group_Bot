@@ -85,6 +85,7 @@ from bot.services.join_verification import (
     activate_manual_unban_recovery,
     ban_member,
     begin_moderation_challenge,
+    close_private_challenge_message,
     complete_leased_join_verification,
     delete_join_verification,
     enforce_ban_with_policy_reconciliation_result,
@@ -1576,6 +1577,12 @@ async def _moderation_direct_ban(
             lease_until=recovery.lease_until,
             status="unbanning",
         )
+        if claimed:
+            await close_private_challenge_message(
+                callback.bot,
+                target_id,
+                int(getattr(recovery, "private_message_id", 0) or 0),
+            )
         if not claimed:
             await session.rollback()
             attempted_ban = False
@@ -2385,6 +2392,12 @@ async def _finalize_vote_enforcement(
 
     if outcome_persisted:
         cancel_vote_enforcement_recovery(session_id)
+        if banned:
+            await close_private_challenge_message(
+                callback.bot,
+                target_id,
+                int(getattr(recovery, "private_message_id", 0) or 0),
+            )
         await finalize_vote_message(
             callback.bot,
             settings,

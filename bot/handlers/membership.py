@@ -59,6 +59,7 @@ from bot.services.join_verification import (
     build_group_prompt_text,
     build_private_deep_link,
     claim_join_verification,
+    close_private_challenge_message,
     chat_member_is_present,
     complete_leased_join_verification,
     commit_prepared_join_verification,
@@ -791,12 +792,17 @@ async def _enforce_pending_moderation_challenge(
         )
         if not restored:
             return
-        await _complete_terminal_verification(
+        if await _complete_terminal_verification(
             session,
             verification_id=int(record.id),
             lease_until=lease_until,
             status=VERIFICATION_STATUS_RELEASING,
-        )
+        ):
+            await close_private_challenge_message(
+                event.bot,
+                int(record.user_id),
+                int(snapshot.get("private_message_id") or 0),
+            )
         return
 
     is_patrol = record.kind in (VERIFICATION_KIND_PATROL, VERIFICATION_KIND_RAID)
@@ -827,12 +833,17 @@ async def _enforce_pending_moderation_challenge(
                 preserve_ban=preserve_ban,
             )
             if enforced:
-                await _complete_terminal_verification(
+                if await _complete_terminal_verification(
                     session,
                     verification_id=int(record.id),
                     lease_until=lease_until,
                     status=VERIFICATION_STATUS_ENFORCING,
-                )
+                ):
+                    await close_private_challenge_message(
+                        event.bot,
+                        int(record.user_id),
+                        int(snapshot.get("private_message_id") or 0),
+                    )
             else:
                 requeued = await _requeue_verification(
                     session,
@@ -889,12 +900,17 @@ async def _enforce_pending_moderation_challenge(
             enforcement.final_banned is False
             and enforcement.final_restricted is not True
         ):
-            await _complete_terminal_verification(
+            if await _complete_terminal_verification(
                 session,
                 verification_id=int(record.id),
                 lease_until=lease_until,
                 status=VERIFICATION_STATUS_ENFORCING,
-            )
+            ):
+                await close_private_challenge_message(
+                    event.bot,
+                    int(record.user_id),
+                    int(snapshot.get("private_message_id") or 0),
+                )
             return
         if enforcement.final_banned is False:
             log.info(
@@ -919,14 +935,19 @@ async def _enforce_pending_moderation_challenge(
                 deferred,
             )
             return
-        await _complete_moderation_enforcement_or_reconcile(
+        if await _complete_moderation_enforcement_or_reconcile(
             event.bot,
             session,
             group_id=int(record.group_id),
             user_id=int(record.user_id),
             verification_id=int(record.id),
             lease_until=lease_until,
-        )
+        ):
+            await close_private_challenge_message(
+                event.bot,
+                int(record.user_id),
+                int(snapshot.get("private_message_id") or 0),
+            )
         return
 
     # End the read transaction before the Telegram call. A concurrent web
@@ -996,6 +1017,7 @@ def _verification_snapshot(record: JoinVerification) -> dict[str, object]:
         "reason": str(record.reason or ""),
         "display_name": str(record.display_name or ""),
         "prompt_message_id": int(record.prompt_message_id or 0),
+        "private_message_id": int(getattr(record, "private_message_id", 0) or 0),
     }
 
 
@@ -1500,6 +1522,11 @@ async def _handle_verification_admin_callback(
             else f"✅ <b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
         )
         await _edit_verification_prompt(callback, settings, text=approved_text)
+        await close_private_challenge_message(
+            callback.bot,
+            target_user_id,
+            int(snapshot.get("private_message_id") or 0),
+        )
         await _ack_security_callback(callback, "已直接通过验证")
         if kind == VERIFICATION_KIND_JOIN:
             await send_group_welcome(
@@ -1512,14 +1539,15 @@ async def _handle_verification_admin_callback(
             )
         return
 
-    ban_state = None
-    if kind == VERIFICATION_KIND_MODERATION:
-        ban_state = await mark_group_banned(session, group_id, target_user_id)
+    # An admin rejection is a ban decision for every prompt kind: unlike the
+    # timeout path (temporary ban + unban so the member can rejoin), rejecting
+    # marks the durable group-local ban and applies a permanent Telegram ban.
+    ban_state = await mark_group_banned(session, group_id, target_user_id)
     await session.commit()
 
-    if kind == VERIFICATION_KIND_MODERATION:
-        enforced = await ban_member(callback.bot, group_id, target_user_id)
-        if not enforced:
+    enforced = await ban_member(callback.bot, group_id, target_user_id)
+    if not enforced:
+        if kind == VERIFICATION_KIND_MODERATION:
             rolled_back = await rollback_group_ban(
                 session,
                 group_id,
@@ -1539,41 +1567,11 @@ async def _handle_verification_admin_callback(
                     status=VERIFICATION_STATUS_ENFORCING,
                 )
             )
-            log.warning(
-                "moderation verification admin ban failed | group=%s user=%s "
-                "state_restored=%s",
-                group_id,
-                target_user_id,
-                rolled_back,
-            )
-            await _ack_security_callback(
-                callback,
-                "封禁失败，验证已保留待处理"
-                if requeued
-                else "Telegram 封禁失败，群内状态已变化，请人工检查",
-                show_alert=True,
-            )
-            return
-        rejected_text = (
-            f"🚫 <b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
-        )
-    else:
-        async def preserve_ban() -> bool:
-            blocked = await verification_release_blocked_by_ban(
-                session,
-                group_id=group_id,
-                user_id=target_user_id,
-            )
-            await session.commit()
-            return blocked
-
-        enforced = await kick_member(
-            callback.bot,
-            group_id,
-            target_user_id,
-            preserve_ban=preserve_ban,
-        )
-        if not enforced:
+        else:
+            # Keep the durable local ban: the admin's rejection IS the ban
+            # policy. The retried enforcement (sweeper kick with preserve_ban)
+            # re-applies and then keeps the Telegram ban.
+            rolled_back = False
             requeued = await _requeue_verification(
                 session,
                 settings,
@@ -1582,41 +1580,36 @@ async def _handle_verification_admin_callback(
                 lease_until=lease_until,
                 status=VERIFICATION_STATUS_ENFORCING,
             )
-            await _ack_security_callback(
-                callback,
-                "移出群聊失败，验证已保留待处理"
-                if requeued
-                else "移出群聊失败，执行工单已由后台接管",
-                show_alert=True,
-            )
-            return
-        rejected_text = (
-            f"❌ <b>{shown}</b> 的入群验证已被管理员拒绝，已移出群聊。"
+        log.warning(
+            "verification admin ban failed | kind=%s group=%s user=%s "
+            "state_restored=%s",
+            kind,
+            group_id,
+            target_user_id,
+            rolled_back,
         )
-    if kind == VERIFICATION_KIND_MODERATION:
-        completed = await _complete_moderation_enforcement_or_reconcile(
-            callback.bot,
-            session,
-            group_id=group_id,
-            user_id=target_user_id,
-            verification_id=int(record.id),
-            lease_until=lease_until,
+        await _ack_security_callback(
+            callback,
+            "封禁失败，验证已保留待处理"
+            if requeued
+            else "Telegram 封禁失败，群内状态已变化，请人工检查",
+            show_alert=True,
         )
-    else:
-        completed = await _complete_terminal_verification(
-            session,
-            verification_id=int(record.id),
-            lease_until=lease_until,
-            status=VERIFICATION_STATUS_ENFORCING,
-        )
+        return
+    rejected_text = (
+        f"🚫 <b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
+        if kind == VERIFICATION_KIND_MODERATION
+        else f"🚫 <b>{shown}</b> 的入群验证已被管理员拒绝，已在当前群封禁。"
+    )
+    completed = await _complete_moderation_enforcement_or_reconcile(
+        callback.bot,
+        session,
+        group_id=group_id,
+        user_id=target_user_id,
+        verification_id=int(record.id),
+        lease_until=lease_until,
+    )
     if not completed:
-        if kind != VERIFICATION_KIND_MODERATION:
-            await _reconcile_stale_restriction(
-                SimpleNamespace(bot=callback.bot, chat=chat),
-                session,
-                user_id=target_user_id,
-                session_factory=session_factory,
-            )
         await _ack_security_callback(
             callback,
             "操作已执行，验证状态由后台继续确认",
@@ -1624,6 +1617,11 @@ async def _handle_verification_admin_callback(
         )
         return
     await _edit_verification_prompt(callback, settings, text=rejected_text)
+    await close_private_challenge_message(
+        callback.bot,
+        target_user_id,
+        int(snapshot.get("private_message_id") or 0),
+    )
     await _ack_security_callback(callback, "已直接拒绝验证")
 
 
@@ -2412,6 +2410,11 @@ async def _process_member_join(
             group_id,
             int(recovery.prompt_message_id),
         )
+    await close_private_challenge_message(
+        event.bot,
+        user_id,
+        int(getattr(recovery, "private_message_id", 0) or 0),
+    )
     completed = await complete_leased_join_verification(
         session,
         verification_id=int(recovery.verification_id),

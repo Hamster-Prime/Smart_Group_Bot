@@ -58,6 +58,7 @@ from bot.services.join_verification import (
     activate_manual_unban_recovery,
     UnbanRecovery,
     ban_member,
+    close_private_challenge_messages,
     complete_leased_join_verification,
     delete_verification_prompts,
     get_join_verification,
@@ -1211,9 +1212,14 @@ async def _perform_group_ban_locked(
         return "不能直接封禁本群管理员，请先在 Telegram 中撤销其管理员身份。"
 
     prompts: set[tuple[int, int]] = set()
+    private_prompts: set[tuple[int, int]] = set()
     verification = await get_join_verification(session, group_id, target_id)
     if verification is not None and int(verification.prompt_message_id or 0) > 0:
         prompts.add((group_id, int(verification.prompt_message_id)))
+    if verification is not None and int(
+        getattr(verification, "private_message_id", 0) or 0
+    ) > 0:
+        private_prompts.add((target_id, int(verification.private_message_id)))
     # Crash-compensation journal: until the local ban policy and terminal
     # delete commit together below, a SIGKILL after Telegram applies the ban
     # must recover by unbanning rather than strand an untracked permanent ban.
@@ -1346,6 +1352,7 @@ async def _perform_group_ban_locked(
                 target_id,
             )
     await delete_verification_prompts(message.bot, prompts)
+    await close_private_challenge_messages(message.bot, private_prompts)
     if not persisted:
         return (
             "封禁执行期间权限策略已被更新或数据库写入失败；"
@@ -1418,9 +1425,14 @@ async def _perform_group_unban_locked(
     )
     cleared_count = warning_snapshot[1] if warning_snapshot is not None else 0
     prompts: set[tuple[int, int]] = set()
+    private_prompts: set[tuple[int, int]] = set()
     verification = await get_join_verification(session, group_id, target_id)
     if verification is not None and int(verification.prompt_message_id or 0) > 0:
         prompts.add((group_id, int(verification.prompt_message_id)))
+    if verification is not None and int(
+        getattr(verification, "private_message_id", 0) or 0
+    ) > 0:
+        private_prompts.add((target_id, int(verification.private_message_id)))
     # Cancel the current verification/enforcement generation durably before
     # Telegram is touched.  The delayed ``unbanning`` journal survives SIGKILL
     # and outlives any stale worker already inside its bounded ban call.
@@ -1504,6 +1516,12 @@ async def _perform_group_unban_locked(
         and int(current_verification.prompt_message_id or 0) > 0
     ):
         prompts.add((group_id, int(current_verification.prompt_message_id)))
+    if current_verification is not None and int(
+        getattr(current_verification, "private_message_id", 0) or 0
+    ) > 0:
+        private_prompts.add(
+            (target_id, int(current_verification.private_message_id))
+        )
     try:
         await session.commit()
     except Exception:
@@ -1519,6 +1537,7 @@ async def _perform_group_unban_locked(
         return "Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请稍后重试。"
 
     await delete_verification_prompts(message.bot, prompts)
+    await close_private_challenge_messages(message.bot, private_prompts)
     restored = await restore_member_permissions(message.bot, group_id, target_id)
     target_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
     try:
@@ -1643,6 +1662,11 @@ async def _perform_global_ban_locked(
             if item.prompt_message_id > 0
             and int(item.group_id) in active_group_set
         )
+        private_prompts = tuple(
+            (item.user_id, item.private_message_id)
+            for item in recoveries
+            if item.private_message_id > 0
+        )
         await session.commit()
     await _publish_privileged_result(
         message,
@@ -1697,6 +1721,7 @@ async def _perform_global_ban_locked(
         deadline_seconds=45.0,
     )
     await delete_verification_prompts(message.bot, prompts)
+    await close_private_challenge_messages(message.bot, private_prompts)
     banned_groups = sum(outcome.succeeded for outcome in outcomes)
     status = "已加入全局封禁名单" if created else "已在全局封禁名单（信息已更新）"
     lines = [
@@ -1768,6 +1793,11 @@ async def _perform_global_unban_locked(
             if item.prompt_message_id > 0
             and int(item.group_id) in active_group_set
         )
+        private_prompts = tuple(
+            (item.user_id, item.private_message_id)
+            for item in recoveries
+            if item.private_message_id > 0
+        )
         cleared_total = 0
         for group_id in journal_group_ids:
             cleared_count, _ = await _clear_user_warning(
@@ -1828,6 +1858,7 @@ async def _perform_global_unban_locked(
 
     outcomes = await _run_group_actions_bounded(group_ids, unban_one)
     await delete_verification_prompts(message.bot, prompts)
+    await close_private_challenge_messages(message.bot, private_prompts)
     unbanned_groups = sum(outcome.succeeded for outcome in outcomes)
     restored_groups = len(restored_group_ids)
 

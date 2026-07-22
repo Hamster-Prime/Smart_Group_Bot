@@ -3024,7 +3024,7 @@ class VerificationCallbackTests(_DbTestCase):
             message_id=857,
         )
 
-        async def cancelled_kick(*_args, **_kwargs):
+        async def cancelled_ban(*_args, **_kwargs):
             async with self.session_factory() as check_session:
                 row = await get_join_verification(check_session, -100, 957)
                 self.assertEqual(row.status, "enforcing")
@@ -3037,8 +3037,8 @@ class VerificationCallbackTests(_DbTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "bot.handlers.membership.kick_member",
-                new=AsyncMock(side_effect=cancelled_kick),
+                "bot.handlers.membership.ban_member",
+                new=AsyncMock(side_effect=cancelled_ban),
             ),
         ):
             async with self.session_factory() as session:
@@ -3163,7 +3163,9 @@ class VerificationCallbackTests(_DbTestCase):
             self.assertEqual(record.prompt_message_id, 847)
         callback.bot.edit_message_text.assert_not_awaited()
 
-    async def test_admin_reject_join_kicks_without_global_ban(self) -> None:
+    async def test_admin_reject_join_bans_in_group_without_global_ban(self) -> None:
+        # An admin rejection is a ban decision: unlike the timeout path (kick =
+        # temporary ban + unban), it must permanently ban in this group only.
         await self._add_record(user_id=948, message_id=848)
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3171,14 +3173,14 @@ class VerificationCallbackTests(_DbTestCase):
             operator_id=11,
             message_id=848,
         )
-        kick = AsyncMock(return_value=True)
+        ban = AsyncMock(return_value=True)
 
         with (
             patch(
                 "bot.handlers.membership.is_group_admin_or_higher",
                 new=AsyncMock(return_value=True),
             ),
-            patch("bot.handlers.membership.kick_member", new=kick),
+            patch("bot.handlers.membership.ban_member", new=ban),
         ):
             async with self.session_factory() as session:
                 await membership.on_verification_callback(
@@ -3187,14 +3189,21 @@ class VerificationCallbackTests(_DbTestCase):
                     settings=_settings(),
                 )
 
-        kick.assert_awaited_once()
-        self.assertEqual(kick.await_args.args, (callback.bot, -100, 948))
-        self.assertTrue(callable(kick.await_args.kwargs["preserve_ban"]))
+        ban.assert_awaited_once_with(callback.bot, -100, 948)
+        callback.bot.unban_chat_member.assert_not_awaited()
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 948))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 948,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
             self.assertIsNone(await get_global_ban(session, 948))
 
-    async def test_admin_reject_join_keeps_enforcing_when_kick_fails(self) -> None:
+    async def test_admin_reject_join_keeps_enforcing_when_ban_fails(self) -> None:
         old_deadline = await self._add_record(user_id=949, message_id=849)
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3209,7 +3218,7 @@ class VerificationCallbackTests(_DbTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "bot.handlers.membership.kick_member",
+                "bot.handlers.membership.ban_member",
                 new=AsyncMock(return_value=False),
             ),
         ):
@@ -3226,6 +3235,16 @@ class VerificationCallbackTests(_DbTestCase):
             self.assertEqual(record.deadline_at, old_deadline)
             self.assertEqual(record.status, "enforcing")
             self.assertIsNotNone(record.lease_until)
+            # The rejection's durable local ban survives the Telegram failure
+            # so the sweeper's retry keeps enforcing the admin's decision.
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 949,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
         callback.bot.edit_message_text.assert_not_awaited()
 
     async def test_admin_reject_moderation_only_bans_current_group(self) -> None:
@@ -3711,6 +3730,65 @@ class PrivateStartTests(_DbTestCase):
             self.assertTrue(handled)
             record = await get_join_verification(session, -100, 929)
             self.assertLessEqual(record.deadline_at, capped)
+
+    async def test_private_start_records_challenge_message_id(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=930,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+            )
+            await session.commit()
+
+            message = self._private_message(930)
+            message.bot = SimpleNamespace(edit_message_text=AsyncMock())
+            message.answer = AsyncMock(
+                return_value=SimpleNamespace(message_id=4321)
+            )
+            handled = await maybe_send_private_verification(
+                message, session, _settings()
+            )
+
+            self.assertTrue(handled)
+            record = await get_join_verification(session, -100, 930)
+            self.assertEqual(int(record.private_message_id), 4321)
+
+    async def test_repeated_private_start_supersedes_previous_entry(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=931,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+            )
+            await session.commit()
+
+            edit = AsyncMock()
+            message = self._private_message(931)
+            message.bot = SimpleNamespace(edit_message_text=edit)
+            message.answer = AsyncMock(
+                return_value=SimpleNamespace(message_id=100)
+            )
+            self.assertTrue(
+                await maybe_send_private_verification(message, session, _settings())
+            )
+            message.answer = AsyncMock(
+                return_value=SimpleNamespace(message_id=101)
+            )
+            self.assertTrue(
+                await maybe_send_private_verification(message, session, _settings())
+            )
+
+            record = await get_join_verification(session, -100, 931)
+            self.assertEqual(int(record.private_message_id), 101)
+        # The first entry (100) must have been rewritten to the superseded
+        # notice so its WebApp button is gone.
+        edit.assert_awaited_once()
+        kwargs = edit.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], 931)
+        self.assertEqual(kwargs["message_id"], 100)
+        self.assertIsNone(kwargs["reply_markup"])
 
 
 class SweeperTests(_DbTestCase):

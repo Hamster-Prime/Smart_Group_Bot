@@ -492,6 +492,7 @@ class UnbanRecovery:
     user_id: int
     lease_until: datetime
     prompt_message_id: int = 0
+    private_message_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1274,6 +1275,12 @@ def build_private_challenge_text(
     )
 
 
+# Private-chat challenge entries are rewritten once their record reaches a
+# terminal state so a stale WebApp button cannot keep reopening the challenge.
+PRIVATE_CHALLENGE_SUPERSEDED_TEXT = "ℹ️ 此验证入口已更新，请使用最新的验证消息。"
+PRIVATE_CHALLENGE_CLOSED_TEXT = "ℹ️ 本次验证流程已结束，无需再次验证。"
+
+
 def build_private_challenge_keyboard(
     settings: Settings,
     provider: str | None = None,
@@ -1938,6 +1945,7 @@ async def lease_join_verification_for_unban(
         user_id=int(row.user_id),
         lease_until=recovery_at,
         prompt_message_id=int(row.prompt_message_id or 0),
+        private_message_id=int(getattr(row, "private_message_id", 0) or 0),
     )
 
 
@@ -2015,6 +2023,7 @@ async def lease_join_verifications_for_user_unban(
             user_id=int(row.user_id),
             lease_until=recovery_at,
             prompt_message_id=int(row.prompt_message_id or 0),
+            private_message_id=int(getattr(row, "private_message_id", 0) or 0),
         )
         for row in rows
     )
@@ -3668,6 +3677,126 @@ async def delete_verification_prompt(
         return False
 
 
+async def close_private_challenge_message(
+    bot: Bot,
+    user_id: int,
+    message_id: int,
+    *,
+    text: str = PRIVATE_CHALLENGE_CLOSED_TEXT,
+) -> bool:
+    """Retire a private-chat challenge entry once its record is terminal.
+
+    The WebApp button stays clickable forever if left behind, letting an
+    already-processed member reopen the challenge page and burn provider
+    quota. Rewrite the message into a terminal notice; fall back to deleting
+    it when Telegram rejects the edit (e.g. the 48-hour edit window passed).
+    """
+    message_id = int(message_id or 0)
+    if not message_id:
+        return True
+    try:
+        edited = await _bounded_telegram_call(
+            bot.edit_message_text(
+                chat_id=int(user_id),
+                message_id=message_id,
+                text=text,
+                reply_markup=None,
+            ),
+            timeout_seconds=4.0,
+        )
+        return edited is not False
+    except Exception:
+        log.debug(
+            "private challenge close edit failed | user=%s message=%s",
+            user_id,
+            message_id,
+            exc_info=True,
+        )
+    try:
+        deleted = await _bounded_telegram_call(
+            bot.delete_message(int(user_id), message_id),
+            timeout_seconds=4.0,
+        )
+        return deleted is not False
+    except Exception:
+        log.debug(
+            "private challenge close delete failed | user=%s message=%s",
+            user_id,
+            message_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def close_private_challenge_messages(
+    bot: Bot,
+    entries: Iterable[tuple[int, int]],
+    *,
+    text: str = PRIVATE_CHALLENGE_CLOSED_TEXT,
+) -> int:
+    """Bulk best-effort retirement of private challenge entries.
+
+    ``entries`` is ``(user_id, private_message_id)`` pairs, mirroring
+    ``delete_verification_prompts`` for the group-side keyboards.
+    """
+    unique = {
+        (int(user_id), int(message_id))
+        for user_id, message_id in entries
+        if int(message_id or 0) > 0
+    }
+    if not unique:
+        return 0
+    semaphore = asyncio.Semaphore(4)
+
+    async def close_one(user_id: int, message_id: int) -> bool:
+        async with semaphore:
+            return await close_private_challenge_message(
+                bot, user_id, message_id, text=text
+            )
+
+    results = await asyncio.gather(
+        *(close_one(user_id, message_id) for user_id, message_id in unique),
+        return_exceptions=True,
+    )
+    return sum(result is True for result in results)
+
+
+async def record_private_challenge_message(
+    session: AsyncSession,
+    *,
+    verification_id: int,
+    message_id: int,
+) -> tuple[bool, int]:
+    """Persist the newest private challenge message id.
+
+    Returns ``(recorded, previous_message_id)``. Only pending records are
+    updated: a record that reached a terminal state while the private send was
+    in flight keeps its stored id so the terminal path (which already owns
+    cleanup) does not race this writer, and the caller must retire the fresh
+    message itself.
+    """
+    previous = int(
+        await session.scalar(
+            select(JoinVerification.private_message_id).where(
+                JoinVerification.id == int(verification_id)
+            )
+        )
+        or 0
+    )
+    result = await session.execute(
+        update(JoinVerification)
+        .where(
+            JoinVerification.id == int(verification_id),
+            JoinVerification.status == VERIFICATION_STATUS_PENDING,
+        )
+        .values(private_message_id=int(message_id or 0))
+    )
+    await session.commit()
+    if not result.rowcount:
+        return False, 0
+    return True, previous if previous != int(message_id or 0) else 0
+
+
 async def delete_verification_prompts(
     bot: Bot,
     prompts: Iterable[tuple[int, int]],
@@ -4365,7 +4494,7 @@ async def maybe_send_private_verification(
     # API timeout even though no further database state is needed to render the
     # already-snapshotted challenge.
     await session.commit()
-    await message.answer(
+    sent = await message.answer(
         build_private_challenge_text(
             deadline_at=shown_deadline,
             kind=record.kind,
@@ -4378,6 +4507,32 @@ async def maybe_send_private_verification(
             int(record.id),
         ),
     )
+    raw_message_id = getattr(sent, "message_id", 0)
+    private_message_id = raw_message_id if isinstance(raw_message_id, int) else 0
+    if private_message_id > 0:
+        bot = getattr(message, "bot", None)
+        recorded, previous_id = await record_private_challenge_message(
+            session,
+            verification_id=int(record.id),
+            message_id=private_message_id,
+        )
+        if bot is not None:
+            if not recorded:
+                # The record went terminal while this send was in flight; the
+                # terminal owner only saw the previous id, so retire the fresh
+                # entry here instead of leaving a live button behind.
+                await close_private_challenge_message(
+                    bot,
+                    int(user.id),
+                    private_message_id,
+                )
+            elif previous_id:
+                await close_private_challenge_message(
+                    bot,
+                    int(user.id),
+                    previous_id,
+                    text=PRIVATE_CHALLENGE_SUPERSEDED_TEXT,
+                )
     log.info(
         "verification mini app sent | kind=%s group=%s user=%s",
         record.kind,
@@ -4643,6 +4798,12 @@ class JoinVerificationSweeper:
                 completed = await self._complete_enforcement(record)
                 if not completed:
                     await self._reconcile_lost_moderation_ban(record)
+                    return
+                await close_private_challenge_message(
+                    self.bot,
+                    int(record.user_id),
+                    int(getattr(record, "private_message_id", 0) or 0),
+                )
                 return
             if record.kind == VERIFICATION_KIND_MODERATION:
                 enforcement = await ban_member_result(
@@ -4927,6 +5088,11 @@ class JoinVerificationSweeper:
                 int(record.group_id),
                 int(record.prompt_message_id),
             )
+        await close_private_challenge_message(
+            self.bot,
+            int(record.user_id),
+            int(getattr(record, "private_message_id", 0) or 0),
+        )
         return True
 
     async def _recover_unbanning(self, record: JoinVerification) -> bool:
@@ -4999,6 +5165,11 @@ class JoinVerificationSweeper:
                 int(record.group_id),
                 int(record.prompt_message_id),
             )
+        await close_private_challenge_message(
+            self.bot,
+            int(record.user_id),
+            int(getattr(record, "private_message_id", 0) or 0),
+        )
         return True
 
     async def _recover_unauthorized_enforcing(
@@ -5098,7 +5269,13 @@ class JoinVerificationSweeper:
                 await session.commit()
             else:
                 await session.rollback()
-            return completed
+        if completed:
+            await close_private_challenge_message(
+                self.bot,
+                int(record.user_id),
+                int(getattr(record, "private_message_id", 0) or 0),
+            )
+        return completed
 
     async def _recover_protected_owner(self, record: JoinVerification) -> bool:
         """Never let any verification kind kick/ban the configured owner."""
@@ -5349,6 +5526,11 @@ class JoinVerificationSweeper:
         # loop), so each outcome is identifiable in both branches. The outcome
         # is a moderation notice ("审核通知"): honor the group's auto-delete
         # retention like the ban notice does.
+        await close_private_challenge_message(
+            self.bot,
+            int(record.user_id),
+            int(getattr(record, "private_message_id", 0) or 0),
+        )
         seconds = self._moderation_auto_delete_seconds()
         # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others, so post

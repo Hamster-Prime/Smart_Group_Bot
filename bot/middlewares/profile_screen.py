@@ -26,6 +26,7 @@ from bot.services.join_screening import (
     screen_member_profile_verbose,
 )
 from bot.services.join_verification import (
+    close_private_challenge_message,
     complete_leased_join_verification,
     enforce_ban_with_policy_reconciliation_result,
     lease_join_verification_for_unban,
@@ -439,6 +440,14 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                     )
                     if completed:
                         await completion_session.commit()
+                        await close_private_challenge_message(
+                            event.bot,
+                            int(user.id),
+                            int(
+                                getattr(ban_recovery, "private_message_id", 0)
+                                or 0
+                            ),
+                        )
                     else:
                         await completion_session.rollback()
                         enforcement = (

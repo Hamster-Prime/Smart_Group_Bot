@@ -44,6 +44,7 @@ from bot.services.join_verification import (
     activate_manual_unban_recoveries,
     activate_manual_unban_recovery,
     ban_member as enforce_ban_member,
+    close_private_challenge_messages,
     complete_leased_join_verification,
     delete_join_verification,
     delete_verification_prompts,
@@ -1839,6 +1840,11 @@ def register_settings_routes(
                 if item.prompt_message_id > 0
                 and int(item.group_id) in active_group_set
             )
+            private_prompts = tuple(
+                (item.user_id, item.private_message_id)
+                for item in recoveries
+                if item.private_message_id > 0
+            )
             await session.commit()
         recovery_by_group = {int(item.group_id): item for item in recoveries}
 
@@ -1884,6 +1890,7 @@ def register_settings_routes(
 
         outcomes = await _run_privileged_group_fanout(group_ids, ban_one)
         await delete_verification_prompts(bot, prompts)
+        await close_private_challenge_messages(bot, private_prompts)
         succeeded = sum(outcomes)
         failures = len(outcomes) - succeeded
         if failures:
@@ -1944,6 +1951,11 @@ def register_settings_routes(
             if item.prompt_message_id > 0
             and int(item.group_id) in active_group_set
         )
+        private_prompts = tuple(
+            (item.user_id, item.private_message_id)
+            for item in recoveries
+            if item.private_message_id > 0
+        )
         recovery_by_group = {int(item.group_id): item for item in recoveries}
         restored_group_ids: set[int] = set()
 
@@ -1984,6 +1996,7 @@ def register_settings_routes(
 
         outcomes = await _run_privileged_group_fanout(group_ids, unban_one)
         await delete_verification_prompts(bot, prompts)
+        await close_private_challenge_messages(bot, private_prompts)
         succeeded = sum(outcomes)
         restored = len(restored_group_ids)
         failures = (len(outcomes) - succeeded) + (succeeded - restored)
@@ -2677,6 +2690,7 @@ def register_settings_routes(
         if not callable(ban_member):
             raise _APIError(503, "telegram_unavailable", "当前无法调用 Telegram 封禁接口。")
         prompts: set[tuple[int, int]] = set()
+        private_prompts: set[tuple[int, int]] = set()
         async with session_factory() as session:
             if await is_globally_banned(session, body.user_id):
                 raise _APIError(
@@ -2689,6 +2703,12 @@ def register_settings_routes(
             )
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
+            if verification is not None and int(
+                getattr(verification, "private_message_id", 0) or 0
+            ) > 0:
+                private_prompts.add(
+                    (int(body.user_id), int(verification.private_message_id))
+                )
             recovery = await lease_join_verification_for_unban(
                 session,
                 group_id,
@@ -2796,6 +2816,7 @@ def register_settings_routes(
             )
             await session.commit()
         await delete_verification_prompts(bot, prompts)
+        await close_private_challenge_messages(bot, private_prompts)
         return _success_response({"ban": _ban_document(row)})
 
     @any_admin
@@ -2804,6 +2825,7 @@ def register_settings_routes(
         await _require_group_access(group_id, int(user.id))
         target_id = _path_int(request, "user_id")
         prompts: set[tuple[int, int]] = set()
+        private_prompts: set[tuple[int, int]] = set()
         async with session_factory() as session:
             if await is_globally_banned(session, target_id):
                 raise _APIError(
@@ -2827,6 +2849,12 @@ def register_settings_routes(
             verification = await get_join_verification(session, group_id, target_id)
             if verification is not None and int(verification.prompt_message_id or 0) > 0:
                 prompts.add((group_id, int(verification.prompt_message_id)))
+            if verification is not None and int(
+                getattr(verification, "private_message_id", 0) or 0
+            ) > 0:
+                private_prompts.add(
+                    (int(target_id), int(verification.private_message_id))
+                )
             recovery = await lease_join_verification_for_unban(
                 session,
                 group_id,
@@ -2913,6 +2941,12 @@ def register_settings_routes(
                 prompts.add(
                     (group_id, int(current_verification.prompt_message_id))
                 )
+            if current_verification is not None and int(
+                getattr(current_verification, "private_message_id", 0) or 0
+            ) > 0:
+                private_prompts.add(
+                    (int(target_id), int(current_verification.private_message_id))
+                )
             try:
                 await session.commit()
             except Exception as exc:
@@ -2931,6 +2965,7 @@ def register_settings_routes(
                     "Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请重试。",
                 ) from exc
         await delete_verification_prompts(bot, prompts)
+        await close_private_challenge_messages(bot, private_prompts)
         restored = await restore_member_permissions(bot, group_id, target_id)
         if restored and recovery is not None:
             async with session_factory() as completion_session:

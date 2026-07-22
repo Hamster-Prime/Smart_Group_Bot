@@ -55,6 +55,7 @@ from bot.services.join_verification import (
     VERIFICATION_STATUS_RELEASING,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
+    close_private_challenge_message,
     complete_leased_join_verification,
     delete_join_verification,
     delete_verification_prompt,
@@ -416,6 +417,18 @@ function setStatus(text, cls) {{
   status.className = cls || "";
 }}
 
+function closeChallenge(text) {{
+  // Terminal outcome: the record is gone (passed elsewhere, admin decision,
+  // timeout, ban). Remove the widget so repeated solves cannot keep burning
+  // provider quota, and leave only the outcome text.
+  challengeSubmitting = true;
+  const widget = document.querySelector(".challenge-widget");
+  if (widget) widget.remove();
+  const intro = document.querySelector(".card p");
+  if (intro) intro.remove();
+  setStatus(text, "err");
+}}
+
 function setHcaptchaStepLocked(locked) {{
   const step = document.getElementById("step-hcaptcha");
   if (step) step.classList.toggle("locked", locked);
@@ -460,6 +473,9 @@ async function submitVerification(tokens) {{
     if (resp.ok && data.ok) {{
       setStatus("✅ 验证通过，群内权限已恢复。", "ok");
       setTimeout(() => tg.close(), 1500);
+    }} else if (data.terminal) {{
+      closeChallenge("ℹ️ " + (data.error || "本次验证流程已结束。"));
+      setTimeout(() => tg.close(), 2500);
     }} else {{
       challengeSubmitting = false;
       if (Number.isInteger(data.verification_id) && data.verification_id > 0) {{
@@ -513,6 +529,27 @@ function onHcaptchaExpired() {{
 }}
 
 if (combined) setStatus("请先完成第 1 步 Turnstile 验证。", "");
+
+(async function precheckStatus() {{
+  // Ask the server whether this member still has a pending record before the
+  // human spends effort on the widget; a stale entry (already passed, admin
+  // decision, timeout) collapses into a terminal notice instead.
+  if (!tg || !tg.initData) return;
+  try {{
+    const resp = await fetch("/verify/status", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{verification_id: verificationId, init_data: tg.initData}}),
+    }});
+    const data = await resp.json();
+    if (resp.ok && data.ok && data.pending === false && !challengeSubmitting) {{
+      closeChallenge("ℹ️ 当前没有待处理的验证，本入口已失效。");
+      setTimeout(() => tg.close(), 2500);
+    }}
+  }} catch (e) {{
+    // Pre-check is best-effort: on failure the normal submit flow decides.
+  }}
+}})();
 </script>
 </body>
 </html>"""
@@ -3314,6 +3351,7 @@ class VerifyWebServer:
         app = web.Application(client_max_size=_WEB_MAX_REQUEST_BYTES)
         app.router.add_get("/verify", self.handle_challenge_page)
         app.router.add_post("/verify", self.handle_challenge_submit)
+        app.router.add_post("/verify/status", self.handle_challenge_status)
         app.router.add_get("/healthz", self.handle_health)
         if self.runtime_config is not None:
             app.router.add_get("/settings", self.handle_settings_page)
@@ -3737,6 +3775,95 @@ class VerifyWebServer:
             },
         )
 
+    async def handle_challenge_status(self, request: web.Request) -> web.Response:
+        """Signed pre-check for the challenge page.
+
+        Lets an opened Mini App page discover before rendering the widget that
+        its member no longer has a pending record (already passed, admin
+        decision, timeout, ban), so a stale entry cannot keep burning provider
+        challenges. Same initData authentication and rate limits as /verify.
+        """
+        try:
+            body = await _read_json_body_hard(
+                request,
+                timeout_seconds=_PUBLIC_JSON_BODY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return web.json_response(
+                {"ok": False, "error": "请求体读取超时"},
+                status=408,
+            )
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw_verification_id_text = str(body.get("verification_id") or 0).strip()
+        init_data = str(body.get("init_data") or "")
+        if (
+            len(raw_verification_id_text) > _VERIFICATION_MAX_ID_CHARS
+            or len(init_data) > _VERIFICATION_MAX_INIT_DATA_CHARS
+        ):
+            return web.json_response(
+                {"ok": False, "error": "验证参数过长"},
+                status=413,
+            )
+        remote_ip = _client_public_ip(request)
+        if self._verification_rate_limited(user_id=None, remote_ip=remote_ip):
+            return web.json_response(
+                {"ok": False, "error": "请求过于频繁，请稍后重试"},
+                status=429,
+                headers={"Retry-After": str(int(_VERIFICATION_RATE_WINDOW_SECONDS))},
+            )
+        try:
+            verification_id = int(raw_verification_id_text or 0)
+        except (TypeError, ValueError):
+            verification_id = -1
+        if not init_data or verification_id < 0:
+            return web.json_response({"ok": False, "error": "缺少验证参数"}, status=400)
+        try:
+            web_app_data = safe_parse_webapp_init_data(
+                token=self.bot.token, init_data=init_data
+            )
+            auth_timestamp = _auth_timestamp(web_app_data.auth_date)
+        except (ValueError, AttributeError, TypeError, OverflowError, OSError):
+            return web.json_response(
+                {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
+            )
+        init_data_age = time.time() - auth_timestamp
+        if (
+            init_data_age > MAX_INIT_DATA_AGE_SECONDS
+            or init_data_age < -MAX_INIT_DATA_FUTURE_SECONDS
+        ):
+            return web.json_response(
+                {"ok": False, "error": "会话已过期，请从 Telegram 重新打开"},
+                status=403,
+            )
+        web_user = web_app_data.user
+        if web_user is None:
+            return web.json_response(
+                {"ok": False, "error": "会话校验失败，请从 Telegram 重新打开"}, status=403
+            )
+        user_id = int(web_user.id)
+        async with self.session_factory() as session:
+            record = None
+            if verification_id:
+                record = await get_pending_verification_by_id_for_user(
+                    session,
+                    verification_id,
+                    user_id,
+                )
+            if record is None and verification_id:
+                record = await get_sole_pending_verification_for_user(
+                    session, user_id
+                )
+            elif record is None:
+                record = await get_pending_verification_for_user(session, user_id)
+        pending = bool(
+            record is not None
+            and not verification_deadline_passed(record.deadline_at)
+        )
+        return web.json_response({"ok": True, "pending": pending})
+
     async def handle_challenge_submit(self, request: web.Request) -> web.Response:
         try:
             body = await _read_json_body_hard(
@@ -3914,17 +4041,29 @@ class VerifyWebServer:
             ):
                 return web.json_response({"ok": True})
             return web.json_response(
-                {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
+                {
+                    "ok": False,
+                    "error": "没有有效的待处理验证，请联系群管理员",
+                    "terminal": True,
+                },
                 status=404,
             )
         if verification_deadline_passed(record.deadline_at):
             return web.json_response(
-                {"ok": False, "error": "没有有效的待处理验证，请联系群管理员"},
+                {
+                    "ok": False,
+                    "error": "没有有效的待处理验证，请联系群管理员",
+                    "terminal": True,
+                },
                 status=404,
             )
         if locally_banned:
             return web.json_response(
-                {"ok": False, "error": "该用户已被本群管理员封禁，请联系管理员"},
+                {
+                    "ok": False,
+                    "error": "该用户已被本群管理员封禁，请联系管理员",
+                    "terminal": True,
+                },
                 status=403,
             )
 
@@ -4138,7 +4277,11 @@ class VerifyWebServer:
                 if await self._wait_for_completed_verification(active):
                     return web.json_response({"ok": True})
                 return web.json_response(
-                    {"ok": False, "error": "验证已过期或失效，请联系群管理员"},
+                    {
+                        "ok": False,
+                        "error": "验证已过期或失效，请联系群管理员",
+                        "terminal": True,
+                    },
                     status=404,
                 )
             if await is_globally_banned(session, user_id):
@@ -4151,7 +4294,11 @@ class VerifyWebServer:
                 )
                 active_released = True
                 return web.json_response(
-                    {"ok": False, "error": "该账号已被管理员封禁，请联系管理员"},
+                    {
+                        "ok": False,
+                        "error": "该账号已被管理员封禁，请联系管理员",
+                        "terminal": True,
+                    },
                     status=403,
                 )
             if await session.scalar(
@@ -4168,7 +4315,11 @@ class VerifyWebServer:
                 )
                 active_released = True
                 return web.json_response(
-                    {"ok": False, "error": "该用户已被本群管理员封禁，请联系管理员"},
+                    {
+                        "ok": False,
+                        "error": "该用户已被本群管理员封禁，请联系管理员",
+                        "terminal": True,
+                    },
                     status=403,
                 )
 
@@ -4189,12 +4340,19 @@ class VerifyWebServer:
                 if await self._wait_for_completed_verification(active):
                     return web.json_response({"ok": True})
                 return web.json_response(
-                    {"ok": False, "error": "验证已失效，请重新打开验证入口"},
+                    {
+                        "ok": False,
+                        "error": "验证已失效，请重新打开验证入口",
+                        "terminal": True,
+                    },
                     status=404,
                 )
 
             group_id = int(current.group_id)
             prompt_message_id = int(current.prompt_message_id or 0)
+            private_message_id = int(
+                getattr(current, "private_message_id", 0) or 0
+            )
             display_name = (current.display_name or "").strip()
             kind = current.kind
             # Persist the releasing lease before Telegram calls. A crash after
@@ -4209,6 +4367,7 @@ class VerifyWebServer:
                 fingerprint=record_fingerprint,
                 group_id=group_id,
                 prompt_message_id=prompt_message_id,
+                private_message_id=private_message_id,
                 display_name=display_name,
                 kind=kind,
                 lease_until=lease_until,
@@ -4227,6 +4386,7 @@ class VerifyWebServer:
                         fingerprint=record_fingerprint,
                         group_id=group_id,
                         prompt_message_id=prompt_message_id,
+                        private_message_id=private_message_id,
                         display_name=display_name,
                         kind=kind,
                         lease_until=lease_until,
@@ -4241,6 +4401,7 @@ class VerifyWebServer:
                     fingerprint=record_fingerprint,
                     group_id=group_id,
                     prompt_message_id=prompt_message_id,
+                    private_message_id=private_message_id,
                     display_name=display_name,
                     kind=kind,
                     lease_until=lease_until,
@@ -4261,6 +4422,7 @@ class VerifyWebServer:
         display_name: str,
         kind: str,
         lease_until: datetime,
+        private_message_id: int = 0,
     ) -> web.Response:
         restored = await restore_member_permissions(self.bot, group_id, user_id)
         log.info(
@@ -4327,6 +4489,14 @@ class VerifyWebServer:
             user_id,
             fingerprint,
         )
+        # The record is consumed: retire the private-chat challenge entry so
+        # its WebApp button cannot reopen the challenge page.
+        await close_private_challenge_message(
+            self.bot,
+            user_id,
+            private_message_id,
+            text="✅ 验证已通过，群内权限已恢复。",
+        )
         if kind == VERIFICATION_KIND_PATROL:
             # Whitelist the passing profile so the next patrol run and the
             # on-message screening do not immediately re-flag it.
@@ -4384,6 +4554,7 @@ class VerifyWebServer:
         display_name: str,
         kind: str,
         lease_until: datetime,
+        private_message_id: int = 0,
     ) -> None:
         try:
             restored = await self._completed_member_is_unrestricted(
@@ -4406,6 +4577,12 @@ class VerifyWebServer:
                     verification_id,
                     user_id,
                     fingerprint,
+                )
+                await close_private_challenge_message(
+                    self.bot,
+                    user_id,
+                    private_message_id,
+                    text="✅ 验证已通过，群内权限已恢复。",
                 )
                 return
 

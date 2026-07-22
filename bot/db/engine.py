@@ -1279,6 +1279,12 @@ async def init_db(
                 "lease_until",
                 "lease_until DATETIME",
             )
+            await _sqlite_ensure_column(
+                conn,
+                "join_verifications",
+                "private_message_id",
+                "private_message_id BIGINT NOT NULL DEFAULT 0",
+            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_join_verifications_status_lease "

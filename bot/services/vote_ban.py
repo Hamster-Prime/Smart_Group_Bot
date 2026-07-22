@@ -33,6 +33,7 @@ from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     UnbanRecovery,
     ban_member,
+    close_private_challenge_message,
     complete_leased_join_verification,
     join_verification_lease_is_current,
     lease_join_verification_for_unban,
@@ -1303,6 +1304,12 @@ async def recover_stale_vote_enforcement(
         return None
 
     cancel_vote_expiry(int(fresh.id))
+    if banned:
+        await close_private_challenge_message(
+            bot,
+            int(fresh.target_user_id),
+            int(getattr(recovery, "private_message_id", 0) or 0),
+        )
     await finalize_vote_message(
         bot,
         settings,
