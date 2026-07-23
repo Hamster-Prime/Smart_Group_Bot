@@ -206,7 +206,7 @@ def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, Inl
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🗑 删除记忆 #{memory_id}",
+                    text=f"删除记忆 #{memory_id}",
                     callback_data=f"lmd:{memory_id}:{page}",
                 )
             ]
@@ -214,9 +214,9 @@ def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, Inl
 
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"lml:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text="上一页", callback_data=f"lml:{page - 1}"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"lml:{page + 1}"))
+        nav_row.append(InlineKeyboardButton(text="下一页", callback_data=f"lml:{page + 1}"))
     if nav_row:
         keyboard_rows.append(nav_row)
     return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
@@ -363,14 +363,14 @@ def _build_av_search_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"avs:{session.token}:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"avs:{session.token}:{page + 1}",
             )
         )
@@ -460,13 +460,13 @@ def _build_av_detail_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🧲 浏览种子 ({len(detail.seeds)})",
+                    text=f"浏览种子 ({len(detail.seeds)})",
                     callback_data=f"avm:{session.token}:{result_idx}:0",
                 )
             ]
         )
     if detail.url.startswith("http"):
-        rows.append([InlineKeyboardButton(text="🌐 打开详情页", url=detail.url)])
+        rows.append([InlineKeyboardButton(text="打开详情页", url=detail.url)])
     if not rows:
         return None
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -511,14 +511,14 @@ def _build_av_seed_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"avm:{session.token}:{result_idx}:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"avm:{session.token}:{result_idx}:{page + 1}",
             )
         )
@@ -528,14 +528,14 @@ def _build_av_seed_page(
     rows.append(
         [
             InlineKeyboardButton(
-                text="⬅️ 返回详情",
+                text="返回详情",
                 callback_data=f"avd:{session.token}:{result_idx}",
             )
         ]
     )
 
     if detail.url.startswith("http"):
-        rows.append([InlineKeyboardButton(text="🌐 打开详情页", url=detail.url)])
+        rows.append([InlineKeyboardButton(text="打开详情页", url=detail.url)])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     return "\n".join(lines).rstrip(), keyboard

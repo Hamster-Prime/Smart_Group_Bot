@@ -30,6 +30,7 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
+from bot.services.message_templates import card_field, render_notice_card
 from bot.services.join_verification import (
     UnbanRecovery,
     ban_member,
@@ -248,24 +249,23 @@ def _remaining_seconds(record: VoteBanSession) -> int:
 
 
 def build_vote_text(record: VoteBanSession, *, approvals: int) -> str:
-    lines = [
-        "🗳 <b>民主投票封禁</b>",
-        f"目标：{_mention(record.target_user_id, record.target_display)}",
-        f"发起人：{_mention(record.starter_user_id, record.starter_display)}",
+    body = [
+        card_field("目标", _mention(record.target_user_id, record.target_display)),
+        card_field("发起人", _mention(record.starter_user_id, record.starter_display)),
     ]
     reason = str(record.reason or "").strip()
     evidence = str(record.evidence or "").strip()
     if reason:
-        lines.append(f"举报理由：{html.escape(_break_user_mentions(reason[:300]))}")
+        body.append(card_field("举报理由", html.escape(_break_user_mentions(reason[:300]))))
     if evidence:
-        lines.append(f"被举报消息：{html.escape(_break_user_mentions(evidence[:300]))}")
-    lines.append(f"票数：<b>{approvals}/{record.threshold}</b>")
-    lines.append(
+        body.append(card_field("被举报消息", html.escape(_break_user_mentions(evidence[:300]))))
+    body.append(card_field("票数", f"{approvals}/{record.threshold}"))
+    body.append(
         f"达到 {record.threshold} 票后立即封禁；"
         f"投票 {_format_duration(_remaining_seconds(record))} 后自动失效。"
     )
-    lines.append("管理员可使用下方按钮取消投票或直接封禁。")
-    return "\n".join(lines)
+    body.append("管理员可使用下方按钮取消投票或直接封禁。")
+    return render_notice_card("民主投票封禁", body)
 
 
 def build_vote_keyboard(session_id: int, approvals: int, threshold: int) -> InlineKeyboardMarkup:
@@ -273,17 +273,17 @@ def build_vote_keyboard(session_id: int, approvals: int, threshold: int) -> Inli
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"🗳 投票封禁（{approvals}/{threshold}）",
+                    text=f"投票封禁（{approvals}/{threshold}）",
                     callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:vote:{int(session_id)}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="❌ 取消投票",
+                    text="取消投票",
                     callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:cancel:{int(session_id)}",
                 ),
                 InlineKeyboardButton(
-                    text="🔨 直接封禁",
+                    text="直接封禁",
                     callback_data=f"{VOTE_BAN_CALLBACK_PREFIX}:ban:{int(session_id)}",
                 ),
             ],
@@ -1337,17 +1337,16 @@ async def finalize_vote_message(
 ) -> None:
     if not record.message_id:
         return
-    lines = [
-        "🗳 <b>民主投票封禁</b>",
-        f"目标：{_mention(record.target_user_id, record.target_display)}",
-        f"票数：<b>{approvals}/{record.threshold}</b>",
-        f"<b>处理结果</b>: {outcome_line}",
+    body = [
+        card_field("目标", _mention(record.target_user_id, record.target_display)),
+        card_field("票数", f"{approvals}/{record.threshold}"),
+        card_field("处理结果", outcome_line),
     ]
     try:
         edited = await bot.edit_message_text(
             chat_id=int(record.group_id),
             message_id=int(record.message_id),
-            text="\n".join(lines),
+            text=render_notice_card("民主投票封禁", body),
             parse_mode="HTML",
             reply_markup=None,
         )

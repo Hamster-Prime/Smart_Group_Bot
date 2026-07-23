@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import Settings
 from bot.db.models import AuthorizedGroup, Group, JoinVerification
 from bot.services.authz import is_group_authorized
+from bot.services.message_templates import render_notice_card
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
@@ -459,12 +460,14 @@ def build_raid_lockdown_text(
     window_seconds: int,
     lockdown_seconds: int,
 ) -> str:
-    return (
-        "🚨 <b>爆破防护已触发</b>\n"
-        f"检测到 {_format_duration(window_seconds)}内有 {joined_count} 名成员加入，"
-        "疑似遭遇批量爆破。\n"
-        f"群组已临时锁定 {_format_duration(lockdown_seconds)}：期间任何新加入的成员"
-        "都会被自动移出（不封禁，解除后可重新加入）。"
+    return render_notice_card(
+        "爆破防护已触发",
+        (
+            f"检测到 {_format_duration(window_seconds)}内有 {joined_count} 名成员加入，"
+            "疑似遭遇批量爆破。\n"
+            f"群组已临时锁定 {_format_duration(lockdown_seconds)}：期间任何新加入的成员"
+            "都会被自动移出（不封禁，解除后可重新加入）。"
+        ),
     )
 
 
@@ -475,16 +478,16 @@ def build_manual_raid_lockdown_text(*, duration_minutes: int | None) -> str:
         duration_text = (
             f"将在 {_format_duration(duration_minutes * 60)} 内拒绝新成员加入"
         )
-    return (
-        "🛡 <b>爆破防护已手动开启</b>\n"
-        f"{duration_text}；被拒绝的成员不会封禁，解除后可以重新加入。"
+    return render_notice_card(
+        "爆破防护已手动开启",
+        f"{duration_text}；被拒绝的成员不会封禁，解除后可以重新加入。",
     )
 
 
 def build_raid_unlock_text() -> str:
-    return (
-        "✅ <b>爆破防护已解除</b>\n"
-        "群组已恢复接收新成员；此前被临时移出的用户现在可以重新加入。"
+    return render_notice_card(
+        "爆破防护已解除",
+        "群组已恢复接收新成员；此前被临时移出的用户现在可以重新加入。",
     )
 
 
@@ -554,19 +557,16 @@ def build_raid_challenge_text(
     *,
     timeout_seconds: int,
 ) -> str:
-    lines = [
-        "🚨 <b>爆破防护真人质询</b>",
-        "以下近期加入的成员需要完成真人验证，已暂时禁言：",
-    ]
+    body = ["以下近期加入的成员需要完成真人验证，已暂时禁言："]
     for suspect in suspects:
-        lines.append(f"• {_mention(suspect)}")
-    lines.append("")
-    lines.append(
+        body.append(f"• {_mention(suspect)}")
+    body.append("")
+    body.append(
         f"请相关成员在 {_format_duration(timeout_seconds)} 内点击下方「真人质询」按钮，"
         "与我私聊完成人机验证；"
     )
-    lines.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
-    return "\n".join(lines)
+    body.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
+    return render_notice_card("爆破防护真人质询", body)
 
 
 def build_raid_challenge_keyboard() -> InlineKeyboardMarkup:
@@ -574,13 +574,13 @@ def build_raid_challenge_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🙋 真人质询（仅被点名成员可用）",
+                    text="真人质询（仅被点名成员可用）",
                     callback_data=RAID_VERIFY_CALLBACK_DATA,
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🚫 一键移除被追溯用户（仅管理员）",
+                    text="一键移除被追溯用户（仅管理员）",
                     callback_data=RAID_REMOVE_CALLBACK_DATA,
                 )
             ],

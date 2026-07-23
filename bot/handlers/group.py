@@ -112,6 +112,7 @@ from bot.services.bot_screening import (
 )
 from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.member_identity import member_display_name
+from bot.services.message_templates import card_field, render_notice_card
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
 from bot.services.reply_mode import ReplyModeService
@@ -614,21 +615,17 @@ def _build_moderation_notice(
     else:
         rule_ref = "未定位具体规则（AI语义判定）"
 
-    lines = [
-        f"<b>{title}</b>",
-        "————————",
-        f"<b>用户</b>: {warn_target}",
-    ]
+    body = [card_field("用户", warn_target)]
     if show_warning_count and count is not None and threshold is not None:
-        lines.append(f"<b>警告次数</b>: {count}/{threshold}")
-    lines.extend(
+        body.append(card_field("警告次数", f"{count}/{threshold}"))
+    body.extend(
         [
-            f"<b>原因</b>: {reason_text}",
-            f"<b>依据规则</b>: {rule_ref}",
-            f"<b>处理结果</b>: {action_result}",
+            card_field("原因", reason_text),
+            card_field("依据规则", rule_ref),
+            card_field("处理结果", action_result),
         ]
     )
-    return "\n".join(lines)
+    return render_notice_card(title, body)
 
 
 _MODERATION_OUTCOME_LABELS = {
@@ -637,9 +634,13 @@ _MODERATION_OUTCOME_LABELS = {
     "exempt": "永久豁免",
 }
 # Matches the "处理结果" line inside a rendered notice (message.html_text keeps
-# the <b> entity). "处理结果" is not always the last line — a failed-ban notice
-# appends a ⚠️ warning after it — so rewrite only that one line.
-_MODERATION_RESULT_LINE_RE = re.compile(r"(<b>处理结果</b>:)[^\n]*")
+# the <b> entity and the surrounding <blockquote>). The value is separated by a
+# full-width space and never contains a raw "<", so stopping at "<" keeps the
+# closing </blockquote> tag intact. The legacy ": " separator is still accepted
+# so a notice posted just before this style change is rewritten in place rather
+# than gaining a duplicate line. "处理结果" is not always the last line — a
+# failed-ban notice appends a ⚠️ warning after the card — so rewrite only it.
+_MODERATION_RESULT_LINE_RE = re.compile(r"(<b>处理结果</b>(?:　|: ))[^\n<]*")
 
 
 async def _apply_moderation_outcome_notice(
@@ -680,14 +681,16 @@ async def _apply_moderation_outcome_notice(
     # Sanitize like the send path so the operator handle renders the same way
     # as the "用户" line (monospace @handle / stripped profile link).
     body = sanitize_outgoing_mentions(f"已被 {mention} {verb}")
+    # group(1) already carries the label separator (full-width space or the
+    # legacy ": "), so append the body directly without inserting another gap.
     new_text, replaced = _MODERATION_RESULT_LINE_RE.subn(
-        lambda m: f"{m.group(1)} {body}", current, count=1
+        lambda m: f"{m.group(1)}{body}", current, count=1
     )
     if replaced == 0:
         # Notice format changed unexpectedly: append the outcome instead of
         # silently dropping it.
         new_text = f"{current.rstrip()}\n" + sanitize_outgoing_mentions(
-            f"<b>处理结果</b>: 已被 {mention} {verb}"
+            card_field("处理结果", f"已被 {mention} {verb}")
         )
 
     try:

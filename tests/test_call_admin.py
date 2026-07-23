@@ -170,8 +170,8 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
         combined = "\n".join(texts)
         for user_id in range(1, 46):
             self.assertEqual(combined.count(f"tg://user?id={user_id}\""), 1)
-        self.assertIn("管理员通知批次：1/3", texts[0])
-        self.assertIn("管理员通知批次：3/3", texts[2])
+        self.assertIn("<b>管理员通知批次</b>　1/3", texts[0])
+        self.assertIn("<b>管理员通知批次</b>　3/3", texts[2])
 
     async def test_disabled_group_sends_nothing(self) -> None:
         bot = self._bot([self._admin_member(7)])
