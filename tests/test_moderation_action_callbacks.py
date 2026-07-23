@@ -231,6 +231,9 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             42,
             revoke_messages=True,
         )
+        # The rewritten notice is the only feedback: a successful direct ban
+        # acks the callback silently instead of announcing a duplicate line.
+        callback.answer.assert_awaited_once_with()
         async with self.session_factory() as session:
             violation = await session.get(Violation, violation_id)
             self.assertEqual(violation.action_taken, "warn_direct")
@@ -863,6 +866,60 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
             revoke_messages=True,
         )
         callback.bot.edit_message_text.assert_not_awaited()
+        # Without the rewrite (>48h inaccessible or deleted notice) the silent
+        # success ack would leave no feedback at all, so the explicit
+        # confirmation is restored on this path only.
+        self.assertIn(
+            "已在当前群直接封禁该用户",
+            callback.answer.await_args.args[0],
+        )
+
+    async def test_failed_notice_edit_falls_back_to_explicit_ban_answer(self) -> None:
+        violation_id = await self._seed_violation("warn")
+        callback = self._callback("ban", violation_id, operator_username="mod_alice")
+        callback.bot.edit_message_text = AsyncMock(
+            side_effect=RuntimeError("message to edit not found")
+        )
+
+        await self._invoke(callback)
+
+        callback.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
+        self.assertIn(
+            "已在当前群直接封禁该用户",
+            callback.answer.await_args.args[0],
+        )
+
+    async def test_successful_direct_ban_posts_no_group_message_via_proxy(self) -> None:
+        # In production the action runs through _DetachedCallbackProxy, whose
+        # answer() posts a group message for non-empty text. A successful ban
+        # must stay silent there: the rewritten notice is the feedback.
+        violation_id = await self._seed_violation("warn")
+        inner = self._callback("ban", violation_id, operator_username="mod_alice")
+        inner.message.answer = AsyncMock()
+        proxy = group._DetachedCallbackProxy(inner)
+
+        async with self.session_factory() as session:
+            with patch(
+                "bot.handlers.group.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ):
+                await group.on_moderation_action(
+                    proxy,  # type: ignore[arg-type]
+                    session=session,
+                    settings=self.settings,
+                )
+
+        inner.bot.ban_chat_member.assert_awaited_once_with(
+            -100,
+            42,
+            revoke_messages=True,
+        )
+        inner.bot.edit_message_text.assert_awaited_once()
+        inner.message.answer.assert_not_awaited()
 
 
 if __name__ == "__main__":

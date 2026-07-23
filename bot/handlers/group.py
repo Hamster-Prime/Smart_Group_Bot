@@ -647,13 +647,15 @@ async def _apply_moderation_outcome_notice(
     settings: Settings,
     *,
     outcome: str,
-) -> None:
+) -> bool:
     """Finalize the notice after a manual intervention: rewrite the "处理结果"
     line to name the operator and action, and drop the action buttons.
 
     Mirrors the join-verification admin outcome (``_edit_verification_prompt``):
     edit the message in place, remove the keyboard, and re-apply the group's
-    "moderation" auto-delete retention. Best-effort — never raises.
+    "moderation" auto-delete retention. Best-effort — never raises. Returns
+    whether the rewrite happened so the caller can fall back to a plain
+    answer when the notice is inaccessible or already deleted.
     """
     verb = _MODERATION_OUTCOME_LABELS.get(outcome)
     message = callback.message
@@ -668,7 +670,7 @@ async def _apply_moderation_outcome_notice(
         or not isinstance(current, str)
         or not current.strip()
     ):
-        return
+        return False
 
     mention = _build_user_mention(
         user_id=int(getattr(operator, "id", 0) or 0),
@@ -709,6 +711,8 @@ async def _apply_moderation_outcome_notice(
             getattr(message, "message_id", "?"),
             exc_info=True,
         )
+        return False
+    return True
 
 
 async def _screen_bot_sender_message(
@@ -1702,7 +1706,9 @@ async def _moderation_direct_ban(
         await callback.answer("用户已被 Telegram 封禁，但状态保存失败", show_alert=True)
         return "retry"
 
-    await callback.answer("已在当前群直接封禁该用户", show_alert=True)
+    # The rewritten notice ("已被 … 手动封禁") is the group-visible feedback;
+    # through the detached proxy a text answer would post a duplicate message.
+    await callback.answer()
     return "ban"
 
 
@@ -2214,7 +2220,15 @@ async def on_moderation_action(
             outcome = "retry"
 
         if outcome and outcome != "retry":
-            await _apply_moderation_outcome_notice(callback, settings, outcome=outcome)
+            rewritten = await _apply_moderation_outcome_notice(
+                callback, settings, outcome=outcome
+            )
+            if not rewritten and outcome == "ban":
+                # The ban succeeded but the notice could not carry the outcome
+                # (inaccessible >48h message or already-deleted notice). The
+                # silent success ack relies on that rewrite, so restore the
+                # explicit confirmation here.
+                await callback.answer("已在当前群直接封禁该用户", show_alert=True)
         if _outcome_sink is not None:
             _outcome_sink.append(outcome)
 

@@ -72,6 +72,7 @@ from bot.services.join_verification import (
     join_verification_policy,
     join_verification_lease_is_current,
     manual_unban_generation_is_active,
+    mask_display_name,
     kick_member,
     lease_expired_join_verification,
     lease_join_verification_for_unban,
@@ -353,7 +354,9 @@ async def _ban_and_notify(
     # revoke_messages only hides history from the banned account itself; the
     # spam they raced in before the ban stays visible to everyone else.
     await delete_messages_since_join(event.bot, int(event.chat.id), int(user_id))
-    shown = html.escape(display_name or str(user_id))
+    # A screened-out joiner never verified: mask the name so an ad display
+    # name gets no exposure through the ban notice. The ID stays visible.
+    shown = html.escape(mask_display_name(display_name, user_id))
     reason_text = html.escape(reason or "入群资料命中群规")
     try:
         sent = await event.bot.send_message(
@@ -1466,7 +1469,8 @@ async def _handle_verification_admin_callback(
         return
 
     kind = str(snapshot["kind"])
-    shown = html.escape(str(snapshot["display_name"] or target_user_id))
+    display_name = str(snapshot["display_name"] or "")
+    shown = html.escape(display_name.strip() or str(target_user_id))
     lease_is_current = await join_verification_lease_is_current(
         session,
         verification_id=int(record.id),
@@ -1596,10 +1600,17 @@ async def _handle_verification_admin_callback(
             show_alert=True,
         )
         return
+    # A rejected joiner never passed verification: keep the name masked so a
+    # spam display name gets no exposure even in the terminal notice. The
+    # numeric ID stays visible so admins can still identify the account.
+    masked = html.escape(mask_display_name(display_name, target_user_id))
     rejected_text = (
         f"🚫 <b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
         if kind == VERIFICATION_KIND_MODERATION
-        else f"🚫 <b>{shown}</b> 的入群验证已被管理员拒绝，已在当前群封禁。"
+        else (
+            f"🚫 <b>{masked}</b>（ID: <code>{target_user_id}</code>）"
+            "的入群验证已被管理员拒绝，已在当前群封禁。"
+        )
     )
     completed = await _complete_moderation_enforcement_or_reconcile(
         callback.bot,

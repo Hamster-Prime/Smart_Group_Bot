@@ -33,6 +33,7 @@ import asyncio
 import html
 import logging
 import time
+import unicodedata
 import weakref
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import nullcontext
@@ -1150,13 +1151,43 @@ def _format_timeout(timeout_seconds: int) -> str:
     return f"{seconds} 秒"
 
 
+# The kept lead character must be visibly printable: format chars (Cf, e.g.
+# U+202E RLO), separators (Zs/Zl/Zp) and controls (Cc) would let a spammer
+# smuggle a bidi override or an "empty" mask through the notice.
+_MASK_HIDDEN_CATEGORIES = frozenset({"Cf", "Cc", "Cs", "Co", "Cn", "Zs", "Zl", "Zp"})
+# Not classified as invisible by Unicode but rendered blank in chat clients.
+_MASK_BLANK_CHARS = frozenset("ᅠㅤﾠ⠀")
+
+
+def mask_display_name(display_name: str, user_id: int) -> str:
+    """Mask all but the first character of an unverified member's name.
+
+    Spam accounts carry the ad in the display name itself, so the join
+    challenge prompt must not reprint it; the tg://user link still lets
+    admins open the real profile. Verified outcomes show the real name.
+    """
+    label = (display_name or "").strip()
+    lead = next(
+        (
+            ch
+            for ch in label
+            if unicodedata.category(ch) not in _MASK_HIDDEN_CATEGORIES
+            and ch not in _MASK_BLANK_CHARS
+        ),
+        "",
+    )
+    if not lead:
+        return str(user_id)
+    return lead + "*" * min(max(len(label) - 1, 2), 6)
+
+
 def build_group_prompt_text(
     *,
     user_id: int,
     display_name: str,
     timeout_seconds: int,
 ) -> str:
-    shown = html.escape((display_name or "").strip() or str(user_id))
+    shown = html.escape(mask_display_name(display_name, user_id))
     return (
         f'👋 欢迎 <a href="tg://user?id={user_id}">{shown}</a>！\n'
         "本群已开启入群真人验证，验证通过前你暂时无法发言。\n\n"
@@ -4884,8 +4915,16 @@ class JoinVerificationSweeper:
                         "已移出群聊（未封禁，可重新加入）。"
                     )
                 else:
+                    # A timed-out joiner never verified: keep the name masked
+                    # like the challenge prompt so an ad display name gets no
+                    # exposure through the terminal notice either. The ID keeps
+                    # the account identifiable for admins.
+                    masked = html.escape(
+                        mask_display_name(record.display_name or "", record.user_id)
+                    )
                     text = (
-                        f"⏰ <b>{shown}</b> 验证超时，已移出群聊。可重新加入再次验证。"
+                        f"⏰ <b>{masked}</b>（ID: <code>{record.user_id}</code>）"
+                        "验证超时，已移出群聊。可重新加入再次验证。"
                     )
             await self._finalize_prompt(record, text)
 

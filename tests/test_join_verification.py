@@ -41,6 +41,7 @@ from bot.services.join_verification import (
     ban_member_result,
     begin_moderation_challenge,
     build_group_prompt_keyboard,
+    build_group_prompt_text,
     build_mini_app_url,
     build_private_challenge_keyboard,
     build_private_deep_link,
@@ -63,6 +64,7 @@ from bot.services.join_verification import (
     lease_join_verifications_for_user_unban,
     list_expired_preparing_verifications,
     list_expired_verifications,
+    mask_display_name,
     maybe_send_private_verification,
     moderation_challenge_ready,
     mark_turnstile_configuration_unavailable,
@@ -152,6 +154,35 @@ class HelperTests(unittest.TestCase):
             )
         )
         self.assertFalse(join_verification_ready(_settings(join_verification_public_base_url="")))
+
+    def test_mask_display_name_hides_all_but_first_character(self) -> None:
+        self.assertEqual(mask_display_name("广告用户加V信xyz", 42), "广******")
+        self.assertEqual(mask_display_name("张三", 42), "张**")
+        self.assertEqual(mask_display_name("A", 42), "A**")
+        # Empty names fall back to the numeric id, unmasked.
+        self.assertEqual(mask_display_name("", 42), "42")
+        self.assertEqual(mask_display_name("   ", 42), "42")
+
+    def test_mask_display_name_skips_invisible_lead_characters(self) -> None:
+        # A leading RLO (U+202E) must not survive as the kept character:
+        # it would reverse the rest of the notice line (bidi spoofing).
+        self.assertEqual(mask_display_name("‮www.spam.com", 42), "w******")
+        # Hangul filler / braille blank render as empty; fall through them.
+        self.assertEqual(mask_display_name("ㅤㅤ", 42), "42")
+        self.assertEqual(mask_display_name("⠀广告", 42), "广**")
+        # Zero-width space and joiner are skipped too.
+        self.assertEqual(mask_display_name("​‍张三", 42), "张***")
+
+    def test_group_prompt_masks_display_name(self) -> None:
+        text = build_group_prompt_text(
+            user_id=42,
+            display_name="加微信xw123领福利",
+            timeout_seconds=300,
+        )
+        self.assertIn("加******", text)
+        self.assertNotIn("微信", text)
+        # The profile link still lets admins inspect the real account.
+        self.assertIn('tg://user?id=42', text)
 
     def test_moderation_challenge_ready_does_not_require_join_feature(self) -> None:
         settings = _settings(join_verification_enabled=False)
@@ -3191,6 +3222,14 @@ class VerificationCallbackTests(_DbTestCase):
 
         ban.assert_awaited_once_with(callback.bot, -100, 948)
         callback.bot.unban_chat_member.assert_not_awaited()
+        # The rejected joiner never verified: the outcome notice keeps the
+        # display name masked so a spam name gets no terminal exposure,
+        # while the numeric ID keeps the account identifiable.
+        rejected_text = callback.bot.edit_message_text.await_args.kwargs["text"]
+        self.assertIn("用****", rejected_text)
+        self.assertNotIn("用户948", rejected_text)
+        self.assertIn("<code>948</code>", rejected_text)
+        self.assertIn("已被管理员拒绝", rejected_text)
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 948))
             warning = await session.scalar(
@@ -4271,8 +4310,12 @@ class SweeperTests(_DbTestCase):
         self.assertEqual(edit_kwargs["message_id"], 781)
         self.assertEqual(edit_kwargs["parse_mode"], "HTML")
         self.assertIsNone(edit_kwargs["reply_markup"])
-        # Name shown like the pass notice, and the outcome auto-deletes.
-        self.assertIn("<b>张三</b>", edit_kwargs["text"])
+        # The joiner never verified, so the timeout notice keeps the name
+        # masked like the challenge prompt while the ID stays identifiable;
+        # the outcome auto-deletes.
+        self.assertIn("<b>张**</b>", edit_kwargs["text"])
+        self.assertNotIn("张三", edit_kwargs["text"])
+        self.assertIn("<code>940</code>", edit_kwargs["text"])
         self.assertIn("验证超时", edit_kwargs["text"])
         schedule_mock.assert_awaited_once_with(edited, 30)
 
