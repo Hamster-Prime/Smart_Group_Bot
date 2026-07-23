@@ -111,6 +111,7 @@ from bot.services.recent_messages import (
     delete_messages_since_join,
     mark_member_join,
     member_join_marker,
+    retract_removed_member_residue,
 )
 from bot.services.request_priority import privileged_request_scope
 from bot.services.update_completion import request_current_update_retry
@@ -357,8 +358,9 @@ async def _ban_and_notify(
             )
         return enforcement
     # revoke_messages only hides history from the banned account itself; the
-    # spam they raced in before the ban stays visible to everyone else.
-    await delete_messages_since_join(
+    # spam they raced in before the ban — plus the join announcement and the
+    # "X was removed" notice — stay visible to everyone else.
+    await retract_removed_member_residue(
         event.bot,
         int(event.chat.id),
         int(user_id),
@@ -852,7 +854,7 @@ async def _enforce_pending_moderation_challenge(
                 preserve_ban=preserve_ban,
             )
             if enforced:
-                await delete_messages_since_join(
+                await retract_removed_member_residue(
                     event.bot,
                     int(record.group_id),
                     int(record.user_id),
@@ -1627,9 +1629,9 @@ async def _handle_verification_admin_callback(
         )
         return
     # revoke_messages only hides history from the banned account; the join
-    # service message and any raced-in residue stay visible to everyone else
-    # and would keep the unverified name exposed after removal.
-    await delete_messages_since_join(
+    # announcement, raced-in residue, and "X was removed" notice stay visible
+    # to everyone else and would keep the unverified name exposed.
+    await retract_removed_member_residue(
         callback.bot,
         group_id,
         target_user_id,

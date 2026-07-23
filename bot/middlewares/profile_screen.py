@@ -38,8 +38,8 @@ from bot.services.join_verification import (
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
 from bot.services.recent_messages import (
-    delete_messages_since_join,
     member_join_marker,
+    retract_removed_member_residue,
 )
 from bot.services.request_priority import is_privileged_execution
 from bot.services.update_delivery import telegram_message_is_privileged_candidate
@@ -479,9 +479,10 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                 if enforcement.final_restricted is True
                                 else "released"
                             )
-            # A just-joined violator may have messages beyond this one that
+            # A just-joined violator may have messages beyond this one — plus
+            # the join announcement and "X was removed" notice — that
             # revoke_messages will not remove for other members.
-            await delete_messages_since_join(
+            await retract_removed_member_residue(
                 event.bot,
                 int(chat.id),
                 int(user.id),

@@ -17,7 +17,7 @@ from bot.services.join_verification import (
     reconcile_moderation_ban_after_lost_lease,
     verification_restriction_required,
 )
-from bot.services.recent_messages import delete_messages_since_join
+from bot.services.recent_messages import retract_removed_member_residue
 from bot.services.update_completion import request_current_update_retry
 
 log = logging.getLogger(__name__)
@@ -185,9 +185,11 @@ class GlobalBanEnforcementMiddleware(BaseMiddleware):
         except Exception:
             pass
         # A banned rejoin may have raced several messages in before this one;
-        # sweep the residue from the same fresh-join window.
+        # sweep the residue from the same fresh-join window and (for a fresh
+        # rejoin) arm deletion of the "X was removed" notice the imminent ban
+        # will post. Runs before the ban, so the live join marker is intact.
         try:
-            await delete_messages_since_join(event.bot, int(chat.id), int(user.id))
+            await retract_removed_member_residue(event.bot, int(chat.id), int(user.id))
         except Exception:
             log.debug(
                 "banned-user residue sweep failed | chat=%s user=%s",

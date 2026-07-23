@@ -16,11 +16,14 @@ from bot.services.join_verification import upsert_join_verification
 from bot.services.recent_messages import (
     clear_member_join_marker,
     clear_recent_member_messages,
+    consume_member_removal,
     delete_messages_since_join,
     drain_recent_member_messages,
     mark_member_join,
+    mark_member_removed,
     member_join_marker,
     record_group_message,
+    retract_removed_member_residue,
 )
 from bot.utils.timezone import now_shanghai_naive
 
@@ -174,6 +177,46 @@ class RecentMessageBufferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted, 0)
         bot.delete_messages.assert_not_awaited()
 
+    def test_member_removal_mark_is_one_shot(self) -> None:
+        mark_member_removed(GROUP_ID, 970)
+        self.assertTrue(consume_member_removal(GROUP_ID, 970))
+        # A single removal yields exactly one service message; the mark is
+        # cleared so a later unrelated leave is not deleted.
+        self.assertFalse(consume_member_removal(GROUP_ID, 970))
+
+    def test_member_removal_mark_expires(self) -> None:
+        mark_member_removed(
+            GROUP_ID,
+            971,
+            at=now_shanghai_naive() - timedelta(minutes=20),
+        )
+        self.assertFalse(consume_member_removal(GROUP_ID, 971))
+
+    def test_unmarked_member_removal_is_not_consumed(self) -> None:
+        self.assertFalse(consume_member_removal(GROUP_ID, 972))
+
+    async def test_retract_arms_removal_notice_for_fresh_join(self) -> None:
+        bot = SimpleNamespace(delete_messages=AsyncMock(return_value=True))
+        mark_member_join(GROUP_ID, 973)
+        record_group_message(GROUP_ID, 973, 57)
+
+        deleted = await retract_removed_member_residue(bot, GROUP_ID, 973)
+        self.assertEqual(deleted, 1)
+        # The join residue was swept AND the pending "X removed" notice armed.
+        self.assertTrue(consume_member_removal(GROUP_ID, 973))
+
+    async def test_retract_does_not_arm_removal_for_stale_join(self) -> None:
+        # An established member's ban must not delete their removal notice.
+        bot = SimpleNamespace(delete_messages=AsyncMock(return_value=True))
+        deleted = await retract_removed_member_residue(
+            bot,
+            GROUP_ID,
+            974,
+            marker=now_shanghai_naive() - timedelta(hours=2),
+        )
+        self.assertEqual(deleted, 0)
+        self.assertFalse(consume_member_removal(GROUP_ID, 974))
+
 
 class PendingVerificationGateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -300,6 +343,51 @@ class PendingVerificationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(drain_recent_member_messages(GROUP_ID, 919), [72])
         # The exempt inviter's own buffer must not absorb the announcement.
         self.assertEqual(drain_recent_member_messages(GROUP_ID, 1), [])
+
+    async def test_removed_member_leave_service_message_is_deleted(self) -> None:
+        # After a terminal removal the "X was removed" service message reprints
+        # the unverified name; when the member is marked removed, the gate
+        # deletes that announcement and swallows the update. Its from_user is
+        # the acting bot, so the gate must key on left_chat_member instead.
+        mark_member_removed(GROUP_ID, 920)
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=99, message_id=81, is_bot=True)
+        event.left_chat_member = SimpleNamespace(id=920, is_bot=False)
+
+        result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        event.delete.assert_awaited_once()
+        # One-shot: a subsequent leave message for the same user is left alone.
+        self.assertFalse(consume_member_removal(GROUP_ID, 920))
+
+    async def test_unmarked_member_leave_service_message_passes_through(self) -> None:
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=99, message_id=82, is_bot=True)
+        event.left_chat_member = SimpleNamespace(id=921, is_bot=False)
+
+        result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertEqual(result, "handled")
+        event.delete.assert_not_awaited()
+
+    async def test_removed_member_leave_delete_failure_uses_durable_queue(self) -> None:
+        mark_member_removed(GROUP_ID, 922)
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=99, message_id=83, is_bot=True)
+        event.left_chat_member = SimpleNamespace(id=922, is_bot=False)
+        event.delete = AsyncMock(side_effect=RuntimeError("flood"))
+
+        with patch(
+            "bot.middlewares.verification_gate.schedule_message_auto_delete_durable",
+            new=AsyncMock(return_value=True),
+        ) as durable:
+            result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertIsNone(result)
+        handler.assert_not_awaited()
+        durable.assert_awaited_once()
 
     async def test_banned_sender_is_not_gated_here(self) -> None:
         # Local bans are the GlobalBanEnforcementMiddleware's job; without a

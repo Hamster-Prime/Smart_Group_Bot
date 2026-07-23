@@ -15,6 +15,13 @@ service messages (``new_chat_members``) are recorded under each announced
 member — not their inviter — because the announcement reprints the member's
 display name and must disappear with the member's other residue when a
 verification timeout or screening ban removes them.
+
+The mirror artifact is handled here too: when a terminal removal bans/kicks
+an unverified member, Telegram posts a ``left_chat_member`` ("X was removed")
+service message that reprints the same name. That message is created only
+after the ban, so it cannot be pre-recorded; the removing site arms a
+one-shot mark (``mark_member_removed``) and this gate deletes the
+announcement when its update arrives.
 """
 from __future__ import annotations
 
@@ -27,7 +34,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.services.authz import is_super_admin_user_id
 from bot.services.join_verification import verification_restriction_required
-from bot.services.recent_messages import record_group_message
+from bot.services.recent_messages import (
+    consume_member_removal,
+    record_group_message,
+)
 from bot.utils.telegram import schedule_message_auto_delete_durable
 
 log = logging.getLogger(__name__)
@@ -44,6 +54,25 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self.session_factory = session_factory
+
+    @staticmethod
+    async def _delete_or_schedule(event: Message, chat_id: int) -> None:
+        """Delete a message, falling back to the durable deletion queue.
+
+        A transient Telegram outage or permissions hiccup must not leave the
+        residue behind; the durable queue retries once conditions recover.
+        """
+        try:
+            await event.delete()
+        except Exception:
+            try:
+                await schedule_message_auto_delete_durable(event, 1)
+            except Exception:
+                log.exception(
+                    "verification gate fallback delete failed | chat=%s message=%s",
+                    chat_id,
+                    getattr(event, "message_id", 0),
+                )
 
     async def __call__(
         self,
@@ -69,6 +98,22 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
             member_id = int(getattr(member, "id", 0) or 0)
             if member_id > 0:
                 record_group_message(int(chat.id), member_id, service_message_id)
+
+        # A "X was removed" service message for a member we just removed
+        # reprints their unverified name. Its from_user is the actor (bot or
+        # admin), so key on the departed member and handle it before the
+        # sender-based bypasses below.
+        left_member = getattr(event, "left_chat_member", None)
+        if left_member is not None and not bool(getattr(left_member, "is_bot", False)):
+            left_id = int(getattr(left_member, "id", 0) or 0)
+            if left_id > 0 and consume_member_removal(int(chat.id), left_id):
+                log.info(
+                    "[%s] deleting removal service message for member %s",
+                    chat.id,
+                    left_id,
+                )
+                await self._delete_or_schedule(event, chat.id)
+                return None
 
         if (
             user is None
@@ -111,18 +156,5 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
             chat.id,
             user.id,
         )
-        try:
-            await event.delete()
-        except Exception:
-            # Telegram refused the direct delete (transient outage or a
-            # permissions hiccup). Hand the message to the durable deletion
-            # queue so the residue still disappears once conditions recover.
-            try:
-                await schedule_message_auto_delete_durable(event, 1)
-            except Exception:
-                log.exception(
-                    "verification gate fallback delete failed | chat=%s message=%s",
-                    chat.id,
-                    getattr(event, "message_id", 0),
-                )
+        await self._delete_or_schedule(event, chat.id)
         return None

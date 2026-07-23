@@ -4464,6 +4464,7 @@ class SweeperTests(_DbTestCase):
         from bot.services.recent_messages import (
             clear_member_join_marker,
             clear_recent_member_messages,
+            consume_member_removal,
             mark_member_join,
             record_group_message,
         )
@@ -4504,6 +4505,8 @@ class SweeperTests(_DbTestCase):
             chat_id=-100,
             message_ids=[601, 602],
         )
+        # The pending "X was removed" service message is armed for the gate.
+        self.assertTrue(consume_member_removal(-100, 952))
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 952))
 

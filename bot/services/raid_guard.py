@@ -87,6 +87,7 @@ from bot.services.join_verification import (
 from bot.services.recent_messages import (
     delete_messages_since_join,
     member_join_marker,
+    retract_removed_member_residue,
 )
 from bot.utils.timezone import (
     now_shanghai_naive,
@@ -810,10 +811,10 @@ async def remove_raid_challenged_users(
                 # Keep the removal intent durable. The sweeper retries after
                 # the renewed lease instead of exposing a passable challenge.
                 return user_id, False
-            # The removed raider's join service message and raced-in residue
-            # stay visible to other members; retract them so the unverified
-            # name gets no post-removal exposure.
-            await delete_messages_since_join(
+            # The removed raider's join announcement, raced-in residue, and
+            # "X was removed" notice stay visible to other members; retract
+            # them so the unverified name gets no post-removal exposure.
+            await retract_removed_member_residue(
                 bot,
                 group_id,
                 user_id,
@@ -1745,7 +1746,7 @@ class RaidGuardService:
         )
         if not kicked:
             return False
-        await delete_messages_since_join(
+        await retract_removed_member_residue(
             self.bot,
             group_id,
             user_id,

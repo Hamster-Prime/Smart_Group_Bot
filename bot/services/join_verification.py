@@ -74,6 +74,7 @@ from bot.services.join_screening import is_globally_banned
 from bot.services.recent_messages import (
     delete_messages_since_join,
     member_join_marker,
+    retract_removed_member_residue,
 )
 from bot.services.request_priority import (
     ExecutionPriority,
@@ -4840,10 +4841,10 @@ class JoinVerificationSweeper:
                     )
                     return
                 # revoke_messages only hides history from the banned account;
-                # the join service message and any raced-in residue stay
-                # visible to everyone else and would keep the unverified name
-                # exposed after removal.
-                await delete_messages_since_join(
+                # the join announcement, raced-in residue, and "X was removed"
+                # notice stay visible to everyone else and would keep the
+                # unverified name exposed after removal.
+                await retract_removed_member_residue(
                     self.bot,
                     int(record.group_id),
                     int(record.user_id),
@@ -4881,7 +4882,7 @@ class JoinVerificationSweeper:
                         deferred,
                     )
                     return
-                await delete_messages_since_join(
+                await retract_removed_member_residue(
                     self.bot,
                     int(record.group_id),
                     int(record.user_id),
@@ -4925,10 +4926,10 @@ class JoinVerificationSweeper:
                         record.user_id,
                     )
                     return
-                # A kicked (rejoinable) member's join service message and
-                # raced-in residue survive the temporary ban; retract them so
-                # the unverified name is not left exposed in history.
-                await delete_messages_since_join(
+                # A kicked (rejoinable) member's join announcement, raced-in
+                # residue, and "X was removed" notice survive the temporary
+                # ban; retract them so the unverified name is not left exposed.
+                await retract_removed_member_residue(
                     self.bot,
                     int(record.group_id),
                     int(record.user_id),
