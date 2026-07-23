@@ -43,9 +43,14 @@ class StyleSettingsTests(unittest.TestCase):
     def test_build_style_profile_context_renders_block(self) -> None:
         context = build_style_profile_context("语气懒散，爱用「捏」结尾。", target_name="老王")
 
-        self.assertTrue(context.startswith("[SPEECH_STYLE_PROFILE]\n"))
+        self.assertTrue(context.startswith("[ACTIVE_PERSONA]\n"))
         self.assertIn("语气懒散", context)
         self.assertIn("老王", context)
+        # Highest-priority override wording must be present so the clone beats
+        # the default persona sitting at messages[0].
+        self.assertIn("authoritative: yes", context)
+        self.assertIn("优先级最高", context)
+        self.assertIn("覆盖", context)
 
     def test_build_style_profile_context_empty_profile_returns_empty(self) -> None:
         self.assertEqual(build_style_profile_context("", target_name="x"), "")
@@ -271,10 +276,18 @@ class StylePromptInjectionTests(unittest.TestCase):
             style_profile_context=build_style_profile_context("爱用捏。", target_name="老王"),
         )
 
-        contents = [m["content"] for m in payload["messages"]]
-        blocks = [c for c in contents if c.startswith("[SPEECH_STYLE_PROFILE]\n")]
+        messages = payload["messages"]
+        contents = [m["content"] for m in messages]
+        blocks = [c for c in contents if c.startswith("[ACTIVE_PERSONA]\n")]
         self.assertEqual(len(blocks), 1)
         self.assertIn("爱用捏", blocks[0])
+        # The clone persona must be the LAST system block (only the user
+        # message follows) so it wins on recency over the default persona.
+        active_idx = next(
+            i for i, m in enumerate(messages) if m["content"].startswith("[ACTIVE_PERSONA]\n")
+        )
+        self.assertTrue(all(m["role"] != "system" for m in messages[active_idx + 1 :]))
+        self.assertEqual(messages[-1]["role"], "user")
 
     def test_casual_prompt_without_profile_has_no_block(self) -> None:
         from bot.services.casual import CasualService
@@ -283,7 +296,7 @@ class StylePromptInjectionTests(unittest.TestCase):
         payload = service.build_prompt_payload("你好")
 
         contents = [m["content"] for m in payload["messages"]]
-        self.assertFalse(any(c.startswith("[SPEECH_STYLE_PROFILE]\n") for c in contents))
+        self.assertFalse(any(c.startswith("[ACTIVE_PERSONA]\n") for c in contents))
 
     def test_skill_prompt_includes_style_block(self) -> None:
         from bot.services.skills.service import SkillService
@@ -294,9 +307,15 @@ class StylePromptInjectionTests(unittest.TestCase):
             style_profile_context=build_style_profile_context("爱用捏。", target_name="老王"),
         )
 
-        contents = [m["content"] for m in payload["messages"]]
-        blocks = [c for c in contents if c.startswith("[SPEECH_STYLE_PROFILE]\n")]
+        messages = payload["messages"]
+        contents = [m["content"] for m in messages]
+        blocks = [c for c in contents if c.startswith("[ACTIVE_PERSONA]\n")]
         self.assertEqual(len(blocks), 1)
+        active_idx = next(
+            i for i, m in enumerate(messages) if m["content"].startswith("[ACTIVE_PERSONA]\n")
+        )
+        self.assertTrue(all(m["role"] != "system" for m in messages[active_idx + 1 :]))
+        self.assertEqual(messages[-1]["role"], "user")
 
 
 class MimicCommandTests(unittest.IsolatedAsyncioTestCase):

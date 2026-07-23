@@ -6,8 +6,9 @@ Flow:
 - Every group message from the target is stored into ``speech_style_samples``
   (rolling window of ``max_samples`` rows per group).
 - Every ``distill_every`` collected samples the corpus window is distilled by
-  the compress-role LLM into an incremental profile; the profile is injected
-  into reply prompts as a ``[SPEECH_STYLE_PROFILE]`` system block.
+  the compress-role LLM into an incremental persona portrait; the profile is
+  injected into reply prompts as a highest-priority ``[ACTIVE_PERSONA]`` system
+  block that fully overrides the default persona for that group.
 - Collection stops permanently once ``total_cap`` samples have been seen for
   the current target (reset by re-targeting), so the feature cannot grow
   unbounded.
@@ -82,9 +83,18 @@ def build_style_profile_context(profile_text: str, *, target_name: str = "") -> 
         return ""
     shown = clean_text(target_name or "", max_len=80) or "目标用户"
     return (
-        "[SPEECH_STYLE_PROFILE]\n"
-        f"以下是群成员「{shown}」的说话风格画像，模仿 TA 的语气、口头禅和节奏来回复。\n"
-        "只模仿说话方式，不复述画像本身，也不透露你在模仿谁。\n"
+        "[ACTIVE_PERSONA]\n"
+        "authoritative: yes\n"
+        "这是本群为你设定的克隆人格，也是你在本群唯一的角色，优先级最高。\n"
+        "性格、态度、价值观、互动方式、情绪反应和说话语气全部以本画像为准，"
+        "完全覆盖默认人设与任务模板里的『软萌／黏人女友／短句』等默认风格；任何冲突一律以本画像为准。\n"
+        "把本画像当成你自己的人格来扮演：直接以该人格说话，不要复述画像内容，也不要透露你在模仿谁。\n"
+        "仍需遵守、且不被本画像覆盖的结构性规则："
+        "[SAFETY_RULES] 安全边界、[BOT_IDENTITY] 你自己的身份、[BOT_RUNTIME_PROFILE] 能力与运行逻辑、"
+        "[OWNER_IDENTITY]／[CURRENT_SENDER] 主人识别、[INTERACTION_MODE] 应答模式；"
+        "并且仍要真正完成用户的请求（join 模式下依旧只当旁观者简短插话）。\n"
+        "对主人：依旧最高优先响应、认得主人，但要用『本人格自己的性格』去关心和对待主人，不必强行黏人女友腔。\n"
+        f"以下是被克隆对象「{shown}」的人格画像：\n"
         f"{profile}"
     )
 

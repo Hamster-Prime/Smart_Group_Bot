@@ -46,6 +46,25 @@ class ConversationContextTests(unittest.TestCase):
         self.assertNotIn("first question", context)
         self.assertNotIn("previous topic", context)
 
+    def test_recent_group_context_marks_owner_line(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": (
+                    "[id:7 username:@root is_owner:yes is_tg_admin:no trusted_source:none "
+                    "name:Root] 在吗"
+                ),
+                "created_at": "2026-03-20 10:00:00",
+                "sender_id": 7,
+                "sender_name": "Root",
+                "message_type": "text",
+            }
+        ]
+
+        context = format_recent_group_context(history, max_items=1, max_item_chars=120)
+
+        self.assertIn("sender_role=owner", context)
+
     def test_current_turn_focus_keeps_merged_structure(self) -> None:
         merged_context = (
             "count=2\n"
