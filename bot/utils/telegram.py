@@ -329,7 +329,7 @@ def build_delete_button_markup(base: object | None = None) -> object:
 
     delete_row = [
         InlineKeyboardButton(
-            text="🗑 删除消息",
+            text="删除消息",
             callback_data=DELETE_BUTTON_CALLBACK_DATA,
         )
     ]

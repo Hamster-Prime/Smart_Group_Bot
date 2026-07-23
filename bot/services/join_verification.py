@@ -82,6 +82,7 @@ from bot.services.request_priority import (
     current_execution_priority,
 )
 from bot.services.resource_health import register_resource_health_provider
+from bot.services.message_templates import card_field, render_notice_card
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -1196,12 +1197,15 @@ def build_group_prompt_text(
     timeout_seconds: int,
 ) -> str:
     shown = spoiler_display_name(display_name, user_id)
-    return (
-        f'👋 欢迎 <a href="tg://user?id={user_id}">{shown}</a>！\n'
-        "本群已开启入群真人验证，验证通过前你暂时无法发言。\n\n"
-        f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮，"
-        "与我私聊并完成人机验证；\n"
-        "超时将被移出群聊（可重新加入再试）。"
+    return render_notice_card(
+        "入群验证",
+        (
+            f'欢迎 <a href="tg://user?id={user_id}">{shown}</a> 加入。\n'
+            "本群已开启入群真人验证，验证通过前你暂时无法发言。\n\n"
+            f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮，"
+            "与我私聊并完成人机验证；\n"
+            "超时将被移出群聊（可重新加入再试）。"
+        ),
     )
 
 
@@ -1231,7 +1235,7 @@ def build_group_prompt_keyboard(user_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔐 开始验证",
+                    text="开始验证",
                     callback_data=build_verification_callback_data(
                         VERIFICATION_CALLBACK_START,
                         user_id,
@@ -1240,14 +1244,14 @@ def build_group_prompt_keyboard(user_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="✅ 管理员通过",
+                    text="管理员通过",
                     callback_data=build_verification_callback_data(
                         VERIFICATION_CALLBACK_APPROVE,
                         user_id,
                     ),
                 ),
                 InlineKeyboardButton(
-                    text="❌ 管理员拒绝",
+                    text="管理员拒绝",
                     callback_data=build_verification_callback_data(
                         VERIFICATION_CALLBACK_REJECT,
                         user_id,
@@ -1267,12 +1271,16 @@ def build_moderation_prompt_text(
 ) -> str:
     shown = html.escape((display_name or "").strip() or str(user_id))
     safe_reason = html.escape((reason or "疑似命中群规").strip())
-    return (
-        f'⚠️ <a href="tg://user?id={user_id}">{shown}</a> 的消息触发了低置信度违规判定。\n'
-        f"原因：{safe_reason}\n\n"
-        "验证通过前你暂时无法继续发言。\n"
-        f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮完成真人验证；\n"
-        "验证成功后自动恢复发言权限，超时将被封禁。"
+    return render_notice_card(
+        "消息审查验证",
+        [
+            f'⚠️ <a href="tg://user?id={user_id}">{shown}</a> 的消息触发了低置信度违规判定。',
+            card_field("原因", safe_reason),
+            "",
+            "验证通过前你暂时无法继续发言。",
+            f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮完成真人验证；",
+            "验证成功后自动恢复发言权限，超时将被封禁。",
+        ],
     )
 
 
@@ -1285,39 +1293,51 @@ def build_private_challenge_text(
     deadline = deadline_at.strftime("%H:%M:%S")
     if kind == VERIFICATION_KIND_MODERATION:
         safe_reason = html.escape((reason or "疑似命中群规").strip())
-        return (
-            "<b>消息审查真人验证</b>\n"
-            f"待核验原因：{safe_reason}\n"
-            "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
-            f"请在今天 {deadline} 前完成，超时将被封禁。"
+        return render_notice_card(
+            "消息审查真人验证",
+            [
+                card_field("待核验原因", safe_reason),
+                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
+                "",
+                f"请在今天 {deadline} 前完成，超时将被封禁。",
+            ],
         )
     if kind == VERIFICATION_KIND_PATROL:
         safe_reason = html.escape((reason or "资料疑似命中群规").strip())
-        return (
-            "<b>资料巡检真人质询</b>\n"
-            f"待核验原因：{safe_reason}\n"
-            "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
-            f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。"
+        return render_notice_card(
+            "资料巡检真人质询",
+            [
+                card_field("待核验原因", safe_reason),
+                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
+                "",
+                f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。",
+            ],
         )
     if kind == VERIFICATION_KIND_RAID:
         safe_reason = html.escape((reason or "群组正遭遇批量加入").strip())
-        return (
-            "<b>爆破防护真人质询</b>\n"
-            f"待核验原因：{safe_reason}\n"
-            "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。\n\n"
-            f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。"
+        return render_notice_card(
+            "爆破防护真人质询",
+            [
+                card_field("待核验原因", safe_reason),
+                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
+                "",
+                f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。",
+            ],
         )
-    return (
-        "<b>入群真人验证</b>\n"
-        "点击下方按钮，在弹出的窗口中完成人机验证，通过后即可在群内发言。\n\n"
-        f"请在今天 {deadline} 前完成，超时将被移出群聊。"
+    return render_notice_card(
+        "入群真人验证",
+        [
+            "点击下方按钮，在弹出的窗口中完成人机验证，通过后即可在群内发言。",
+            "",
+            f"请在今天 {deadline} 前完成，超时将被移出群聊。",
+        ],
     )
 
 
 # Private-chat challenge entries are rewritten once their record reaches a
 # terminal state so a stale WebApp button cannot keep reopening the challenge.
-PRIVATE_CHALLENGE_SUPERSEDED_TEXT = "ℹ️ 此验证入口已更新，请使用最新的验证消息。"
-PRIVATE_CHALLENGE_CLOSED_TEXT = "ℹ️ 本次验证流程已结束，无需再次验证。"
+PRIVATE_CHALLENGE_SUPERSEDED_TEXT = "此验证入口已更新，请使用最新的验证消息。"
+PRIVATE_CHALLENGE_CLOSED_TEXT = "本次验证流程已结束，无需再次验证。"
 
 
 def build_private_challenge_keyboard(
@@ -1329,7 +1349,7 @@ def build_private_challenge_keyboard(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ 开始验证",
+                    text="开始验证",
                     web_app=WebAppInfo(
                         url=build_mini_app_url(
                             settings,
@@ -4812,7 +4832,7 @@ class JoinVerificationSweeper:
                     return
                 await self._finalize_prompt(
                     record,
-                    f"✅ <b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
+                    f"<b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
                 )
                 return
             if globally_banned:
@@ -4890,7 +4910,7 @@ class JoinVerificationSweeper:
                 )
                 if not await self._complete_enforcement(record, mark_banned=True):
                     return
-                text = f"⏰ <b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
+                text = f"<b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
             else:
                 async def preserve_ban() -> bool:
                     async with self.session_factory() as session:
@@ -4945,12 +4965,12 @@ class JoinVerificationSweeper:
                     return
                 if record.kind == VERIFICATION_KIND_PATROL:
                     text = (
-                        f"⏰ <b>{shown}</b> 资料巡检质询超时，"
+                        f"<b>{shown}</b> 资料巡检质询超时，"
                         "已移出群聊（未封禁，可重新加入）。"
                     )
                 elif record.kind == VERIFICATION_KIND_RAID:
                     text = (
-                        f"⏰ <b>{shown}</b> 爆破防护质询超时，"
+                        f"<b>{shown}</b> 爆破防护质询超时，"
                         "已移出群聊（未封禁，可重新加入）。"
                     )
                 else:
@@ -4962,7 +4982,7 @@ class JoinVerificationSweeper:
                         record.display_name or "", record.user_id
                     )
                     text = (
-                        f"⏰ <b>{spoilered}</b>（ID: <code>{record.user_id}</code>）"
+                        f"<b>{spoilered}</b>（ID: <code>{record.user_id}</code>）"
                         "验证超时，已移出群聊。可重新加入再次验证。"
                     )
             await self._finalize_prompt(record, text)

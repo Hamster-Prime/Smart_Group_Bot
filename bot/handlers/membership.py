@@ -373,7 +373,7 @@ async def _ban_and_notify(
     try:
         sent = await event.bot.send_message(
             event.chat.id,
-            f"🚫 已封禁新成员 <b>{shown}</b>（ID: <code>{user_id}</code>）\n原因：{reason_text}\n"
+            f"已封禁新成员 <b>{shown}</b>（ID: <code>{user_id}</code>）\n原因：{reason_text}\n"
             "如需解封请管理员使用 /unban 命令。",
             parse_mode="HTML",
         )
@@ -1545,9 +1545,9 @@ async def _handle_verification_admin_callback(
             )
             return
         approved_text = (
-            f"✅ <b>{shown}</b> 已由管理员直接通过消息审查验证，发言权限已恢复。"
+            f"<b>{shown}</b> 已由管理员直接通过消息审查验证，发言权限已恢复。"
             if kind == VERIFICATION_KIND_MODERATION
-            else f"✅ <b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
+            else f"<b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
         )
         await _edit_verification_prompt(callback, settings, text=approved_text)
         await close_private_challenge_message(
@@ -1642,10 +1642,10 @@ async def _handle_verification_admin_callback(
     # numeric ID stays visible so admins can still identify the account.
     spoilered = spoiler_display_name(display_name, target_user_id)
     rejected_text = (
-        f"🚫 <b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
+        f"<b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
         if kind == VERIFICATION_KIND_MODERATION
         else (
-            f"🚫 <b>{spoilered}</b>（ID: <code>{target_user_id}</code>）"
+            f"<b>{spoilered}</b>（ID: <code>{target_user_id}</code>）"
             "的入群验证已被管理员拒绝，已在当前群封禁。"
         )
     )

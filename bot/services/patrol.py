@@ -47,6 +47,7 @@ from bot.db.models import (
 from bot.services.background_health import record_background_failure
 from bot.services.authz import is_group_authorized, list_authorized_groups
 from bot.services.group_settings import acquire_group_settings_write_intent
+from bot.services.message_templates import render_notice_card
 from bot.services.join_screening import (
     build_join_profile_text,
     is_globally_banned,
@@ -456,20 +457,17 @@ def build_patrol_warning_text(
     *,
     timeout_seconds: int,
 ) -> str:
-    lines = [
-        "🚨 <b>资料巡检警告</b>",
-        "以下成员的名字或简介涉嫌违反群规，已暂时禁言：",
-    ]
+    body = ["以下成员的名字或简介涉嫌违反群规，已暂时禁言："]
     for violator in violators:
         reason = html.escape((violator.reason or "资料命中群规").strip()[:80])
-        lines.append(f"• {_mention(violator)} — {reason}")
-    lines.append("")
-    lines.append(
+        body.append(f"• {_mention(violator)} — {reason}")
+    body.append("")
+    body.append(
         f"请相关成员在 {_format_timeout(timeout_seconds)} 内点击下方「真人质询」按钮，"
         "与我私聊完成人机验证；"
     )
-    lines.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
-    return "\n".join(lines)
+    body.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
+    return render_notice_card("资料巡检警告", body)
 
 
 def build_patrol_challenge_keyboard() -> InlineKeyboardMarkup:
@@ -477,7 +475,7 @@ def build_patrol_challenge_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🙋 真人质询（仅被点名成员可用）",
+                    text="真人质询（仅被点名成员可用）",
                     callback_data=PATROL_VERIFY_CALLBACK_DATA,
                 )
             ]

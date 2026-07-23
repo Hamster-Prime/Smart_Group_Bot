@@ -4495,7 +4495,7 @@ class VerifyWebServer:
             self.bot,
             user_id,
             private_message_id,
-            text="✅ 验证已通过，群内权限已恢复。",
+            text="验证已通过，群内权限已恢复。",
         )
         if kind == VERIFICATION_KIND_PATROL:
             # Whitelist the passing profile so the next patrol run and the
@@ -4582,7 +4582,7 @@ class VerifyWebServer:
                     self.bot,
                     user_id,
                     private_message_id,
-                    text="✅ 验证已通过，群内权限已恢复。",
+                    text="验证已通过，群内权限已恢复。",
                 )
                 return
 
@@ -4627,13 +4627,13 @@ class VerifyWebServer:
     ) -> None:
         shown = html.escape(display_name or str(user_id))
         if kind == VERIFICATION_KIND_MODERATION:
-            passed_text = f"✅ <b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
+            passed_text = f"<b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
         elif kind == VERIFICATION_KIND_PATROL:
-            passed_text = f"✅ <b>{shown}</b> 已通过资料巡检质询，发言权限已恢复。"
+            passed_text = f"<b>{shown}</b> 已通过资料巡检质询，发言权限已恢复。"
         elif kind == VERIFICATION_KIND_RAID:
-            passed_text = f"✅ <b>{shown}</b> 已通过爆破防护质询，发言权限已恢复。"
+            passed_text = f"<b>{shown}</b> 已通过爆破防护质询，发言权限已恢复。"
         else:
-            passed_text = f"✅ <b>{shown}</b> 已通过真人验证，欢迎加入！"
+            passed_text = f"<b>{shown}</b> 已通过真人验证，欢迎加入！"
         text = passed_text + (
             "" if restored else "\n⚠️ 权限恢复失败，请管理员手动解除禁言。"
         )

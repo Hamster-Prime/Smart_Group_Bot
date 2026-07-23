@@ -296,6 +296,36 @@ def render_plain_template(
     return rendered.strip()
 
 
+# Unified notice-card style: a bold, emoji-free title followed by a single
+# blockquote body.  Field rows inside the body use a full-width ideographic
+# space to separate label and value instead of a colon, which reads cleaner in
+# the quoted block.  All moderation / verification / raid / vote notices share
+# this so a member sees one consistent card shape everywhere.
+CARD_FIELD_SPACE = "　"
+
+
+def card_field(label: str, value: object) -> str:
+    """Render one ``<b>label</b>　value`` row for a notice-card body.
+
+    ``label`` is a trusted, caller-authored constant.  ``value`` must already
+    be HTML-safe — escaped, or built from trusted fragments (mentions, ``<code>``
+    handles) by the caller — because it is emitted verbatim.
+    """
+    return f"<b>{label}</b>{CARD_FIELD_SPACE}{value}"
+
+
+def render_notice_card(title: str, body: object) -> str:
+    """Render the unified notice card: a bold title above a blockquote body.
+
+    ``title`` is plain text and is escaped here.  ``body`` is trusted HTML —
+    either a single pre-built string or an iterable of pre-built lines joined
+    with newlines (typically :func:`card_field` rows).
+    """
+    if not isinstance(body, str):
+        body = "\n".join(str(line) for line in body)
+    return f"<b>{html.escape(str(title))}</b>\n<blockquote>{body}</blockquote>"
+
+
 def buttons_to_lines(value: object) -> str:
     """Human-readable/debug representation used by tests and migrations."""
     try:
@@ -311,12 +341,15 @@ def buttons_to_lines(value: object) -> str:
 
 
 __all__ = [
+    "CARD_FIELD_SPACE",
     "MAX_TEMPLATE_BUTTONS",
     "TEMPLATE_BUTTON_ACTIONS",
     "build_template_keyboard",
     "buttons_to_lines",
+    "card_field",
     "normalize_template_buttons",
     "render_markdown_html",
+    "render_notice_card",
     "render_plain_template",
     "send_template_with_fallback",
 ]

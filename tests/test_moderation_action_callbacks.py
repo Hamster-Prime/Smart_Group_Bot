@@ -71,12 +71,12 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=group_id, type="supergroup"),
                 message_id=555,
                 html_text=(
-                    "<b>AI审查警告</b>\n————————\n"
-                    "<b>用户</b>: <code>@aLnTpu</code>\n"
-                    "<b>警告次数</b>: 1/3\n"
-                    "<b>原因</b>: 发布上门按摩服务广告信息\n"
-                    "<b>依据规则</b>: #47（语义）\n"
-                    "<b>处理结果</b>: 已删除违规消息并发出警告"
+                    "<b>AI审查警告</b>\n<blockquote>"
+                    "<b>用户</b>　<code>@aLnTpu</code>\n"
+                    "<b>警告次数</b>　1/3\n"
+                    "<b>原因</b>　发布上门按摩服务广告信息\n"
+                    "<b>依据规则</b>　#47（语义）\n"
+                    "<b>处理结果</b>　已删除违规消息并发出警告</blockquote>"
                 ),
                 reply_markup=group._build_moderation_action_keyboard(violation_id),
             ),
@@ -789,12 +789,12 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["parse_mode"], "HTML")
         self.assertIsNone(kwargs["reply_markup"])
         text = kwargs["text"]
-        self.assertIn("<b>处理结果</b>: 已被", text)
+        self.assertIn("<b>处理结果</b>　已被", text)
         self.assertIn("mod_alice", text)
         self.assertIn("手动封禁", text)
         # The original automated outcome line must be gone, other lines kept.
         self.assertNotIn("已删除违规消息并发出警告", text)
-        self.assertIn("<b>用户</b>: <code>@aLnTpu</code>", text)
+        self.assertIn("<b>用户</b>　<code>@aLnTpu</code>", text)
 
     async def test_false_positive_undo_rewrites_notice(self) -> None:
         violation_id = await self._seed_violation("ban_warning", warning=(2, False))
@@ -804,7 +804,7 @@ class ModerationActionCallbackTests(unittest.IsolatedAsyncioTestCase):
 
         callback.bot.edit_message_text.assert_awaited_once()
         text = callback.bot.edit_message_text.await_args.kwargs["text"]
-        self.assertIn("<b>处理结果</b>: 已被", text)
+        self.assertIn("<b>处理结果</b>　已被", text)
         self.assertIn("mod_bob", text)
         self.assertIn("确认误封", text)
 

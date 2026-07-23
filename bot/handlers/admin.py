@@ -351,14 +351,14 @@ def _build_auth_group_list_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"atl:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"atl:{page + 1}",
             )
         )
@@ -393,14 +393,14 @@ def _build_admin_list_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"adl:{group_id}:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"adl:{group_id}:{page + 1}",
             )
         )
@@ -439,14 +439,14 @@ def _build_warning_list_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"wpl:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"wpl:{page + 1}",
             )
         )
@@ -486,7 +486,7 @@ def _build_rule_list_page(
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🗑 删除规则 #{rule.id}",
+                    text=f"删除规则 #{rule.id}",
                     callback_data=f"rud:{rule.id}:{page}",
                 )
             ]
@@ -496,14 +496,14 @@ def _build_rule_list_page(
     if page > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ 上一页",
+                text="上一页",
                 callback_data=f"rul:{page - 1}",
             )
         )
     if page < total_pages - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="下一页 ➡️",
+                text="下一页",
                 callback_data=f"rul:{page + 1}",
             )
         )

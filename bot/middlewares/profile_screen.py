@@ -493,7 +493,7 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             # stays visible.
             shown = spoiler_display_name(full_name or username or "", int(user.id))
             notice = (
-                f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
+                f"已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
                 f"原因：{html.escape(reason or '资料命中群规')}\n"
                 "如需解封请管理员使用 /unban 命令。"
             )

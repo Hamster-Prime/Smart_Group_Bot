@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Admin, GroupMember
+from bot.services.message_templates import card_field, render_notice_card
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     is_reply_target_missing_error,
@@ -192,20 +193,23 @@ def build_call_admin_text(
     batch_count: int = 1,
 ) -> str:
     shown = html.escape(str(caller_name or "").strip() or str(caller_id))
-    lines = [
-        "📣 <b>呼叫管理员</b>",
-        " ".join(mentions),
-        f'发起人：<a href="tg://user?id={int(caller_id)}">{shown}</a>',
-    ]
+    body = [" ".join(mentions)]
     if batch_count > 1:
-        lines.insert(1, f"管理员通知批次：{int(batch_index)}/{int(batch_count)}")
+        body.append(card_field("管理员通知批次", f"{int(batch_index)}/{int(batch_count)}"))
+    body.append(
+        card_field("发起人", f'<a href="tg://user?id={int(caller_id)}">{shown}</a>')
+    )
     clean_reason = str(reason or "").strip()
     if clean_reason:
-        lines.append(f"补充说明：{html.escape(_break_user_mentions(clean_reason[:200]))}")
+        body.append(
+            card_field("补充说明", html.escape(_break_user_mentions(clean_reason[:200])))
+        )
     clean_reported = str(reported_text or "").strip()
     if clean_reported:
-        lines.append(f"被举报消息：{html.escape(_break_user_mentions(clean_reported[:200]))}")
-    return "\n".join(lines)
+        body.append(
+            card_field("被举报消息", html.escape(_break_user_mentions(clean_reported[:200])))
+        )
+    return render_notice_card("呼叫管理员", body)
 
 
 async def handle_call_admin(
