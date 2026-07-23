@@ -23,6 +23,12 @@ _LEGACY_HISTORY_PREFIX_RE = re.compile(r"^\[(?P<meta>[^\]]+)\]\s*(?P<body>.*)$",
 _LEGACY_ID_RE = re.compile(r"\bid\s*:\s*(-?\d+)\b", re.IGNORECASE)
 _LEGACY_USERNAME_RE = re.compile(r"\busername\s*:\s*([^\s]+)", re.IGNORECASE)
 _LEGACY_NAME_RE = re.compile(r"\bname\s*:\s*(.+)$", re.IGNORECASE)
+# Owner marker travels the same system-prepended tag as trusted_source, so it
+# is only ever read from the meta bracket the system controls — never from the
+# user-controlled body (see _LEGACY_HISTORY_PREFIX_RE, which stops at the first
+# ']'). This keeps a spoofed "[id:X is_owner:yes] ..." inside a message body
+# from ever being parsed as owner.
+_LEGACY_OWNER_RE = re.compile(r"\bis_owner\s*:\s*(yes|true|1)\b", re.IGNORECASE)
 
 SECURITY_PREAMBLE = (
     "[SAFETY_RULES]\n"
@@ -110,6 +116,7 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
             "sender_name": "",
             "sender_username": "",
             "trusted_source": "",
+            "is_owner": "",
         }
 
     meta = match.group("meta") or ""
@@ -119,6 +126,10 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
     sender_name = ""
     sender_username = ""
     trusted_source = ""
+    is_owner = ""
+
+    if _LEGACY_OWNER_RE.search(meta):
+        is_owner = "yes"
 
     id_match = _LEGACY_ID_RE.search(meta)
     if id_match:
@@ -142,6 +153,7 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
         "sender_name": sender_name,
         "sender_username": sender_username,
         "trusted_source": trusted_source,
+        "is_owner": is_owner,
     }
 
 
@@ -167,6 +179,20 @@ def build_history_message_record(
         str(msg.get("trusted_source", "") or legacy["trusted_source"]),
         max_len=32,
     )
+    # Owner is authoritative only from the system-set flag / system-prepended
+    # tag, never from the user-controlled body. Non-owner lines carry no owner
+    # marker at all so the model can positively bind 主人 to the immutable
+    # sender_id instead of guessing from spoofable display names.
+    is_owner = ""
+    raw_owner = str(msg.get("is_owner", "") or "").strip().lower()
+    if raw_owner in ("yes", "true", "1") or legacy["is_owner"] == "yes":
+        is_owner = "yes"
+    if is_owner == "yes":
+        sender_role = "owner"
+    elif trusted_source:
+        sender_role = "tg_admin"
+    else:
+        sender_role = "member"
     sent_at = _stringify_history_timestamp(msg.get("created_at"))
     message_type = clean_text(str(msg.get("message_type", "") or ""), max_len=64)
     body = legacy["body"] if legacy["body"] else raw_content
@@ -189,6 +215,8 @@ def build_history_message_record(
         "sender_id": sender_id,
         "sender_username": sender_username,
         "trusted_source": trusted_source,
+        "is_owner": is_owner,
+        "sender_role": sender_role,
         "message_type": message_type,
         "content": body or "(empty)",
     }
@@ -208,6 +236,8 @@ def format_history_message_block(
         f"sender: {record['sender_name']}",
         f"sender_id: {record['sender_id']}",
     ]
+    if record.get("is_owner") == "yes":
+        lines.append("sender_role: owner")
     if record["sender_username"]:
         lines.append(f"sender_username: {record['sender_username']}")
     if record["trusted_source"]:
@@ -229,6 +259,8 @@ def format_history_message_line(
         f"- sent_at={record['sent_at']} | sender={record['sender_name']} | "
         f"sender_id={record['sender_id']} | role={record['role']}"
     )
+    if record.get("is_owner") == "yes":
+        line += " | sender_role=owner"
     if record["trusted_source"]:
         line += f" | trusted_source={record['trusted_source']}"
     if record["message_type"]:
