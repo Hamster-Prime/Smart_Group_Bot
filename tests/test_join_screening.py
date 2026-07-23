@@ -510,11 +510,10 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
                 revoke_messages=True,
             )
             event.bot.send_message.assert_awaited_once()
-            # The banned joiner never verified: the notice masks the display
-            # name ("新人" → "新**") while keeping the numeric ID visible.
+            # The banned joiner never verified: the notice hides the display
+            # name behind a spoiler while keeping the numeric ID visible.
             notice_text = event.bot.send_message.await_args.args[1]
-            self.assertIn("新**", notice_text)
-            self.assertNotIn("新人", notice_text)
+            self.assertIn("<tg-spoiler>新人</tg-spoiler>", notice_text)
             self.assertIn("906", notice_text)
             # The ban notice ("审核通知") must inherit the moderation retention.
             schedule_mock.assert_awaited_once_with(sent, 42)

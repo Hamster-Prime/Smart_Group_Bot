@@ -64,7 +64,6 @@ from bot.services.join_verification import (
     lease_join_verifications_for_user_unban,
     list_expired_preparing_verifications,
     list_expired_verifications,
-    mask_display_name,
     maybe_send_private_verification,
     moderation_challenge_ready,
     mark_turnstile_configuration_unavailable,
@@ -76,6 +75,7 @@ from bot.services.join_verification import (
     restrict_new_member,
     release_join_verification_lease,
     resume_group_verification_recovery,
+    spoiler_display_name,
     telegram_group_is_unreachable_error,
     telegram_group_requires_operator_action,
     upsert_join_verification,
@@ -155,34 +155,53 @@ class HelperTests(unittest.TestCase):
         )
         self.assertFalse(join_verification_ready(_settings(join_verification_public_base_url="")))
 
-    def test_mask_display_name_hides_all_but_first_character(self) -> None:
-        self.assertEqual(mask_display_name("广告用户加V信xyz", 42), "广******")
-        self.assertEqual(mask_display_name("张三", 42), "张**")
-        self.assertEqual(mask_display_name("A", 42), "A**")
-        # Empty names fall back to the numeric id, unmasked.
-        self.assertEqual(mask_display_name("", 42), "42")
-        self.assertEqual(mask_display_name("   ", 42), "42")
+    def test_spoiler_display_name_wraps_name_in_spoiler(self) -> None:
+        # The real name is preserved but hidden behind a tap-to-reveal spoiler,
+        # so it is not passively visible during the verification window.
+        self.assertEqual(
+            spoiler_display_name("广告用户加V信xyz", 42),
+            "<tg-spoiler>广告用户加V信xyz</tg-spoiler>",
+        )
+        self.assertEqual(
+            spoiler_display_name("张三", 42), "<tg-spoiler>张三</tg-spoiler>"
+        )
+        # HTML-significant characters in the name are escaped inside the spoiler.
+        self.assertEqual(
+            spoiler_display_name("<b>&x", 42), "<tg-spoiler>&lt;b&gt;&amp;x</tg-spoiler>"
+        )
+        # Empty names fall back to the numeric id, without a spoiler.
+        self.assertEqual(spoiler_display_name("", 42), "42")
+        self.assertEqual(spoiler_display_name("   ", 42), "42")
 
-    def test_mask_display_name_skips_invisible_lead_characters(self) -> None:
-        # A leading RLO (U+202E) must not survive as the kept character:
-        # it would reverse the rest of the notice line (bidi spoofing).
-        self.assertEqual(mask_display_name("‮www.spam.com", 42), "w******")
-        # Hangul filler / braille blank render as empty; fall through them.
-        self.assertEqual(mask_display_name("ㅤㅤ", 42), "42")
-        self.assertEqual(mask_display_name("⠀广告", 42), "广**")
-        # Zero-width space and joiner are skipped too.
-        self.assertEqual(mask_display_name("​‍张三", 42), "张***")
+    def test_spoiler_display_name_strips_bidi_and_blank_characters(self) -> None:
+        # A leading RLO (U+202E) is stripped: even hidden in a spoiler it would
+        # reverse the rest of the notice line (bidi spoofing).
+        self.assertEqual(
+            spoiler_display_name("‮www.spam.com", 42),
+            "<tg-spoiler>www.spam.com</tg-spoiler>",
+        )
+        # An all-blank name (Hangul/braille fillers) falls back to the id.
+        self.assertEqual(spoiler_display_name("ㅤㅤ", 42), "42")
+        self.assertEqual(
+            spoiler_display_name("⠀广告", 42), "<tg-spoiler>广告</tg-spoiler>"
+        )
+        # Zero-width space and joiner are removed from the revealed name.
+        self.assertEqual(
+            spoiler_display_name("​‍张三", 42), "<tg-spoiler>张三</tg-spoiler>"
+        )
 
-    def test_group_prompt_masks_display_name(self) -> None:
+    def test_group_prompt_spoilers_display_name(self) -> None:
         text = build_group_prompt_text(
             user_id=42,
             display_name="加微信xw123领福利",
             timeout_seconds=300,
         )
-        self.assertIn("加******", text)
-        self.assertNotIn("微信", text)
-        # The profile link still lets admins inspect the real account.
-        self.assertIn('tg://user?id=42', text)
+        # The name is hidden behind a spoiler nested inside the mention link,
+        # so it gets no passive exposure but admins can tap to reveal it.
+        self.assertIn(
+            '<a href="tg://user?id=42"><tg-spoiler>加微信xw123领福利</tg-spoiler></a>',
+            text,
+        )
 
     def test_moderation_challenge_ready_does_not_require_join_feature(self) -> None:
         settings = _settings(join_verification_enabled=False)
@@ -3222,12 +3241,11 @@ class VerificationCallbackTests(_DbTestCase):
 
         ban.assert_awaited_once_with(callback.bot, -100, 948)
         callback.bot.unban_chat_member.assert_not_awaited()
-        # The rejected joiner never verified: the outcome notice keeps the
-        # display name masked so a spam name gets no terminal exposure,
-        # while the numeric ID keeps the account identifiable.
+        # The rejected joiner never verified: the outcome notice hides the
+        # display name behind a spoiler so a spam name gets no passive terminal
+        # exposure, while the numeric ID keeps the account identifiable.
         rejected_text = callback.bot.edit_message_text.await_args.kwargs["text"]
-        self.assertIn("用****", rejected_text)
-        self.assertNotIn("用户948", rejected_text)
+        self.assertIn("<tg-spoiler>用户948</tg-spoiler>", rejected_text)
         self.assertIn("<code>948</code>", rejected_text)
         self.assertIn("已被管理员拒绝", rejected_text)
         async with self.session_factory() as session:
@@ -4364,11 +4382,10 @@ class SweeperTests(_DbTestCase):
         self.assertEqual(edit_kwargs["message_id"], 781)
         self.assertEqual(edit_kwargs["parse_mode"], "HTML")
         self.assertIsNone(edit_kwargs["reply_markup"])
-        # The joiner never verified, so the timeout notice keeps the name
-        # masked like the challenge prompt while the ID stays identifiable;
-        # the outcome auto-deletes.
-        self.assertIn("<b>张**</b>", edit_kwargs["text"])
-        self.assertNotIn("张三", edit_kwargs["text"])
+        # The joiner never verified, so the timeout notice hides the name
+        # behind a spoiler like the challenge prompt while the ID stays
+        # identifiable; the outcome auto-deletes.
+        self.assertIn("<b><tg-spoiler>张三</tg-spoiler></b>", edit_kwargs["text"])
         self.assertIn("<code>940</code>", edit_kwargs["text"])
         self.assertIn("验证超时", edit_kwargs["text"])
         schedule_mock.assert_awaited_once_with(edited, 30)

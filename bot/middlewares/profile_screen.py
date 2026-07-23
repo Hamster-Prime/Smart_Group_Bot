@@ -31,7 +31,7 @@ from bot.services.join_verification import (
     enforce_ban_with_policy_reconciliation_result,
     lease_join_verification_for_unban,
     manual_unban_generation_is_active,
-    mask_display_name,
+    spoiler_display_name,
     verification_release_blocked_by_ban,
     verification_restriction_required,
 )
@@ -487,11 +487,10 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 int(user.id),
                 marker=residue_marker,
             )
-            # The profile itself is the violation (ad name/bio): mask the name
-            # so the ban notice does not reprint it. The ID stays visible.
-            shown = html.escape(
-                mask_display_name(full_name or username or "", int(user.id))
-            )
+            # The profile itself is the violation (ad name/bio): spoiler the
+            # name so the ban notice does not passively reprint it. The ID
+            # stays visible.
+            shown = spoiler_display_name(full_name or username or "", int(user.id))
             notice = (
                 f"🚫 已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
                 f"原因：{html.escape(reason or '资料命中群规')}\n"

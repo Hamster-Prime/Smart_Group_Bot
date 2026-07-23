@@ -1154,34 +1154,38 @@ def _format_timeout(timeout_seconds: int) -> str:
     return f"{seconds} 秒"
 
 
-# The kept lead character must be visibly printable: format chars (Cf, e.g.
-# U+202E RLO), separators (Zs/Zl/Zp) and controls (Cc) would let a spammer
-# smuggle a bidi override or an "empty" mask through the notice.
-_MASK_HIDDEN_CATEGORIES = frozenset({"Cf", "Cc", "Cs", "Co", "Cn", "Zs", "Zl", "Zp"})
-# Not classified as invisible by Unicode but rendered blank in chat clients.
-_MASK_BLANK_CHARS = frozenset("ᅠㅤﾠ⠀")
+# Format/control characters are stripped from a name before it is shown.
+# Even hidden inside a spoiler, a U+202E RLO reorders the rest of the notice
+# line (bidi is a paragraph property, unbounded by the entity); stripping also
+# keeps the id fallback meaningful for an otherwise-blank name.
+_HIDDEN_NAME_CATEGORIES = frozenset({"Cf", "Cc", "Cs", "Co", "Cn"})
+# Rendered blank by chat clients but not flagged invisible by Unicode category.
+_BLANK_NAME_CHARS = frozenset("ᅠㅤﾠ⠀")
 
 
-def mask_display_name(display_name: str, user_id: int) -> str:
-    """Mask all but the first character of an unverified member's name.
+def _sanitize_display_name(display_name: str) -> str:
+    return "".join(
+        ch
+        for ch in (display_name or "")
+        if unicodedata.category(ch) not in _HIDDEN_NAME_CATEGORIES
+        and ch not in _BLANK_NAME_CHARS
+    ).strip()
 
-    Spam accounts carry the ad in the display name itself, so the join
-    challenge prompt must not reprint it; the tg://user link still lets
-    admins open the real profile. Verified outcomes show the real name.
+
+def spoiler_display_name(display_name: str, user_id: int) -> str:
+    """Hide an unverified member's display name behind a Telegram spoiler.
+
+    Spam accounts carry the ad in the display name itself, so a group message
+    shown during the verification window blurs it behind a tap-to-reveal
+    spoiler — no passive exposure — while admins can still uncover the real
+    name and notices keep the numeric id visible. Returns ready-to-embed HTML;
+    callers must not escape it again. Verified outcomes and member-visible
+    moderation challenges show the real name.
     """
-    label = (display_name or "").strip()
-    lead = next(
-        (
-            ch
-            for ch in label
-            if unicodedata.category(ch) not in _MASK_HIDDEN_CATEGORIES
-            and ch not in _MASK_BLANK_CHARS
-        ),
-        "",
-    )
-    if not lead:
-        return str(user_id)
-    return lead + "*" * min(max(len(label) - 1, 2), 6)
+    label = _sanitize_display_name(display_name)
+    if not label:
+        return html.escape(str(user_id))
+    return f"<tg-spoiler>{html.escape(label)}</tg-spoiler>"
 
 
 def build_group_prompt_text(
@@ -1190,7 +1194,7 @@ def build_group_prompt_text(
     display_name: str,
     timeout_seconds: int,
 ) -> str:
-    shown = html.escape(mask_display_name(display_name, user_id))
+    shown = spoiler_display_name(display_name, user_id)
     return (
         f'👋 欢迎 <a href="tg://user?id={user_id}">{shown}</a>！\n'
         "本群已开启入群真人验证，验证通过前你暂时无法发言。\n\n"
@@ -4949,15 +4953,15 @@ class JoinVerificationSweeper:
                         "已移出群聊（未封禁，可重新加入）。"
                     )
                 else:
-                    # A timed-out joiner never verified: keep the name masked
-                    # like the challenge prompt so an ad display name gets no
+                    # A timed-out joiner never verified: spoiler the name like
+                    # the challenge prompt so an ad display name gets no passive
                     # exposure through the terminal notice either. The ID keeps
                     # the account identifiable for admins.
-                    masked = html.escape(
-                        mask_display_name(record.display_name or "", record.user_id)
+                    spoilered = spoiler_display_name(
+                        record.display_name or "", record.user_id
                     )
                     text = (
-                        f"⏰ <b>{masked}</b>（ID: <code>{record.user_id}</code>）"
+                        f"⏰ <b>{spoilered}</b>（ID: <code>{record.user_id}</code>）"
                         "验证超时，已移出群聊。可重新加入再次验证。"
                     )
             await self._finalize_prompt(record, text)
