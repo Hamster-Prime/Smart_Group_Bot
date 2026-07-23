@@ -215,6 +215,8 @@ async def delete_messages_since_join(
     bot: object,
     group_id: int,
     user_id: int,
+    *,
+    marker: datetime | None = None,
 ) -> int:
     """Delete residue posted since the member's recently observed join.
 
@@ -223,15 +225,21 @@ async def delete_messages_since_join(
     deleting an established member's tracked history on a much later ban
     would be wrong — Telegram's ``revoke_messages`` already covers the
     banned account's own view.
+
+    Terminal enforcement (timeout kick, screening/admin ban) removes the
+    member, and the resulting leave update clears the live join marker
+    concurrently. Those callers must snapshot ``member_join_marker`` before
+    the Telegram removal and pass it as ``marker`` so the post-removal sweep
+    still sees the membership window it is cleaning.
     """
-    marker = member_join_marker(group_id, user_id)
-    if marker is None or marker < now_shanghai_naive() - _JOIN_RESIDUE_WINDOW:
+    anchor = marker if marker is not None else member_join_marker(group_id, user_id)
+    if anchor is None or anchor < now_shanghai_naive() - _JOIN_RESIDUE_WINDOW:
         return 0
     return await delete_recent_member_messages(
         bot,
         group_id,
         user_id,
-        since=marker - _JOIN_MARKER_SKEW_GRACE,
+        since=anchor - _JOIN_MARKER_SKEW_GRACE,
     )
 
 

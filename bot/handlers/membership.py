@@ -110,6 +110,7 @@ from bot.services.recent_messages import (
     clear_member_join_marker,
     delete_messages_since_join,
     mark_member_join,
+    member_join_marker,
 )
 from bot.services.request_priority import privileged_request_scope
 from bot.services.update_completion import request_current_update_retry
@@ -318,6 +319,10 @@ async def _ban_and_notify(
     preserve_ban: Callable[[], Awaitable[bool]] | None = None,
     restriction_required: Callable[[], Awaitable[bool]] | None = None,
 ) -> BanEnforcementResult:
+    # Snapshot before the ban: the resulting leave update clears the live
+    # join marker concurrently, and the post-ban residue sweep still needs
+    # the membership window.
+    residue_marker = member_join_marker(int(event.chat.id), int(user_id))
     if preserve_ban is None:
         enforcement = await ban_member_result(
             event.bot,
@@ -353,7 +358,12 @@ async def _ban_and_notify(
         return enforcement
     # revoke_messages only hides history from the banned account itself; the
     # spam they raced in before the ban stays visible to everyone else.
-    await delete_messages_since_join(event.bot, int(event.chat.id), int(user_id))
+    await delete_messages_since_join(
+        event.bot,
+        int(event.chat.id),
+        int(user_id),
+        marker=residue_marker,
+    )
     # A screened-out joiner never verified: mask the name so an ad display
     # name gets no exposure through the ban notice. The ID stays visible.
     shown = html.escape(mask_display_name(display_name, user_id))
@@ -829,6 +839,12 @@ async def _enforce_pending_moderation_challenge(
                 await session.commit()
                 return blocked
 
+            # Snapshot before the kick: its leave update clears the live join
+            # marker concurrently, and the post-kick residue sweep still needs
+            # the rejoin window (which includes the join service message).
+            residue_marker = member_join_marker(
+                int(record.group_id), int(record.user_id)
+            )
             enforced = await kick_member(
                 event.bot,
                 record.group_id,
@@ -836,6 +852,12 @@ async def _enforce_pending_moderation_challenge(
                 preserve_ban=preserve_ban,
             )
             if enforced:
+                await delete_messages_since_join(
+                    event.bot,
+                    int(record.group_id),
+                    int(record.user_id),
+                    marker=residue_marker,
+                )
                 if await _complete_terminal_verification(
                     session,
                     verification_id=int(record.id),
@@ -1549,6 +1571,10 @@ async def _handle_verification_admin_callback(
     ban_state = await mark_group_banned(session, group_id, target_user_id)
     await session.commit()
 
+    # Snapshot before the ban: the resulting leave update clears the live
+    # join marker concurrently, and the post-ban residue sweep still needs
+    # the membership window.
+    residue_marker = member_join_marker(group_id, target_user_id)
     enforced = await ban_member(callback.bot, group_id, target_user_id)
     if not enforced:
         if kind == VERIFICATION_KIND_MODERATION:
@@ -1600,6 +1626,15 @@ async def _handle_verification_admin_callback(
             show_alert=True,
         )
         return
+    # revoke_messages only hides history from the banned account; the join
+    # service message and any raced-in residue stay visible to everyone else
+    # and would keep the unverified name exposed after removal.
+    await delete_messages_since_join(
+        callback.bot,
+        group_id,
+        target_user_id,
+        marker=residue_marker,
+    )
     # A rejected joiner never passed verification: keep the name masked so a
     # spam display name gets no exposure even in the terminal notice. The
     # numeric ID stays visible so admins can still identify the account.

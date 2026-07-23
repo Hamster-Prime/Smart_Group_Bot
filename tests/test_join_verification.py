@@ -3242,6 +3242,60 @@ class VerificationCallbackTests(_DbTestCase):
             self.assertTrue(warning.is_banned)
             self.assertIsNone(await get_global_ban(session, 948))
 
+    async def test_admin_reject_retracts_join_residue_despite_leave_race(self) -> None:
+        # The rejected joiner's "xxx joined" service message and raced-in
+        # residue stay visible after the permanent ban; the callback must
+        # retract them even though the ban's own leave update clears the
+        # live join marker first.
+        from bot.services.recent_messages import (
+            clear_member_join_marker,
+            clear_recent_member_messages,
+            mark_member_join,
+            record_group_message,
+        )
+
+        clear_recent_member_messages()
+        self.addCleanup(clear_recent_member_messages)
+        mark_member_join(-100, 954)
+        record_group_message(-100, 954, 621)
+
+        await self._add_record(user_id=954, message_id=854)
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=954,
+            operator_id=11,
+            message_id=854,
+        )
+        callback.bot.delete_messages = AsyncMock(return_value=True)
+
+        async def ban_and_clear_marker(*args, **kwargs):
+            clear_member_join_marker(-100, 954)
+            return True
+
+        with (
+            patch(
+                "bot.handlers.membership.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.membership.ban_member",
+                new=AsyncMock(side_effect=ban_and_clear_marker),
+            ),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        callback.bot.delete_messages.assert_awaited_once_with(
+            chat_id=-100,
+            message_ids=[621],
+        )
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 954))
+
     async def test_admin_reject_join_keeps_enforcing_when_ban_fails(self) -> None:
         old_deadline = await self._add_record(user_id=949, message_id=849)
         callback = _verification_callback(
@@ -4384,6 +4438,96 @@ class SweeperTests(_DbTestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.status, "enforcing")
             self.assertIsNotNone(record.lease_until)
+
+    async def test_join_timeout_kick_retracts_join_residue_despite_leave_race(self) -> None:
+        # The join service message ("xxx joined") and raced-in residue stay
+        # visible to other members after the timeout kick; the sweep must
+        # retract them even though the kick's own leave update clears the
+        # live join marker before the sweep runs.
+        from bot.services.recent_messages import (
+            clear_member_join_marker,
+            clear_recent_member_messages,
+            mark_member_join,
+            record_group_message,
+        )
+
+        clear_recent_member_messages()
+        self.addCleanup(clear_recent_member_messages)
+        mark_member_join(-100, 952)
+        record_group_message(-100, 952, 601)
+        record_group_message(-100, 952, 602)
+
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=952,
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
+                prompt_message_id=791,
+            )
+            await session.commit()
+
+        async def ban_and_clear_marker(*args, **kwargs):
+            # Telegram delivers the leave update caused by this very ban; its
+            # handler clears the live marker before the post-kick sweep.
+            clear_member_join_marker(-100, 952)
+            return True
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(side_effect=ban_and_clear_marker),
+            unban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(),
+            delete_messages=AsyncMock(return_value=True),
+        )
+        sweeper = JoinVerificationSweeper(bot=bot, session_factory=self.session_factory)
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+        bot.delete_messages.assert_awaited_once_with(
+            chat_id=-100,
+            message_ids=[601, 602],
+        )
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 952))
+
+    async def test_moderation_timeout_ban_retracts_join_residue(self) -> None:
+        from bot.services.recent_messages import (
+            clear_recent_member_messages,
+            mark_member_join,
+            record_group_message,
+        )
+
+        clear_recent_member_messages()
+        self.addCleanup(clear_recent_member_messages)
+        mark_member_join(-100, 953)
+        record_group_message(-100, 953, 611)
+
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=953,
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=2),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="疑似违规",
+                prompt_message_id=792,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(return_value=True),
+            unban_chat_member=AsyncMock(return_value=True),
+            edit_message_text=AsyncMock(),
+            delete_messages=AsyncMock(return_value=True),
+        )
+        sweeper = JoinVerificationSweeper(bot=bot, session_factory=self.session_factory)
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+        bot.delete_messages.assert_awaited_once_with(
+            chat_id=-100,
+            message_ids=[611],
+        )
 
     async def test_sweep_noop_when_nothing_expired(self) -> None:
         bot = SimpleNamespace(

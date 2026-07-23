@@ -37,7 +37,10 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.moderation import ModerationService
-from bot.services.recent_messages import delete_messages_since_join
+from bot.services.recent_messages import (
+    delete_messages_since_join,
+    member_join_marker,
+)
 from bot.services.request_priority import is_privileged_execution
 from bot.services.update_delivery import telegram_message_is_privileged_candidate
 from bot.services.update_completion import request_current_update_retry
@@ -391,6 +394,10 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 user.id,
                 reason or "-",
             )
+            # Snapshot before the ban: the resulting leave update clears the
+            # live join marker concurrently, and the post-ban residue sweep
+            # still needs the membership window.
+            residue_marker = member_join_marker(int(chat.id), int(user.id))
             enforcement = await enforce_ban_with_policy_reconciliation_result(
                 event.bot,
                 int(chat.id),
@@ -474,7 +481,12 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                             )
             # A just-joined violator may have messages beyond this one that
             # revoke_messages will not remove for other members.
-            await delete_messages_since_join(event.bot, int(chat.id), int(user.id))
+            await delete_messages_since_join(
+                event.bot,
+                int(chat.id),
+                int(user.id),
+                marker=residue_marker,
+            )
             # The profile itself is the violation (ad name/bio): mask the name
             # so the ban notice does not reprint it. The ID stays visible.
             shown = html.escape(

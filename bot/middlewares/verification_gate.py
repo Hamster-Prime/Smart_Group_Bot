@@ -10,7 +10,11 @@ whose sender still has a verification record in a restriction-required state
 
 It also feeds the in-process recent-message buffer used by
 ``bot.services.recent_messages`` so verification start and ban enforcement
-can retroactively clear residue sent before any record existed at all.
+can retroactively clear residue sent before any record existed at all. Join
+service messages (``new_chat_members``) are recorded under each announced
+member — not their inviter — because the announcement reprints the member's
+display name and must disappear with the member's other residue when a
+verification timeout or screening ban removes them.
 """
 from __future__ import annotations
 
@@ -49,10 +53,25 @@ class PendingVerificationGateMiddleware(BaseMiddleware):
     ) -> Any:
         chat = getattr(event, "chat", None)
         user = getattr(event, "from_user", None)
+        if chat is None or getattr(chat, "type", "") not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        # A join service message announces each new member's display name, but
+        # its from_user is the actor (the joiner on self-join, the inviter —
+        # possibly an admin — otherwise). Record it under every new member
+        # before any sender-based bypass below, so a verification timeout or
+        # screening ban can retract the announcement with the member's other
+        # residue instead of leaving the unverified name exposed.
+        service_message_id = int(getattr(event, "message_id", 0) or 0)
+        for member in getattr(event, "new_chat_members", None) or ():
+            if member is None or bool(getattr(member, "is_bot", False)):
+                continue
+            member_id = int(getattr(member, "id", 0) or 0)
+            if member_id > 0:
+                record_group_message(int(chat.id), member_id, service_message_id)
+
         if (
-            chat is None
-            or getattr(chat, "type", "") not in ("group", "supergroup")
-            or user is None
+            user is None
             or getattr(user, "is_bot", False)
             or getattr(event, "sender_chat", None) is not None
         ):

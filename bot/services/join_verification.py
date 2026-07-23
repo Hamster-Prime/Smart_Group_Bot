@@ -71,7 +71,10 @@ from bot.services.authz import (
 )
 from bot.services.background_health import record_background_failure
 from bot.services.join_screening import is_globally_banned
-from bot.services.recent_messages import delete_messages_since_join
+from bot.services.recent_messages import (
+    delete_messages_since_join,
+    member_join_marker,
+)
 from bot.services.request_priority import (
     ExecutionPriority,
     ReservedCapacityGate,
@@ -4790,6 +4793,12 @@ class JoinVerificationSweeper:
                 record.group_id,
                 record.user_id,
             )
+            # Snapshot before the removal: the ban/kick below emits a leave
+            # update whose handler clears the live join marker concurrently,
+            # and the post-removal sweep still needs the membership window.
+            residue_marker = member_join_marker(
+                int(record.group_id), int(record.user_id)
+            )
             shown = html.escape(
                 (record.display_name or "").strip() or str(record.user_id)
             )
@@ -4826,6 +4835,16 @@ class JoinVerificationSweeper:
                         deferred,
                     )
                     return
+                # revoke_messages only hides history from the banned account;
+                # the join service message and any raced-in residue stay
+                # visible to everyone else and would keep the unverified name
+                # exposed after removal.
+                await delete_messages_since_join(
+                    self.bot,
+                    int(record.group_id),
+                    int(record.user_id),
+                    marker=residue_marker,
+                )
                 completed = await self._complete_enforcement(record)
                 if not completed:
                     await self._reconcile_lost_moderation_ban(record)
@@ -4858,6 +4877,12 @@ class JoinVerificationSweeper:
                         deferred,
                     )
                     return
+                await delete_messages_since_join(
+                    self.bot,
+                    int(record.group_id),
+                    int(record.user_id),
+                    marker=residue_marker,
+                )
                 if not await self._complete_enforcement(record, mark_banned=True):
                     return
                 text = f"⏰ <b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
@@ -4896,6 +4921,15 @@ class JoinVerificationSweeper:
                         record.user_id,
                     )
                     return
+                # A kicked (rejoinable) member's join service message and
+                # raced-in residue survive the temporary ban; retract them so
+                # the unverified name is not left exposed in history.
+                await delete_messages_since_join(
+                    self.bot,
+                    int(record.group_id),
+                    int(record.user_id),
+                    marker=residue_marker,
+                )
                 if not await self._complete_enforcement(record):
                     await reconcile_stale_verification_restriction(
                         self.bot,

@@ -138,6 +138,42 @@ class RecentMessageBufferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted, 2)
         self.assertEqual(bot.delete_message.await_count, 2)
 
+    async def test_explicit_marker_snapshot_survives_concurrent_leave_clear(self) -> None:
+        # Terminal enforcement kicks/bans the member, and the resulting leave
+        # update clears the live join marker before the post-removal sweep
+        # runs. A marker snapshot taken before the removal must keep working.
+        bot = SimpleNamespace(delete_messages=AsyncMock(return_value=True))
+        mark_member_join(GROUP_ID, 907)
+        record_group_message(GROUP_ID, 907, 55)
+        marker = member_join_marker(GROUP_ID, 907)
+        clear_member_join_marker(GROUP_ID, 907)
+
+        deleted = await delete_messages_since_join(bot, GROUP_ID, 907)
+        self.assertEqual(deleted, 0)
+        bot.delete_messages.assert_not_awaited()
+
+        deleted = await delete_messages_since_join(
+            bot, GROUP_ID, 907, marker=marker
+        )
+        self.assertEqual(deleted, 1)
+        bot.delete_messages.assert_awaited_once_with(
+            chat_id=GROUP_ID,
+            message_ids=[55],
+        )
+
+    async def test_explicit_stale_marker_does_not_sweep(self) -> None:
+        bot = SimpleNamespace(delete_messages=AsyncMock(return_value=True))
+        record_group_message(GROUP_ID, 908, 56)
+
+        deleted = await delete_messages_since_join(
+            bot,
+            GROUP_ID,
+            908,
+            marker=now_shanghai_naive() - timedelta(hours=2),
+        )
+        self.assertEqual(deleted, 0)
+        bot.delete_messages.assert_not_awaited()
+
 
 class PendingVerificationGateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -230,6 +266,40 @@ class PendingVerificationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         handler.assert_not_awaited()
         durable.assert_awaited_once()
+
+    async def test_join_service_message_is_tracked_under_each_new_member(self) -> None:
+        # The "xxx joined" service message reprints the member's display name;
+        # it must be recorded under the announced member (not the inviter) so
+        # a later timeout kick / screening ban retracts it with the member's
+        # other residue.
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=915, message_id=71)
+        event.new_chat_members = [
+            SimpleNamespace(id=916, is_bot=False),
+            SimpleNamespace(id=917, is_bot=False),
+            SimpleNamespace(id=918, is_bot=True),
+        ]
+
+        result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertEqual(result, "handled")
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 916), [71])
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 917), [71])
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 918), [])
+
+    async def test_admin_invited_join_service_message_is_still_tracked(self) -> None:
+        # An admin inviting a member is exempt from the gate as the sender,
+        # but the join announcement still belongs to the invited member.
+        handler = AsyncMock(return_value="handled")
+        event = _message_event(user_id=1, message_id=72)
+        event.new_chat_members = [SimpleNamespace(id=919, is_bot=False)]
+
+        result = await self.middleware(handler, event, {"settings": _settings()})
+
+        self.assertEqual(result, "handled")
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 919), [72])
+        # The exempt inviter's own buffer must not absorb the announcement.
+        self.assertEqual(drain_recent_member_messages(GROUP_ID, 1), [])
 
     async def test_banned_sender_is_not_gated_here(self) -> None:
         # Local bans are the GlobalBanEnforcementMiddleware's job; without a

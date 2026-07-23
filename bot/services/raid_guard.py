@@ -84,7 +84,10 @@ from bot.services.join_verification import (
     verification_service_ready,
     verification_timeout_seconds_for_kind,
 )
-from bot.services.recent_messages import delete_messages_since_join
+from bot.services.recent_messages import (
+    delete_messages_since_join,
+    member_join_marker,
+)
 from bot.utils.timezone import (
     now_shanghai_naive,
     to_shanghai_datetime,
@@ -776,6 +779,10 @@ async def remove_raid_challenged_users(
                         user_id=user_id,
                     )
 
+            # Snapshot before the removal: its leave update clears the live
+            # join marker concurrently, and the post-removal residue sweep
+            # still needs the membership window.
+            residue_marker = member_join_marker(group_id, user_id)
             # No database session or application lock is held across these
             # Telegram calls. Each member has a hard outer deadline, while the
             # lower-level wrappers retain their cancellation-safe journals.
@@ -803,6 +810,15 @@ async def remove_raid_challenged_users(
                 # Keep the removal intent durable. The sweeper retries after
                 # the renewed lease instead of exposing a passable challenge.
                 return user_id, False
+            # The removed raider's join service message and raced-in residue
+            # stay visible to other members; retract them so the unverified
+            # name gets no post-removal exposure.
+            await delete_messages_since_join(
+                bot,
+                group_id,
+                user_id,
+                marker=residue_marker,
+            )
 
             async with work_session_factory() as completion_session:
                 completed = await complete_leased_join_verification(
@@ -1717,6 +1733,10 @@ class RaidGuardService:
 
         if not await self._group_authorized(group_id):
             return False
+        # Snapshot before the kick: its leave update clears the live join
+        # marker concurrently, and the post-kick residue sweep still needs
+        # the rejoin window (which includes the join service message).
+        residue_marker = member_join_marker(group_id, user_id)
         kicked = await kick_member(
             self.bot,
             group_id,
@@ -1725,6 +1745,12 @@ class RaidGuardService:
         )
         if not kicked:
             return False
+        await delete_messages_since_join(
+            self.bot,
+            group_id,
+            user_id,
+            marker=residue_marker,
+        )
         async with self.session_factory() as session:
             completed = await complete_leased_join_verification(
                 session,
