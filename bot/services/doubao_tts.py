@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import inspect
 import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from bot.config import Settings
 from bot.db.models import Group
 from bot.services.resource_health import register_resource_health_provider
 from bot.utils.telegram import (
+    confirm_telegram_delivery,
     is_reply_target_missing_error,
     sanitize_outgoing_text,
     schedule_message_auto_delete_durable,
@@ -126,6 +128,20 @@ def is_tts_always_enabled(value: Any) -> bool:
     return normalize_tts_mode(value) == TTS_MODE_ALWAYS
 
 
+def tts_sender_accepts_delivery_callback(sender: Any) -> bool:
+    """Return whether a current or legacy TTS sender accepts on_delivery."""
+
+    try:
+        parameters = inspect.signature(sender).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "on_delivery"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def set_tts_mode(group_settings: dict | None, mode: str) -> dict[str, Any]:
     normalized = normalize_tts_mode(mode)
     settings_data = dict(group_settings or {})
@@ -215,6 +231,33 @@ class TTSSynthesisResult:
     usage: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     logid: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class TTSDeliveryResult:
+    requested_segments: tuple[str, ...] = ()
+    sent_segment_count: int = 0
+    error: str = ""
+
+    @property
+    def any_sent(self) -> bool:
+        return self.sent_segment_count > 0
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.requested_segments) and self.sent_segment_count >= len(
+            self.requested_segments
+        )
+
+    @property
+    def delivered_text(self) -> str:
+        count = min(max(0, self.sent_segment_count), len(self.requested_segments))
+        return "\n".join(self.requested_segments[:count]).strip()
+
+    @property
+    def remaining_text(self) -> str:
+        count = min(max(0, self.sent_segment_count), len(self.requested_segments))
+        return "\n".join(self.requested_segments[count:]).strip()
 
 
 @dataclass(slots=True)
@@ -958,6 +1001,7 @@ class DoubaoTTSService:
         auto_delete_seconds: int,
         caption: str = "",
         parse_mode: str | None = None,
+        on_delivery: Callable[[], None] | None = None,
     ) -> bool:
         filename = f"tts_{index + 1}{self.file_extension}"
         send_as_reply = (delivery_mode or "reply").strip().lower() != "message"
@@ -1027,10 +1071,18 @@ class DoubaoTTSService:
                             parse_mode=parse_mode,
                             title="Doubao TTS",
                         )
-                await schedule_message_auto_delete_durable(
-                    sent,
-                    auto_delete_seconds,
-                )
+                confirm_telegram_delivery(on_delivery)
+                try:
+                    await schedule_message_auto_delete_durable(
+                        sent,
+                        auto_delete_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "tts auto-delete scheduling failed after confirmed delivery"
+                    )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -1068,17 +1120,54 @@ class DoubaoTTSService:
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
         context: str = "",
+        on_delivery: Callable[[], None] | None = None,
     ) -> bool:
-        if not self.available:
-            return False
+        result = await self.send_message_tts_result(
+            message,
+            text,
+            delivery_mode=delivery_mode,
+            reply_to_message_id=reply_to_message_id,
+            auto_delete_seconds=auto_delete_seconds,
+            uid=uid,
+            emotion=emotion,
+            emotion_scale=emotion_scale,
+            speech_rate=speech_rate,
+            loudness_rate=loudness_rate,
+            context=context,
+            on_delivery=on_delivery,
+        )
+        return result.complete
 
-        segments = self.split_text(text)
+    async def send_message_tts_result(
+        self,
+        message: Message,
+        text: str,
+        *,
+        delivery_mode: str = "reply",
+        reply_to_message_id: int | None = None,
+        auto_delete_seconds: int = 0,
+        uid: str = "",
+        emotion: str = "",
+        emotion_scale: int | None = None,
+        speech_rate: int | None = None,
+        loudness_rate: int | None = None,
+        context: str = "",
+        on_delivery: Callable[[], None] | None = None,
+    ) -> TTSDeliveryResult:
+        if not self.available:
+            return TTSDeliveryResult(error="tts_not_configured")
+
+        segments = tuple(self.split_text(text))
         if not segments:
-            return False
+            return TTSDeliveryResult(error="empty_text")
         if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
             log.warning("tts message has too many segments: %d", len(segments))
-            return False
+            return TTSDeliveryResult(
+                requested_segments=segments,
+                error="too_many_segments",
+            )
 
+        sent_segment_count = 0
         for idx, segment in enumerate(segments):
             if self.audio_format == "ogg_opus":
                 result = await self.synthesize_voice_payload(
@@ -1101,7 +1190,11 @@ class DoubaoTTSService:
                     context=context,
                 )
             if not result.ok or not result.audio_bytes:
-                return False
+                return TTSDeliveryResult(
+                    requested_segments=segments,
+                    sent_segment_count=sent_segment_count,
+                    error=result.error or "synthesis_failed",
+                )
             ok = await self._send_to_message(
                 message,
                 audio_bytes=result.audio_bytes,
@@ -1109,10 +1202,19 @@ class DoubaoTTSService:
                 delivery_mode=delivery_mode,
                 reply_to_message_id=reply_to_message_id if idx == 0 else None,
                 auto_delete_seconds=auto_delete_seconds,
+                on_delivery=on_delivery,
             )
             if not ok:
-                return False
-        return True
+                return TTSDeliveryResult(
+                    requested_segments=segments,
+                    sent_segment_count=sent_segment_count,
+                    error="telegram_send_failed",
+                )
+            sent_segment_count += 1
+        return TTSDeliveryResult(
+            requested_segments=segments,
+            sent_segment_count=sent_segment_count,
+        )
 
     async def send_chat_tts(
         self,
@@ -1130,22 +1232,63 @@ class DoubaoTTSService:
         speech_rate: int | None = None,
         loudness_rate: int | None = None,
         context: str = "",
+        on_delivery: Callable[[], None] | None = None,
     ) -> bool:
-        if not self.available:
-            return False
+        result = await self.send_chat_tts_result(
+            bot,
+            chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            fallback_mention_user_id=fallback_mention_user_id,
+            fallback_mention_name=fallback_mention_name,
+            auto_delete_seconds=auto_delete_seconds,
+            uid=uid,
+            emotion=emotion,
+            emotion_scale=emotion_scale,
+            speech_rate=speech_rate,
+            loudness_rate=loudness_rate,
+            context=context,
+            on_delivery=on_delivery,
+        )
+        return result.complete
 
-        segments = self.split_text(text)
+    async def send_chat_tts_result(
+        self,
+        bot: Bot,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        fallback_mention_user_id: int = 0,
+        fallback_mention_name: str = "",
+        auto_delete_seconds: int = 0,
+        uid: str = "",
+        emotion: str = "",
+        emotion_scale: int | None = None,
+        speech_rate: int | None = None,
+        loudness_rate: int | None = None,
+        context: str = "",
+        on_delivery: Callable[[], None] | None = None,
+    ) -> TTSDeliveryResult:
+        if not self.available:
+            return TTSDeliveryResult(error="tts_not_configured")
+
+        segments = tuple(self.split_text(text))
         if not segments:
-            return False
+            return TTSDeliveryResult(error="empty_text")
         if len(segments) > _TTS_MAX_SEGMENTS_PER_MESSAGE:
             log.warning("tts message has too many segments: %d", len(segments))
-            return False
+            return TTSDeliveryResult(
+                requested_segments=segments,
+                error="too_many_segments",
+            )
 
         fallback_caption_html = ""
         if fallback_mention_user_id:
             shown = html.escape((fallback_mention_name or str(fallback_mention_user_id)).strip())
             fallback_caption_html = f'<a href="tg://user?id={fallback_mention_user_id}">@{shown}</a>'
 
+        sent_segment_count = 0
         for idx, segment in enumerate(segments):
             if self.audio_format == "ogg_opus":
                 result = await self.synthesize_voice_payload(
@@ -1168,7 +1311,11 @@ class DoubaoTTSService:
                     context=context,
                 )
             if not result.ok or not result.audio_bytes:
-                return False
+                return TTSDeliveryResult(
+                    requested_segments=segments,
+                    sent_segment_count=sent_segment_count,
+                    error=result.error or "synthesis_failed",
+                )
 
             attempt = 0
             current_reply_to = reply_to_message_id if idx == 0 else None
@@ -1197,15 +1344,29 @@ class DoubaoTTSService:
                             parse_mode=current_parse_mode,
                             title="Doubao TTS",
                         )
-                    await schedule_message_auto_delete_durable(
-                        sent,
-                        auto_delete_seconds,
-                    )
+                    confirm_telegram_delivery(on_delivery)
+                    try:
+                        await schedule_message_auto_delete_durable(
+                            sent,
+                            auto_delete_seconds,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception(
+                            "tts auto-delete scheduling failed after confirmed "
+                            "delivery chat_id=%s",
+                            chat_id,
+                        )
                     break
                 except TelegramRetryAfter as exc:
                     wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
                     if wait_s > 10.0:
-                        return False
+                        return TTSDeliveryResult(
+                            requested_segments=segments,
+                            sent_segment_count=sent_segment_count,
+                            error="retry_after_too_long",
+                        )
                     await asyncio.sleep(wait_s)
                     attempt += 1
                 except TelegramBadRequest as exc:
@@ -1218,13 +1379,29 @@ class DoubaoTTSService:
                         attempt += 1
                         continue
                     log.warning("tts bot send failed chat_id=%s error=%s", chat_id, exc)
-                    return False
+                    return TTSDeliveryResult(
+                        requested_segments=segments,
+                        sent_segment_count=sent_segment_count,
+                        error="telegram_bad_request",
+                    )
                 except Exception:
                     if attempt >= 2:
                         log.exception("tts bot send failed chat_id=%s", chat_id)
-                        return False
+                        return TTSDeliveryResult(
+                            requested_segments=segments,
+                            sent_segment_count=sent_segment_count,
+                            error="telegram_send_failed",
+                        )
                     attempt += 1
                     await asyncio.sleep(0.6 * attempt)
             else:
-                return False
-        return True
+                return TTSDeliveryResult(
+                    requested_segments=segments,
+                    sent_segment_count=sent_segment_count,
+                    error="telegram_send_failed",
+                )
+            sent_segment_count += 1
+        return TTSDeliveryResult(
+            requested_segments=segments,
+            sent_segment_count=sent_segment_count,
+        )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -38,6 +39,9 @@ class SkillContext:
     embedded_reply_sent: bool = False
     embedded_reply_text: str = ""
     suppress_followup_text: bool = False
+    auto_delete_reply_seconds: int = 0
+    delivery_callback: Callable[[], None] | None = None
+    delivery_confirmed: bool = False
 
 
 @dataclass(slots=True)
@@ -60,6 +64,12 @@ class SkillAnswerResult:
     sticker_file_id: str = ""
     tts_sent: bool = False
     tts_text: str = ""
+    delivery_confirmed: bool = False
+    # A non-text skill (for example music or a vote prompt) may deliver the
+    # reply directly through Telegram. Keep that proof separate from handled,
+    # which only controls whether the normal text fallback should run.
+    embedded_reply_sent: bool = False
+    embedded_reply_text: str = ""
 
 
 class Skill(Protocol):

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 
-from bot.services.doubao_tts import DoubaoTTSService
+from bot.services.doubao_tts import DoubaoTTSService, TTSDeliveryResult
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
+from bot.utils.telegram import send_chat_message, send_reply
 
 log = logging.getLogger(__name__)
 
@@ -80,9 +81,9 @@ class DoubaoTTSSkill:
         loudness_rate = int(loudness_rate_raw) if isinstance(loudness_rate_raw, int) else None
 
         uid = str(context.sender_user_id or context.chat_id or "smart-group-bot")
-        ok = False
+        delivery = TTSDeliveryResult()
         if context.message is not None:
-            ok = await self.tts_service.send_message_tts(
+            delivery = await self.tts_service.send_message_tts_result(
                 context.message,
                 text,
                 delivery_mode=delivery_mode,
@@ -93,9 +94,10 @@ class DoubaoTTSSkill:
                 speech_rate=speech_rate,
                 loudness_rate=loudness_rate,
                 context=context_text,
+                on_delivery=context.delivery_callback,
             )
         elif context.bot is not None and int(context.chat_id or 0):
-            ok = await self.tts_service.send_chat_tts(
+            delivery = await self.tts_service.send_chat_tts_result(
                 context.bot,
                 int(context.chat_id),
                 text,
@@ -106,6 +108,7 @@ class DoubaoTTSSkill:
                 speech_rate=speech_rate,
                 loudness_rate=loudness_rate,
                 context=context_text,
+                on_delivery=context.delivery_callback,
             )
         else:
             return SkillRunResult(
@@ -115,25 +118,91 @@ class DoubaoTTSSkill:
                 error="missing_chat_context",
             )
 
-        if not ok:
+        if not delivery.any_sent:
             log.warning("doubao_tts skill send failed")
             return SkillRunResult(ok=False, skill=self.name, summary="TTS 发送失败", error="send_failed")
 
         context.handled = True
         context.tts_sent = True
-        context.tts_text = text
         context.suppress_followup_text = True
+        remaining_text_sent = False
+        if not delivery.complete and delivery.remaining_text:
+            if context.message is not None:
+                remaining_text_sent = await send_reply(
+                    context.message,
+                    delivery.remaining_text,
+                    delivery_mode=delivery_mode,
+                    stream=False,
+                    auto_delete_seconds=context.auto_delete_reply_seconds,
+                    on_delivery=context.delivery_callback,
+                )
+            elif context.bot is not None and int(context.chat_id or 0):
+                remaining_text_sent = await send_chat_message(
+                    context.bot,
+                    int(context.chat_id),
+                    delivery.remaining_text,
+                    auto_delete_seconds=context.auto_delete_reply_seconds,
+                    on_delivery=context.delivery_callback,
+                )
+
+        delivered_parts = [delivery.delivered_text]
+        if remaining_text_sent:
+            delivered_parts.append(delivery.remaining_text)
+        context.tts_text = "\n".join(part for part in delivered_parts if part).strip()
+
+        if not delivery.complete:
+            log.warning(
+                "doubao_tts skill partially delivered | sent=%d total=%d "
+                "text_fallback=%s error=%s",
+                delivery.sent_segment_count,
+                len(delivery.requested_segments),
+                remaining_text_sent,
+                delivery.error or "unknown",
+            )
+            if remaining_text_sent:
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary=context.tts_text,
+                    payload={
+                        "text": context.tts_text,
+                        "delivery_mode": delivery_mode,
+                        "complete": True,
+                        "voice_complete": False,
+                        "text_fallback_sent": True,
+                        "segments_sent": delivery.sent_segment_count,
+                        "segments_total": len(delivery.requested_segments),
+                    },
+                )
+            return SkillRunResult(
+                ok=False,
+                skill=self.name,
+                summary="TTS 已部分发送，后续分段发送失败",
+                error="partial_send",
+                payload={
+                    "text": context.tts_text,
+                    "complete": False,
+                    "voice_complete": False,
+                    "text_fallback_sent": False,
+                    "segments_sent": delivery.sent_segment_count,
+                    "segments_total": len(delivery.requested_segments),
+                },
+            )
         return SkillRunResult(
             ok=True,
             skill=self.name,
-            summary=text,
+            summary=context.tts_text,
             payload={
-                "text": text,
+                "text": context.tts_text,
                 "delivery_mode": delivery_mode,
                 "emotion": emotion,
                 "emotion_scale": emotion_scale,
                 "speech_rate": speech_rate,
                 "loudness_rate": loudness_rate,
                 "context": context_text,
+                "complete": True,
+                "voice_complete": True,
+                "text_fallback_sent": False,
+                "segments_sent": delivery.sent_segment_count,
             },
         )

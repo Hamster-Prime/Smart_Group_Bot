@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -566,6 +567,9 @@ class SkillService:
                 "suppress_followup_text",
             ):
                 setattr(context, attribute, getattr(tool_context, attribute))
+            context.delivery_confirmed = bool(
+                context.delivery_confirmed or tool_context.delivery_confirmed
+            )
             return result
         except asyncio.CancelledError:
             task.cancel()
@@ -1342,6 +1346,7 @@ class SkillService:
         current_user_text: str = "",
         session_factory: Any | None = None,
         is_direct_request: bool = False,
+        delivery_callback: Callable[[], None] | None = None,
     ) -> SkillRunResult:
         context = SkillContext(
             session=session,
@@ -1363,7 +1368,19 @@ class SkillService:
                 if self.settings is not None
                 else 0
             ),
+            auto_delete_reply_seconds=(
+                configured_auto_delete_seconds(self.settings, "reply")
+                if self.settings is not None
+                else 0
+            ),
         )
+
+        def _confirm_delivery() -> None:
+            context.delivery_confirmed = True
+            if delivery_callback is not None:
+                delivery_callback()
+
+        context.delivery_callback = _confirm_delivery
         return await self._run_tool(name=name, arguments=arguments or {}, context=context)
 
     async def answer_with_skill(
@@ -1388,6 +1405,7 @@ class SkillService:
         is_reply_to_bot: bool = False,
         is_direct_request: bool | None = None,
         style_profile_context: str = "",
+        delivery_callback: Callable[[], None] | None = None,
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         if contains_prompt_injection(user_text):
@@ -1436,7 +1454,19 @@ class SkillService:
                 if self.settings is not None
                 else 0
             ),
+            auto_delete_reply_seconds=(
+                configured_auto_delete_seconds(self.settings, "reply")
+                if self.settings is not None
+                else 0
+            ),
         )
+
+        def _confirm_delivery() -> None:
+            context.delivery_confirmed = True
+            if delivery_callback is not None:
+                delivery_callback()
+
+        context.delivery_callback = _confirm_delivery
         last_success_summary = ""
         last_tool_summary = ""
         recent_tool_results: list[dict[str, Any]] = []
@@ -1455,10 +1485,18 @@ class SkillService:
                 sticker_file_id=context.sticker_file_id,
                 tts_sent=context.tts_sent,
                 tts_text=context.tts_text,
+                delivery_confirmed=context.delivery_confirmed,
+                embedded_reply_sent=context.embedded_reply_sent,
+                embedded_reply_text=context.embedded_reply_text,
             )
 
         def _action_reply_completed() -> bool:
-            return context.handled and (context.embedded_reply_sent or context.suppress_followup_text)
+            return bool(
+                context.sticker_sent
+                or context.tts_sent
+                or context.embedded_reply_sent
+                or context.delivery_confirmed
+            )
 
         for step in range(1, self.max_tool_rounds + 1):
             current_task = asyncio.current_task()
@@ -1639,19 +1677,12 @@ class SkillService:
                         }
                     )
 
-                if result.error == _AMBIGUOUS_SIDE_EFFECT_ERROR:
-                    log.warning(
-                        "skill tool loop stopped at ambiguous side effect | skill=%s",
-                        result.skill,
-                    )
-                    return _build_answer_result(result.summary)
-
                 # A delivered action (sticker, voice, media, vote prompt, ...)
                 # is the terminal reply for this turn.  Do not execute any
                 # remaining tool calls emitted in the same model response: they
                 # may be duplicate non-idempotent actions and the model is not a
                 # trusted transaction coordinator for Telegram side effects.
-                if result.ok and _action_reply_completed():
+                if _action_reply_completed():
                     skipped = len(tool_calls) - tool_index - 1
                     log.info(
                         "skill tool loop finished after delivered action | "
@@ -1661,6 +1692,12 @@ class SkillService:
                         max(0, skipped),
                     )
                     return _build_answer_result()
+                if result.error == _AMBIGUOUS_SIDE_EFFECT_ERROR:
+                    log.warning(
+                        "skill tool loop stopped at ambiguous side effect | skill=%s",
+                        result.skill,
+                    )
+                    return _build_answer_result(result.summary)
                 if self._committed_state_mutation(result):
                     side_effect_committed = result.skill
 

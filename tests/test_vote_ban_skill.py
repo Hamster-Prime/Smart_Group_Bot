@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy import select
 
@@ -104,6 +104,7 @@ class VoteBanSkillTests(unittest.IsolatedAsyncioTestCase):
             result = await self.skill.run({"reason": "持续骚扰"}, context)
         self.assertTrue(result.ok)
         self.assertTrue(context.handled)
+        self.assertTrue(context.embedded_reply_sent)
         self.assertTrue(context.suppress_followup_text)
         message.bot.send_message.assert_awaited_once()
         async with self.session_factory() as session:
@@ -111,6 +112,34 @@ class VoteBanSkillTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record.source, "skill")
             self.assertEqual(record.reason, "持续骚扰")
             self.assertEqual(record.evidence, "持续骚扰内容")
+
+    async def test_delivery_receipt_survives_post_send_failure(self) -> None:
+        message = self._message()
+        outer_delivery = Mock()
+
+        async def fail_after_delivery(*_args: object, **kwargs: object) -> None:
+            on_delivery = kwargs.get("on_delivery")
+            self.assertTrue(callable(on_delivery))
+            on_delivery()
+            raise RuntimeError("post-send persistence failed")
+
+        async with self.session_factory() as session:
+            context = self._context(session, message)
+            context.delivery_callback = outer_delivery
+            with (
+                patch(
+                    "bot.services.skills.vote_ban.start_vote_ban",
+                    new=AsyncMock(side_effect=fail_after_delivery),
+                ),
+                self.assertRaisesRegex(RuntimeError, "post-send persistence failed"),
+            ):
+                await self.skill.run({}, context)
+
+        self.assertTrue(context.handled)
+        self.assertTrue(context.embedded_reply_sent)
+        self.assertTrue(context.suppress_followup_text)
+        self.assertEqual(context.embedded_reply_text, "民主投票已经发起。")
+        outer_delivery.assert_called_once_with()
 
     async def test_quota_exhaustion_returns_structured_error_for_main_model(self) -> None:
         first = self._message(555)

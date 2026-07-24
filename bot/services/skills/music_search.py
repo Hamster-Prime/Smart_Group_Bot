@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 
 import aiohttp
@@ -17,6 +18,7 @@ from bot.services.skills.platform_common import (
     fetch_json,
 )
 from bot.utils.telegram import (
+    confirm_telegram_delivery,
     is_reply_target_missing_error,
     sanitize_outgoing_text,
     schedule_message_auto_delete_durable,
@@ -543,6 +545,7 @@ class MusicSearchSkill:
         caption_text: str,
         delivery_mode: str,
         auto_delete_seconds: int,
+        on_delivery: Callable[[], None] | None = None,
     ) -> bool:
         send_as_reply = delivery_mode == "reply"
         attempt = 0
@@ -559,10 +562,18 @@ class MusicSearchSkill:
                     sent = await message.reply_audio(**kwargs)
                 else:
                     sent = await message.answer_audio(**kwargs)
-                await schedule_message_auto_delete_durable(
-                    sent,
-                    auto_delete_seconds,
-                )
+                confirm_telegram_delivery(on_delivery)
+                try:
+                    await schedule_message_auto_delete_durable(
+                        sent,
+                        auto_delete_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "music auto-delete scheduling failed after confirmed delivery"
+                    )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -592,6 +603,7 @@ class MusicSearchSkill:
         fallback_mention_user_id: int = 0,
         fallback_mention_name: str = "",
         auto_delete_seconds: int = 0,
+        on_delivery: Callable[[], None] | None = None,
     ) -> bool:
         attempt = 0
         current_reply_to = reply_to_message_id
@@ -613,10 +625,20 @@ class MusicSearchSkill:
                     caption=current_caption or None,
                     parse_mode=current_parse_mode,
                 )
-                await schedule_message_auto_delete_durable(
-                    sent,
-                    auto_delete_seconds,
-                )
+                confirm_telegram_delivery(on_delivery)
+                try:
+                    await schedule_message_auto_delete_durable(
+                        sent,
+                        auto_delete_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "music auto-delete scheduling failed after confirmed delivery "
+                        "chat_id=%s",
+                        chat_id,
+                    )
                 return True
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
@@ -681,6 +703,7 @@ class MusicSearchSkill:
                 caption_text=caption_text,
                 delivery_mode=delivery_mode,
                 auto_delete_seconds=auto_delete_seconds,
+                on_delivery=getattr(context, "delivery_callback", None),
             )
         elif context.bot is not None and int(context.chat_id or 0):
             ok = await self._send_audio_to_chat(
@@ -691,6 +714,7 @@ class MusicSearchSkill:
                 performer=performer,
                 caption_text=caption_text,
                 auto_delete_seconds=auto_delete_seconds,
+                on_delivery=getattr(context, "delivery_callback", None),
             )
 
         if not ok:

@@ -102,6 +102,7 @@ class SendStickerSkill:
                 sticker=sticker_file_id,
                 delivery_mode=delivery_mode,
                 auto_delete_seconds=context.auto_delete_media_seconds,
+                on_delivery=context.delivery_callback,
             )
         except Exception as exc:
             log.exception("[%s] send_sticker skill failed", group_id)

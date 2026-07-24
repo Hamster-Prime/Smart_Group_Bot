@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.config import BotConfig, Settings
 from bot.handlers import admin
+from bot.services import proactive as proactive_module
 from bot.services.proactive import (
     ProactiveTopicService,
     get_cooldown_status_text,
@@ -59,6 +61,63 @@ def _due_settings(now: datetime) -> dict:
 
 
 class ProactiveStateTests(unittest.TestCase):
+    def test_delivery_claim_is_single_owner_and_finalizes_processed_state(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+        settings = _due_settings(now)
+
+        claimed, first_applied = proactive_module._claim_cooldown_delivery(
+            settings,
+            activity_revision=1,
+            default_enabled=True,
+            token="owner-1",
+            claimed_at=now,
+        )
+        claimed_again, second_applied = proactive_module._claim_cooldown_delivery(
+            claimed,
+            activity_revision=1,
+            default_enabled=True,
+            token="owner-2",
+            claimed_at=now,
+        )
+        finalized, did_finalize = (
+            proactive_module._finalize_cooldown_delivery_claim(
+                claimed_again,
+                token="owner-1",
+                last_user_at=now - timedelta(hours=4),
+                activity_revision=1,
+                sent_at=now,
+            )
+        )
+
+        self.assertTrue(first_applied)
+        self.assertFalse(second_applied)
+        self.assertTrue(did_finalize)
+        state = get_cooldown_task_state(finalized)
+        self.assertNotIn("delivery_claim", state)
+        self.assertEqual(state["processed_activity_revision"], 1)
+
+    def test_delivery_claim_respects_latest_admin_state(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
+        muted = {**_due_settings(now), "mute_all_replies": True}
+        disabled = _due_settings(now)
+        disabled["scheduled_tasks"]["cooldown_topic"]["enabled"] = False
+
+        for settings in (muted, disabled):
+            with self.subTest(settings=settings):
+                updated, applied = proactive_module._claim_cooldown_delivery(
+                    settings,
+                    activity_revision=1,
+                    default_enabled=True,
+                    token="owner",
+                    claimed_at=now,
+                )
+
+                self.assertFalse(applied)
+                self.assertNotIn(
+                    "delivery_claim",
+                    get_cooldown_task_state(updated),
+                )
+
     def test_status_uses_effective_runtime_config(self) -> None:
         config = BotConfig(
             proactive_idle_minutes=240,
@@ -204,6 +263,14 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         initial_settings = _due_settings(now)
         service = self._service(fresh_settings=initial_settings)
+        persisted_settings = initial_settings
+
+        async def commit_settings(_group_id: int, mutate: object) -> bool:
+            nonlocal persisted_settings
+            persisted_settings = mutate(persisted_settings)
+            return True
+
+        commit = AsyncMock(side_effect=commit_settings)
 
         with (
             patch.object(
@@ -219,19 +286,57 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 service,
                 "_commit_fresh_settings",
-                new=AsyncMock(),
-            ) as commit,
+                new=commit,
+            ),
             patch("bot.services.proactive._now_local", return_value=now),
         ):
             with self.assertRaisesRegex(RuntimeError, "delivery failed"):
                 await service._run_group_cooldown_task(-100123, now=now)
 
-        commit.assert_not_awaited()
+        commit.assert_awaited_once()
+        claim = get_cooldown_task_state(persisted_settings)["delivery_claim"]
+        self.assertEqual(claim["activity_revision"], 1)
+
+    async def test_active_delivery_claim_prevents_restart_resend(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        claimed_settings, applied = proactive_module._claim_cooldown_delivery(
+            _due_settings(now),
+            activity_revision=1,
+            default_enabled=True,
+            token="prior-process",
+            claimed_at=now,
+        )
+        self.assertTrue(applied)
+        service = self._service(fresh_settings=claimed_settings)
+        deliver = AsyncMock(return_value=True)
+
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=claimed_settings),
+            ),
+            patch.object(service, "_deliver_topic", new=deliver),
+        ):
+            attempted = await service._run_group_cooldown_task(-100123, now=now)
+
+        self.assertFalse(attempted)
+        deliver.assert_not_awaited()
 
     async def test_sent_topic_requires_persisted_outcome(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         initial_settings = _due_settings(now)
         service = self._service(fresh_settings=initial_settings)
+        persisted_settings = initial_settings
+        commit_count = 0
+
+        async def fail_outcome_commit(_group_id: int, mutate: object) -> bool:
+            nonlocal commit_count, persisted_settings
+            commit_count += 1
+            if commit_count == 1:
+                persisted_settings = mutate(persisted_settings)
+                return True
+            return False
 
         with (
             patch.object(
@@ -247,13 +352,55 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 service,
                 "_commit_fresh_settings",
-                new=AsyncMock(return_value=False),
+                new=AsyncMock(side_effect=fail_outcome_commit),
             ),
             patch("bot.services.proactive._now_local", return_value=now),
         ):
             with self.assertRaisesRegex(RuntimeError, "persist"):
                 await service._run_group_cooldown_task(-100123, now=now)
 
+        service.memory.add_message.assert_not_awaited()
+        self.assertIn("delivery_claim", get_cooldown_task_state(persisted_settings))
+
+    async def test_cancelled_after_delivery_persists_marker_before_propagating(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        initial_settings = _due_settings(now)
+        service = self._service(fresh_settings=initial_settings)
+        persisted_settings = initial_settings
+
+        async def commit_settings(_group_id: int, mutate: object) -> bool:
+            nonlocal persisted_settings
+            persisted_settings = mutate(persisted_settings)
+            return True
+
+        commit = AsyncMock(side_effect=commit_settings)
+
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(
+                service,
+                "_deliver_topic",
+                new=AsyncMock(
+                    return_value=proactive_module._TopicDeliveryResult(
+                        True,
+                        interrupted=True,
+                    )
+                ),
+            ),
+            patch.object(service, "_commit_fresh_settings", new=commit),
+            patch("bot.services.proactive._now_local", return_value=now),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await service._run_group_cooldown_task(-100123, now=now)
+
+        self.assertEqual(commit.await_count, 2)
+        state = get_cooldown_task_state(persisted_settings)
+        self.assertNotIn("delivery_claim", state)
+        self.assertEqual(state["processed_activity_revision"], 1)
         service.memory.add_message.assert_not_awaited()
 
     async def test_new_activity_during_generation_suppresses_topic(self) -> None:
@@ -330,6 +477,72 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await service._run_group_cooldown_task(-100123, now=now)
                 deliver.assert_not_awaited()
 
+    async def test_admin_state_change_after_claim_suppresses_topic(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+
+        for mode in ("muted", "disabled"):
+            with self.subTest(mode=mode):
+                initial_settings = _due_settings(now)
+                persisted_settings = initial_settings
+                fresh_read_count = 0
+                service = self._service(fresh_settings=initial_settings)
+
+                def apply_admin_change(settings: dict) -> dict:
+                    updated = dict(settings)
+                    if mode == "muted":
+                        updated["mute_all_replies"] = True
+                        return updated
+                    tasks = dict(updated.get("scheduled_tasks") or {})
+                    state = dict(tasks.get("cooldown_topic") or {})
+                    state["enabled"] = False
+                    tasks["cooldown_topic"] = state
+                    updated["scheduled_tasks"] = tasks
+                    return updated
+
+                async def load_fresh(_group_id: int) -> dict:
+                    nonlocal fresh_read_count, persisted_settings
+                    fresh_read_count += 1
+                    if fresh_read_count == 2:
+                        persisted_settings = apply_admin_change(persisted_settings)
+                    return persisted_settings
+
+                async def commit_settings(_group_id: int, mutate: object) -> bool:
+                    nonlocal persisted_settings
+                    persisted_settings = mutate(persisted_settings)
+                    return True
+
+                with (
+                    patch.object(
+                        service,
+                        "_load_group_settings",
+                        new=AsyncMock(return_value=initial_settings),
+                    ),
+                    patch.object(
+                        service,
+                        "_load_fresh_settings",
+                        new=AsyncMock(side_effect=load_fresh),
+                    ),
+                    patch.object(service, "_deliver_topic", new=AsyncMock()) as deliver,
+                    patch.object(
+                        service,
+                        "_commit_fresh_settings",
+                        new=AsyncMock(side_effect=commit_settings),
+                    ),
+                    patch("bot.services.proactive._now_local", return_value=now),
+                ):
+                    attempted = await service._run_group_cooldown_task(
+                        -100123,
+                        now=now,
+                    )
+
+                self.assertTrue(attempted)
+                self.assertEqual(fresh_read_count, 2)
+                self.assertIn(
+                    "delivery_claim",
+                    get_cooldown_task_state(persisted_settings),
+                )
+                deliver.assert_not_awaited()
+
     async def test_older_processed_revision_does_not_block_same_second_activity(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         group_settings = _due_settings(now)
@@ -338,6 +551,12 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         state["processed_activity_revision"] = 1
         state["last_processed_user_at"] = state["last_user_at"]
         service = self._service(fresh_settings=group_settings)
+        persisted_settings = group_settings
+
+        async def commit_settings(_group_id: int, mutate: object) -> bool:
+            nonlocal persisted_settings
+            persisted_settings = mutate(persisted_settings)
+            return True
 
         with (
             patch.object(
@@ -350,6 +569,11 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "_deliver_topic",
                 new=AsyncMock(return_value=True),
             ) as deliver,
+            patch.object(
+                service,
+                "_commit_fresh_settings",
+                new=AsyncMock(side_effect=commit_settings),
+            ),
             # _may_send_now re-checks quiet hours against the real clock;
             # pin it to the test's `now` so runs between 0-9 点 don't flake.
             patch("bot.services.proactive._now_local", return_value=now),
@@ -399,6 +623,126 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent)
         fake_tts.send_chat_tts.assert_awaited_once()
         send_text.assert_not_awaited()
+
+    async def test_legacy_tts_sender_without_delivery_callback_is_supported(self) -> None:
+        service = self._service()
+
+        class LegacyTTS:
+            available = True
+
+            async def send_chat_tts(
+                self,
+                bot: object,
+                group_id: int,
+                reply: str,
+                *,
+                auto_delete_seconds: int,
+                uid: str,
+            ) -> bool:
+                del bot, group_id, reply, auto_delete_seconds, uid
+                return True
+
+        with patch(
+            "bot.services.doubao_tts.DoubaoTTSService",
+            return_value=LegacyTTS(),
+        ):
+            result = await service._deliver_topic(
+                -100123,
+                "新话题",
+                {"tts_mode": "always"},
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(result.memory_text, "新话题")
+
+    async def test_text_delivery_receipt_survives_cancellation(self) -> None:
+        service = self._service()
+
+        async def delivered_then_cancelled(
+            _bot: object,
+            _group_id: int,
+            _reply: str,
+            **kwargs: object,
+        ) -> bool:
+            callback = kwargs["on_delivery"]
+            self.assertTrue(callable(callback))
+            callback()
+            raise asyncio.CancelledError
+
+        with patch(
+            "bot.services.proactive.send_chat_message",
+            new=delivered_then_cancelled,
+        ):
+            result = await service._deliver_topic(-100123, "新话题", {})
+
+        self.assertTrue(result)
+        self.assertTrue(result.interrupted)
+        self.assertEqual(result.memory_text, "")
+
+    async def test_partial_always_tts_sends_only_remaining_text(self) -> None:
+        from bot.services.doubao_tts import TTSDeliveryResult
+
+        service = self._service()
+        fake_tts = SimpleNamespace(
+            available=True,
+            send_chat_tts_result=AsyncMock(
+                return_value=TTSDeliveryResult(
+                    requested_segments=("第一段。", "第二段。"),
+                    sent_segment_count=1,
+                    error="synthesis_failed",
+                )
+            ),
+        )
+
+        with (
+            patch("bot.services.doubao_tts.DoubaoTTSService", return_value=fake_tts),
+            patch(
+                "bot.services.proactive.send_chat_message",
+                new=AsyncMock(return_value=True),
+            ) as send_text,
+        ):
+            sent = await service._deliver_topic(
+                -100123,
+                "第一段。第二段。",
+                {"tts_mode": "always"},
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(send_text.await_args.args[2], "第二段。")
+        self.assertEqual(sent.memory_text, "第一段。第二段。")
+
+    async def test_partial_always_tts_records_only_delivered_prefix_when_fallback_fails(
+        self,
+    ) -> None:
+        from bot.services.doubao_tts import TTSDeliveryResult
+
+        service = self._service()
+        fake_tts = SimpleNamespace(
+            available=True,
+            send_chat_tts_result=AsyncMock(
+                return_value=TTSDeliveryResult(
+                    requested_segments=("第一段。", "第二段。"),
+                    sent_segment_count=1,
+                    error="synthesis_failed",
+                )
+            ),
+        )
+
+        with (
+            patch("bot.services.doubao_tts.DoubaoTTSService", return_value=fake_tts),
+            patch(
+                "bot.services.proactive.send_chat_message",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            sent = await service._deliver_topic(
+                -100123,
+                "第一段。第二段。",
+                {"tts_mode": "always"},
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(sent.memory_text, "第一段。")
 
     async def test_always_mode_does_not_fall_back_to_text_when_tts_unavailable(self) -> None:
         service = self._service()

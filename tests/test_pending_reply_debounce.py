@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from bot.config import BotConfig
 from bot.handlers import group
+from bot.services.doubao_tts import TTSDeliveryResult
+from bot.services.skills.base import SkillAnswerResult
 from bot.services.update_completion import UpdateCompletionReceipt
 
 
@@ -203,8 +205,12 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group._is_user_admin_cached", new=admin_lookup),
             patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
         ):
-            await group._process_pending_reply_batch([item], _processing_settings())
+            processed = await group._process_pending_reply_batch(
+                [item],
+                _processing_settings(),
+            )
 
+        self.assertFalse(processed)
         admin_lookup.assert_awaited_once_with(message)
         self.assertFalse(
             fake_skill.build_answer_prompt_payload.call_args.kwargs["sender_is_tg_admin"]
@@ -234,6 +240,137 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(side_effect=RuntimeError("telegram unavailable")),
         ):
             self.assertFalse(await group._revalidate_pending_sender_admin(item))
+
+
+class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _message(text: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            message_id=99,
+            text=text,
+            caption=None,
+            from_user=SimpleNamespace(
+                id=123,
+                is_bot=False,
+                username="tester",
+                full_name="Tester",
+            ),
+            sender_chat=None,
+            reply_to_message=None,
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+        )
+
+    async def _run_guarded(
+        self,
+        skill_result: SkillAnswerResult,
+        *,
+        memory_error: Exception | None = None,
+    ) -> tuple[
+        group._PendingReplyOutcome,
+        group._PendingReplyItem,
+        SimpleNamespace,
+        AsyncMock,
+        Mock,
+    ]:
+        message = self._message("@bot 执行动作")
+        item = _item(
+            message.text,
+            message=message,
+            explicit_mention=True,
+            mentioned=True,
+        )
+        session = _PendingSession()
+        memory = SimpleNamespace(
+            session_factory=lambda: session,
+            get_history=Mock(return_value=[]),
+            get_history_for_llm=AsyncMock(return_value=[]),
+            add_message=AsyncMock(side_effect=memory_error),
+        )
+        fake_skill = SimpleNamespace(
+            tts_service=SimpleNamespace(available=False),
+            build_answer_prompt_payload=Mock(return_value={"messages": [], "tools": []}),
+            answer_with_skill=AsyncMock(return_value=skill_result),
+        )
+        notify_failure = AsyncMock(return_value=True)
+        schedule_compaction = Mock()
+
+        with (
+            patch("bot.handlers.group.memory_holder.get", return_value=memory),
+            patch("bot.handlers.group.LLMService", return_value=object()),
+            patch("bot.handlers.group.SkillService", return_value=fake_skill),
+            patch(
+                "bot.handlers.group._is_user_admin_cached",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
+            patch(
+                "bot.handlers.group._schedule_memory_compaction",
+                new=schedule_compaction,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify_failure,
+            ),
+        ):
+            outcome = await group._process_pending_reply_batch_guarded(
+                (item.group_id, item.user_id),
+                [item],
+                _processing_settings(),
+            )
+
+        return outcome, item, memory, notify_failure, schedule_compaction
+
+    async def test_embedded_music_and_vote_deliveries_do_not_emit_failure(self) -> None:
+        for embedded_text in ("这首《稻香》给你。", "民主投票已经发起。"):
+            with self.subTest(embedded_text=embedded_text):
+                outcome, item, memory, notify_failure, schedule_compaction = (
+                    await self._run_guarded(
+                        SkillAnswerResult(
+                            handled=True,
+                            embedded_reply_sent=True,
+                            embedded_reply_text=embedded_text,
+                        )
+                    )
+                )
+
+                self.assertTrue(outcome.succeeded)
+                notify_failure.assert_not_awaited()
+                memory.add_message.assert_awaited_once_with(
+                    item.group_id,
+                    "assistant",
+                    embedded_text,
+                    message_type="assistant_reply",
+                    defer_persistence=True,
+                    completions=(),
+                )
+                schedule_compaction.assert_called_once_with(memory, item.group_id)
+
+    async def test_handled_without_delivery_still_emits_failure(self) -> None:
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(SkillAnswerResult(handled=True))
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_awaited_once_with([item], timed_out=False)
+        memory.add_message.assert_not_awaited()
+        schedule_compaction.assert_not_called()
+
+    async def test_post_delivery_memory_error_does_not_emit_failure(self) -> None:
+        outcome, _item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(
+                SkillAnswerResult(
+                    handled=True,
+                    embedded_reply_sent=True,
+                    embedded_reply_text="这首《稻香》给你。",
+                ),
+                memory_error=RuntimeError("memory queue unavailable"),
+            )
+        )
+
+        self.assertTrue(outcome.succeeded)
+        memory.add_message.assert_awaited_once()
+        notify_failure.assert_not_awaited()
+        schedule_compaction.assert_not_called()
 
 
 class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -278,6 +415,7 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
             key: tuple[int, int],
             items: list[group._PendingReplyItem],
             settings: object,
+            **_kwargs: object,
         ) -> group._PendingReplyOutcome:
             nonlocal active, max_active
             del key, settings
@@ -440,7 +578,7 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.wait_for(flush_task, timeout=1.0)
 
-    async def test_cancelling_active_direct_batch_emits_visible_failure(self) -> None:
+    async def test_cancelling_active_worker_does_not_race_with_failure_notice(self) -> None:
         started = asyncio.Event()
         notify = AsyncMock()
 
@@ -469,6 +607,110 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+        notify.assert_not_awaited()
+
+    async def test_late_delivery_from_timed_out_child_suppresses_timeout_notice(self) -> None:
+        cancelled = asyncio.Event()
+        release_delivery = asyncio.Event()
+        notify = AsyncMock(return_value=True)
+
+        async def deliver_after_cancel(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release_delivery.wait()
+                delivery_receipt.confirm()
+                return True
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=deliver_after_cancel,
+            ),
+            patch(
+                "bot.handlers.group._pending_reply_timeout_seconds",
+                return_value=0.02,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify,
+            ),
+        ):
+            await group._enqueue_pending_reply(
+                _item("direct", mentioned=True),
+                _settings(0.0),
+            )
+            await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+            await asyncio.sleep(0.02)
+            notify.assert_not_awaited()
+            release_delivery.set()
+
+            async def queue_empty() -> None:
+                while True:
+                    async with group._PENDING_REPLY_LOCK:
+                        if not group._PENDING_REPLY_BATCHES:
+                            return
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(queue_empty(), timeout=1.0)
+
+        notify.assert_not_awaited()
+
+    async def test_timeout_notice_waits_until_child_cannot_deliver(self) -> None:
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+        notified = asyncio.Event()
+
+        async def record_notification(*_args: object, **_kwargs: object) -> bool:
+            notified.set()
+            return True
+
+        notify = AsyncMock(side_effect=record_notification)
+
+        async def finish_without_delivery(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings, delivery_receipt
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+                return False
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=finish_without_delivery,
+            ),
+            patch(
+                "bot.handlers.group._pending_reply_timeout_seconds",
+                return_value=0.02,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify,
+            ),
+        ):
+            await group._enqueue_pending_reply(
+                _item("direct", mentioned=True),
+                _settings(0.0),
+            )
+            await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+            notify.assert_not_awaited()
+            release.set()
+            await asyncio.wait_for(notified.wait(), timeout=1.0)
+
         notify.assert_awaited_once()
         self.assertTrue(notify.await_args.kwargs["timed_out"])
 
@@ -491,6 +733,82 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(loop.time() - started, 0.2)
         release.set()
         await asyncio.sleep(0)
+
+    async def test_deadline_after_confirmed_delivery_suppresses_timeout_notice(self) -> None:
+        release = asyncio.Event()
+        notify_failure = AsyncMock(return_value=True)
+
+        async def delivered_then_stuck(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings
+            delivery_receipt.confirm()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()
+            return True
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=delivered_then_stuck,
+            ),
+            patch(
+                "bot.handlers.group._pending_reply_timeout_seconds",
+                return_value=0.02,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify_failure,
+            ),
+        ):
+            outcome = await group._process_pending_reply_batch_guarded(
+                (-10001, 123),
+                [_item("@bot 发一首歌", mentioned=True)],
+                _processing_settings(),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertIsNotNone(outcome.orphan)
+        notify_failure.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(outcome.orphan, timeout=1.0)
+
+    async def test_exception_after_confirmed_delivery_suppresses_failure_notice(self) -> None:
+        notify_failure = AsyncMock(return_value=True)
+
+        async def delivered_then_failed(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings
+            delivery_receipt.confirm()
+            raise RuntimeError("session exit failed after delivery")
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=delivered_then_failed,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify_failure,
+            ),
+        ):
+            outcome = await group._process_pending_reply_batch_guarded(
+                (-10001, 123),
+                [_item("@bot 发一首歌", mentioned=True)],
+                _processing_settings(),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
 
     async def test_outer_cancellation_tracks_child_until_shutdown_drain(self) -> None:
         started = asyncio.Event()
@@ -606,6 +924,121 @@ class MemoryCompactionSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_tts_sender_without_delivery_callback_remains_compatible(
+        self,
+    ) -> None:
+        class LegacyTTS:
+            available = True
+
+            async def send_message_tts(
+                self,
+                message: object,
+                text: str,
+                *,
+                delivery_mode: str,
+                reply_to_message_id: int | None,
+                auto_delete_seconds: int,
+                uid: str,
+            ) -> bool:
+                del (
+                    message,
+                    text,
+                    delivery_mode,
+                    reply_to_message_id,
+                    auto_delete_seconds,
+                    uid,
+                )
+                return True
+
+        receipt = Mock()
+        with (
+            patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
+            patch("bot.handlers.group.configured_auto_delete_seconds", return_value=0),
+        ):
+            sent, tts_sent, stored = await group._deliver_reply_plans(
+                message=SimpleNamespace(),
+                delivery_plans=[group._ReplyDeliveryPlan("语音内容", "reply", 1)],
+                settings=_processing_settings(),
+                tts_mode="always",
+                tts_service=LegacyTTS(),
+                user_id=123,
+                group_id=-10001,
+                tts_already_sent=False,
+                on_delivery=receipt,
+            )
+
+        self.assertTrue(sent)
+        self.assertTrue(tts_sent)
+        self.assertEqual(stored, ["语音内容"])
+        receipt.assert_called_once_with()
+
+    async def test_partial_text_delivery_confirms_receipt_without_full_memory(self) -> None:
+        receipt = Mock()
+
+        async def send_part_then_fail(
+            _message: object,
+            _text: str,
+            **kwargs: object,
+        ) -> bool:
+            callback = kwargs["on_delivery"]
+            self.assertTrue(callable(callback))
+            callback()
+            return False
+
+        with patch("bot.handlers.group.send_reply", new=send_part_then_fail):
+            sent, tts_sent, stored = await group._deliver_reply_plans(
+                message=SimpleNamespace(),
+                delivery_plans=[group._ReplyDeliveryPlan("很长的回复", "message", None)],
+                settings=_processing_settings(),
+                tts_mode="off",
+                tts_service=SimpleNamespace(available=False),
+                user_id=123,
+                group_id=-10001,
+                tts_already_sent=False,
+                on_delivery=receipt,
+            )
+
+        self.assertTrue(sent)
+        self.assertFalse(tts_sent)
+        self.assertEqual(stored, [])
+        receipt.assert_called_once_with()
+
+    async def test_partial_always_tts_falls_back_with_remaining_text_only(self) -> None:
+        tts_service = SimpleNamespace(
+            available=True,
+            send_message_tts_result=AsyncMock(
+                return_value=TTSDeliveryResult(
+                    requested_segments=("第一段。", "第二段。"),
+                    sent_segment_count=1,
+                    error="synthesis_failed",
+                )
+            ),
+        )
+        send_text = AsyncMock(return_value=True)
+        plan = group._ReplyDeliveryPlan("第一段。第二段。", "reply", 1)
+        settings = _processing_settings()
+
+        with (
+            patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
+            patch("bot.handlers.group.configured_auto_delete_seconds", return_value=0),
+            patch("bot.handlers.group.send_reply", new=send_text),
+        ):
+            sent, tts_sent, stored = await group._deliver_reply_plans(
+                message=SimpleNamespace(),
+                delivery_plans=[plan],
+                settings=settings,
+                tts_mode="always",
+                tts_service=tts_service,
+                user_id=123,
+                group_id=-10001,
+                tts_already_sent=False,
+            )
+
+        self.assertTrue(sent)
+        self.assertTrue(tts_sent)
+        self.assertEqual(stored, [plan.text])
+        self.assertEqual(send_text.await_args.args[1], "第二段。")
+
     async def test_failed_always_tts_item_falls_back_to_text(self) -> None:
         tts_service = SimpleNamespace(
             available=True,

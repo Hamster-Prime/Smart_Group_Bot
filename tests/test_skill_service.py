@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from bot.services.skills import service as skill_service_module
 from bot.services.skills.base import SkillContext, SkillRunResult
@@ -174,6 +174,25 @@ class _AmbiguousPlannedSkillService(_PlannedSkillService):
         del arguments, context, skills
         self.tool_runs.append(name)
         return self._ambiguous_side_effect_result(name)
+
+
+class _EmbeddedReplySkill:
+    description = "Test skill that sends its reply directly."
+    parameters_schema = {"type": "object", "properties": {}}
+
+    def __init__(self, name: str, *, embedded_text: str) -> None:
+        self.name = name
+        self.embedded_text = embedded_text
+        self.run_count = 0
+
+    async def run(self, arguments, context):
+        del arguments
+        self.run_count += 1
+        context.handled = True
+        context.embedded_reply_sent = True
+        context.embedded_reply_text = self.embedded_text
+        context.suppress_followup_text = self.name == "vote_ban"
+        return SkillRunResult(ok=True, skill=self.name, summary=self.embedded_text)
 
 
 class SkillServiceTTSPromptTests(unittest.TestCase):
@@ -383,6 +402,136 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.sticker_sent)
         self.assertEqual(result.sticker_file_id, "sticker-file-id")
         self.assertEqual(result.text, "")
+
+    async def test_embedded_deliveries_are_exported_without_followup_text(self) -> None:
+        cases = (
+            ("music_search", "这首《稻香》给你。"),
+            ("vote_ban", "民主投票已经发起。"),
+        )
+        for skill_name, embedded_text in cases:
+            with self.subTest(skill=skill_name):
+                embedded_skill = _EmbeddedReplySkill(
+                    skill_name,
+                    embedded_text=embedded_text,
+                )
+                service = SkillService(_llm_stub(), tool_timeout_seconds=0.1)
+                service.skills = {skill_name: embedded_skill}
+                complete = AsyncMock(
+                    return_value=_resp(
+                        tool_calls=[
+                            {
+                                "id": f"call-{skill_name}",
+                                "function": {
+                                    "name": skill_name,
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    )
+                )
+                with patch.object(
+                    service,
+                    "_completion_with_fallbacks",
+                    new=complete,
+                ):
+                    result = await service.answer_with_skill(
+                        "执行这个动作",
+                        intent_type="casual",
+                    )
+
+                self.assertTrue(result.handled)
+                self.assertTrue(result.embedded_reply_sent)
+                self.assertEqual(result.embedded_reply_text, embedded_text)
+                self.assertEqual(result.text, "")
+                self.assertEqual(embedded_skill.run_count, 1)
+                complete.assert_awaited_once()
+
+    async def test_partial_delivery_skips_later_tools_in_same_model_response(self) -> None:
+        class PartialTTSSkill:
+            name = "doubao_tts"
+            description = "Partially sends TTS."
+            parameters_schema = {"type": "object", "properties": {}}
+
+            async def run(self, arguments, context):
+                del arguments
+                context.handled = True
+                context.tts_sent = True
+                context.tts_text = "第一段。"
+                context.suppress_followup_text = True
+                return SkillRunResult(
+                    ok=False,
+                    skill=self.name,
+                    summary="TTS 已部分发送",
+                    error="partial_send",
+                )
+
+        skipped = _EmbeddedReplySkill("music_search", embedded_text="不应发送")
+        service = SkillService(_llm_stub(), tool_timeout_seconds=0.1)
+        service.skills = {
+            "doubao_tts": PartialTTSSkill(),
+            "music_search": skipped,
+        }
+        complete = AsyncMock(
+            return_value=_resp(
+                tool_calls=[
+                    {
+                        "id": "call-tts",
+                        "function": {"name": "doubao_tts", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call-music",
+                        "function": {"name": "music_search", "arguments": "{}"},
+                    },
+                ]
+            )
+        )
+
+        with patch.object(service, "_completion_with_fallbacks", new=complete):
+            result = await service.answer_with_skill("依次执行两个动作")
+
+        self.assertTrue(result.handled)
+        self.assertTrue(result.tts_sent)
+        self.assertEqual(result.tts_text, "第一段。")
+        self.assertEqual(result.text, "")
+        self.assertEqual(skipped.run_count, 0)
+
+    async def test_delivery_callback_suppresses_ambiguous_failure_text(self) -> None:
+        class DeliveredThenFailedMusicSkill:
+            name = "music_search"
+            description = "Sends media before post-send bookkeeping fails."
+            parameters_schema = {"type": "object", "properties": {}}
+
+            async def run(self, arguments, context):
+                del arguments
+                context.delivery_callback()
+                raise RuntimeError("post-send bookkeeping failed")
+
+        service = SkillService(_llm_stub(), tool_timeout_seconds=0.1)
+        service.skills = {"music_search": DeliveredThenFailedMusicSkill()}
+        external_receipt = Mock()
+        complete = AsyncMock(
+            return_value=_resp(
+                tool_calls=[
+                    {
+                        "id": "call-music",
+                        "function": {
+                            "name": "music_search",
+                            "arguments": '{"action":"send_audio"}',
+                        },
+                    }
+                ]
+            )
+        )
+
+        with patch.object(service, "_completion_with_fallbacks", new=complete):
+            result = await service.answer_with_skill(
+                "发首歌",
+                delivery_callback=external_receipt,
+            )
+
+        self.assertTrue(result.delivery_confirmed)
+        self.assertEqual(result.text, "")
+        external_receipt.assert_called_once_with()
 
     async def test_tts_skill_does_not_return_followup_text(self) -> None:
         service = _PlannedSkillService(

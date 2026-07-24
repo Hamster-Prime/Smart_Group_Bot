@@ -6,6 +6,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 
 from bot.db.engine import init_db
@@ -1372,6 +1373,88 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "admin_target")
 
+    async def test_delivery_callback_precedes_post_send_commit_failure(self) -> None:
+        message = self._message(reply=self._reply())
+        events: list[str] = []
+        prompt_sent = False
+
+        async def send_prompt(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            nonlocal prompt_sent
+            prompt_sent = True
+            events.append("send_returned")
+            return SimpleNamespace(message_id=888)
+
+        message.bot.send_message = AsyncMock(side_effect=send_prompt)
+        async with self.session_factory() as session:
+            original_commit = session.commit
+
+            async def commit_with_post_send_failure() -> None:
+                if prompt_sent:
+                    events.append("post_send_commit")
+                    raise RuntimeError("message-id commit failed")
+                await original_commit()
+
+            with patch.object(
+                session,
+                "commit",
+                new=AsyncMock(side_effect=commit_with_post_send_failure),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "message-id commit failed"):
+                    await vote_ban.start_vote_ban(
+                        message,
+                        session,
+                        self.settings,
+                        on_delivery=lambda: events.append("delivery_confirmed"),
+                    )
+
+        self.assertEqual(
+            events,
+            ["send_returned", "delivery_confirmed", "post_send_commit"],
+        )
+
+    async def test_post_send_commit_failure_recovers_message_id_and_arms_expiry(
+        self,
+    ) -> None:
+        message = self._message(reply=self._reply())
+        prompt_sent = False
+
+        async def send_prompt(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            nonlocal prompt_sent
+            prompt_sent = True
+            return SimpleNamespace(message_id=888)
+
+        message.bot.send_message = AsyncMock(side_effect=send_prompt)
+        schedule_expiry = patch("bot.services.vote_ban.schedule_vote_expiry")
+        async with self.session_factory() as session:
+            original_commit = session.commit
+
+            async def commit_with_post_send_failure() -> None:
+                if prompt_sent:
+                    raise RuntimeError("message-id commit failed")
+                await original_commit()
+
+            with (
+                patch.object(
+                    session,
+                    "commit",
+                    new=AsyncMock(side_effect=commit_with_post_send_failure),
+                ),
+                schedule_expiry as schedule_mock,
+            ):
+                result = await vote_ban.start_vote_ban(
+                    message,
+                    session,
+                    self.settings,
+                    session_factory=self.session_factory,
+                )
+
+        self.assertTrue(result.ok)
+        schedule_mock.assert_called_once()
+        async with self.session_factory() as session:
+            record = await session.scalar(select(VoteBanSession))
+            self.assertEqual(record.message_id, 888)
+            self.assertEqual(record.status, "active")
+
     async def test_persistent_trigger_quota_blocks_next_target(self) -> None:
         self.settings.vote_ban_trigger_limit = 1
         first = self._message(reply=self._reply(target_id=555))
@@ -1424,6 +1507,7 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                     session_factory=None,
                 )
         answer_text = answer_mock.await_args.args[2]
+        message.bot.send_message.assert_awaited_once()
         self.assertIn("<b>民主投票封禁 · 未发起</b>", answer_text)
         self.assertIn("<blockquote expandable>", answer_text)
         self.assertIn("未扣除额度", answer_text)
@@ -1433,6 +1517,29 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
             record = await session.scalar(select(VoteBanSession))
             self.assertEqual(bucket.used_count, 0)
             self.assertEqual(record.status, "cancelled")
+
+    async def test_missing_reply_target_retries_poll_without_reply_anchor(self) -> None:
+        message = self._message(reply=self._reply())
+        reply_missing = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: reply message not found",
+        )
+        message.bot.send_message = AsyncMock(
+            side_effect=[reply_missing, SimpleNamespace(message_id=888)]
+        )
+
+        async with self.session_factory() as session:
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(message.bot.send_message.await_count, 2)
+        first_call, second_call = message.bot.send_message.await_args_list
+        self.assertIn("reply_to_message_id", first_call.kwargs)
+        self.assertNotIn("reply_to_message_id", second_call.kwargs)
 
     async def test_concurrent_starts_cannot_exceed_single_use_quota(self) -> None:
         self.settings.vote_ban_trigger_limit = 1

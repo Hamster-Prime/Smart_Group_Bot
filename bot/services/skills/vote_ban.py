@@ -7,6 +7,7 @@ from bot.config import Settings
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.vote_ban import start_vote_ban
 from bot.utils.security import clean_multiline_text
+from bot.utils.telegram import confirm_telegram_delivery
 
 _EXPLICIT_VOTE_REQUEST_RE = re.compile(
     r"(?:/voteban\b|(?:发起|开启|开始|开个|组织|来(?:一场|个)?)[^\n]{0,10}(?:民主|骚扰)?投票|"
@@ -88,6 +89,17 @@ class VoteBanSkill:
             )
 
         reason = clean_multiline_text(str(arguments.get("reason", "") or ""), max_len=500).strip()
+
+        def _confirm_poll_delivery() -> None:
+            # The poll itself is the reply. Record delivery at Telegram
+            # acceptance time rather than after message-id persistence, which
+            # may fail even though users can already see the poll.
+            context.handled = True
+            context.embedded_reply_sent = True
+            context.embedded_reply_text = "民主投票已经发起。"
+            context.suppress_followup_text = True
+            confirm_telegram_delivery(context.delivery_callback)
+
         result = await start_vote_ban(
             message,
             context.session,
@@ -95,6 +107,7 @@ class VoteBanSkill:
             reason_override=reason,
             trigger_source="skill",
             session_factory=context.session_factory,
+            on_delivery=_confirm_poll_delivery,
         )
         if not result.ok:
             payload = result.payload()
@@ -107,12 +120,9 @@ class VoteBanSkill:
                 payload=payload,
             )
 
-        # The poll itself is the delivered action. Suppress a redundant model
-        # follow-up such as "已经发起了" after the tool succeeds.
-        context.handled = True
-        context.embedded_reply_sent = True
+        # Keep the richer confirmed summary for conversation memory after the
+        # normal persistence path completes.
         context.embedded_reply_text = result.summary
-        context.suppress_followup_text = True
         return SkillRunResult(
             ok=True,
             skill=self.name,

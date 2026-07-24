@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
@@ -10,6 +10,27 @@ from bot.utils.telegram import answer_with_auto_delete, send_chat_message, send_
 
 
 class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sticker_cleanup_failure_does_not_undo_delivery(self) -> None:
+        sent = SimpleNamespace(message_id=76, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(reply_sticker=AsyncMock(return_value=sent))
+        on_delivery = Mock()
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ) as cleanup:
+            result = await telegram.send_sticker_with_auto_delete(
+                message,
+                sticker="sticker-file-id",
+                auto_delete_seconds=60,
+                on_delivery=on_delivery,
+            )
+
+        self.assertIs(result, sent)
+        message.reply_sticker.assert_awaited_once()
+        on_delivery.assert_called_once_with()
+        cleanup.assert_awaited_once_with(sent, 60)
+
     async def test_answer_with_auto_delete_can_retry_tls_record_error_once(self) -> None:
         sent_message = SimpleNamespace(message_id=87, chat=SimpleNamespace(id=-10001))
         message = SimpleNamespace(
@@ -160,6 +181,89 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_kwargs["parse_mode"], "HTML")
         self.assertIn('tg://user?id=42', second_kwargs["text"])
         self.assertIn("@Alice", second_kwargs["text"])
+
+    async def test_send_reply_cleanup_failure_does_not_retry_delivered_message(self) -> None:
+        sent = SimpleNamespace(message_id=77, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(return_value=sent),
+        )
+        on_delivery = Mock()
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ) as cleanup:
+            ok = await send_reply(
+                message,
+                "已经发出的内容",
+                delivery_mode="message",
+                auto_delete_seconds=60,
+                on_delivery=on_delivery,
+            )
+
+        self.assertTrue(ok)
+        message.answer.assert_awaited_once()
+        on_delivery.assert_called_once_with()
+        cleanup.assert_awaited_once_with(sent, 60)
+
+    async def test_send_chat_cleanup_failure_does_not_retry_delivered_message(self) -> None:
+        sent = SimpleNamespace(message_id=78, chat=SimpleNamespace(id=-10001))
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+        on_delivery = Mock()
+
+        with patch(
+            "bot.utils.telegram.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ) as cleanup:
+            ok = await send_chat_message(
+                bot,
+                -10001,
+                "已经发出的主动消息",
+                auto_delete_seconds=60,
+                on_delivery=on_delivery,
+            )
+
+        self.assertTrue(ok)
+        bot.send_message.assert_awaited_once()
+        on_delivery.assert_called_once_with()
+        cleanup.assert_awaited_once_with(sent, 60)
+
+    async def test_multipart_reply_confirms_first_delivery_when_later_part_fails(self) -> None:
+        sent = SimpleNamespace(message_id=79, chat=SimpleNamespace(id=-10001))
+        parse_error = TelegramBadRequest(
+            method=SimpleNamespace(),
+            message="Bad Request: can't parse entities",
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(
+                side_effect=[sent, parse_error, parse_error, parse_error]
+            ),
+        )
+        on_delivery = Mock()
+
+        with (
+            patch(
+                "bot.utils.telegram._split_for_telegram",
+                return_value=["第一段", "第二段"],
+            ),
+            patch(
+                "bot.utils.telegram.schedule_message_auto_delete_durable",
+                new=AsyncMock(return_value=True),
+            ) as cleanup,
+        ):
+            ok = await send_reply(
+                message,
+                "第一段第二段",
+                delivery_mode="message",
+                on_delivery=on_delivery,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(message.answer.await_count, 4)
+        on_delivery.assert_called_once_with()
+        cleanup.assert_awaited_once_with(sent, 0)
 
     async def test_send_reply_messages_sends_each_message_without_streaming_batch(self) -> None:
         message = SimpleNamespace()

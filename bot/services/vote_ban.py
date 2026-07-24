@@ -9,11 +9,13 @@ import asyncio
 import html
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, insert, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -47,7 +49,9 @@ from bot.services.join_verification import (
     verification_restriction_required,
 )
 from bot.utils.telegram import (
+    confirm_telegram_delivery,
     configured_auto_delete_seconds,
+    is_reply_target_missing_error,
     schedule_message_auto_delete_durable,
 )
 from bot.utils.timezone import now_shanghai_naive
@@ -846,6 +850,7 @@ async def start_vote_ban(
     reason_override: str = "",
     trigger_source: str = "command",
     session_factory: Any | None = None,
+    on_delivery: Callable[[], None] | None = None,
 ) -> VoteBanStartResult:
     """Validate, reserve quota, open, and deliver a vote-ban poll."""
     chat = getattr(request_message, "chat", None)
@@ -995,6 +1000,37 @@ async def start_vote_ban(
             return VoteBanStartResult(False, "database_failed", "投票创建失败，请稍后重试。")
 
         approvals = 1
+
+        async def _cancel_after_prompt_failure(error: Exception) -> VoteBanStartResult:
+            log.error(
+                "vote-ban prompt send failed | group=%s session=%s",
+                group_id,
+                record.id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            record.status = "cancelled"
+            await release_vote_ban_quota(
+                session,
+                group_id=group_id,
+                user_id=starter_id,
+                reservation=quota,
+            )
+            await session.commit()
+            released_quota = _quota_state(
+                allowed=True,
+                config=config,
+                used=max(0, quota.used - 1),
+                window_started_at=quota.window_started_at,
+                now=now_shanghai_naive(),
+            )
+            return VoteBanStartResult(
+                False,
+                "send_failed",
+                "投票消息发送失败，本次未扣除额度，请稍后重试。",
+                record=record,
+                quota=released_quota,
+            )
+
         try:
             sent = await request_message.bot.send_message(
                 group_id,
@@ -1003,7 +1039,12 @@ async def start_vote_ban(
                 reply_markup=build_vote_keyboard(int(record.id), approvals, int(record.threshold)),
                 reply_to_message_id=target_message_id or None,
             )
-        except Exception:
+        except TelegramBadRequest as exc:
+            if not (
+                target_message_id
+                and is_reply_target_missing_error(str(exc))
+            ):
+                return await _cancel_after_prompt_failure(exc)
             try:
                 sent = await request_message.bot.send_message(
                     group_id,
@@ -1013,41 +1054,81 @@ async def start_vote_ban(
                         int(record.id), approvals, int(record.threshold)
                     ),
                 )
-            except Exception:
-                log.exception("vote-ban prompt send failed | group=%s session=%s", group_id, record.id)
-                record.status = "cancelled"
-                await release_vote_ban_quota(
-                    session,
-                    group_id=group_id,
-                    user_id=starter_id,
-                    reservation=quota,
-                )
-                await session.commit()
-                released_quota = _quota_state(
-                    allowed=True,
-                    config=config,
-                    used=max(0, quota.used - 1),
-                    window_started_at=quota.window_started_at,
-                    now=now_shanghai_naive(),
-                )
-                return VoteBanStartResult(
-                    False,
-                    "send_failed",
-                    "投票消息发送失败，本次未扣除额度，请稍后重试。",
-                    record=record,
-                    quota=released_quota,
-                )
+            except Exception as fallback_exc:
+                return await _cancel_after_prompt_failure(fallback_exc)
+        except Exception as exc:
+            return await _cancel_after_prompt_failure(exc)
 
-        record.message_id = int(getattr(sent, "message_id", 0) or 0)
-        await session.commit()
-        if session_factory is not None:
+        # Telegram has accepted the externally visible poll. Publish that fact
+        # before persisting message_id or starting expiry bookkeeping so a later
+        # local failure cannot make the caller emit a contradictory failure reply.
+        confirm_telegram_delivery(on_delivery)
+        record_id = int(record.id)
+        delivered_message_id = int(getattr(sent, "message_id", 0) or 0)
+        record.message_id = delivered_message_id
+        if callable(session_factory):
+            # Arm expiry before the post-send commit. If that commit fails, the
+            # already-visible poll is still closed by a fresh-session worker.
             schedule_vote_expiry(
                 session_factory=session_factory,
                 bot=request_message.bot,
                 settings=settings,
-                session_id=int(record.id),
+                session_id=record_id,
                 delay_seconds=config.duration_seconds,
             )
+        try:
+            await session.commit()
+        except Exception:
+            log.exception(
+                "vote-ban message-id commit failed after delivery | group=%s "
+                "session=%s message=%s",
+                group_id,
+                record_id,
+                delivered_message_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                log.exception(
+                    "vote-ban rollback failed after message-id commit error | "
+                    "group=%s session=%s",
+                    group_id,
+                    record_id,
+                )
+
+            recovered = False
+            recovered_record: VoteBanSession | None = None
+            if callable(session_factory):
+                try:
+                    async with session_factory() as recovery_session:
+                        persisted = await recovery_session.get(
+                            VoteBanSession,
+                            record_id,
+                        )
+                        if persisted is not None:
+                            persisted.message_id = delivered_message_id
+                            await recovery_session.commit()
+                            recovered = True
+                            recovered_record = persisted
+                except Exception:
+                    log.exception(
+                        "vote-ban message-id recovery failed | group=%s "
+                        "session=%s message=%s",
+                        group_id,
+                        record_id,
+                        delivered_message_id,
+                    )
+            if not recovered:
+                raise
+            log.warning(
+                "vote-ban message-id persisted through recovery session | "
+                "group=%s session=%s message=%s",
+                group_id,
+                record_id,
+                delivered_message_id,
+            )
+            if recovered_record is not None:
+                record = recovered_record
         log.info(
             "[%s] democratic vote opened | target=%s starter=%s threshold=%s source=%s quota=%s/%s",
             group_id,

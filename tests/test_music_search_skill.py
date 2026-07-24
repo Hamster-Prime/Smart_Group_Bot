@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from bot.services.skills.music_search import MusicSearchSkill
 
@@ -102,6 +102,34 @@ class MusicSearchSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.reply_audio.await_args.kwargs["performer"], "周杰伦")
         self.assertEqual(message.reply_audio.await_args.kwargs["parse_mode"], "HTML")
         self.assertIn("这首", message.reply_audio.await_args.kwargs["caption"])
+
+    async def test_post_delivery_cleanup_failure_does_not_resend_audio(self) -> None:
+        skill = self._skill()
+        sent = SimpleNamespace(chat=SimpleNamespace(id=-10001), message_id=10)
+        message = SimpleNamespace(
+            reply_audio=AsyncMock(return_value=sent),
+            answer_audio=AsyncMock(),
+        )
+        receipt = Mock()
+
+        with patch(
+            "bot.services.skills.music_search.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ):
+            ok = await skill._send_audio_to_message(
+                message,
+                audio_url="https://example.com/song.mp3",
+                title="稻香",
+                performer="周杰伦",
+                caption_text="这首《稻香》给你。",
+                delivery_mode="reply",
+                auto_delete_seconds=60,
+                on_delivery=receipt,
+            )
+
+        self.assertTrue(ok)
+        message.reply_audio.assert_awaited_once()
+        receipt.assert_called_once_with()
 
     async def test_send_audio_can_search_first_then_send_top_result(self) -> None:
         skill = self._skill(music_api_stable_sources="kuwo")

@@ -10,6 +10,7 @@ import re
 import time
 import weakref
 from collections import Counter
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextvars import Context
 from dataclasses import dataclass, field
@@ -71,9 +72,11 @@ from bot.services.casual import CasualService
 from bot.services.decision import DecisionService
 from bot.services.doubao_tts import (
     DoubaoTTSService,
+    TTSDeliveryResult,
     is_tts_always_enabled,
     is_tts_tool_enabled,
     normalize_tts_mode,
+    tts_sender_accepts_delivery_callback,
 )
 from bot.services.speech_style import (
     SpeechStyleService,
@@ -133,6 +136,7 @@ from bot.utils.security import format_history_message_line
 from bot.utils.timezone import now_shanghai_naive
 from bot.utils.telegram import (
     answer_with_auto_delete,
+    confirm_telegram_delivery,
     configured_auto_delete_seconds,
     DELETE_BUTTON_CALLBACK_PREFIX,
     extract_reply_context,
@@ -3915,6 +3919,7 @@ async def _deliver_reply_plans(
     group_id: int,
     tts_already_sent: bool,
     force_text: bool = False,
+    on_delivery: Callable[[], None] | None = None,
 ) -> tuple[bool, bool, list[str]]:
     """Deliver every plan, falling back to text per failed voice item."""
 
@@ -3930,24 +3935,98 @@ async def _deliver_reply_plans(
         and is_tts_always_enabled(tts_mode)
         and bool(getattr(tts_service, "available", False))
     ):
-        voice_results: list[bool] = []
+        voice_results: list[tuple[TTSDeliveryResult, list[bool]]] = []
         for plan in delivery_plans:
-            voice_results.append(
-                await tts_service.send_message_tts(
+            plan_receipt = [False]
+
+            def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
+                receipt[0] = True
+                confirm_telegram_delivery(on_delivery)
+
+            detailed_sender = getattr(tts_service, "send_message_tts_result", None)
+            if callable(detailed_sender):
+                delivery = await detailed_sender(
                     message,
                     plan.text,
                     delivery_mode=plan.delivery_mode,
                     reply_to_message_id=plan.reply_to_message_id,
                     auto_delete_seconds=configured_auto_delete_seconds(settings, "media"),
                     uid=str(user_id or group_id),
+                    on_delivery=_confirm_plan_delivery,
                 )
-            )
+            else:
+                legacy_sender = tts_service.send_message_tts
+                legacy_kwargs = {
+                    "delivery_mode": plan.delivery_mode,
+                    "reply_to_message_id": plan.reply_to_message_id,
+                    "auto_delete_seconds": configured_auto_delete_seconds(
+                        settings,
+                        "media",
+                    ),
+                    "uid": str(user_id or group_id),
+                }
+                if tts_sender_accepts_delivery_callback(legacy_sender):
+                    complete = await legacy_sender(
+                        message,
+                        plan.text,
+                        **legacy_kwargs,
+                        on_delivery=_confirm_plan_delivery,
+                    )
+                else:
+                    complete = await legacy_sender(
+                        message,
+                        plan.text,
+                        **legacy_kwargs,
+                    )
+                delivery = TTSDeliveryResult(
+                    requested_segments=(plan.text,),
+                    sent_segment_count=1 if complete else 0,
+                    error="" if complete else "legacy_send_failed",
+                )
+            if delivery.any_sent and not plan_receipt[0]:
+                _confirm_plan_delivery()
+            voice_results.append((delivery, plan_receipt))
 
-        for plan, voice_ok in zip(delivery_plans, voice_results):
-            if voice_ok:
+        for plan, (delivery, plan_receipt) in zip(delivery_plans, voice_results):
+            def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
+                receipt[0] = True
+                confirm_telegram_delivery(on_delivery)
+
+            if delivery.complete:
                 sent_messages.append(plan.text)
                 sent_ok = True
                 tts_sent_ok = True
+                continue
+            if delivery.any_sent:
+                remaining_sent = False
+                if delivery.remaining_text:
+                    remaining_sent = await send_reply(
+                        message,
+                        delivery.remaining_text,
+                        delivery_mode=plan.delivery_mode,
+                        reply_to_message_id=plan.reply_to_message_id,
+                        stream=False,
+                        auto_delete_seconds=configured_auto_delete_seconds(
+                            settings,
+                            "reply",
+                        ),
+                        on_delivery=_confirm_plan_delivery,
+                    )
+                sent_messages.append(
+                    plan.text
+                    if remaining_sent
+                    else delivery.delivered_text
+                )
+                sent_ok = True
+                tts_sent_ok = True
+                log.warning(
+                    "[%s] always-tts item partially delivered | sent=%d total=%d "
+                    "text_fallback=%s",
+                    group_id,
+                    delivery.sent_segment_count,
+                    len(delivery.requested_segments),
+                    remaining_sent,
+                )
                 continue
             log.warning("[%s] always-tts item failed; using text fallback", group_id)
             text_ok = await send_reply(
@@ -3957,9 +4036,12 @@ async def _deliver_reply_plans(
                 reply_to_message_id=plan.reply_to_message_id,
                 stream=False,
                 auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
+                on_delivery=_confirm_plan_delivery,
             )
             if text_ok:
                 sent_messages.append(plan.text)
+                sent_ok = True
+            elif plan_receipt[0]:
                 sent_ok = True
         return sent_ok, tts_sent_ok, sent_messages
 
@@ -3969,6 +4051,12 @@ async def _deliver_reply_plans(
         return True, True, sent_messages
 
     for plan in delivery_plans:
+        plan_receipt = [False]
+
+        def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
+            receipt[0] = True
+            confirm_telegram_delivery(on_delivery)
+
         text_ok = await send_reply(
             message,
             plan.text,
@@ -3978,9 +4066,12 @@ async def _deliver_reply_plans(
             stream_chunk_size=settings.bot.stream_chunk_size,
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
+            on_delivery=_confirm_plan_delivery,
         )
         if text_ok:
             sent_messages.append(plan.text)
+            sent_ok = True
+        elif plan_receipt[0]:
             sent_ok = True
     return sent_ok, tts_sent_ok, sent_messages
 
@@ -4040,6 +4131,14 @@ async def _resolve_pending_reply_action(
     return action, False
 
 
+@dataclass(slots=True)
+class _PendingReplyDeliveryReceipt:
+    delivered: bool = False
+
+    def confirm(self) -> None:
+        self.delivered = True
+
+
 def _log_pending_reply_action(
     *,
     group_id: int,
@@ -4083,6 +4182,8 @@ def _log_pending_reply_action(
 async def _process_pending_reply_batch(
     items: list[_PendingReplyItem],
     settings: Settings,
+    *,
+    delivery_receipt: _PendingReplyDeliveryReceipt | None = None,
 ) -> bool:
     if not items:
         return True
@@ -4098,6 +4199,13 @@ async def _process_pending_reply_batch(
     memory_entries = [item.memory_entry for item in items if item.memory_entry]
     memory = memory_holder.get()
     session_factory = memory.session_factory
+    delivery_confirmed = bool(delivery_receipt and delivery_receipt.delivered)
+
+    def _confirm_delivery() -> None:
+        nonlocal delivery_confirmed
+        delivery_confirmed = True
+        if delivery_receipt is not None:
+            delivery_receipt.confirm()
 
     llm = LLMService(
         settings.bot.main_model,
@@ -4204,9 +4312,11 @@ async def _process_pending_reply_batch(
             skill_must_deliver_text = False
             sticker_sent_ok = False
             tts_sent_ok = False
+            embedded_reply_sent_ok = False
             sticker_file = ""
             delivery_mode = "reply"
             tts_text = ""
+            embedded_reply_text = ""
             explicit_no_reply = False
             force_reply = bool(action_forced and action == "casual")
             tts_service = skill.tts_service or DoubaoTTSService(settings)
@@ -4271,6 +4381,7 @@ async def _process_pending_reply_batch(
                         is_reply_to_bot=reply_to_bot,
                         is_direct_request=latest_is_direct_request,
                         style_profile_context=style_profile_context,
+                        delivery_callback=_confirm_delivery,
                     )
                     skill_handled = bool(skill_result.handled)
                     skill_must_deliver_text = bool(
@@ -4278,10 +4389,27 @@ async def _process_pending_reply_batch(
                     )
                     sticker_sent_ok = bool(skill_result.sticker_sent)
                     tts_sent_ok = bool(skill_result.tts_sent)
+                    embedded_reply_sent_ok = bool(
+                        getattr(skill_result, "embedded_reply_sent", False)
+                    )
+                    skill_delivery_confirmed = bool(
+                        getattr(skill_result, "delivery_confirmed", False)
+                    )
                     sticker_file = skill_result.sticker_file_id or ""
                     tts_text = skill_result.tts_text or ""
-                    if tts_sent_ok:
+                    embedded_reply_text = str(
+                        getattr(skill_result, "embedded_reply_text", "") or ""
+                    ).strip()
+                    skill_delivery_sent = bool(
+                        sticker_sent_ok
+                        or tts_sent_ok
+                        or embedded_reply_sent_ok
+                        or skill_delivery_confirmed
+                    )
+                    if skill_delivery_sent:
+                        skill_handled = True
                         sent_ok = True
+                        _confirm_delivery()
                     if skill_result.text:
                         raw_reply = skill_result.text
                         reply_source = "skill"
@@ -4289,9 +4417,12 @@ async def _process_pending_reply_batch(
                     elif skill_handled:
                         reply_source = "skill"
                         log.info(
-                            "[%s] pending batch handled by skill | sticker_sent=%s file=%s",
+                            "[%s] pending batch handled by skill | sticker_sent=%s "
+                            "tts_sent=%s embedded_sent=%s file=%s",
                             group_id,
                             sticker_sent_ok,
+                            tts_sent_ok,
+                            embedded_reply_sent_ok,
                             sticker_file[:32] if sticker_file else "-",
                         )
                     if (
@@ -4504,8 +4635,11 @@ async def _process_pending_reply_batch(
                     group_id=group_id,
                     tts_already_sent=tts_sent_ok,
                     force_text=skill_must_deliver_text,
+                    on_delivery=_confirm_delivery,
                 )
                 sent_ok = sent_ok or delivered
+                if delivered:
+                    _confirm_delivery()
 
             if action == "skip":
                 log.info(
@@ -4526,6 +4660,12 @@ async def _process_pending_reply_batch(
             stored_reply_messages = list(sent_reply_messages)
             if not stored_reply_messages and tts_text and tts_sent_ok:
                 stored_reply_messages = [tts_text]
+            if (
+                not stored_reply_messages
+                and embedded_reply_text
+                and embedded_reply_sent_ok
+            ):
+                stored_reply_messages = [embedded_reply_text]
             if stored_reply_messages:
                 current_task = asyncio.current_task()
                 if current_task is not None and current_task.cancelling():
@@ -4541,7 +4681,9 @@ async def _process_pending_reply_batch(
                     )
                 _schedule_memory_compaction(memory, group_id)
             log.info(
-                "[%s] pending batch finished | action=%s source=%s generated=%s sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s file=%s count=%d len=%d elapsed=%dms",
+                "[%s] pending batch finished | action=%s source=%s generated=%s "
+                "sent=%s mode=%s skill_handled=%s sticker_sent=%s tts_sent=%s "
+                "embedded_sent=%s file=%s count=%d len=%d elapsed=%dms",
                 group_id,
                 action,
                 reply_source,
@@ -4551,6 +4693,7 @@ async def _process_pending_reply_batch(
                 skill_handled,
                 sticker_sent_ok,
                 tts_sent_ok,
+                embedded_reply_sent_ok,
                 sticker_file[:32] if sticker_file else "-",
                 len(reply_specs),
                 len(reply or ""),
@@ -4562,8 +4705,22 @@ async def _process_pending_reply_batch(
                 or tts_sent_ok
                 or not latest_is_direct_request
             )
-        except Exception:
-            await session.rollback()
+        except Exception as exc:
+            try:
+                await session.rollback()
+            except Exception:
+                log.exception(
+                    "[%s] pending batch rollback failed after processing error",
+                    group_id,
+                )
+            if delivery_confirmed:
+                log.error(
+                    "[%s] pending batch post-delivery processing failed; "
+                    "suppressing duplicate failure reply",
+                    group_id,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                return True
             raise
 
 
@@ -4652,6 +4809,7 @@ async def _notify_pending_reply_failure(
 class _PendingReplyOutcome:
     succeeded: bool
     orphan: asyncio.Task[Any] | None = None
+    timed_out: bool = False
 
 
 def _finish_pending_reply_items(
@@ -4683,17 +4841,25 @@ async def _process_pending_reply_batch_guarded(
     key: tuple[int, int],
     items: list[_PendingReplyItem],
     settings: Settings,
+    *,
+    delivery_receipt: _PendingReplyDeliveryReceipt | None = None,
 ) -> _PendingReplyOutcome:
     timeout_seconds = _pending_reply_timeout_seconds(settings)
+    if delivery_receipt is None:
+        delivery_receipt = _PendingReplyDeliveryReceipt()
 
     async def _run() -> bool:
         async with _PENDING_REPLY_EXECUTION_SEMAPHORE:
-            return await _process_pending_reply_batch(items, settings)
+            return await _process_pending_reply_batch(
+                items,
+                settings,
+                delivery_receipt=delivery_receipt,
+            )
 
     try:
         succeeded = bool(
             await _await_hard_deadline(_run(), timeout_seconds=timeout_seconds)
-        )
+        ) or delivery_receipt.delivered
         if not succeeded:
             succeeded = await _notify_pending_reply_failure(items, timed_out=False)
         return _PendingReplyOutcome(succeeded=succeeded)
@@ -4704,15 +4870,44 @@ async def _process_pending_reply_batch_guarded(
             len(items),
             timeout_seconds,
         )
+        if delivery_receipt.delivered:
+            log.warning(
+                "pending batch exceeded deadline after confirmed delivery; "
+                "failure notification suppressed | key=%s messages=%d",
+                key,
+                len(items),
+            )
+            return _PendingReplyOutcome(
+                succeeded=True,
+                orphan=exc.task if not exc.task.done() else None,
+            )
+        orphan = exc.task if not exc.task.done() else None
+        if orphan is not None:
+            # Do not publish a timeout while the cancelled child can still
+            # complete a Telegram send. The per-sender worker waits for the
+            # real child and decides only after its delivery receipt is final.
+            return _PendingReplyOutcome(
+                succeeded=False,
+                orphan=orphan,
+                timed_out=True,
+            )
         notified = await _notify_pending_reply_failure(items, timed_out=True)
         return _PendingReplyOutcome(
             succeeded=notified,
-            orphan=exc.task if not exc.task.done() else None,
+            timed_out=True,
         )
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("pending batch processing failed | key=%s messages=%d", key, len(items))
+        if delivery_receipt.delivered:
+            log.warning(
+                "pending batch failed after confirmed delivery; failure notification "
+                "suppressed | key=%s messages=%d",
+                key,
+                len(items),
+            )
+            return _PendingReplyOutcome(succeeded=True)
         notified = await _notify_pending_reply_failure(items, timed_out=False)
         return _PendingReplyOutcome(succeeded=notified)
 
@@ -4722,6 +4917,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
 
     current_task = asyncio.current_task()
     active_items: list[_PendingReplyItem] = []
+    active_delivery_receipt: _PendingReplyDeliveryReceipt | None = None
     try:
         while True:
             while True:
@@ -4754,8 +4950,16 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                 state.flush_at = 0.0
 
             if settings is not None and items:
-                outcome = await _process_pending_reply_batch_guarded(key, items, settings)
-                final_succeeded = bool(outcome.succeeded)
+                active_delivery_receipt = _PendingReplyDeliveryReceipt()
+                outcome = await _process_pending_reply_batch_guarded(
+                    key,
+                    items,
+                    settings,
+                    delivery_receipt=active_delivery_receipt,
+                )
+                final_succeeded = bool(
+                    outcome.succeeded or active_delivery_receipt.delivered
+                )
                 orphan = outcome.orphan
                 if orphan is not None:
                     # Preserve per-sender single-flight even when a provider
@@ -4773,6 +4977,14 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                         # this is completion, not cancellation of the worker.
                     except Exception:
                         pass
+                final_succeeded = bool(
+                    final_succeeded or active_delivery_receipt.delivered
+                )
+                if outcome.timed_out and not final_succeeded:
+                    final_succeeded = await _notify_pending_reply_failure(
+                        items,
+                        timed_out=True,
+                    )
                 # The durable receipt belongs to the real execution owner, not
                 # merely its timeout wrapper. Releasing it before a
                 # cancellation-resistant child exits permits replay and a
@@ -4781,6 +4993,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
             elif items:
                 _finish_pending_reply_items(items, succeeded=False)
             active_items = []
+            active_delivery_receipt = None
 
             async with _PENDING_REPLY_LOCK:
                 state = _PENDING_REPLY_BATCHES.get(key)
@@ -4794,11 +5007,15 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                     state.flush_at = time.monotonic()
     except asyncio.CancelledError:
         if active_items:
-            _finish_pending_reply_items(active_items, succeeded=False)
-            try:
-                await _notify_pending_reply_failure(active_items, timed_out=True)
-            except asyncio.CancelledError:
-                pass
+            _finish_pending_reply_items(
+                active_items,
+                succeeded=bool(
+                    active_delivery_receipt
+                    and active_delivery_receipt.delivered
+                ),
+            )
+            active_items = []
+            active_delivery_receipt = None
         raise
     finally:
         if active_items:

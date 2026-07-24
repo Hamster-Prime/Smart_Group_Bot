@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from bot.config import Settings
 from bot.handlers import admin
 from bot.services import doubao_tts as doubao_tts_module
-from bot.services.doubao_tts import DoubaoTTSService
+from bot.services.doubao_tts import DoubaoTTSService, TTSDeliveryResult
 from bot.services.doubao_tts import (
     TTS_MODE_ALWAYS,
     TTS_MODE_OFF,
@@ -134,6 +134,214 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(parts), 1)
+
+    async def test_message_delivery_reports_partial_segments(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+        synthesized = [
+            SimpleNamespace(ok=True, audio_bytes=b"first", error=""),
+            SimpleNamespace(ok=False, audio_bytes=b"", error="synthesis_failed"),
+        ]
+
+        with (
+            patch.object(service, "split_text", return_value=["第一段。", "第二段。"]),
+            patch.object(
+                service,
+                "synthesize_voice_payload",
+                new=AsyncMock(side_effect=synthesized),
+            ),
+            patch.object(service, "_send_to_message", new=AsyncMock(return_value=True)),
+        ):
+            result = await service.send_message_tts_result(
+                SimpleNamespace(),
+                "第一段。第二段。",
+            )
+
+        self.assertTrue(result.any_sent)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.delivered_text, "第一段。")
+        self.assertEqual(result.remaining_text, "第二段。")
+        self.assertEqual(result.error, "synthesis_failed")
+
+    async def test_message_cleanup_failure_does_not_resend_delivered_voice(self) -> None:
+        service = DoubaoTTSService(_settings())
+        sent = SimpleNamespace(chat=SimpleNamespace(id=-10001), message_id=10)
+        message = SimpleNamespace(
+            reply_voice=AsyncMock(return_value=sent),
+        )
+        receipt = Mock()
+
+        with patch(
+            "bot.services.doubao_tts.schedule_message_auto_delete_durable",
+            new=AsyncMock(side_effect=RuntimeError("cleanup unavailable")),
+        ):
+            ok = await service._send_to_message(
+                message,
+                audio_bytes=b"voice",
+                index=0,
+                delivery_mode="reply",
+                reply_to_message_id=None,
+                auto_delete_seconds=60,
+                on_delivery=receipt,
+            )
+
+        self.assertTrue(ok)
+        message.reply_voice.assert_awaited_once()
+        receipt.assert_called_once_with()
+
+    async def test_chat_delivery_reports_partial_segments(self) -> None:
+        settings = _settings()
+        settings.doubao_tts_enabled = True
+        settings.doubao_tts_app_id = "app-id"
+        settings.doubao_tts_access_key = "access-key"
+        settings.doubao_tts_resource_id = "seed-tts-2.0"
+        settings.doubao_tts_speaker = "voice_1"
+        service = DoubaoTTSService(settings)
+        synthesized = [
+            SimpleNamespace(ok=True, audio_bytes=b"first", error=""),
+            SimpleNamespace(ok=False, audio_bytes=b"", error="synthesis_failed"),
+        ]
+        bot = SimpleNamespace(send_voice=AsyncMock(return_value=SimpleNamespace()))
+
+        with (
+            patch.object(service, "split_text", return_value=["第一段。", "第二段。"]),
+            patch.object(
+                service,
+                "synthesize_voice_payload",
+                new=AsyncMock(side_effect=synthesized),
+            ),
+            patch(
+                "bot.services.doubao_tts.schedule_message_auto_delete_durable",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await service.send_chat_tts_result(
+                bot,
+                -10001,
+                "第一段。第二段。",
+            )
+
+        self.assertTrue(result.any_sent)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.delivered_text, "第一段。")
+        self.assertEqual(result.remaining_text, "第二段。")
+        bot.send_voice.assert_awaited_once()
+
+    async def test_tts_skill_sends_only_remaining_text_after_partial_voice(self) -> None:
+        delivery = TTSDeliveryResult(
+            requested_segments=("第一段。", "第二段。"),
+            sent_segment_count=1,
+            error="synthesis_failed",
+        )
+        tts_service = SimpleNamespace(
+            send_message_tts_result=AsyncMock(return_value=delivery),
+        )
+        message = SimpleNamespace()
+        delivery_callback = Mock()
+        context = SkillContext(
+            message=message,
+            current_user_text="第一段。第二段。",
+            auto_delete_media_seconds=120,
+            auto_delete_reply_seconds=45,
+            delivery_callback=delivery_callback,
+        )
+
+        with patch(
+            "bot.services.skills.doubao_tts.send_reply",
+            new=AsyncMock(return_value=True),
+        ) as send_text:
+            result = await DoubaoTTSSkill(tts_service).run({}, context)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(context.handled)
+        self.assertTrue(context.tts_sent)
+        self.assertEqual(context.tts_text, "第一段。\n第二段。")
+        self.assertTrue(context.suppress_followup_text)
+        self.assertTrue(result.payload["text_fallback_sent"])
+        tts_service.send_message_tts_result.assert_awaited_once()
+        voice_kwargs = tts_service.send_message_tts_result.await_args.kwargs
+        self.assertEqual(voice_kwargs["auto_delete_seconds"], 120)
+        self.assertIs(voice_kwargs["on_delivery"], delivery_callback)
+        send_text.assert_awaited_once_with(
+            message,
+            "第二段。",
+            delivery_mode="reply",
+            stream=False,
+            auto_delete_seconds=45,
+            on_delivery=delivery_callback,
+        )
+
+    async def test_tts_skill_chat_partial_voice_sends_only_remaining_text(self) -> None:
+        delivery = TTSDeliveryResult(
+            requested_segments=("第一段。", "第二段。", "第三段。"),
+            sent_segment_count=1,
+            error="synthesis_failed",
+        )
+        tts_service = SimpleNamespace(
+            send_chat_tts_result=AsyncMock(return_value=delivery),
+        )
+        bot = SimpleNamespace()
+        delivery_callback = Mock()
+        context = SkillContext(
+            bot=bot,
+            chat_id=-10001,
+            current_user_text="第一段。第二段。第三段。",
+            auto_delete_media_seconds=120,
+            auto_delete_reply_seconds=45,
+            delivery_callback=delivery_callback,
+        )
+
+        with patch(
+            "bot.services.skills.doubao_tts.send_chat_message",
+            new=AsyncMock(return_value=True),
+        ) as send_text:
+            result = await DoubaoTTSSkill(tts_service).run({}, context)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(context.tts_text, "第一段。\n第二段。\n第三段。")
+        tts_service.send_chat_tts_result.assert_awaited_once()
+        voice_kwargs = tts_service.send_chat_tts_result.await_args.kwargs
+        self.assertEqual(voice_kwargs["auto_delete_seconds"], 120)
+        self.assertIs(voice_kwargs["on_delivery"], delivery_callback)
+        send_text.assert_awaited_once_with(
+            bot,
+            -10001,
+            "第二段。\n第三段。",
+            auto_delete_seconds=45,
+            on_delivery=delivery_callback,
+        )
+
+    async def test_tts_skill_keeps_only_voice_text_when_tail_fallback_fails(self) -> None:
+        delivery = TTSDeliveryResult(
+            requested_segments=("第一段。", "第二段。"),
+            sent_segment_count=1,
+            error="telegram_send_failed",
+        )
+        tts_service = SimpleNamespace(
+            send_message_tts_result=AsyncMock(return_value=delivery),
+        )
+        context = SkillContext(
+            message=SimpleNamespace(),
+            current_user_text="第一段。第二段。",
+        )
+
+        with patch(
+            "bot.services.skills.doubao_tts.send_reply",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await DoubaoTTSSkill(tts_service).run({}, context)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "partial_send")
+        self.assertTrue(context.handled)
+        self.assertTrue(context.tts_sent)
+        self.assertEqual(context.tts_text, "第一段。")
+        self.assertFalse(result.payload["text_fallback_sent"])
 
     def test_normalize_text_replaces_semicolons_for_tts(self) -> None:
         settings = _settings()

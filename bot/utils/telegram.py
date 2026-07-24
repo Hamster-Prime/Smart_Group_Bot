@@ -8,7 +8,7 @@ import logging
 import re
 import time
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -36,6 +36,19 @@ _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
 _TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
 _TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
 _UNINITIALIZED_AUTO_DELETE_WARNED = False
+
+
+def confirm_telegram_delivery(callback: Callable[[], None] | None) -> None:
+    """Publish Telegram acceptance without making bookkeeping part of send success."""
+
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        # Telegram has already accepted the message. A receipt failure must
+        # never make a caller resend the externally visible side effect.
+        log.exception("Telegram delivery callback failed")
 
 
 def _observe_telegram_background_task(task: asyncio.Task[object]) -> None:
@@ -566,6 +579,18 @@ async def schedule_message_auto_delete_durable(
     return accepted
 
 
+async def _schedule_delivered_message_cleanup(
+    sent: Message | None,
+    auto_delete_seconds: int,
+) -> None:
+    """Keep post-delivery cleanup failures outside transport retry decisions."""
+
+    try:
+        await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+    except Exception:
+        log.exception("Telegram post-delivery cleanup scheduling failed")
+
+
 def is_reply_target_missing_error(detail: str) -> bool:
     normalized = str(detail or "").lower()
     return any(marker in normalized for marker in _REPLY_TARGET_MISSING_MARKERS)
@@ -675,13 +700,15 @@ async def send_sticker_with_auto_delete(
     sticker: str,
     delivery_mode: str = "reply",
     auto_delete_seconds: int = 0,
+    on_delivery: Callable[[], None] | None = None,
     **kwargs: object,
 ) -> Message:
     if (delivery_mode or "").strip().lower() == "message":
         sent = await message.answer_sticker(sticker=sticker, **kwargs)
     else:
         sent = await message.reply_sticker(sticker=sticker, **kwargs)
-    await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+    confirm_telegram_delivery(on_delivery)
+    await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
     return sent
 
 
@@ -1113,6 +1140,7 @@ async def send_reply(
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
     auto_delete_seconds: int = 0,
+    on_delivery: Callable[[], None] | None = None,
 ) -> bool:
     """Send reply in normal mode or stream-like incremental edits.
 
@@ -1152,8 +1180,9 @@ async def send_reply(
                         sent = await message.reply(body, parse_mode=parse_mode)
                 else:
                     sent = await message.answer(body, parse_mode=parse_mode)
+                confirm_telegram_delivery(on_delivery)
                 if schedule_cleanup:
-                    await schedule_message_auto_delete_durable(
+                    await _schedule_delivered_message_cleanup(
                         sent,
                         auto_delete_seconds,
                     )
@@ -1274,7 +1303,7 @@ async def send_reply(
             if not sent:
                 return False
             ok = await _finalize_stream_format(sent, segment)
-            await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+            await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
             return ok
 
         sent = await _safe_send(
@@ -1303,14 +1332,14 @@ async def send_reply(
             # Do not send/delete as fallback to avoid duplicate notifications.
             markdown_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
             if not markdown_ok:
-                await schedule_message_auto_delete_durable(
+                await _schedule_delivered_message_cleanup(
                     sent,
                     auto_delete_seconds,
                 )
                 return False
 
         ok = await _finalize_stream_format(sent, segment)
-        await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+        await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
         return ok
 
     payload = sanitize_outgoing_text((text or "").strip())
@@ -1416,6 +1445,7 @@ async def send_chat_message(
     fallback_mention_user_id: int = 0,
     fallback_mention_name: str = "",
     auto_delete_seconds: int = 0,
+    on_delivery: Callable[[], None] | None = None,
 ) -> bool:
     payload = sanitize_outgoing_text((text or "").strip())
     payload = sanitize_outgoing_mentions(payload)
@@ -1447,7 +1477,8 @@ async def send_chat_message(
                     parse_mode=current_parse_mode,
                     reply_to_message_id=current_reply_id,
                 )
-                await schedule_message_auto_delete_durable(
+                confirm_telegram_delivery(on_delivery)
+                await _schedule_delivered_message_cleanup(
                     sent,
                     auto_delete_seconds,
                 )
