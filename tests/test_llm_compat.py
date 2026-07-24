@@ -1,7 +1,7 @@
 import unittest
 
 from bot.config import ChatEndpointConfig, _build_litellm_model, _canonical_provider
-from bot.services.llm import LLMService
+from bot.services.llm import LLMService, _IncompleteInlineReasoningError
 
 
 class InlineReasoningStripTests(unittest.TestCase):
@@ -9,17 +9,32 @@ class InlineReasoningStripTests(unittest.TestCase):
         text = "<think>internal monologue</think>\n\n我是 MiniMax-M3。"
         self.assertEqual(LLMService._normalize_content_text(text), "我是 MiniMax-M3。")
 
-    def test_strips_unclosed_think_block(self) -> None:
+    def test_rejects_unclosed_think_block(self) -> None:
         text = "<think>The user is asking me to introduce myself in one sen"
-        self.assertEqual(LLMService._normalize_content_text(text), "")
+        with self.assertRaises(_IncompleteInlineReasoningError):
+            LLMService._normalize_content_text(text)
 
     def test_strips_multiple_blocks_and_stray_close_tag(self) -> None:
         text = "<think>a</think>回答一</think><reasoning>b</reasoning>回答二"
         self.assertEqual(LLMService._normalize_content_text(text), "回答一回答二")
 
-    def test_keeps_text_after_unclosed_tag_prefixed_answer(self) -> None:
+    def test_rejects_prefixed_answer_with_unclosed_tag(self) -> None:
         text = "答案在前面。<think>被截断的推理"
-        self.assertEqual(LLMService._normalize_content_text(text), "答案在前面。")
+        with self.assertRaises(_IncompleteInlineReasoningError):
+            LLMService._normalize_content_text(text)
+
+    def test_does_not_strip_similarly_named_tags(self) -> None:
+        text = "<analysis_result>可见内容</analysis_result>结尾"
+        self.assertEqual(LLMService._normalize_content_text(text), text)
+
+    def test_strips_nested_reasoning_blocks_without_leaking_inner_text(self) -> None:
+        text = "<think>外层<think>内层</think>外层结尾</think>完整答案"
+        self.assertEqual(LLMService._normalize_content_text(text), "完整答案")
+
+    def test_rejects_mismatched_reasoning_tags(self) -> None:
+        text = "<think>内部推理</analysis>不完整答案"
+        with self.assertRaises(_IncompleteInlineReasoningError):
+            LLMService._normalize_content_text(text)
 
     def test_plain_text_untouched(self) -> None:
         text = "1 < 2 and 3 > 2, plain text with <code>x</code>"

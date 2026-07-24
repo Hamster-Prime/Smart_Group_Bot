@@ -360,15 +360,18 @@ _PROVIDER_OFFICIAL_HOSTS = {
 }
 
 # Reasoning models behind OpenAI-compatible gateways (MiniMax M3, GLM, ...)
-# often inline `<think>...</think>` into message content instead of returning
-# a separate reasoning_content field. Keep the tag set aligned with
-# bot/utils/telegram.py so both layers agree on what counts as internal markup.
+# can inline `<think>...</think>` instead of using a separate reasoning field.
+# Only exact, same-name pairs are reasoning markup: broad prefix matching here
+# can silently remove ordinary output such as `<analysis_result>`.
 _REASONING_TAG = r"(?:think|analysis|reasoning|scratchpad)"
-_REASONING_BLOCK_RE = re.compile(
-    rf"(?is)<\s*{_REASONING_TAG}[\w:-]*[^>]*>[\s\S]*?</\s*{_REASONING_TAG}[\w:-]*\s*>"
+_REASONING_TAG_RE = re.compile(
+    rf"(?is)<\s*(?P<closing>/?)\s*(?P<tag>{_REASONING_TAG})"
+    rf"(?=\s|/?>)(?P<attributes>[^>]*)>"
 )
-_REASONING_OPEN_TAG_RE = re.compile(rf"(?is)<\s*{_REASONING_TAG}[\w:-]*[^>]*>")
-_REASONING_CLOSE_TAG_RE = re.compile(rf"(?is)</\s*{_REASONING_TAG}[\w:-]*\s*>")
+
+
+class _IncompleteInlineReasoningError(RuntimeError):
+    """A provider emitted malformed inline reasoning markup."""
 
 # Disable extra LiteLLM debug logs.
 litellm.suppress_debug_info = True
@@ -632,29 +635,42 @@ class LLMService:
     def _strip_inline_reasoning(text: str) -> str:
         """Remove inline reasoning markup that some providers leave in content.
 
-        MiniMax M3/M2.7, GLM and other reasoning models served through
-        OpenAI-compatible gateways emit `<think>...</think>` (or an unclosed
-        `<think>` when max_tokens cuts the response) inside message content.
-        Downstream decision/moderation parsers expect clean text.
+        Only a complete, same-name block is safe to remove.  If an opening tag
+        remains after that pass, do not guess which later text is reasoning:
+        returning a sliced prefix can send a visibly corrupted answer.  Raise
+        so the normal LLM retry/fallback path obtains a fresh response instead.
         """
         if not text or "<" not in text:
             return text
-        cleaned = _REASONING_BLOCK_RE.sub("", text)
-        open_match = _REASONING_OPEN_TAG_RE.search(cleaned)
-        if open_match:
-            remainder = cleaned[open_match.end():]
-            close_match = _REASONING_CLOSE_TAG_RE.search(remainder)
-            if close_match:
-                cleaned = (
-                    cleaned[: open_match.start()]
-                    + remainder[close_match.end():]
-                )
+
+        parts: list[str] = []
+        open_tags: list[str] = []
+        cursor = 0
+        for match in _REASONING_TAG_RE.finditer(text):
+            if not open_tags:
+                parts.append(text[cursor : match.start()])
+
+            tag = str(match.group("tag") or "").lower()
+            closing = bool(match.group("closing"))
+            self_closing = str(match.group("attributes") or "").rstrip().endswith("/")
+            if self_closing:
+                cursor = match.end()
+                continue
+            if closing:
+                if open_tags:
+                    if open_tags[-1] != tag:
+                        raise _IncompleteInlineReasoningError(
+                            "mismatched inline reasoning markup"
+                        )
+                    open_tags.pop()
             else:
-                # Truncated reasoning with no closing tag: everything after the
-                # opening tag is internal monologue, not the answer.
-                cleaned = cleaned[: open_match.start()]
-        cleaned = _REASONING_CLOSE_TAG_RE.sub("", cleaned)
-        return cleaned.strip()
+                open_tags.append(tag)
+            cursor = match.end()
+
+        if open_tags:
+            raise _IncompleteInlineReasoningError("incomplete inline reasoning markup")
+        parts.append(text[cursor:])
+        return "".join(parts).strip()
 
     @staticmethod
     def _normalize_content_text(content: Any) -> str:

@@ -141,6 +141,14 @@ class SecurityUtilsTests(unittest.TestCase):
 
         self.assertEqual(cleaned, "感恩你")
 
+    def test_sanitize_outgoing_text_only_strips_exact_reasoning_tags(self) -> None:
+        self.assertEqual(
+            sanitize_outgoing_text("<think>hidden</think>正文"),
+            "正文",
+        )
+        source = "<analysis_result>可见内容</analysis_result>结尾"
+        self.assertEqual(sanitize_outgoing_text(source), source)
+
     def test_sanitize_mentions_preserves_html_attributes_and_cleans_visible_text(self) -> None:
         source = (
             '<a href="https://example.com/search?q=@alice">@alice result</a> '

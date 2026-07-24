@@ -157,6 +157,25 @@ class LLMRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_completion.await_args_list[0].kwargs["model"], "openai/gpt-4.1")
         self.assertEqual(mock_completion.await_args_list[1].kwargs["model"], "openai/gpt-4.1")
 
+    async def test_unclosed_reasoning_markup_retries_instead_of_returning_a_prefix(self) -> None:
+        llm = self._make_llm()
+        mock_completion = AsyncMock(
+            side_effect=[
+                _chat_resp(content="答案开头<think>被截断的推理"),
+                _chat_resp(content="完整答案"),
+            ]
+        )
+
+        with (
+            patch("bot.services.llm.litellm.acompletion", mock_completion),
+            patch("bot.services.llm.litellm.token_counter", return_value=128),
+            patch("bot.services.llm.litellm.get_max_tokens", return_value=8192),
+        ):
+            result = await llm.generate("sys", "hi")
+
+        self.assertEqual(result, "完整答案")
+        self.assertEqual(mock_completion.await_count, 2)
+
     async def test_chat_falls_back_after_same_model_retries(self) -> None:
         llm = self._make_llm()
         mock_completion = AsyncMock(

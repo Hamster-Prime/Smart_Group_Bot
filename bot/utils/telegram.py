@@ -182,11 +182,13 @@ _CODE_SPAN_RE = re.compile(
     r"```[\s\S]*?```|`[^`\n]*`|<code>[\s\S]*?</code>|<pre>[\s\S]*?</pre>",
     flags=re.IGNORECASE,
 )
+_LLM_INTERNAL_TAG = r"(?:think|analysis|reasoning|scratchpad)"
 _LLM_INTERNAL_BLOCK_RE = re.compile(
-    r"(?is)<\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>[\s\S]*?</\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*\s*>"
+    rf"(?is)<\s*(?P<llm_internal_tag>{_LLM_INTERNAL_TAG})(?=\s|/?>)[^>]*>"
+    rf"[\s\S]*?</\s*(?P=llm_internal_tag)\s*>"
 )
 _LLM_INTERNAL_TAG_RE = re.compile(
-    r"(?is)</?\s*(?:think|analysis|reasoning|scratchpad)[\w:-]*[^>]*>"
+    rf"(?is)</?\s*{_LLM_INTERNAL_TAG}(?=\s|/?>)[^>]*>"
 )
 _HISTORY_WRAPPER_TAG_RE = re.compile(
     r"(?im)^\s*</?(?:untrusted|trusted):history_message(?:\(trusted_tg_admin_source\))?>\s*$"
