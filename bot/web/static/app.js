@@ -101,6 +101,8 @@
     { key: "vote_ban_trigger_window_seconds", label: "触发统计窗口（秒）", min: 60, max: 604800 },
   ];
 
+  const TEMPLATE_BUTTON_STYLES = ["primary", "success", "danger"];
+
   const AUTO_DELETE_CATEGORY_META = [
     { key: "reply", label: "普通 AI 回复" },
     { key: "management", label: "命令与管理提示" },
@@ -1033,14 +1035,18 @@
 
   function normalizeTemplateButtons(buttons) {
     if (!Array.isArray(buttons)) return [];
-    return buttons.slice(0, 12).map((button, index) => ({
-      text: String(button?.text || ""),
-      action: ["url", "copy", "share", "dismiss"].includes(button?.action)
-        ? button.action
-        : "url",
-      value: String(button?.value || ""),
-      row: Number.isInteger(Number(button?.row)) ? Number(button.row) : index,
-    })).filter(button => button.text);
+    return buttons.slice(0, 12).map((button, index) => {
+      const style = String(button?.style || "").trim().toLowerCase();
+      return {
+        text: String(button?.text || ""),
+        action: ["url", "copy", "share", "dismiss"].includes(button?.action)
+          ? button.action
+          : "url",
+        value: String(button?.value || ""),
+        row: Number.isInteger(Number(button?.row)) ? Number(button.row) : index,
+        ...(TEMPLATE_BUTTON_STYLES.includes(style) ? { style } : {}),
+      };
+    }).filter(button => button.text);
   }
 
   function escapeTemplateButtonPart(value) {
@@ -1070,11 +1076,11 @@
   }
 
   function templateButtonsToText(buttons) {
-    return normalizeTemplateButtons(buttons).map(button =>
-      [button.text, button.action, button.value, Number(button.row) + 1]
-        .map(escapeTemplateButtonPart)
-        .join(" | "),
-    ).join("\n");
+    return normalizeTemplateButtons(buttons).map(button => {
+      const parts = [button.text, button.action, button.value, Number(button.row) + 1];
+      if (button.style) parts.push(button.style);
+      return parts.map(escapeTemplateButtonPart).join(" | ");
+    }).join("\n");
   }
 
   function parseTemplateButtonsText(raw) {
@@ -1082,15 +1088,16 @@
     if (lines.length > 12) throw new Error("内联按钮最多 12 个");
     return lines.map((line, index) => {
       const parts = splitTemplateButtonLine(line);
-      if (parts.length > 4) {
+      if (parts.length > 5) {
         throw new Error(`第 ${index + 1} 行包含未转义的“|”，请写成 \\|`);
       }
-      while (parts.length < 4) parts.push("");
+      while (parts.length < 5) parts.push("");
       const normalizedParts = parts.map(part => part.trim());
       const text = normalizedParts[0] || "";
       const action = (normalizedParts[1] || "url").toLowerCase();
       const value = normalizedParts[2] || "";
       const rowValue = normalizedParts[3] || String(index + 1);
+      const style = (normalizedParts[4] || "").toLowerCase();
       const row = Number(rowValue) - 1;
       if (!text) throw new Error(`第 ${index + 1} 行缺少按钮名称`);
       if (text.length > 64) throw new Error(`第 ${index + 1} 行按钮名称不能超过 64 字`);
@@ -1112,8 +1119,25 @@
       if (!Number.isInteger(row) || row < 0 || row > 7) {
         throw new Error(`第 ${index + 1} 行的行号需为 1-8`);
       }
-      return { text, action, value: action === "dismiss" ? "" : value, row };
+      if (style && !TEMPLATE_BUTTON_STYLES.includes(style)) {
+        throw new Error(`第 ${index + 1} 行颜色无效，请使用 primary/success/danger`);
+      }
+      return {
+        text,
+        action,
+        value: action === "dismiss" ? "" : value,
+        row,
+        ...(style ? { style } : {}),
+      };
     });
+  }
+
+  function templateButtonStyleLegend() {
+    return `<span class="template-button-style-legend" aria-label="按钮颜色选项">
+      <span><i class="template-button-style-swatch primary"></i><code>primary</code> 蓝</span>
+      <span><i class="template-button-style-swatch success"></i><code>success</code> 绿</span>
+      <span><i class="template-button-style-swatch danger"></i><code>danger</code> 红</span>
+    </span>`;
   }
 
   function groupTemplateButtonsText(group) {
@@ -1391,8 +1415,8 @@
                   </div>
                   <div class="field welcome-buttons">
                     <label class="field-label" for="group-${attr(group.id)}-welcome-buttons">欢迎语内联按钮</label>
-                    <textarea id="group-${attr(group.id)}-welcome-buttons" data-template-buttons data-group-id="${attr(group.id)}" data-group-key="welcome_buttons" maxlength="30000" placeholder="每行：按钮名 | 操作 | 内容 | 行号&#10;官网 | url | https://example.com | 1&#10;复制群规 | copy | 群规文本 | 1&#10;管理员删除 | dismiss | | 2"${saving ? " disabled" : ""}>${escapeHtml(groupTemplateButtonsText(group))}</textarea>
-                    <span class="field-hint">操作：url 跳转、copy 复制、share 分享、dismiss 管理员删除；相同行号横向排列。内容中的 |、换行和反斜杠分别写成 \\|、\\n、\\\\</span>
+                    <textarea id="group-${attr(group.id)}-welcome-buttons" data-template-buttons data-group-id="${attr(group.id)}" data-group-key="welcome_buttons" maxlength="30000" placeholder="每行：按钮名 | 操作 | 内容 | 行号 | 颜色（可选）&#10;官网 | url | https://example.com | 1 | primary&#10;复制群规 | copy | 群规文本 | 1 | success&#10;管理员删除 | dismiss | | 2 | danger"${saving ? " disabled" : ""}>${escapeHtml(groupTemplateButtonsText(group))}</textarea>
+                    <span class="field-hint">操作：url 跳转、copy 复制、share 分享、dismiss 管理员删除；相同行号横向排列。内容中的 |、换行和反斜杠分别写成 \\|、\\n、\\\\。${templateButtonStyleLegend()}</span>
                   </div>
                 </div>`,
             })}
@@ -1549,7 +1573,7 @@
         </select>
         <input name="keyword" maxlength="255" value="${attr(item.keyword)}" aria-label="关键词" required>
         <textarea name="reply_text" maxlength="4000" rows="3" aria-label="回复内容" required>${escapeHtml(item.reply_text)}</textarea>
-        <textarea name="buttons_text" maxlength="30000" rows="2" aria-label="内联按钮" placeholder="按钮名 | url/copy/share/dismiss | 内容 | 行号；内容中 | 写成 \\|">${escapeHtml(templateButtonsToText(item.buttons))}</textarea>
+        <textarea name="buttons_text" maxlength="30000" rows="2" aria-label="内联按钮" placeholder="按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；内容中 | 写成 \\|">${escapeHtml(templateButtonsToText(item.buttons))}</textarea>
         <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
         <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
         <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled ? " checked" : ""}><span>启用</span></label>
@@ -1606,12 +1630,12 @@
             <select name="match_type" aria-label="匹配方式"><option value="contains">包含</option><option value="exact">完全匹配</option><option value="regex">正则</option></select>
             <input name="keyword" maxlength="255" placeholder="关键词" required>
             <textarea name="reply_text" maxlength="4000" rows="3" placeholder="回复内容（支持换行和 Markdown）" required></textarea>
-            <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号；| 写成 \\|"></textarea>
+            <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；| 写成 \\|"></textarea>
             <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
             <label class="compact-check"><input name="auto_delete" type="checkbox" checked><span>自动删除</span></label>
             <button class="icon-button" type="submit" aria-label="新增关键词回复" title="新增关键词回复">${icon("plus")}</button>
           </form>
-          <p class="field-hint">命中后直接发送固定回复并跳过 AI；内容支持换行和 Markdown。按钮同一行号会横向排列；「自动删除」按全局关键词类别执行。</p>
+          <p class="field-hint">命中后直接发送固定回复并跳过 AI；内容支持换行和 Markdown。按钮同一行号会横向排列；「自动删除」按全局关键词类别执行。${templateButtonStyleLegend()}</p>
           ${paginatedRows(resource.keyword_replies, listKey("keyword-replies"), item => renderKeywordReplyRow(group, item))}
         </section>
         <section class="resource-span">

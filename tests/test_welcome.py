@@ -81,6 +81,7 @@ class WelcomeSendTests(unittest.IsolatedAsyncioTestCase):
                         "action": "url",
                         "value": "https://example.com/rules",
                         "row": 0,
+                        "style": "primary",
                     }
                 ],
             },
@@ -107,6 +108,7 @@ class WelcomeSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("欢迎 Ada", bot.send_message.await_args.args[1])
         keyboard = bot.send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(keyboard.inline_keyboard[0][0].text, "群规")
+        self.assertEqual(keyboard.inline_keyboard[0][0].style, "primary")
         self.assertEqual(schedule.call_args.args[1], 45)
 
     async def test_formatted_length_error_falls_back_to_plain_markdown(self) -> None:

@@ -646,6 +646,46 @@ button:disabled {
   line-height: 1.45;
 }
 
+.template-button-style-legend {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 11px;
+  margin-left: 7px;
+}
+
+.template-button-style-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.template-button-style-legend code {
+  color: inherit;
+  font-size: 10px;
+}
+
+.template-button-style-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+
+.template-button-style-swatch.primary {
+  background: #2f80ed;
+}
+
+.template-button-style-swatch.success {
+  background: #2fa568;
+}
+
+.template-button-style-swatch.danger {
+  background: #d94a4a;
+}
+
 .field input,
 .field select,
 .field textarea,

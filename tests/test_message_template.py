@@ -169,6 +169,33 @@ class TemplateKeyboardTests(unittest.TestCase):
             ],
         )
 
+    def test_normalizes_optional_button_style_without_changing_legacy_shape(self) -> None:
+        styled = normalize_template_buttons(
+            [
+                {
+                    "text": "继续",
+                    "action": "copy",
+                    "value": "NEXT",
+                    "row": 0,
+                    "style": " Success ",
+                }
+            ]
+        )
+        legacy = normalize_template_buttons(
+            [
+                {
+                    "text": "默认",
+                    "action": "copy",
+                    "value": "DEFAULT",
+                    "row": 0,
+                    "style": " ",
+                }
+            ]
+        )
+
+        self.assertEqual(styled[0]["style"], "success")
+        self.assertNotIn("style", legacy[0])
+
     def test_builds_link_copy_and_admin_delete_buttons(self) -> None:
         markup = build_template_keyboard(
             [
@@ -177,18 +204,33 @@ class TemplateKeyboardTests(unittest.TestCase):
                     "action": "url",
                     "value": "https://example.com",
                     "row": 0,
+                    "style": "primary",
                 },
-                {"text": "复制", "action": "copy", "value": "ABC-123", "row": 0},
-                {"text": "删除", "action": "dismiss", "row": 1},
+                {
+                    "text": "复制",
+                    "action": "copy",
+                    "value": "ABC-123",
+                    "row": 0,
+                    "style": "success",
+                },
+                {
+                    "text": "删除",
+                    "action": "dismiss",
+                    "row": 1,
+                    "style": "danger",
+                },
             ]
         )
         self.assertIsNotNone(markup)
         self.assertEqual(markup.inline_keyboard[0][0].url, "https://example.com")
+        self.assertEqual(markup.inline_keyboard[0][0].style, "primary")
         self.assertEqual(markup.inline_keyboard[0][1].copy_text.text, "ABC-123")
+        self.assertEqual(markup.inline_keyboard[0][1].style, "success")
         self.assertEqual(
             markup.inline_keyboard[1][0].callback_data,
             DELETE_BUTTON_CALLBACK_DATA,
         )
+        self.assertEqual(markup.inline_keyboard[1][0].style, "danger")
 
     def test_rejects_unsafe_url_and_arbitrary_action(self) -> None:
         with self.assertRaises(ValueError):
@@ -198,6 +240,19 @@ class TemplateKeyboardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_template_buttons(
                 [{"text": "bad", "action": "arbitrary", "value": "owned"}]
+            )
+
+    def test_rejects_unknown_button_style(self) -> None:
+        with self.assertRaisesRegex(ValueError, "按钮颜色无效"):
+            normalize_template_buttons(
+                [
+                    {
+                        "text": "bad",
+                        "action": "url",
+                        "value": "https://example.com",
+                        "style": "red",
+                    }
+                ]
             )
 
     def test_rejects_oversized_layout(self) -> None:

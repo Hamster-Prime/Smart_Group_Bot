@@ -24,6 +24,10 @@ from aiogram.types import (
 from bot.utils.telegram import DELETE_BUTTON_CALLBACK_DATA
 
 TEMPLATE_BUTTON_ACTIONS = frozenset({"url", "copy", "share", "dismiss"})
+# Telegram calls these values ``style`` rather than arbitrary colors.  The
+# client chooses the concrete shade for the current theme; omitting the field
+# keeps the app-specific default used by older clients.
+TEMPLATE_BUTTON_STYLES = frozenset({"primary", "success", "danger"})
 MAX_TEMPLATE_BUTTONS = 12
 MAX_TEMPLATE_BUTTON_TEXT = 64
 MAX_TEMPLATE_BUTTON_VALUE = 2048
@@ -51,9 +55,11 @@ def _safe_link(value: object) -> str:
 def normalize_template_buttons(value: object) -> list[dict[str, Any]]:
     """Validate and normalize the public template-button JSON shape.
 
-    Each button is ``{text, action, value, row}``.  ``row`` is zero-based;
-    omitted rows are assigned in source order, producing one button per row.
-    The UI can give several buttons the same row number for a horizontal row.
+    Each button is ``{text, action, value, row, style?}``.  ``row`` is
+    zero-based; omitted rows are assigned in source order, producing one button
+    per row.  ``style`` is optional and accepts Telegram's ``primary`` (blue),
+    ``success`` (green), or ``danger`` (red) values. The UI can give several
+    buttons the same row number for a horizontal row.
     """
     if value in (None, ""):
         return []
@@ -66,7 +72,7 @@ def normalize_template_buttons(value: object) -> list[dict[str, Any]]:
     for index, raw in enumerate(value):
         if not isinstance(raw, Mapping):
             raise ValueError(f"第 {index + 1} 个内联按钮格式无效。")
-        unknown = set(raw) - {"text", "action", "value", "row"}
+        unknown = set(raw) - {"text", "action", "value", "row", "style"}
         if unknown:
             raise ValueError(
                 f"第 {index + 1} 个内联按钮包含不支持的字段："
@@ -109,6 +115,14 @@ def normalize_template_buttons(value: object) -> list[dict[str, Any]]:
         elif action == "dismiss":
             value_text = ""
 
+        raw_style = raw.get("style")
+        style = "" if raw_style in (None, "") else str(raw_style).strip().lower()
+        if style and style not in TEMPLATE_BUTTON_STYLES:
+            raise ValueError(
+                f"第 {index + 1} 个按钮颜色无效；"
+                "可用 primary（蓝）、success（绿）、danger（红）。"
+            )
+
         raw_row = raw.get("row", index)
         if isinstance(raw_row, bool):
             raise ValueError(f"第 {index + 1} 个按钮的行号无效。")
@@ -121,9 +135,12 @@ def normalize_template_buttons(value: object) -> list[dict[str, Any]]:
                 f"第 {index + 1} 个按钮行号需在 0 到 "
                 f"{MAX_TEMPLATE_BUTTON_ROWS - 1} 之间。"
             )
-        normalized.append(
-            {"text": text, "action": action, "value": value_text, "row": row}
-        )
+        button = {"text": text, "action": action, "value": value_text, "row": row}
+        # Do not add a null/empty key: this keeps legacy documents stable and
+        # lets Telegram select its normal app-specific style.
+        if style:
+            button["style"] = style
+        normalized.append(button)
     row_counts: dict[int, int] = defaultdict(int)
     for item in normalized:
         row_counts[int(item["row"])] += 1
@@ -145,6 +162,8 @@ def build_template_keyboard(value: object) -> InlineKeyboardMarkup | None:
     for item in buttons:
         action = item["action"]
         kwargs: dict[str, Any] = {"text": item["text"]}
+        if item.get("style"):
+            kwargs["style"] = item["style"]
         if action == "url":
             kwargs["url"] = item["value"]
         elif action == "copy":
@@ -539,18 +558,20 @@ def buttons_to_lines(value: object) -> str:
         buttons = normalize_template_buttons(value)
     except ValueError:
         return ""
-    return "\n".join(
-        " | ".join(
-            [item["text"], item["action"], item["value"], str(item["row"] + 1)]
-        ).rstrip(" |")
-        for item in buttons
-    )
+    lines: list[str] = []
+    for item in buttons:
+        parts = [item["text"], item["action"], item["value"], str(item["row"] + 1)]
+        if item.get("style"):
+            parts.append(item["style"])
+        lines.append(" | ".join(parts).rstrip(" |"))
+    return "\n".join(lines)
 
 
 __all__ = [
     "CARD_FIELD_SPACE",
     "MAX_TEMPLATE_BUTTONS",
     "TEMPLATE_BUTTON_ACTIONS",
+    "TEMPLATE_BUTTON_STYLES",
     "build_template_keyboard",
     "buttons_to_lines",
     "card_field",

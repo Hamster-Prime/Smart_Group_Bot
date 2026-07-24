@@ -257,6 +257,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                         "action": "url",
                         "value": "https://example.com/help",
                         "row": 0,
+                        "style": "danger",
                     }
                 ],
                 "pin_message": True,
@@ -269,6 +270,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(document["auto_delete"])
         self.assertIn("\n", document["reply_text"])
         self.assertEqual(document["buttons"][0]["text"], "查看说明")
+        self.assertEqual(document["buttons"][0]["style"], "danger")
         entry_id = document["id"]
 
         async with self.session_factory() as session:
@@ -276,6 +278,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.group_id, -503)
             self.assertEqual(row.created_by, 99)
             self.assertEqual(row.buttons[0]["action"], "url")
+            self.assertEqual(row.buttons[0]["style"], "danger")
 
         invalid_regex = await self.client.post(
             "/api/v1/groups/-503/keyword-replies",
@@ -293,7 +296,9 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={"enabled": False, "reply_text": "改后的回复"},
         )
         self.assertEqual(updated.status, 200)
-        self.assertFalse((await updated.json())["keyword_reply"]["enabled"])
+        updated_document = (await updated.json())["keyword_reply"]
+        self.assertFalse(updated_document["enabled"])
+        self.assertEqual(updated_document["buttons"][0]["style"], "danger")
 
         other_admin = await self.client.delete(
             f"/api/v1/groups/-503/keyword-replies/{entry_id}",
@@ -713,6 +718,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                             "action": "url",
                             "value": "https://example.com/rules",
                             "row": 0,
+                            "style": "success",
                         }
                     ],
                 },
@@ -724,10 +730,16 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             saved_group["settings"]["welcome_message"], "**欢迎**\n{mention} 加入！"
         )
         self.assertEqual(saved_group["settings"]["welcome_buttons"][0]["text"], "群规")
+        self.assertEqual(
+            saved_group["settings"]["welcome_buttons"][0]["style"], "success"
+        )
         async with self.session_factory() as session:
             stored = await session.get(Group, -260)
             self.assertEqual(
                 stored.settings.get("welcome_message"), "**欢迎**\n{mention} 加入！"
+            )
+            self.assertEqual(
+                stored.settings["welcome_buttons"][0]["style"], "success"
             )
 
         cleared = await self.client.put(

@@ -102,7 +102,7 @@ class KeywordReply(Base):
     keyword: Mapped[str] = mapped_column(String(255), default="")
     match_type: Mapped[str] = mapped_column(String(16), default="contains")
     reply_text: Mapped[str] = mapped_column(Text, default="")
-    # Shared template-button schema: [{text, action, value, row}, ...].
+    # Shared template-button schema: [{text, action, value, row, style?}, ...].
     # JSON keeps the feature extensible without a join table for a small,
     # ordered collection capped by the settings API.
     buttons: Mapped[list] = mapped_column(JSON, default=list)

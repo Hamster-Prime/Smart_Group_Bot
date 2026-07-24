@@ -127,6 +127,7 @@ class SendKeywordReplyTests(unittest.IsolatedAsyncioTestCase):
                     "action": "url",
                     "value": "https://example.com",
                     "row": 0,
+                    "style": "success",
                 }
             ],
         )
@@ -139,6 +140,7 @@ class SendKeywordReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<b>欢迎</b>\n第二行", answer_mock.await_args.args[1])
         keyboard = answer_mock.await_args.kwargs["reply_markup"]
         self.assertEqual(keyboard.inline_keyboard[0][0].url, "https://example.com")
+        self.assertEqual(keyboard.inline_keyboard[0][0].style, "success")
 
     async def test_auto_delete_opt_out_sends_persistent_reply(self) -> None:
         message = _message()

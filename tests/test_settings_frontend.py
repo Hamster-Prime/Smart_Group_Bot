@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,50 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
             source,
             r'<link rel="stylesheet" href="/settings-assets/styles\.css\?v=[^"]+">',
         )
+
+    def test_button_style_assets_share_a_new_cache_buster(self) -> None:
+        source = _INDEX_HTML.read_text(encoding="utf-8")
+        script_version = re.search(
+            r'/settings-assets/app\.js\?v=([^"]+)', source
+        )
+        style_version = re.search(
+            r'/settings-assets/styles\.css\?v=([^"]+)', source
+        )
+
+        self.assertIsNotNone(script_version)
+        self.assertIsNotNone(style_version)
+        self.assertEqual(script_version.group(1), style_version.group(1))
+        self.assertIn("button-styles", script_version.group(1))
+
+    def test_template_button_text_roundtrips_optional_style_as_fifth_column(
+        self,
+    ) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        normalize = source.split("function normalizeTemplateButtons", 1)[1].split(
+            "function escapeTemplateButtonPart", 1
+        )[0]
+        serialize = source.split("function templateButtonsToText", 1)[1].split(
+            "function parseTemplateButtonsText", 1
+        )[0]
+        parse = source.split("function parseTemplateButtonsText", 1)[1].split(
+            "function templateButtonStyleLegend", 1
+        )[0]
+
+        self.assertIn("TEMPLATE_BUTTON_STYLES.includes(style)", normalize)
+        self.assertIn("if (button.style) parts.push(button.style);", serialize)
+        self.assertIn("if (parts.length > 5)", parse)
+        self.assertIn("const style = (normalizedParts[4] || \"\").toLowerCase();", parse)
+        self.assertIn("...(style ? { style } : {})", parse)
+
+    def test_welcome_and_keyword_buttons_explain_supported_colors(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        styles = _STYLES_CSS.read_text(encoding="utf-8")
+
+        self.assertIn("按钮名 | 操作 | 内容 | 行号 | 颜色（可选）", source)
+        self.assertGreaterEqual(source.count("primary/success/danger（可选）"), 2)
+        self.assertIn('aria-label="按钮颜色选项"', source)
+        for style in ("primary", "success", "danger"):
+            self.assertIn(f".template-button-style-swatch.{style}", styles)
 
     def test_group_settings_are_split_into_collapsible_categories(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
