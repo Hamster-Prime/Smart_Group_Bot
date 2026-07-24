@@ -1,3 +1,5 @@
+import html
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -64,7 +66,11 @@ class CallAdminTriggerTests(unittest.TestCase):
             reported_text="买片加微信",
         )
         self.assertIn("<b>呼叫管理员 · 需要处理</b>", text)
+        self.assertEqual(text.count("<blockquote>"), 2)
         self.assertIn("<blockquote expandable>", text)
+        self.assertIn('<blockquote><a href="tg://user?id=7">A</a></blockquote>', text)
+        self.assertIn('<blockquote><b>发起人</b>　<a href="tg://user?id=5">', text)
+        self.assertNotIn("管理员通知批次", text)
         self.assertIn('tg://user?id=7', text)
         self.assertIn('tg://user?id=5', text)
         self.assertIn("&lt;u&gt;", text)
@@ -95,12 +101,18 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def _admin_member(user_id: int, *, username: str = "", is_bot: bool = False):
+    def _admin_member(
+        user_id: int,
+        *,
+        username: str = "",
+        full_name: str | None = None,
+        is_bot: bool = False,
+    ):
         return SimpleNamespace(
             user=SimpleNamespace(
                 id=user_id,
                 username=username,
-                full_name=f"user{user_id}",
+                full_name=full_name if full_name is not None else f"user{user_id}",
                 is_bot=is_bot,
             )
         )
@@ -154,8 +166,13 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tg://user?id=7", text)
         self.assertIn("tg://user?id=8", text)
 
-    async def test_more_than_twenty_admins_are_sent_in_batches(self) -> None:
-        bot = self._bot([self._admin_member(user_id) for user_id in range(1, 46)])
+    async def test_many_admins_are_sent_in_one_bounded_notice(self) -> None:
+        bot = self._bot(
+            [
+                self._admin_member(user_id, full_name="😀" * 128)
+                for user_id in range(1, 46)
+            ]
+        )
         async with self.session_factory() as session:
             sent = await handle_call_admin(
                 self._message(bot),
@@ -166,13 +183,13 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
                 caller_name="小明",
             )
         self.assertTrue(sent)
-        self.assertEqual(bot.send_message.await_count, 3)
-        texts = [call.args[1] for call in bot.send_message.await_args_list]
-        combined = "\n".join(texts)
+        bot.send_message.assert_awaited_once()
+        text = bot.send_message.await_args.args[1]
         for user_id in range(1, 46):
-            self.assertEqual(combined.count(f"tg://user?id={user_id}\""), 1)
-        self.assertIn("<b>管理员通知批次</b>　1/3", texts[0])
-        self.assertIn("<b>管理员通知批次</b>　3/3", texts[2])
+            self.assertEqual(text.count(f"tg://user?id={user_id}\""), 1)
+        self.assertNotIn("管理员通知批次", text)
+        visible = html.unescape(re.sub(r"<[^>]+>", "", text))
+        self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, 4096)
 
     async def test_disabled_group_sends_nothing(self) -> None:
         bot = self._bot([self._admin_member(7)])

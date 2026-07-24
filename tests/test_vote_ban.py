@@ -121,6 +121,24 @@ class VoteBanTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(vote_ban._expiry_tasks.get(321), second)
 
+    async def test_cancel_vote_expiry_stops_the_countdown_task(self) -> None:
+        kwargs = {
+            "session_factory": object(),
+            "bot": SimpleNamespace(),
+            "settings": _settings(),
+            "session_id": 654,
+            "delay_seconds": 3600,
+        }
+        vote_ban.schedule_vote_expiry(**kwargs)
+        await asyncio.sleep(0)
+        task = vote_ban._expiry_tasks[654]
+
+        vote_ban.cancel_vote_expiry(654)
+        await asyncio.sleep(0)
+
+        self.assertNotIn(654, vote_ban._expiry_tasks)
+        self.assertTrue(task.cancelled())
+
 
 class VoteBanConfigTests(unittest.TestCase):
     def test_group_overrides_and_clamping(self) -> None:
@@ -154,7 +172,7 @@ class VoteBanConfigTests(unittest.TestCase):
 
 
 class VoteBanMessageLayoutTests(unittest.TestCase):
-    def test_active_vote_uses_summary_and_expandable_details(self) -> None:
+    def test_active_vote_separates_context_initiator_details_and_timer(self) -> None:
         record = SimpleNamespace(
             target_user_id=42,
             target_display="被举报者",
@@ -169,9 +187,13 @@ class VoteBanMessageLayoutTests(unittest.TestCase):
         text = build_vote_text(record, approvals=1)
 
         self.assertIn("<b>民主投票封禁 · 进行中</b>", text)
-        self.assertIn("<b>当前票数</b>　<code>1/3</code>", text)
+        self.assertIn("<b>目标</b>　<a href=\"tg://user?id=42\">被举报者</a>", text)
+        self.assertIn("<b>被举报消息</b>　推广链接", text)
+        self.assertIn("<blockquote><b>发起人</b>　<a href=\"tg://user?id=7\">发起人</a></blockquote>", text)
         self.assertIn("<blockquote expandable>", text)
         self.assertIn("疑似&amp;lt;广告&amp;gt;", text)
+        self.assertIn("投票 <b><i>10</i> 分钟</b> 后自动失效。", text)
+        self.assertNotIn("当前票数", text)
 
     def test_start_failures_render_as_not_started_without_changing_summary(self) -> None:
         now = now_shanghai_naive()
@@ -277,6 +299,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         self.settings = _settings()
 
     async def asyncTearDown(self) -> None:
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.5)
         await self.engine.dispose()
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -379,6 +402,102 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsNone(duplicate)
 
+    async def test_countdown_refresh_updates_timer_and_live_keyboard(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        bot = SimpleNamespace(edit_message_text=AsyncMock(return_value=True))
+
+        remaining = await vote_ban._refresh_active_vote_message(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+            session_id=session_id,
+        )
+
+        self.assertIsNotNone(remaining)
+        kwargs = bot.edit_message_text.await_args.kwargs
+        self.assertIn("投票 <b><i>10</i> 分钟</b> 后自动失效。", kwargs["text"])
+        self.assertNotIn("当前票数", kwargs["text"])
+        self.assertEqual(
+            kwargs["reply_markup"].inline_keyboard[0][0].text,
+            "投票封禁（1/3）",
+        )
+
+    async def test_restore_active_vote_resumes_countdown_refresh(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        refreshed = asyncio.Event()
+
+        async def record_refresh(**_kwargs):
+            refreshed.set()
+            return True
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock(side_effect=record_refresh))
+        with patch.object(vote_ban, "VOTE_BAN_COUNTDOWN_REFRESH_SECONDS", 0.01):
+            await vote_ban.restore_vote_ban_tasks(
+                session_factory=self.session_factory,
+                bot=bot,
+                settings=self.settings,
+            )
+            await asyncio.wait_for(refreshed.wait(), timeout=0.5)
+
+        self.assertIn(session_id, vote_ban._expiry_tasks)
+        vote_ban.cancel_vote_expiry(session_id)
+
+    async def test_countdown_refresh_cannot_overwrite_newer_vote_edit(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        ticker_started = asyncio.Event()
+        release_ticker = asyncio.Event()
+        edits: list[dict] = []
+
+        async def delayed_edit(**kwargs):
+            edits.append(kwargs)
+            if len(edits) == 1:
+                ticker_started.set()
+                await release_ticker.wait()
+            return True
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(side_effect=delayed_edit),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
+        )
+        ticker = asyncio.create_task(
+            vote_ban._refresh_active_vote_message(
+                session_factory=self.session_factory,
+                bot=bot,
+                settings=self.settings,
+                session_id=session_id,
+            )
+        )
+        await asyncio.wait_for(ticker_started.wait(), timeout=0.5)
+
+        callback = self._callback(session_id, voter_id=11, bot=bot)
+
+        async def run_vote_callback() -> None:
+            async with self.session_factory() as session:
+                await group.on_vote_ban_action(callback, self.settings, session=session)
+
+        callback_task = asyncio.create_task(run_vote_callback())
+        for _ in range(50):
+            async with self.session_factory() as session:
+                approvals = await count_approvals(session, session_id)
+                await session.commit()
+            if approvals == 2:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(approvals, 2)
+
+        release_ticker.set()
+        await asyncio.wait_for(asyncio.gather(ticker, callback_task), timeout=1.0)
+
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(
+            edits[0]["reply_markup"].inline_keyboard[0][0].text,
+            "投票封禁（1/3）",
+        )
+        self.assertEqual(
+            edits[-1]["reply_markup"].inline_keyboard[0][0].text,
+            "投票封禁（2/3）",
+        )
+
     async def test_vote_below_threshold_updates_message(self) -> None:
         session_id = await self._open_session(threshold=3)
         callback = self._callback(session_id, voter_id=11)
@@ -394,10 +513,13 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         callback.bot.ban_chat_member.assert_not_awaited()
         callback.bot.edit_message_text.assert_awaited()
         kwargs = callback.bot.edit_message_text.await_args.kwargs
-        self.assertIn("2/3", kwargs["text"])
         self.assertIn("民主投票封禁 · 进行中", kwargs["text"])
         self.assertIn("<blockquote expandable>", kwargs["text"])
         self.assertIsNotNone(kwargs["reply_markup"])
+        self.assertEqual(
+            kwargs["reply_markup"].inline_keyboard[0][0].text,
+            "投票封禁（2/3）",
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "active")
@@ -506,6 +628,15 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_cancel_finalizes_without_ban(self) -> None:
         session_id = await self._open_session()
         callback = self._callback(session_id, voter_id=42, action="cancel")
+        vote_ban.schedule_vote_expiry(
+            session_factory=self.session_factory,
+            bot=callback.bot,
+            settings=self.settings,
+            session_id=session_id,
+            delay_seconds=600,
+        )
+        await asyncio.sleep(0)
+        self.assertIn(session_id, vote_ban._expiry_tasks)
         with patch.object(
             group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
         ):
@@ -513,6 +644,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 await group.on_vote_ban_action(callback, self.settings, session=session)
         callback.bot.ban_chat_member.assert_not_awaited()
         self.assertIn("已取消", callback.answer.await_args.args[0])
+        self.assertNotIn(session_id, vote_ban._expiry_tasks)
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("取消本次投票", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
@@ -1176,7 +1308,9 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
         message.bot.send_message.assert_awaited()
         text = message.bot.send_message.await_args.args[1]
         self.assertIn("民主投票封禁", text)
-        self.assertIn("1/3", text)
+        self.assertNotIn("1/3", text)
+        markup = message.bot.send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].text, "投票封禁（1/3）")
         async with self.session_factory() as session:
             record = await session.scalar(select(VoteBanSession))
             self.assertEqual(record.target_user_id, 555)

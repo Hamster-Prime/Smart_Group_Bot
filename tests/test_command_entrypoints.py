@@ -344,6 +344,106 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("15 分钟", answer_mock.await_args.args[2])
 
+    async def test_raid_guard_release_callback_updates_current_status_only(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            message_id=777,
+        )
+        callback = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            bot=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        service = SimpleNamespace(
+            lockdown_status_message_matches=lambda group_id, message_id: (
+                group_id == -10001 and message_id == 777
+            ),
+            disable_manual_lockdown=AsyncMock(return_value=True),
+        )
+
+        with (
+            patch("bot.handlers.admin.is_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.is_group_admin_or_higher", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.get_raid_guard_service", return_value=service),
+        ):
+            await admin.on_raid_guard_disable_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        service.disable_manual_lockdown.assert_awaited_once_with(-10001)
+        callback.answer.assert_awaited_once_with("爆破防护已解除")
+
+    async def test_raid_guard_release_callback_rejects_stale_status_message(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            message_id=776,
+        )
+        callback = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            bot=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        service = SimpleNamespace(
+            lockdown_status_message_matches=lambda _group_id, _message_id: False,
+            disable_manual_lockdown=AsyncMock(),
+        )
+
+        with (
+            patch("bot.handlers.admin.is_group_authorized", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.is_group_admin_or_higher", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.get_raid_guard_service", return_value=service),
+        ):
+            await admin.on_raid_guard_disable_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        service.disable_manual_lockdown.assert_not_awaited()
+        callback.answer.assert_awaited_once_with(
+            "防护状态已更新，请使用最新消息操作",
+            show_alert=True,
+        )
+
+    async def test_raid_guard_release_callback_rejects_unauthorized_group(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            message_id=777,
+        )
+        callback = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=123),
+            bot=SimpleNamespace(),
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        service = SimpleNamespace(
+            lockdown_status_message_matches=lambda _group_id, _message_id: True,
+            disable_manual_lockdown=AsyncMock(),
+        )
+
+        with (
+            patch("bot.handlers.admin.is_group_authorized", new=AsyncMock(return_value=False)),
+            patch("bot.handlers.admin.get_raid_guard_service", return_value=service),
+        ):
+            await admin.on_raid_guard_disable_callback(
+                callback,
+                session=session,
+                settings=_settings(),
+            )
+
+        service.disable_manual_lockdown.assert_not_awaited()
+        callback.answer.assert_awaited_once_with(
+            "当前群组未授权",
+            show_alert=True,
+        )
+
     async def test_settings_entry_allows_authorized_group_admin(self) -> None:
         message = SimpleNamespace(
             chat=SimpleNamespace(id=99, type="private"),

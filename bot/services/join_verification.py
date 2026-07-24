@@ -1152,8 +1152,8 @@ def parse_private_verify_group_id(payload: str) -> int | None:
 def _format_timeout(timeout_seconds: int) -> str:
     seconds = max(1, int(timeout_seconds))
     if seconds % 60 == 0:
-        return f"{seconds // 60} 分钟"
-    return f"{seconds} 秒"
+        return f"<b>{seconds // 60} 分钟</b>"
+    return f"<b>{seconds} 秒</b>"
 
 
 # Format/control characters are stripped from a name before it is shown.

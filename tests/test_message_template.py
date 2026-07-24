@@ -61,6 +61,24 @@ class TemplateRenderTests(unittest.TestCase):
             "<b>后续</b>　再次违规将升级处理</blockquote>",
         )
 
+    def test_summary_notice_separates_context_and_visible_emphasis(self) -> None:
+        rendered = render_summary_notice(
+            "民主投票封禁 · 进行中",
+            "<b>目标</b>　Alice",
+            context="<b>发起人</b>　Bob",
+            emphasis="投票 <b><i>30</i> 分钟</b> 后自动失效。",
+            details="<b>举报理由</b>　垃圾信息",
+        )
+
+        self.assertEqual(
+            rendered,
+            "<b>民主投票封禁 · 进行中</b>\n\n"
+            "<blockquote><b>目标</b>　Alice</blockquote>\n\n"
+            "<blockquote><b>发起人</b>　Bob</blockquote>\n\n"
+            "投票 <b><i>30</i> 分钟</b> 后自动失效。\n\n"
+            "<blockquote expandable><b>举报理由</b>　垃圾信息</blockquote>",
+        )
+
     def test_progress_notice_marks_completed_steps_and_promotes_action(self) -> None:
         rendered = render_progress_notice(
             "入群验证 · 待完成",
@@ -77,6 +95,22 @@ class TemplateRenderTests(unittest.TestCase):
             "<b>当前</b>　完成人机验证\n"
             "<b>下一步</b>　恢复发言权限</blockquote>\n\n"
             "请在 10 分钟内点击下方「开始验证」。",
+        )
+
+    def test_progress_notice_separates_context_from_state(self) -> None:
+        rendered = render_progress_notice(
+            "本群封禁 · 执行中",
+            completed="已受理请求",
+            current="执行 Telegram 封禁",
+            next_step="写入结果并更新本消息",
+            context="<b>目标</b>　<code>42</code>",
+            action="正在执行。",
+        )
+
+        self.assertIn(
+            "</blockquote>\n\n<blockquote><b>目标</b>　<code>42</code></blockquote>"
+            "\n\n正在执行。",
+            rendered,
         )
 
     def test_action_notice_and_data_brief_keep_html_values_unescaped(self) -> None:

@@ -57,6 +57,7 @@ from bot.services.vote_ban import (
     cancel_vote_expiry,
     claim_session_status,
     count_approvals,
+    edit_vote_message,
     enforcement_outcome_line,
     expire_overdue,
     finalize_vote_message,
@@ -630,9 +631,12 @@ def _build_moderation_notice(
         ]
     )
     clean_failure_note = str(failure_note or "").strip()
-    if clean_failure_note:
-        details.append(html.escape(clean_failure_note))
-    return render_summary_notice(title, summary, details=details)
+    return render_summary_notice(
+        title,
+        summary,
+        emphasis=(f"<b>{html.escape(clean_failure_note)}</b>" if clean_failure_note else None),
+        details=details,
+    )
 
 
 _MODERATION_OUTCOME_LABELS = {
@@ -2892,11 +2896,12 @@ async def on_vote_ban_action(
                 await callback.answer(answer_text, show_alert=True)
                 return
             try:
-                await callback.bot.edit_message_text(
-                    chat_id=group_id,
+                await edit_vote_message(
+                    callback.bot,
+                    session_id=session_id,
+                    group_id=group_id,
                     message_id=vote_message_id,
                     text=build_vote_text(record, approvals=approvals),
-                    parse_mode="HTML",
                     reply_markup=build_vote_keyboard(
                         session_id, approvals, threshold
                     ),

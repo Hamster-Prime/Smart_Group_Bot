@@ -95,6 +95,7 @@ from bot.services.proactive import (
     set_cooldown_task_enabled,
 )
 from bot.services.raid_guard import (
+    RAID_GUARD_DISABLE_CALLBACK_DATA,
     get_raid_guard_service,
     normalize_manual_lockdown_minutes,
 )
@@ -1149,6 +1150,7 @@ async def _publish_privileged_progress(
     current: str,
     next_step: str,
     completed: object | None = "已受理请求",
+    context: object | None = None,
     action: object | None = None,
     details: object | None = None,
 ) -> None:
@@ -1160,6 +1162,7 @@ async def _publish_privileged_progress(
             completed=completed,
             current=current,
             next_step=next_step,
+            context=context,
             action=action,
             details=details,
         ),
@@ -1856,7 +1859,7 @@ async def _perform_global_ban_locked(
         current=f"处理 <code>{len(group_ids)}</code> 个授权群",
         next_step="写入汇总结果并更新本消息",
         action="全局策略已持久化，正在并发执行群内封禁。",
-        details=f"<b>目标</b>　<code>{target_id}</code>",
+        context=f"<b>目标</b>　<code>{target_id}</code>",
     )
 
     recovery_by_group = {int(item.group_id): item for item in recoveries}
@@ -2000,7 +2003,7 @@ async def _perform_global_unban_locked(
         current=f"处理 <code>{len(group_ids)}</code> 个授权群",
         next_step="恢复权限并更新本消息",
         action="恢复工单已持久化，正在并发执行群内解封。",
-        details=f"<b>目标</b>　<code>{target_id}</code>",
+        context=f"<b>目标</b>　<code>{target_id}</code>",
     )
     recovery_by_group = {int(item.group_id): item for item in recoveries}
     restored_group_ids: set[int] = set()
@@ -2245,7 +2248,7 @@ async def cmd_ban(
                     completed="已受理请求",
                     current="执行 Telegram 封禁",
                     next_step="写入结果并更新本消息",
-                    details=f"<b>目标</b>　<code>{target_id}</code>",
+                    context=f"<b>目标</b>　<code>{target_id}</code>",
                 ),
                 parse_mode="HTML",
             )
@@ -2340,7 +2343,7 @@ async def cmd_unban(
                     completed="已受理请求",
                     current="解除 Telegram 封禁",
                     next_step="恢复权限并更新本消息",
-                    details=f"<b>目标</b>　<code>{target_id}</code>",
+                    context=f"<b>目标</b>　<code>{target_id}</code>",
                 ),
                 parse_mode="HTML",
             )
@@ -2575,7 +2578,7 @@ async def on_ban_scope_choice(
                     title=f"{task_title} · 执行中",
                     current=f"执行 {scope_label}{verb}",
                     next_step="写入结果并更新本消息",
-                    details=task_details,
+                    context=task_details,
                 )
         finally:
             ack_gate.set()
@@ -2587,7 +2590,7 @@ async def on_ban_scope_choice(
         title=f"{task_title} · 执行中",
         current=f"执行 {scope_label}{verb}",
         next_step="写入结果并更新本消息",
-        details=task_details,
+        context=task_details,
     )
     try:
         if action == "ban" and scope == "l":
@@ -2709,7 +2712,7 @@ async def cmd_raidguard(
                         completed="已受理请求",
                         current="解除手动锁定",
                         next_step="写入结果并更新本消息",
-                        details=f"<b>群组</b>　<code>{group_id}</code>",
+                        context=f"<b>群组</b>　<code>{group_id}</code>",
                     ),
                     parse_mode="HTML",
                 )
@@ -2790,7 +2793,7 @@ async def cmd_raidguard(
                     completed="已受理请求",
                     current="开启手动锁定",
                     next_step="写入结果并更新本消息",
-                    details=f"<b>群组</b>　<code>{group_id}</code>",
+                    context=f"<b>群组</b>　<code>{group_id}</code>",
                 ),
                 parse_mode="HTML",
             )
@@ -2860,6 +2863,117 @@ async def cmd_raidguard(
             else "爆破防护已手动开启，将持续到管理员发送 /raidguard off。"
         ),
     )
+
+
+@router.callback_query(F.data == RAID_GUARD_DISABLE_CALLBACK_DATA)
+async def on_raid_guard_disable_callback(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """Release the active raid lockdown from its current status message."""
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    operator = callback.from_user
+    if message is None or chat is None or chat.type not in ("group", "supergroup"):
+        await callback.answer("爆破防护状态消息已失效", show_alert=True)
+        return
+    if operator is None:
+        await callback.answer("无法识别操作者", show_alert=True)
+        return
+    group_id = int(chat.id)
+    message_id = int(message.message_id)
+
+    authorized = await is_group_authorized(session, group_id)
+    await _commit_if_supported(session)
+    if not authorized:
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
+    try:
+        with privileged_request_scope():
+            async with asyncio.timeout(4.0):
+                can_manage = await is_group_admin_or_higher(
+                    bot=callback.bot,
+                    session=session,
+                    settings=settings,
+                    group_id=group_id,
+                    user_id=int(operator.id),
+                )
+    except Exception:
+        can_manage = False
+        log.warning(
+            "raid guard callback admin lookup failed | group=%s user=%s",
+            group_id,
+            operator.id,
+            exc_info=True,
+        )
+    if not can_manage:
+        await callback.answer("仅本群管理员可解除爆破防护", show_alert=True)
+        return
+
+    service = get_raid_guard_service()
+    if service is None:
+        await callback.answer("爆破防护服务尚未启动，请稍后重试", show_alert=True)
+        return
+    if not service.lockdown_status_message_matches(group_id, message_id):
+        await callback.answer("防护状态已更新，请使用最新消息操作", show_alert=True)
+        return
+
+    if session_factory is None:
+        try:
+            disabled = await service.disable_manual_lockdown(group_id)
+        except Exception:
+            log.exception("raid guard callback disable failed | group=%s", group_id)
+            await callback.answer("解除爆破防护失败，请稍后重试", show_alert=True)
+            return
+        await callback.answer(
+            "爆破防护已解除" if disabled else "当前没有正在运行的爆破锁定"
+        )
+        return
+
+    callback_acknowledged = asyncio.Event()
+
+    async def disable_operation() -> None:
+        await callback_acknowledged.wait()
+        if not await _queued_operator_can_manage_members(
+            bot=callback.bot,
+            session_factory=session_factory,
+            settings=settings,
+            group_id=group_id,
+            user_id=int(operator.id),
+        ):
+            log.warning(
+                "raid guard callback cancelled after authorization changed | "
+                "group=%s operator=%s",
+                group_id,
+                operator.id,
+            )
+            return
+        if not service.lockdown_status_message_matches(group_id, message_id):
+            return
+        try:
+            await service.disable_manual_lockdown(group_id)
+        except Exception:
+            log.exception("raid guard callback disable failed | group=%s", group_id)
+
+    submission = submit_privileged_task(
+        key=f"raidguard:disable:{group_id}",
+        label=f"disable raid guard in {group_id}",
+        operation=disable_operation,
+        lane="critical",
+        priority=0,
+        timeout_seconds=60.0,
+    )
+    try:
+        if not submission.accepted:
+            await callback.answer("权限任务队列正忙，请再次点击", show_alert=True)
+        elif not submission.created:
+            await callback.answer("爆破防护解除正在执行", show_alert=True)
+        else:
+            await callback.answer("正在解除爆破防护…")
+    finally:
+        callback_acknowledged.set()
 
 
 async def _clear_style_samples(session: AsyncSession, group_id: int) -> None:
@@ -3015,7 +3129,7 @@ async def cmd_addrule(
                 completed="已受理请求",
                 current="解析并更新群审核规则",
                 next_step="写入结果并更新本消息",
-                details=f"<b>请求</b>　{html.escape(_truncate_text(args, 160))}",
+                context=f"<b>请求</b>　{html.escape(_truncate_text(args, 160))}",
             ),
             parse_mode="HTML",
         )

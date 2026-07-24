@@ -400,10 +400,8 @@ async def _ban_and_notify(
                         f"已封禁成员 <b>{shown}</b>（ID: <code>{user_id}</code>）",
                     ),
                 ],
-                details=[
-                    card_field("原因", reason_text),
-                    "如需解封请管理员使用 <code>/unban</code> 命令。",
-                ],
+                emphasis="如需解封请管理员使用 <code>/unban</code> 命令。",
+                details=[card_field("原因", reason_text)],
             ),
             parse_mode="HTML",
         )

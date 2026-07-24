@@ -26,7 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Admin, GroupMember
-from bot.services.message_templates import card_field, render_summary_notice
+from bot.services.message_templates import (
+    card_field,
+    render_summary_notice,
+    truncate_telegram_text,
+)
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     is_reply_target_missing_error,
@@ -45,10 +49,10 @@ _CALL_ADMIN_RE = re.compile(
     r"(?<![A-Za-z0-9_/.])@admins?(?![A-Za-z0-9_])", re.IGNORECASE
 )
 
-# Keep each Telegram message comfortably below the HTML/text limit.  Large
-# admin teams are sent in multiple batches so "all admins" never silently
-# drops the 21st and later administrators.
-_MENTIONS_PER_MESSAGE = 20
+# Keep the single notice comfortably below Telegram's text limit even when
+# administrators use maximum-length display names. Usernames are already
+# short; full names and stale roster values are compacted before rendering.
+_ADMIN_MENTION_LABEL_LIMIT = 32
 
 _last_call_at: dict[int, float] = {}
 
@@ -113,6 +117,14 @@ def _break_user_mentions(text: str) -> str:
     return re.sub(r"@(?=\w)", "@​", str(text or ""))
 
 
+def _compact_admin_label(value: object, *, fallback: str) -> str:
+    """Keep one all-admin notice within Telegram's single-message budget."""
+    label = truncate_telegram_text(
+        str(value or "").strip(), _ADMIN_MENTION_LABEL_LIMIT
+    )
+    return label or fallback
+
+
 async def _resolve_admin_mentions(
     bot: Bot,
     session: AsyncSession,
@@ -141,9 +153,11 @@ async def _resolve_admin_mentions(
                 continue
             username = str(getattr(user, "username", "") or "").strip()
             if username:
-                label = f"@{username}"
+                label = _compact_admin_label(f"@{username}", fallback=str(user_id))
             else:
-                label = str(getattr(user, "full_name", "") or "").strip() or str(user_id)
+                label = _compact_admin_label(
+                    getattr(user, "full_name", ""), fallback=str(user_id)
+                )
             admins[user_id] = label
     except Exception:
         log.warning(
@@ -167,9 +181,9 @@ async def _resolve_admin_mentions(
             user_id = int(user_id)
             clean_username = str(username or "").strip()
             label = (
-                f"@{clean_username}"
+                _compact_admin_label(f"@{clean_username}", fallback=str(user_id))
                 if clean_username
-                else str(full_name or "").strip() or str(user_id)
+                else _compact_admin_label(full_name, fallback=str(user_id))
             )
             admins[user_id] = label
 
@@ -189,16 +203,8 @@ def build_call_admin_text(
     caller_name: str,
     reason: str,
     reported_text: str,
-    batch_index: int = 1,
-    batch_count: int = 1,
 ) -> str:
     shown = html.escape(str(caller_name or "").strip() or str(caller_id))
-    summary = [" ".join(mentions)]
-    if batch_count > 1:
-        summary.append(card_field("管理员通知批次", f"{int(batch_index)}/{int(batch_count)}"))
-    summary.append(
-        card_field("发起人", f'<a href="tg://user?id={int(caller_id)}">{shown}</a>')
-    )
     details: list[str] = []
     clean_reason = str(reason or "").strip()
     if clean_reason:
@@ -212,7 +218,10 @@ def build_call_admin_text(
         )
     return render_summary_notice(
         "呼叫管理员 · 需要处理",
-        summary,
+        " ".join(mentions),
+        context=card_field(
+            "发起人", f'<a href="tg://user?id={int(caller_id)}">{shown}</a>'
+        ),
         details=details,
     )
 
@@ -263,8 +272,8 @@ async def handle_call_admin(
         message.bot, session, group_id, call_admin_targets(group_settings)
     )
     # The Telegram fallback path may have queried the local Admin/roster
-    # tables. End that fresh read transaction before sending notification
-    # batches so it cannot remain checked out across network retries.
+    # tables. End that fresh read transaction before sending the notification
+    # so it cannot remain checked out across network retries.
     try:
         await session.commit()
     except Exception:
@@ -284,49 +293,36 @@ async def handle_call_admin(
     reply = getattr(message, "reply_to_message", None)
     reported_text = str(getattr(reply, "text", None) or getattr(reply, "caption", None) or "")
     reply_target = int(getattr(reply, "message_id", 0) or 0) or None
-    mention_batches = [
-        mentions[index : index + _MENTIONS_PER_MESSAGE]
-        for index in range(0, len(mentions), _MENTIONS_PER_MESSAGE)
-    ]
-    sent_messages = []
-    for batch_index, mention_batch in enumerate(mention_batches, start=1):
-        text = build_call_admin_text(
-            mention_batch,
-            caller_id=caller_id,
-            caller_name=caller_name,
-            reason=reason,
-            reported_text=reported_text,
-            batch_index=batch_index,
-            batch_count=len(mention_batches),
-        )
+    text = build_call_admin_text(
+        mentions,
+        caller_id=caller_id,
+        caller_name=caller_name,
+        reason=reason,
+        reported_text=reported_text,
+    )
+    try:
         try:
-            try:
-                sent = await message.bot.send_message(
-                    group_id,
-                    text,
-                    parse_mode="HTML",
-                    reply_to_message_id=reply_target,
-                )
-            except TelegramBadRequest as exc:
-                # Only retry unanchored when the reported message is gone; a
-                # blanket retry would double-ping on transient errors.
-                if reply_target is None or not is_reply_target_missing_error(str(exc)):
-                    raise
-                sent = await message.bot.send_message(group_id, text, parse_mode="HTML")
-        except Exception:
-            if not sent_messages:
-                _release_call(group_id, claim_stamp)
-            log.warning(
-                "[%s] call admin send failed | batch=%s/%s sent=%s",
+            sent = await message.bot.send_message(
                 group_id,
-                batch_index,
-                len(mention_batches),
-                len(sent_messages),
-                exc_info=True,
+                text,
+                parse_mode="HTML",
+                reply_to_message_id=reply_target,
             )
-            return bool(sent_messages)
-        sent_messages.append(sent)
-        await schedule_message_auto_delete_durable(
-            sent, configured_auto_delete_seconds(settings, "call_admin")
+        except TelegramBadRequest as exc:
+            # Only retry unanchored when the reported message is gone; a
+            # blanket retry would double-ping on transient errors.
+            if reply_target is None or not is_reply_target_missing_error(str(exc)):
+                raise
+            sent = await message.bot.send_message(group_id, text, parse_mode="HTML")
+    except Exception:
+        _release_call(group_id, claim_stamp)
+        log.warning(
+            "[%s] call admin send failed",
+            group_id,
+            exc_info=True,
         )
-    return bool(sent_messages)
+        return False
+    await schedule_message_auto_delete_durable(
+        sent, configured_auto_delete_seconds(settings, "call_admin")
+    )
+    return True

@@ -25,12 +25,14 @@ from bot.services.join_verification import (
 )
 from bot.services.raid_guard import (
     MANUAL_LOCKDOWN_SETTINGS_KEY,
+    RAID_GUARD_DISABLE_CALLBACK_DATA,
     RAID_REMOVE_CALLBACK_DATA,
     RaidGuardService,
     RaidRemovalResult,
     RaidSuspect,
     build_raid_challenge_keyboard,
     build_raid_challenge_text,
+    build_raid_lockdown_keyboard,
     build_raid_lockdown_text,
     build_raid_unlock_text,
     normalize_manual_lockdown_minutes,
@@ -214,6 +216,7 @@ class MessageTests(unittest.TestCase):
         self.assertIn("8 名成员", text)
         self.assertIn("1 分钟", text)
         self.assertIn("10 分钟", text)
+        self.assertIn("</blockquote>\n\n<b>锁定时长：10 分钟。</b>", text)
         self.assertIn("自动移出", text)
 
     def test_challenge_text_mentions_all_suspects(self) -> None:
@@ -230,6 +233,7 @@ class MessageTests(unittest.TestCase):
         self.assertIn("张三", text)
         self.assertIn("@spam_guy", text)
         self.assertIn("10 分钟", text)
+        self.assertIn("<b>请在 10 分钟 内完成。</b>", text)
         self.assertIn("真人质询", text)
         self.assertIn("不会封禁", text)
 
@@ -263,6 +267,13 @@ class MessageTests(unittest.TestCase):
         )
         self.assertIn("仅管理员", keyboard.inline_keyboard[1][0].text)
 
+    def test_lockdown_keyboard_has_admin_release_action(self) -> None:
+        keyboard = build_raid_lockdown_keyboard()
+        button = keyboard.inline_keyboard[0][0]
+
+        self.assertEqual(button.text, "解除爆破防护")
+        self.assertEqual(button.callback_data, RAID_GUARD_DISABLE_CALLBACK_DATA)
+
     def test_unlock_text_describes_recovery(self) -> None:
         text = build_raid_unlock_text()
         self.assertIn("爆破防护 · 已解除", text)
@@ -278,6 +289,23 @@ class MessageTests(unittest.TestCase):
 
 
 class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_unlock_ignores_a_new_lockdown(self) -> None:
+        bot = _bot_mock()
+        service = RaidGuardService(
+            bot=bot,
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        service._status_message_ids[-100] = 777
+        service._schedule_unlock_notice(-100, source="automatic")
+        service._lockdown_until[-100] = now_shanghai_naive() + timedelta(minutes=1)
+        service._lockdown_source[-100] = "manual"
+
+        await asyncio.sleep(0)
+
+        bot.edit_message_text.assert_not_awaited()
+        self.assertTrue(service.lockdown_status_message_matches(-100, 777))
+
     async def test_passive_unlock_notice_is_tracked_and_drained_on_shutdown(self) -> None:
         bot = _bot_mock()
         service = RaidGuardService(
@@ -291,9 +319,10 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
             started.set()
             await asyncio.sleep(60)
 
-        bot.send_message.side_effect = slow_notice
+        bot.edit_message_text.side_effect = slow_notice
         service._lockdown_until[-100] = now_shanghai_naive() - timedelta(seconds=1)
         service._lockdown_source[-100] = "automatic"
+        service._status_message_ids[-100] = 777
 
         self.assertFalse(service.lockdown_active(-100))
         await asyncio.wait_for(started.wait(), timeout=1.0)
@@ -327,7 +356,8 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async def rejected_notice() -> None:
             rejected_started.set()
 
-        bot.send_message.side_effect = stubborn_notice
+        bot.edit_message_text.side_effect = stubborn_notice
+        service._status_message_ids[-100] = 777
         try:
             with (
                 patch.object(raid_guard_module, "_NOTICE_CALL_CAPACITY", 1),
@@ -695,6 +725,11 @@ class DetectionTests(_DbTestCase):
         self.assertEqual(bot.send_message.await_count, 2)
         notice = bot.send_message.await_args_list[0].args[1]
         self.assertIn("爆破防护 · 已触发", notice)
+        status_keyboard = bot.send_message.await_args_list[0].kwargs["reply_markup"]
+        self.assertEqual(
+            status_keyboard.inline_keyboard[0][0].callback_data,
+            RAID_GUARD_DISABLE_CALLBACK_DATA,
+        )
         challenge_call = bot.send_message.await_args_list[1]
         challenge = challenge_call.args[1]
         for handle in ("@one", "@two", "@three"):
@@ -794,7 +829,7 @@ class DetectionTests(_DbTestCase):
         # A join after expiry flows through normal handling again.
         self.assertFalse(await self._join(service, 50))
 
-    async def test_lockdown_expiry_sends_persistent_unlock_notice(self) -> None:
+    async def test_lockdown_expiry_updates_persistent_status_message(self) -> None:
         service, bot = self._service()
         for user_id in (1, 2, 3):
             await self._join(service, user_id)
@@ -805,8 +840,14 @@ class DetectionTests(_DbTestCase):
 
         self.assertTrue(await service._expire_lockdown(-100, expired_at))
         self.assertFalse(service.lockdown_active(-100))
-        bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            text=build_raid_unlock_text(),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
 
     async def test_manual_lockdown_works_when_automatic_policy_is_off(self) -> None:
         settings = _settings(raid_guard_enabled=False)
@@ -819,6 +860,10 @@ class DetectionTests(_DbTestCase):
         self.assertIsNotNone(deadline)
         self.assertTrue(service.manual_lockdown_active(-100))
         self.assertIn("5 分钟", bot.send_message.await_args.args[1])
+        self.assertEqual(
+            bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text,
+            "解除爆破防护",
+        )
 
         bot.send_message.reset_mock()
         self.assertTrue(await self._join(service, 99))
@@ -834,7 +879,60 @@ class DetectionTests(_DbTestCase):
         )
         self.assertTrue(await service.disable_manual_lockdown(-100))
         self.assertFalse(service.lockdown_active(-100))
-        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            text=build_raid_unlock_text(),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+
+    async def test_manual_reconfiguration_updates_existing_status_message(self) -> None:
+        service, bot = self._service()
+
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        await service.enable_manual_lockdown(-100, duration_minutes=10)
+
+        bot.send_message.assert_awaited_once()
+        bot.edit_message_text.assert_awaited_once()
+        edit = bot.edit_message_text.await_args
+        self.assertEqual(edit.kwargs["chat_id"], -100)
+        self.assertEqual(edit.kwargs["message_id"], 777)
+        self.assertIn("10 分钟", edit.kwargs["text"])
+        self.assertEqual(
+            edit.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+            RAID_GUARD_DISABLE_CALLBACK_DATA,
+        )
+        self.assertTrue(service.lockdown_status_message_matches(-100, 777))
+
+    async def test_unlock_edit_failure_does_not_post_a_second_status_message(self) -> None:
+        service, bot = self._service()
+
+        await service.enable_manual_lockdown(-100)
+        bot.send_message.reset_mock()
+        bot.edit_message_text.side_effect = Exception("message is too old")
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once()
+        self.assertFalse(service.lockdown_status_message_matches(-100, 777))
+
+    async def test_active_status_edit_failure_replaces_the_release_control(self) -> None:
+        service, bot = self._service()
+
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        bot.edit_message_text.side_effect = Exception("message is too old")
+        await service.enable_manual_lockdown(-100, duration_minutes=10)
+
+        self.assertEqual(bot.send_message.await_count, 2)
+        self.assertTrue(service.lockdown_status_message_matches(-100, 777))
+        replacement = bot.send_message.await_args
+        self.assertIn("10 分钟", replacement.args[1])
+        self.assertEqual(
+            replacement.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+            RAID_GUARD_DISABLE_CALLBACK_DATA,
+        )
 
     async def test_manual_lockdown_persists_without_replacing_group_settings(self) -> None:
         async with self.session_factory() as session:
@@ -855,7 +953,7 @@ class DetectionTests(_DbTestCase):
             self.assertEqual(group.settings["nested"], {"ok": True})
             self.assertEqual(
                 group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY],
-                {"version": 1, "indefinite": True},
+                {"version": 1, "indefinite": True, "status_message_id": 777},
             )
 
         self.assertTrue(await service.disable_manual_lockdown(-100))
@@ -880,6 +978,13 @@ class DetectionTests(_DbTestCase):
         # not repeated.
         restored_bot.send_message.assert_not_awaited()
         await restored.disable_manual_lockdown(-100)
+        restored_bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            text=build_raid_unlock_text(),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
 
     async def test_indefinite_manual_lockdown_is_restored_after_restart(self) -> None:
         first, _first_bot = self._service()
@@ -894,7 +999,7 @@ class DetectionTests(_DbTestCase):
         restored_bot.send_message.assert_not_awaited()
         await restored.disable_manual_lockdown(-100)
 
-    async def test_expired_persisted_lockdown_is_cleaned_and_announced_once(self) -> None:
+    async def test_expired_persisted_lockdown_is_cleaned_and_updates_once(self) -> None:
         expired_until = (now_shanghai_naive() - timedelta(minutes=1)).isoformat()
         async with self.session_factory() as session:
             session.add(
@@ -906,6 +1011,7 @@ class DetectionTests(_DbTestCase):
                         MANUAL_LOCKDOWN_SETTINGS_KEY: {
                             "version": 1,
                             "until": expired_until,
+                            "status_message_id": 777,
                         },
                     },
                 )
@@ -917,8 +1023,14 @@ class DetectionTests(_DbTestCase):
             await first.restore_manual_lockdowns(),
             {"restored": 0, "expired": 1, "invalid": 0},
         )
-        first_bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护 · 已解除", first_bot.send_message.await_args.args[1])
+        first_bot.send_message.assert_not_awaited()
+        first_bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            text=build_raid_unlock_text(),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
 
         second, second_bot = self._service()
         self.assertEqual(
@@ -944,8 +1056,14 @@ class DetectionTests(_DbTestCase):
         ):
             self.assertTrue(await service._expire_lockdown(-100, deadline))
 
-        bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
+        bot.send_message.assert_not_awaited()
+        bot.edit_message_text.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            text=build_raid_unlock_text(),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
         async with self.session_factory() as session:
             group = await session.get(Group, -100)
             self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)

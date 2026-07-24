@@ -12,8 +12,9 @@ lockdown:
   runs for a fixed duration: repelled joins do not extend it (a single
   bouncing account must not be able to lock the group forever), and a raid
   that outlasts it simply re-triggers on the next threshold of joins.
-  Trigger and recovery notices are persistent. A per-lockdown timer announces
-  recovery even when no later member joins to drive another event.
+  One persistent status message is created for the lockdown and updated in
+  place on recovery. A per-lockdown timer updates it even when no later member
+  joins to drive another event.
 - Members who joined within the lookback window before the trigger (the raid
   wave plus the accounts smuggled in just ahead of it) are fully muted and
   challenged: one message per chunk @-mentions them with a shared "真人质询"
@@ -25,7 +26,7 @@ lockdown:
 Automatically detected lockdowns are intentionally in-memory only. Manual
 lockdowns are persisted in ``Group.settings`` so both indefinite and timed
 administrator locks survive a restart; startup restores their timers and
-atomically claims expired records before announcing recovery. Issued
+atomically claims expired records before updating their status message. Issued
 challenges live in join_verifications and stay enforced by the deadline
 sweeper. When the verification service is unavailable the lockdown still
 protects the group, but no challenges are issued (muting members with no
@@ -110,6 +111,9 @@ _MAX_TRACKED_JOINS = 4096
 # Shared raid challenge callback used by administrators to remove every still
 # pending suspect mentioned by the clicked challenge message.
 RAID_REMOVE_CALLBACK_DATA = "rgr"
+# The persistent raid-protection status message lets group administrators end
+# an active automatic or manual lockdown without typing a command.
+RAID_GUARD_DISABLE_CALLBACK_DATA = "rgd"
 # A command typo must not leave a group locked for an effectively unbounded
 # number of years. Indefinite manual lockdown is represented by no duration;
 # explicit minute values are capped at one week.
@@ -119,6 +123,7 @@ MAX_MANUAL_LOCKDOWN_MINUTES = 7 * 24 * 60
 # the group's other settings.
 MANUAL_LOCKDOWN_SETTINGS_KEY = "raid_guard_manual_lockdown"
 _MANUAL_LOCKDOWN_STATE_VERSION = 1
+_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY = "status_message_id"
 _PERSISTENCE_RETRIES = 5
 _PERSISTENCE_ANY = object()
 _PERSISTENCE_DELETE = object()
@@ -472,24 +477,24 @@ def build_raid_lockdown_text(
             f"检测到 {_format_duration(window_seconds)}内有 {joined_count} 名成员加入，"
             "已临时锁定新成员入口。"
         ),
+        emphasis=f"<b>锁定时长：{_format_duration(lockdown_seconds)}。</b>",
         details=(
             "疑似遭遇批量爆破。\n"
-            f"锁定时长：{_format_duration(lockdown_seconds)}。期间新加入的成员"
-            "会被自动移出（不封禁，解除后可重新加入）。"
+            "期间新加入的成员会被自动移出（不封禁，解除后可重新加入）。"
         ),
     )
 
 
 def build_manual_raid_lockdown_text(*, duration_minutes: int | None) -> str:
     if duration_minutes is None:
-        duration_text = "锁定时长：直到管理员手动关闭。"
+        duration_text = "锁定将持续到管理员手动解除。"
     else:
         duration_text = f"锁定时长：{_format_duration(duration_minutes * 60)}。"
     return render_summary_notice(
         "爆破防护 · 已开启",
         "已手动锁定新成员入口。",
+        emphasis=f"<b>{duration_text}</b>",
         details=(
-            f"{duration_text}\n"
             "期间新加入的成员会被自动移出（不封禁，解除后可重新加入）。"
         ),
     )
@@ -500,6 +505,19 @@ def build_raid_unlock_text() -> str:
         "爆破防护 · 已解除",
         "群组已恢复接收新成员。",
         details="此前被临时移出的用户现在可以重新加入。",
+    )
+
+
+def build_raid_lockdown_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="解除爆破防护",
+                    callback_data=RAID_GUARD_DISABLE_CALLBACK_DATA,
+                )
+            ]
+        ]
     )
 
 
@@ -524,20 +542,42 @@ def normalize_manual_lockdown_minutes(value: object | None) -> int | None:
     return minutes
 
 
-def _manual_lockdown_state(until: datetime | None) -> dict[str, object]:
+def _manual_lockdown_state(
+    until: datetime | None,
+    *,
+    status_message_id: int | None = None,
+) -> dict[str, object]:
     """Return the canonical JSON document stored for one manual lockdown."""
+    state: dict[str, object]
     if until is None:
-        return {
+        state = {
             "version": _MANUAL_LOCKDOWN_STATE_VERSION,
             "indefinite": True,
         }
-    return {
-        "version": _MANUAL_LOCKDOWN_STATE_VERSION,
-        # Include the UTC offset so the deadline remains unambiguous if the
-        # host timezone changes. Runtime comparisons still use the project's
-        # Asia/Shanghai-naive convention.
-        "until": to_shanghai_datetime(until).isoformat(),
-    }
+    else:
+        state = {
+            "version": _MANUAL_LOCKDOWN_STATE_VERSION,
+            # Include the UTC offset so the deadline remains unambiguous if the
+            # host timezone changes. Runtime comparisons still use the project's
+            # Asia/Shanghai-naive convention.
+            "until": to_shanghai_datetime(until).isoformat(),
+        }
+    if status_message_id is not None and int(status_message_id) > 0:
+        state[_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY] = int(status_message_id)
+    return state
+
+
+def _manual_lockdown_status_message_id(value: object) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    raw_message_id = value.get(_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY)
+    if isinstance(raw_message_id, bool):
+        return None
+    try:
+        message_id = int(raw_message_id)
+    except (TypeError, ValueError):
+        return None
+    return message_id if message_id > 0 else None
 
 
 def _parse_manual_lockdown_state(value: object) -> datetime | None | object:
@@ -579,8 +619,8 @@ def build_raid_challenge_text(
         current="已暂时限制相关成员发言",
         next_step="完成人机验证后自动恢复权限",
         action=(
-            f"请被点名成员在 {_format_duration(timeout_seconds)} 内"
-            "点击下方「真人质询」按钮。"
+            "请被点名成员点击下方「真人质询」按钮。\n"
+            f"<b>请在 {_format_duration(timeout_seconds)} 内完成。</b>"
         ),
         details=details,
     )
@@ -931,9 +971,13 @@ class RaidGuardService:
         self._lockdown_timers: dict[int, asyncio.TimerHandle] = {}
         self._lockdown_expiry_tasks: dict[int, asyncio.Task[bool]] = {}
         self._unlock_notice_tasks: dict[int, asyncio.Task[None]] = {}
+        # One status message represents one protection lifecycle. Its ID is
+        # retained in the manual state as well, so an unlock after restart can
+        # still retire the same message instead of posting a second notice.
+        self._status_message_ids: dict[int, int] = {}
         # Exact raw JSON values are retained so expiry/disable can use an
         # optimistic compare-and-delete. Only the process that removes the
-        # matching record emits the recovery notice.
+        # matching record updates the terminal state.
         self._manual_persisted_state: dict[int, dict[str, object]] = {}
         self._manual_state_locks: dict[int, asyncio.Lock] = {}
 
@@ -984,7 +1028,11 @@ class RaidGuardService:
         self._lockdown_until[group_id] = until
         self._lockdown_source[group_id] = str(source or "automatic")
         if source == "manual" and persisted_state is not None:
-            self._manual_persisted_state[group_id] = dict(persisted_state)
+            persisted = dict(persisted_state)
+            self._manual_persisted_state[group_id] = persisted
+            status_message_id = _manual_lockdown_status_message_id(persisted)
+            if status_message_id is not None:
+                self._status_message_ids[group_id] = status_message_id
         elif source != "manual":
             self._manual_persisted_state.pop(group_id, None)
         if until is not None and schedule_expiry:
@@ -1210,21 +1258,149 @@ class RaidGuardService:
         self._manual_persisted_state.pop(group_id, None)
         return self._lockdown_source.pop(group_id, "automatic")
 
-    async def _send_unlock_notice(self, group_id: int, *, source: str) -> None:
+    async def _publish_lockdown_status(
+        self,
+        group_id: int,
+        text: str,
+    ) -> int | None:
+        """Create or refresh the one visible status message for a lockdown."""
+        group_id = int(group_id)
+        message_id = self._status_message_ids.get(group_id)
+        keyboard = build_raid_lockdown_keyboard()
+        if message_id is not None:
+            try:
+                await _bounded_notice_call(
+                    self.bot.edit_message_text(
+                        chat_id=group_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    ),
+                    timeout_seconds=10.0,
+                )
+                return message_id
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The original notice may have been deleted or aged out of
+                # Telegram's edit window. A fresh active status is preferable
+                # to leaving the group with no visible way to release it.
+                if self._status_message_ids.get(group_id) == message_id:
+                    self._status_message_ids.pop(group_id, None)
+                log.warning(
+                    "[%s] raid status update failed; replacing message",
+                    group_id,
+                    exc_info=True,
+                )
+
         try:
-            # Protection state notices are intentionally persistent and do
-            # not participate in any general moderation auto-delete policy.
-            await _bounded_notice_call(
+            sent = await _bounded_notice_call(
                 self.bot.send_message(
-                    int(group_id),
-                    build_raid_unlock_text(),
+                    group_id,
+                    text,
                     parse_mode="HTML",
+                    reply_markup=keyboard,
                 ),
                 timeout_seconds=10.0,
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("[%s] raid lockdown status delivery failed", group_id)
+            return None
+        message_id = int(getattr(sent, "message_id", 0) or 0)
+        if message_id > 0:
+            self._status_message_ids[group_id] = message_id
+            return message_id
+        log.warning("[%s] raid lockdown status has no message ID", group_id)
+        return None
+
+    async def _remember_manual_status_message(
+        self,
+        group_id: int,
+        message_id: int | None,
+    ) -> None:
+        """Persist a manual lockdown's status ID for post-restart updates."""
+        if message_id is None or int(message_id) <= 0:
+            return
+        group_id = int(group_id)
+        message_id = int(message_id)
+        async with self._manual_state_lock(group_id):
+            if self._lockdown_source.get(group_id) != "manual":
+                return
+            persisted = self._manual_persisted_state.get(group_id)
+            if persisted is None:
+                return
+            if _manual_lockdown_status_message_id(persisted) == message_id:
+                return
+            updated = dict(persisted)
+            updated[_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY] = message_id
+            try:
+                saved = await self._update_persisted_manual_state(
+                    group_id,
+                    value=updated,
+                    expected=persisted,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "[%s] manual raid status message persistence failed",
+                    group_id,
+                )
+                return
+            if saved:
+                self._manual_persisted_state[group_id] = updated
+            elif saved is None:
+                log.warning(
+                    "[%s] manual raid status message persistence lost races",
+                    group_id,
+                )
+
+    async def _send_unlock_notice(
+        self,
+        group_id: int,
+        *,
+        source: str,
+        expected_message_id: int | None = None,
+    ) -> None:
+        """Retire the current status message without sending a second notice."""
+        group_id = int(group_id)
+        if expected_message_id is not None:
+            if (
+                group_id in self._lockdown_until
+                or self._status_message_ids.get(group_id) != expected_message_id
+            ):
+                return
+        message_id = self._status_message_ids.pop(group_id, None)
+        if message_id is None:
+            log.debug(
+                "[%s] raid unlock status has no tracked message | source=%s",
+                group_id,
+                source,
+            )
+            return
+        try:
+            # Protection state notices are intentionally persistent and do not
+            # participate in any general moderation auto-delete policy.
+            await _bounded_notice_call(
+                self.bot.edit_message_text(
+                    chat_id=group_id,
+                    message_id=message_id,
+                    text=build_raid_unlock_text(),
+                    parse_mode="HTML",
+                    reply_markup=None,
+                ),
+                timeout_seconds=10.0,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception(
-                "[%s] raid unlock notice failed | source=%s", group_id, source
+                "[%s] raid unlock status update failed | source=%s",
+                group_id,
+                source,
             )
 
     def _schedule_unlock_notice(self, group_id: int, *, source: str) -> None:
@@ -1232,9 +1408,16 @@ class RaidGuardService:
         existing = self._unlock_notice_tasks.get(group_id)
         if existing is not None and not existing.done():
             return
+        message_id = self._status_message_ids.get(group_id)
+        if message_id is None:
+            return
         try:
             task = asyncio.get_running_loop().create_task(
-                self._send_unlock_notice(group_id, source=source),
+                self._send_unlock_notice(
+                    group_id,
+                    source=source,
+                    expected_message_id=message_id,
+                ),
                 name=f"raid-unlock-notice:{group_id}",
             )
         except RuntimeError:
@@ -1387,19 +1570,11 @@ class RaidGuardService:
                 persisted_state=persisted,
             )
             self._recent_joins.pop(group_id, None)
-        try:
-            # Manual state notices, like automatic trigger/unlock notices, are
-            # persistent by design.
-            await _bounded_notice_call(
-                self.bot.send_message(
-                    group_id,
-                    build_manual_raid_lockdown_text(duration_minutes=minutes),
-                    parse_mode="HTML",
-                ),
-                timeout_seconds=10.0,
-            )
-        except Exception:
-            log.exception("[%s] manual raid lockdown notice failed", group_id)
+        status_message_id = await self._publish_lockdown_status(
+            group_id,
+            build_manual_raid_lockdown_text(duration_minutes=minutes),
+        )
+        await self._remember_manual_status_message(group_id, status_message_id)
         return until
 
     async def disable_manual_lockdown(self, group_id: int) -> bool:
@@ -1437,6 +1612,18 @@ class RaidGuardService:
             and self._lockdown_source.get(int(group_id)) == "manual"
         )
 
+    def lockdown_status_message_matches(self, group_id: int, message_id: int) -> bool:
+        """Whether an inline action belongs to the currently active status."""
+        try:
+            group_id = int(group_id)
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            self.lockdown_active(group_id)
+            and self._status_message_ids.get(group_id) == message_id
+        )
+
     def lockdown_status(self, group_id: int) -> dict[str, object]:
         """Current in-memory state for commands and Mini App status hints."""
         group_id = int(group_id)
@@ -1462,6 +1649,7 @@ class RaidGuardService:
             self._recent_joins.clear()
             self._lockdown_until.clear()
             self._lockdown_source.clear()
+            self._status_message_ids.clear()
             self._manual_persisted_state.clear()
             self._manual_state_locks.clear()
             return
@@ -1475,6 +1663,7 @@ class RaidGuardService:
         self._recent_joins.pop(int(group_id), None)
         self._lockdown_until.pop(int(group_id), None)
         self._lockdown_source.pop(int(group_id), None)
+        self._status_message_ids.pop(int(group_id), None)
         self._manual_persisted_state.pop(int(group_id), None)
         self._manual_state_locks.pop(int(group_id), None)
 
@@ -1843,22 +2032,14 @@ class RaidGuardService:
     ) -> list[RaidSuspect]:
         if not await self._group_authorized(group_id):
             return []
-        try:
-            await _bounded_notice_call(
-                self.bot.send_message(
-                    group_id,
-                    build_raid_lockdown_text(
-                        joined_count=config.join_threshold,
-                        window_seconds=config.window_seconds,
-                        lockdown_seconds=config.lockdown_seconds,
-                    ),
-                    parse_mode="HTML",
-                ),
-                timeout_seconds=10.0,
-            )
-        except Exception:
-            # The lockdown itself still protects the group.
-            log.exception("[%s] raid lockdown notice failed", group_id)
+        await self._publish_lockdown_status(
+            group_id,
+            build_raid_lockdown_text(
+                joined_count=config.join_threshold,
+                window_seconds=config.window_seconds,
+                lockdown_seconds=config.lockdown_seconds,
+            ),
+        )
 
         provider = verification_provider(self.settings)
         if not verification_service_ready(self.settings, provider):

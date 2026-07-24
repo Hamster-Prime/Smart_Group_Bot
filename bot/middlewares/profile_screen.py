@@ -499,10 +499,8 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                     "处理结果",
                     f"已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）",
                 ),
-                details=[
-                    card_field("原因", html.escape(reason or "资料命中群规")),
-                    "如需解封，请管理员使用 <code>/unban</code> 命令。",
-                ],
+                emphasis="如需解封，请管理员使用 <code>/unban</code> 命令。",
+                details=[card_field("原因", html.escape(reason or "资料命中群规"))],
             )
             try:
                 await answer_with_auto_delete(

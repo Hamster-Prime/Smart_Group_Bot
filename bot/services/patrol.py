@@ -455,8 +455,8 @@ def _mention(violator: PatrolViolator) -> str:
 def _format_timeout(timeout_seconds: int) -> str:
     seconds = max(1, int(timeout_seconds))
     if seconds % 60 == 0:
-        return f"{seconds // 60} 分钟"
-    return f"{seconds} 秒"
+        return f"<b>{seconds // 60} 分钟</b>"
+    return f"<b>{seconds} 秒</b>"
 
 
 def build_patrol_warning_text(

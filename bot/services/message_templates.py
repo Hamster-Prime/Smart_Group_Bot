@@ -387,19 +387,28 @@ def render_summary_notice(
     title: str,
     summary: object | None = None,
     *,
+    context: object | None = None,
+    emphasis: object | None = None,
     details: object | None = None,
 ) -> str:
-    """Render a concise notice with optional expandable supporting detail.
+    """Render a concise notice with separated context and supporting detail.
 
     This is intended for moderation, voting, raid, and escalation notices:
-    the group-visible outcome remains immediately readable while evidence,
-    rationale, and follow-up policy can be collapsed below it. ``summary``
-    and ``details`` are pre-rendered safe Telegram HTML.
+    the group-visible outcome remains immediately readable while actor/context
+    can occupy its own normal quote, an urgent deadline/action stays visible
+    outside quotes, and evidence or policy can be collapsed below it. All
+    non-title arguments are pre-rendered safe Telegram HTML.
     """
     parts = [f"<b>{html.escape(str(title))}</b>"]
     summary_text = _coerce_html_body(summary)
     if summary_text:
         parts.append(f"<blockquote>{summary_text}</blockquote>")
+    context_text = _coerce_html_body(context)
+    if context_text:
+        parts.append(f"<blockquote>{context_text}</blockquote>")
+    emphasis_text = _coerce_html_body(emphasis)
+    if emphasis_text:
+        parts.append(emphasis_text)
     detail_text = render_expandable_blockquote(details)
     if detail_text:
         parts.append(detail_text)
@@ -412,6 +421,7 @@ def render_progress_notice(
     completed: object | None = None,
     current: object | None = None,
     next_step: object | None = None,
+    context: object | None = None,
     action: object | None = None,
     details: object | None = None,
 ) -> str:
@@ -419,9 +429,10 @@ def render_progress_notice(
 
     ``completed`` accepts one line or an iterable of lines and is rendered
     with strikethrough. ``current`` and ``next_step`` become stable field
-    rows in the progress quote. ``action`` stays outside the quote so the
-    member's next action remains prominent. All non-title arguments are
-    pre-rendered safe Telegram HTML, allowing links and code entities.
+    rows in the progress quote. ``context`` is rendered as a separate normal
+    quote for target/scope/request metadata. ``action`` stays outside quotes
+    so the member's next action remains prominent. All non-title arguments
+    are pre-rendered safe Telegram HTML, allowing links and code entities.
     """
     progress_lines: list[str] = []
     completed_text = _coerce_html_body(completed)
@@ -441,6 +452,9 @@ def render_progress_notice(
     parts = [f"<b>{html.escape(str(title))}</b>"]
     if progress_lines:
         parts.append(f"<blockquote>{'\n'.join(progress_lines)}</blockquote>")
+    context_text = _coerce_html_body(context)
+    if context_text:
+        parts.append(f"<blockquote>{context_text}</blockquote>")
     action_text = _coerce_html_body(action)
     if action_text:
         parts.append(action_text)

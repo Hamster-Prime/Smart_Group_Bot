@@ -30,7 +30,11 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
-from bot.services.message_templates import card_field, render_summary_notice
+from bot.services.message_templates import (
+    card_field,
+    render_expandable_blockquote,
+    render_summary_notice,
+)
 from bot.services.join_verification import (
     UnbanRecovery,
     ban_member,
@@ -64,10 +68,12 @@ VOTE_BAN_TRIGGER_WINDOW_KEY = "vote_ban_trigger_window_seconds"
 # combined worst-case duration; otherwise a recovery worker can take over and
 # publish a competing failure while the original ban is still completing.
 VOTE_BAN_ENFORCEMENT_LEASE_SECONDS = 180
+VOTE_BAN_COUNTDOWN_REFRESH_SECONDS = 60
 
 _expiry_tasks: dict[int, asyncio.Task] = {}
 _enforcement_tasks: dict[int, asyncio.Task] = {}
 _start_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_vote_message_edit_locks: dict[int, asyncio.Lock] = {}
 
 
 def _consume_vote_task_result(task: asyncio.Task[Any]) -> None:
@@ -118,6 +124,9 @@ async def flush_vote_ban_tasks(*, timeout_seconds: float = 15.0) -> None:
         for session_id, task in tuple(registry.items()):
             if task.done() and registry.get(session_id) is task:
                 registry.pop(session_id, None)
+    for session_id, lock in tuple(_vote_message_edit_locks.items()):
+        if not lock.locked():
+            _vote_message_edit_locks.pop(session_id, None)
 
 
 @dataclass(slots=True)
@@ -271,30 +280,107 @@ def _remaining_seconds(record: VoteBanSession) -> int:
     return max(0, int(delta.total_seconds()))
 
 
+def _format_countdown_duration(seconds: int) -> str:
+    """Emphasize a countdown value while preserving the readable unit."""
+    duration = _format_duration(seconds)
+    value, separator, unit = duration.partition(" ")
+    if not separator or not value.isdigit():
+        return f"<b>{html.escape(duration)}</b>"
+    return f"<b><i>{value}</i>{separator}{html.escape(unit)}</b>"
+
+
 def build_vote_text(record: VoteBanSession, *, approvals: int) -> str:
+    # The live vote total belongs on the button. Keeping the body stable makes
+    # the countdown the only regular edit and leaves the prompt easier to scan.
+    del approvals
     summary = [
         card_field("目标", _mention(record.target_user_id, record.target_display)),
-        card_field("当前票数", f"<code>{approvals}/{record.threshold}</code>"),
-    ]
-    details = [
-        card_field("发起人", _mention(record.starter_user_id, record.starter_display)),
     ]
     reason = str(record.reason or "").strip()
     evidence = str(record.evidence or "").strip()
+    if evidence:
+        summary.append(card_field("被举报消息", html.escape(_break_user_mentions(evidence[:300]))))
+
+    initiator = card_field(
+        "发起人",
+        _mention(record.starter_user_id, record.starter_display),
+    )
+    details: list[str] = []
     if reason:
         details.append(card_field("举报理由", html.escape(_break_user_mentions(reason[:300]))))
-    if evidence:
-        details.append(card_field("被举报消息", html.escape(_break_user_mentions(evidence[:300]))))
-    details.append(
-        f"达到 {record.threshold} 票后立即封禁；"
-        f"投票 {_format_duration(_remaining_seconds(record))} 后自动失效。"
-    )
+    details.append(f"达到 {record.threshold} 票后立即封禁。")
     details.append("管理员可使用下方按钮取消投票或直接封禁。")
-    return render_summary_notice(
-        "民主投票封禁 · 进行中",
-        summary,
-        details=details,
+    timer = (
+        "投票 "
+        f"{_format_countdown_duration(_remaining_seconds(record))} "
+        "后自动失效。"
     )
+    summary_text = "\n".join(summary)
+    return "\n\n".join(
+        part
+        for part in (
+            "<b>民主投票封禁 · 进行中</b>",
+            f"<blockquote>{summary_text}</blockquote>",
+            f"<blockquote>{initiator}</blockquote>",
+            render_expandable_blockquote(details),
+            timer,
+        )
+        if part
+    )
+
+
+def _vote_message_edit_lock(session_id: int) -> asyncio.Lock:
+    """Return the in-process lock shared by live and timer message edits."""
+    if len(_vote_message_edit_locks) > 4096:
+        for key, lock in tuple(_vote_message_edit_locks.items()):
+            if not lock.locked():
+                _vote_message_edit_locks.pop(key, None)
+            if len(_vote_message_edit_locks) <= 2048:
+                break
+    return _vote_message_edit_locks.setdefault(int(session_id), asyncio.Lock())
+
+
+async def _edit_vote_message_unlocked(
+    bot: Bot,
+    *,
+    group_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> Any:
+    return await bot.edit_message_text(
+        chat_id=int(group_id),
+        message_id=int(message_id),
+        text=text,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+
+
+async def edit_vote_message(
+    bot: Bot,
+    *,
+    session_id: int,
+    group_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> Any:
+    """Serialize all in-process edits for one vote prompt.
+
+    The ticker and callback handlers can both edit the same Telegram message.
+    A shared lock makes the durable state transition decide their output order:
+    a callback that has recorded a newer vote or terminal status always writes
+    after an already-running timer refresh.
+    """
+    async with _vote_message_edit_lock(int(session_id)):
+        return await _edit_vote_message_unlocked(
+            bot,
+            group_id=group_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
 
 
 def build_vote_keyboard(session_id: int, approvals: int, threshold: int) -> InlineKeyboardMarkup:
@@ -1356,7 +1442,7 @@ async def recover_stale_vote_enforcement(
     return str(fresh.status)
 
 
-async def finalize_vote_message(
+async def _finalize_vote_message_unlocked(
     bot: Bot,
     settings: Settings,
     record: VoteBanSession,
@@ -1372,15 +1458,15 @@ async def finalize_vote_message(
         card_field("处理结果", outcome_line),
     ]
     try:
-        edited = await bot.edit_message_text(
-            chat_id=int(record.group_id),
+        edited = await _edit_vote_message_unlocked(
+            bot,
+            group_id=int(record.group_id),
             message_id=int(record.message_id),
             text=render_summary_notice(
                 "民主投票封禁 · 已结束",
                 summary,
                 details="投票已关闭，不能再提交票数。",
             ),
-            parse_mode="HTML",
             reply_markup=None,
         )
         await schedule_message_auto_delete_durable(
@@ -1396,6 +1482,97 @@ async def finalize_vote_message(
         )
 
 
+async def finalize_vote_message(
+    bot: Bot,
+    settings: Settings,
+    record: VoteBanSession,
+    *,
+    outcome_line: str,
+    approvals: int,
+) -> None:
+    """Render a terminal vote result after any in-flight live edit."""
+    async with _vote_message_edit_lock(int(record.id)):
+        await _finalize_vote_message_unlocked(
+            bot,
+            settings,
+            record,
+            outcome_line=outcome_line,
+            approvals=approvals,
+        )
+
+
+async def _refresh_active_vote_message(
+    *,
+    session_factory: Any,
+    bot: Bot,
+    settings: Settings,
+    session_id: int,
+) -> float | None:
+    """Refresh the active prompt and return its remaining lifetime.
+
+    The vote callback commits its ballot before it takes the same message lock.
+    Therefore a timer that started with an older count writes first, and the
+    newer callback follows it; a terminal callback likewise follows with the
+    closed result instead of being overwritten by a timer edit.
+    """
+    session_id = int(session_id)
+    async with _vote_message_edit_lock(session_id):
+        async with session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            if record is None or record.status != "active":
+                await session.commit()
+                return None
+
+            remaining = _remaining_seconds(record)
+            if remaining <= 0:
+                if not await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="expired",
+                ):
+                    await session.rollback()
+                    return None
+                approvals = await count_approvals(session, session_id)
+                await session.commit()
+                await _finalize_vote_message_unlocked(
+                    bot,
+                    settings,
+                    record,
+                    outcome_line="投票超时，未达到封禁票数",
+                    approvals=approvals,
+                )
+                return None
+
+            approvals = await count_approvals(session, session_id)
+            await session.commit()
+
+        if not int(record.message_id or 0):
+            return float(remaining)
+        try:
+            await _edit_vote_message_unlocked(
+                bot,
+                group_id=int(record.group_id),
+                message_id=int(record.message_id),
+                text=build_vote_text(record, approvals=approvals),
+                reply_markup=build_vote_keyboard(
+                    session_id,
+                    approvals,
+                    int(record.threshold),
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug(
+                "vote countdown refresh failed | group=%s session=%s",
+                record.group_id,
+                session_id,
+                exc_info=True,
+            )
+        return float(remaining)
+
+
 def schedule_vote_expiry(
     *,
     session_factory: Any,
@@ -1409,27 +1586,31 @@ def schedule_vote_expiry(
         existing.cancel()
 
     async def _expire() -> None:
-        await asyncio.sleep(max(1, int(delay_seconds)))
+        remaining = max(0.01, float(delay_seconds))
+        refresh_interval = max(0.01, float(VOTE_BAN_COUNTDOWN_REFRESH_SECONDS))
         try:
-            async with session_factory() as session:
-                record = await session.get(VoteBanSession, int(session_id))
-                if record is None or record.status != "active":
+            while True:
+                await asyncio.sleep(min(refresh_interval, remaining))
+                try:
+                    remaining = await _refresh_active_vote_message(
+                        session_factory=session_factory,
+                        bot=bot,
+                        settings=settings,
+                        session_id=int(session_id),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A short database/Telegram outage should not permanently
+                    # drop the expiration timer. Retry on the next refresh.
+                    log.exception("vote countdown refresh failed | session=%s", session_id)
+                    remaining = refresh_interval
+                    continue
+                if remaining is None:
                     return
-                if not await claim_session_status(
-                    session, session_id, expected="active", new_status="expired"
-                ):
-                    return
-                approvals = await count_approvals(session, session_id)
-                await session.commit()
-            await finalize_vote_message(
-                bot,
-                settings,
-                record,
-                outcome_line="投票超时，未达到封禁票数",
-                approvals=approvals,
-            )
-        except Exception:
-            log.exception("vote expiry failed | session=%s", session_id)
+                remaining = max(0.01, float(remaining))
+        except asyncio.CancelledError:
+            raise
         finally:
             current = asyncio.current_task()
             if _expiry_tasks.get(int(session_id)) is current:
@@ -1445,7 +1626,11 @@ def schedule_vote_expiry(
 
 def cancel_vote_expiry(session_id: int) -> None:
     task = _expiry_tasks.pop(int(session_id), None)
-    if task is not None and not task.done():
+    if (
+        task is not None
+        and task is not asyncio.current_task()
+        and not task.done()
+    ):
         task.cancel()
 
 
