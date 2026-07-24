@@ -7,7 +7,7 @@ from bot.utils.security import (
     wrap_untrusted,
     wrap_untrusted_multiline,
 )
-from bot.utils.telegram import sanitize_outgoing_text
+from bot.utils.telegram import sanitize_outgoing_mentions, sanitize_outgoing_text
 
 
 class SecurityUtilsTests(unittest.TestCase):
@@ -140,6 +140,19 @@ class SecurityUtilsTests(unittest.TestCase):
         cleaned = sanitize_outgoing_text(source)
 
         self.assertEqual(cleaned, "感恩你")
+
+    def test_sanitize_mentions_preserves_html_attributes_and_cleans_visible_text(self) -> None:
+        source = (
+            '<a href="https://example.com/search?q=@alice">@alice result</a> '
+            "outside @helper"
+        )
+
+        cleaned = sanitize_outgoing_mentions(source)
+
+        self.assertIn('href="https://example.com/search?q=@alice"', cleaned)
+        self.assertIn(">@\u200balice result</a>", cleaned)
+        self.assertIn("<code>@\u200bhelper</code>", cleaned)
+        self.assertNotIn('href="https://example.com/search?q=<code>', cleaned)
 
 
 if __name__ == "__main__":

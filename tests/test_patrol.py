@@ -1,5 +1,7 @@
 import asyncio
+import html
 import os
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -309,6 +311,9 @@ class WarningMessageTests(unittest.TestCase):
             PatrolViolator(user_id=2, full_name="", username="spam_guy", reason="简介违规"),
         ]
         text = build_patrol_warning_text(violators, timeout_seconds=600)
+        self.assertIn("<b>资料巡检 · 需要验证</b>", text)
+        self.assertIn("<s>已完成资料巡检</s>", text)
+        self.assertIn("<blockquote expandable>", text)
         self.assertIn('tg://user?id=1', text)
         self.assertIn("张三", text)
         self.assertIn("@spam_guy", text)
@@ -316,6 +321,24 @@ class WarningMessageTests(unittest.TestCase):
         self.assertIn("10 分钟", text)
         self.assertIn("真人质询", text)
         self.assertIn("不会封禁", text)
+
+    def test_warning_long_batch_stays_within_telegram_limit_without_duplicates(self) -> None:
+        violators = [
+            PatrolViolator(
+                user_id=index,
+                full_name="😀" * 128,
+                username="",
+                reason="🚫" * 80,
+            )
+            for index in range(1, 9)
+        ]
+
+        text = build_patrol_warning_text(violators, timeout_seconds=600)
+        visible = html.unescape(re.sub(r"<[^>]+>", "", text))
+
+        self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, 4096)
+        for violator in violators:
+            self.assertEqual(text.count(f"tg://user?id={violator.user_id}"), 1)
 
     def test_challenge_keyboard_uses_shared_callback(self) -> None:
         keyboard = build_patrol_challenge_keyboard()
@@ -437,7 +460,7 @@ class PatrolScanTests(_DbTestCase):
         bot.send_message.assert_awaited_once()
         sent_text = bot.send_message.await_args.args[1]
         self.assertIn("@ad_guy", sent_text)
-        self.assertIn("资料巡检警告", sent_text)
+        self.assertIn("资料巡检 · 需要验证", sent_text)
         keyboard = bot.send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(
             keyboard.inline_keyboard[0][0].callback_data, PATROL_VERIFY_CALLBACK_DATA

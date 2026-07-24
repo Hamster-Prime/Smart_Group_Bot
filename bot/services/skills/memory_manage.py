@@ -5,6 +5,7 @@ import re
 
 from bot.services import memory_holder
 from bot.services.manage_intent import GroupIntentService
+from bot.services.message_templates import render_data_brief, truncate_telegram_text
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
 
@@ -42,25 +43,31 @@ class MemoryManageSkill:
     @staticmethod
     def _format_memory_list(items: list[object]) -> str:
         if not items:
-            return "<b>永久记忆</b>\n当前为空。\n\n删除请使用 /lm 打开列表后点按钮。"
+            return render_data_brief(
+                "永久记忆",
+                empty="当前没有保存的永久记忆。",
+                footer="删除请使用 <code>/lm</code> 打开列表后点按钮。",
+            )
 
-        lines = [
-            "<b>永久记忆</b>",
-            f"共 {len(items)} 条",
-            "",
-        ]
-        for item in items[:20]:
-            content = html.escape(_truncate_text(str(getattr(item, "content", "") or ""), 140))
-            lines.append(f"#{getattr(item, 'id', 0)} {content}")
+        lines: list[str] = []
+        for index, item in enumerate(items[:20], start=1):
+            content = html.escape(
+                truncate_telegram_text(
+                    str(getattr(item, "content", "") or "").replace("\n", " ").strip(),
+                    140,
+                )
+            )
+            lines.append(
+                f"<b>{index}.</b> <code>#{getattr(item, 'id', 0)}</code>　{content}"
+            )
         if len(items) > 20:
             lines.append(f"... 其余 {len(items) - 20} 条请使用 /lm 查看")
-        lines.extend(
-            [
-                "",
-                "删除请使用 /lm 打开列表后点按钮。",
-            ]
+        return render_data_brief(
+            "永久记忆",
+            metadata={"总数": f"<code>{len(items)}</code> 条"},
+            items=lines,
+            footer="删除请使用 <code>/lm</code> 打开列表后点按钮。",
         )
-        return "\n".join(lines).rstrip()
 
     async def run(self, arguments: dict, context: SkillContext) -> SkillRunResult:
         if context.llm is None:

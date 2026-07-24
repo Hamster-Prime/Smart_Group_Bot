@@ -112,7 +112,7 @@ from bot.services.bot_screening import (
 )
 from bot.services.keyword_reply import find_keyword_reply, send_keyword_reply
 from bot.services.member_identity import member_display_name
-from bot.services.message_templates import card_field, render_notice_card
+from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
 from bot.services.reply_mode import ReplyModeService
@@ -585,6 +585,7 @@ def _build_moderation_notice(
     count: int | None = None,
     threshold: int | None = None,
     should_ban: bool = False,
+    failure_note: str = "",
 ) -> str:
     rule_type_labels = {
         "keyword": "关键词",
@@ -594,14 +595,14 @@ def _build_moderation_notice(
     reason_text = html.escape((reason or "命中群审核规则（AI判定）").strip())
     action_norm = (hit_action or "").strip().lower()
 
-    title = "AI审查警告"
+    title = "内容审核 · 已警告"
     action_result = "已发出警告"
     show_warning_count = False
     if action_norm == "delete":
-        title = "AI审查删除"
+        title = "内容审核 · 已删除"
         action_result = "已删除违规消息"
     elif action_norm == "ban":
-        title = "AI审查自动封禁" if should_ban else "AI审查警告"
+        title = "内容审核 · 已封禁" if should_ban else "内容审核 · 已处理"
         action_result = "已删除违规消息并封禁用户" if should_ban else "已删除违规消息并发出警告"
         show_warning_count = True
 
@@ -615,17 +616,23 @@ def _build_moderation_notice(
     else:
         rule_ref = "未定位具体规则（AI语义判定）"
 
-    body = [card_field("用户", warn_target)]
+    summary = [
+        card_field("用户", warn_target),
+        card_field("处理结果", action_result),
+    ]
+    details: list[str] = []
     if show_warning_count and count is not None and threshold is not None:
-        body.append(card_field("警告次数", f"{count}/{threshold}"))
-    body.extend(
+        details.append(card_field("警告次数", f"<code>{count}/{threshold}</code>"))
+    details.extend(
         [
             card_field("原因", reason_text),
             card_field("依据规则", rule_ref),
-            card_field("处理结果", action_result),
         ]
     )
-    return render_notice_card(title, body)
+    clean_failure_note = str(failure_note or "").strip()
+    if clean_failure_note:
+        details.append(html.escape(clean_failure_note))
+    return render_summary_notice(title, summary, details=details)
 
 
 _MODERATION_OUTCOME_LABELS = {
@@ -1018,9 +1025,12 @@ async def _screen_bot_sender_message(
                 rule=rule,
                 hit_action="ban" if ban_enforced else "delete",
                 should_ban=ban_enforced,
+                failure_note=(
+                    "⚠️ Telegram 封禁该 bot 失败，请管理员手动处理。"
+                    if not ban_enforced and (ban_retryable or ban_terminal_failure)
+                    else ""
+                ),
             )
-            if not ban_enforced and (ban_retryable or ban_terminal_failure):
-                notice += "\n⚠️ Telegram 封禁该 bot 失败，请管理员手动处理。"
             await _send_moderation_notice_once_locked(
                 session=session,
                 violation=violation,
@@ -1069,7 +1079,8 @@ async def _screen_bot_sender_message(
         count=count,
         threshold=warn_threshold,
         should_ban=ban_enforced,
-    ) + ban_failure_note
+        failure_note=ban_failure_note,
+    )
     async with _moderation_user_lock(group_id, bot_id):
         await _send_moderation_notice_once_locked(
             session=session,
@@ -5472,7 +5483,8 @@ async def on_group_message(
                     count=count,
                     threshold=warn_threshold,
                     should_ban=ban_enforced,
-                ) + ban_failure_note
+                    failure_note=ban_failure_note,
+                )
                 async with _moderation_user_lock(group_id, user_id):
                     await _send_moderation_notice_once_locked(
                         session=session,

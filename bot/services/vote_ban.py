@@ -30,7 +30,7 @@ from bot.db.models import (
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.ban_audit import record_ban_event
 from bot.services.join_screening import is_globally_banned
-from bot.services.message_templates import card_field, render_notice_card
+from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.join_verification import (
     UnbanRecovery,
     ban_member,
@@ -161,6 +161,29 @@ class VoteBanStartResult:
     quota: VoteBanQuotaState | None = None
     sent_message_id: int = 0
 
+    @property
+    def telegram_text(self) -> str:
+        """Render command-facing failures without polluting skill summaries."""
+        if self.ok:
+            return self.summary
+
+        details = [card_field("原因", html.escape(self.summary))]
+        if self.quota is not None:
+            details.extend(
+                [
+                    card_field(
+                        "已用额度",
+                        f"<code>{self.quota.used} / {self.quota.limit}</code>",
+                    ),
+                    card_field("剩余额度", f"<code>{self.quota.remaining}</code>"),
+                ]
+            )
+        return render_summary_notice(
+            "民主投票封禁 · 未发起",
+            card_field("处理结果", "未创建投票"),
+            details=details,
+        )
+
     def payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "code": self.code,
@@ -249,23 +272,29 @@ def _remaining_seconds(record: VoteBanSession) -> int:
 
 
 def build_vote_text(record: VoteBanSession, *, approvals: int) -> str:
-    body = [
+    summary = [
         card_field("目标", _mention(record.target_user_id, record.target_display)),
+        card_field("当前票数", f"<code>{approvals}/{record.threshold}</code>"),
+    ]
+    details = [
         card_field("发起人", _mention(record.starter_user_id, record.starter_display)),
     ]
     reason = str(record.reason or "").strip()
     evidence = str(record.evidence or "").strip()
     if reason:
-        body.append(card_field("举报理由", html.escape(_break_user_mentions(reason[:300]))))
+        details.append(card_field("举报理由", html.escape(_break_user_mentions(reason[:300]))))
     if evidence:
-        body.append(card_field("被举报消息", html.escape(_break_user_mentions(evidence[:300]))))
-    body.append(card_field("票数", f"{approvals}/{record.threshold}"))
-    body.append(
+        details.append(card_field("被举报消息", html.escape(_break_user_mentions(evidence[:300]))))
+    details.append(
         f"达到 {record.threshold} 票后立即封禁；"
         f"投票 {_format_duration(_remaining_seconds(record))} 后自动失效。"
     )
-    body.append("管理员可使用下方按钮取消投票或直接封禁。")
-    return render_notice_card("民主投票封禁", body)
+    details.append("管理员可使用下方按钮取消投票或直接封禁。")
+    return render_summary_notice(
+        "民主投票封禁 · 进行中",
+        summary,
+        details=details,
+    )
 
 
 def build_vote_keyboard(session_id: int, approvals: int, threshold: int) -> InlineKeyboardMarkup:
@@ -1337,16 +1366,20 @@ async def finalize_vote_message(
 ) -> None:
     if not record.message_id:
         return
-    body = [
+    summary = [
         card_field("目标", _mention(record.target_user_id, record.target_display)),
-        card_field("票数", f"{approvals}/{record.threshold}"),
+        card_field("票数", f"<code>{approvals}/{record.threshold}</code>"),
         card_field("处理结果", outcome_line),
     ]
     try:
         edited = await bot.edit_message_text(
             chat_id=int(record.group_id),
             message_id=int(record.message_id),
-            text=render_notice_card("民主投票封禁", body),
+            text=render_summary_notice(
+                "民主投票封禁 · 已结束",
+                summary,
+                details="投票已关闭，不能再提交票数。",
+            ),
             parse_mode="HTML",
             reply_markup=None,
         )

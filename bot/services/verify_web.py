@@ -53,6 +53,7 @@ from bot.services.join_verification import (
     VERIFICATION_KIND_RAID,
     VERIFICATION_PROVIDERS,
     VERIFICATION_STATUS_RELEASING,
+    build_verification_progress_text,
     claim_join_verification,
     clear_turnstile_configuration_unavailable,
     close_private_challenge_message,
@@ -4495,7 +4496,12 @@ class VerifyWebServer:
             self.bot,
             user_id,
             private_message_id,
-            text="验证已通过，群内权限已恢复。",
+            text=build_verification_progress_text(
+                kind=kind,
+                status="已通过",
+                completed="已完成人机验证",
+                current="发言权限已恢复",
+            ),
         )
         if kind == VERIFICATION_KIND_PATROL:
             # Whitelist the passing profile so the next patrol run and the
@@ -4582,7 +4588,12 @@ class VerifyWebServer:
                     self.bot,
                     user_id,
                     private_message_id,
-                    text="验证已通过，群内权限已恢复。",
+                    text=build_verification_progress_text(
+                        kind=kind,
+                        status="已通过",
+                        completed="已完成人机验证",
+                        current="发言权限已恢复",
+                    ),
                 )
                 return
 
@@ -4626,16 +4637,17 @@ class VerifyWebServer:
         restored: bool,
     ) -> None:
         shown = html.escape(display_name or str(user_id))
-        if kind == VERIFICATION_KIND_MODERATION:
-            passed_text = f"<b>{shown}</b> 已通过消息审查验证，发言权限已恢复。"
-        elif kind == VERIFICATION_KIND_PATROL:
-            passed_text = f"<b>{shown}</b> 已通过资料巡检质询，发言权限已恢复。"
-        elif kind == VERIFICATION_KIND_RAID:
-            passed_text = f"<b>{shown}</b> 已通过爆破防护质询，发言权限已恢复。"
-        else:
-            passed_text = f"<b>{shown}</b> 已通过真人验证，欢迎加入！"
-        text = passed_text + (
-            "" if restored else "\n⚠️ 权限恢复失败，请管理员手动解除禁言。"
+        text = build_verification_progress_text(
+            kind=kind,
+            status="已通过" if restored else "放行中",
+            completed="已完成人机验证",
+            current="发言权限已恢复" if restored else "正在恢复发言权限",
+            action=f"<b>{shown}</b> 已完成验证。",
+            details=(
+                "权限恢复暂时失败，后台将继续重试；管理员也可以手动解除禁言。"
+                if not restored
+                else ("欢迎加入。" if kind == VERIFICATION_KIND_JOIN else None)
+            ),
         )
         # A patrol/raid prompt is shared by several members; editing it would
         # remove the warning and its challenge button for the others.

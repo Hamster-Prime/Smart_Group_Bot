@@ -305,6 +305,27 @@ class PrivilegedTaskRunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
+    def test_task_result_status_does_not_depend_on_body_words(self) -> None:
+        completed = admin._render_task_result(
+            "<b>规则添加成功</b>\n<b>规则内容</b>: 禁止伪造支付失败截图",
+            status="completed",
+        )
+        partial = admin._render_task_result(
+            "<b>全局封禁完成</b>\n<b>未完成分类</b>: 网络错误 1\n失败群可重新提交",
+            status="completed",
+        )
+        failed = admin._render_task_result(
+            "<b>规则任务已取消</b>\n操作者权限已变化。",
+            status="failed",
+        )
+
+        self.assertIn("处理结果已返回", completed)
+        self.assertNotIn("后台处理未完成", completed)
+        self.assertIn("请查看下方处理结果", partial)
+        self.assertNotIn("无需进一步操作", partial)
+        self.assertIn("后台处理未完成", failed)
+        self.assertIn("请按下方说明重试", failed)
+
     async def test_group_fanout_never_exceeds_four_calls(self) -> None:
         active = 0
         maximum = 0

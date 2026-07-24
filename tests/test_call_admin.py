@@ -63,7 +63,8 @@ class CallAdminTriggerTests(unittest.TestCase):
             reason="有人<刷屏>",
             reported_text="买片加微信",
         )
-        self.assertIn("呼叫管理员", text)
+        self.assertIn("<b>呼叫管理员 · 需要处理</b>", text)
+        self.assertIn("<blockquote expandable>", text)
         self.assertIn('tg://user?id=7', text)
         self.assertIn('tg://user?id=5', text)
         self.assertIn("&lt;u&gt;", text)

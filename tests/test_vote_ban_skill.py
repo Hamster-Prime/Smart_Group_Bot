@@ -127,6 +127,9 @@ class VoteBanSkillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.payload["quota"]["limit"], 1)
         self.assertEqual(result.payload["quota"]["remaining"], 0)
         self.assertIn("额度已用完", result.summary)
+        self.assertNotIn("<blockquote", result.summary)
+        self.assertIn("民主投票封禁 · 未发起", result.payload["telegram_text"])
+        self.assertIn("<blockquote expandable>", result.payload["telegram_text"])
         self.assertFalse(second_context.handled)
         second.bot.send_message.assert_not_awaited()
 

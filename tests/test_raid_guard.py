@@ -1,5 +1,7 @@
 import asyncio
+import html
 import os
+import re
 import tempfile
 import unittest
 from datetime import timedelta
@@ -25,6 +27,7 @@ from bot.services.raid_guard import (
     MANUAL_LOCKDOWN_SETTINGS_KEY,
     RAID_REMOVE_CALLBACK_DATA,
     RaidGuardService,
+    RaidRemovalResult,
     RaidSuspect,
     build_raid_challenge_keyboard,
     build_raid_challenge_text,
@@ -206,7 +209,8 @@ class MessageTests(unittest.TestCase):
         text = build_raid_lockdown_text(
             joined_count=8, window_seconds=60, lockdown_seconds=600
         )
-        self.assertIn("爆破防护已触发", text)
+        self.assertIn("<b>爆破防护 · 已触发</b>", text)
+        self.assertIn("<blockquote expandable>", text)
         self.assertIn("8 名成员", text)
         self.assertIn("1 分钟", text)
         self.assertIn("10 分钟", text)
@@ -219,12 +223,34 @@ class MessageTests(unittest.TestCase):
             RaidSuspect(user_id=2, full_name="", username="spam_guy", joined_at=now),
         ]
         text = build_raid_challenge_text(suspects, timeout_seconds=600)
+        self.assertIn("<b>爆破防护 · 真人质询</b>", text)
+        self.assertIn("<s>已完成爆破风险识别</s>", text)
+        self.assertIn("<blockquote expandable>", text)
         self.assertIn('tg://user?id=1', text)
         self.assertIn("张三", text)
         self.assertIn("@spam_guy", text)
         self.assertIn("10 分钟", text)
         self.assertIn("真人质询", text)
         self.assertIn("不会封禁", text)
+
+    def test_challenge_long_batch_stays_within_telegram_limit_without_duplicates(self) -> None:
+        now = now_shanghai_naive()
+        suspects = [
+            RaidSuspect(
+                user_id=index,
+                full_name="😀" * 128,
+                username="",
+                joined_at=now,
+            )
+            for index in range(1, 9)
+        ]
+
+        text = build_raid_challenge_text(suspects, timeout_seconds=600)
+        visible = html.unescape(re.sub(r"<[^>]+>", "", text))
+
+        self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, 4096)
+        for suspect in suspects:
+            self.assertEqual(text.count(f"tg://user?id={suspect.user_id}"), 1)
 
     def test_challenge_keyboard_uses_shared_callback(self) -> None:
         keyboard = build_raid_challenge_keyboard()
@@ -239,7 +265,8 @@ class MessageTests(unittest.TestCase):
 
     def test_unlock_text_describes_recovery(self) -> None:
         text = build_raid_unlock_text()
-        self.assertIn("爆破防护已解除", text)
+        self.assertIn("爆破防护 · 已解除", text)
+        self.assertIn("<blockquote expandable>", text)
         self.assertIn("恢复接收新成员", text)
 
     def test_manual_duration_is_always_minutes(self) -> None:
@@ -667,7 +694,7 @@ class DetectionTests(_DbTestCase):
         # One lockdown notice + one challenge message.
         self.assertEqual(bot.send_message.await_count, 2)
         notice = bot.send_message.await_args_list[0].args[1]
-        self.assertIn("爆破防护已触发", notice)
+        self.assertIn("爆破防护 · 已触发", notice)
         challenge_call = bot.send_message.await_args_list[1]
         challenge = challenge_call.args[1]
         for handle in ("@one", "@two", "@three"):
@@ -779,7 +806,7 @@ class DetectionTests(_DbTestCase):
         self.assertTrue(await service._expire_lockdown(-100, expired_at))
         self.assertFalse(service.lockdown_active(-100))
         bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
 
     async def test_manual_lockdown_works_when_automatic_policy_is_off(self) -> None:
         settings = _settings(raid_guard_enabled=False)
@@ -807,7 +834,7 @@ class DetectionTests(_DbTestCase):
         )
         self.assertTrue(await service.disable_manual_lockdown(-100))
         self.assertFalse(service.lockdown_active(-100))
-        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
 
     async def test_manual_lockdown_persists_without_replacing_group_settings(self) -> None:
         async with self.session_factory() as session:
@@ -891,7 +918,7 @@ class DetectionTests(_DbTestCase):
             {"restored": 0, "expired": 1, "invalid": 0},
         )
         first_bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护已解除", first_bot.send_message.await_args.args[1])
+        self.assertIn("爆破防护 · 已解除", first_bot.send_message.await_args.args[1])
 
         second, second_bot = self._service()
         self.assertEqual(
@@ -918,7 +945,7 @@ class DetectionTests(_DbTestCase):
             self.assertTrue(await service._expire_lockdown(-100, deadline))
 
         bot.send_message.assert_awaited_once()
-        self.assertIn("爆破防护已解除", bot.send_message.await_args.args[1])
+        self.assertIn("爆破防护 · 已解除", bot.send_message.await_args.args[1])
         async with self.session_factory() as session:
             group = await session.get(Group, -100)
             self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
@@ -1201,6 +1228,31 @@ class CallbackTests(_DbTestCase):
             )
         callback.answer.assert_awaited_once_with(
             url="https://t.me/my_bot?start=verify_n100"
+        )
+
+    async def test_background_bulk_remove_result_uses_progress_layout(self) -> None:
+        callback = self._callback(42, data=RAID_REMOVE_CALLBACK_DATA)
+        callback.message.answer = AsyncMock()
+
+        await membership._publish_raid_removal_result(
+            callback,
+            group_id=-100,
+            prompt_message_id=777,
+            result=RaidRemovalResult(
+                pending_count=1,
+                removed_user_ids=(73,),
+                failed_user_ids=(74,),
+            ),
+        )
+
+        rendered = callback.message.answer.await_args.args[0]
+        self.assertIn("<b>爆破防护批量移除 · 待重试</b>", rendered)
+        self.assertIn("<s>已提交批量移除</s>", rendered)
+        self.assertIn("<b>下一步</b>　等待后台重试", rendered)
+        self.assertIn("<blockquote expandable>", rendered)
+        self.assertEqual(
+            callback.message.answer.await_args.kwargs["parse_mode"],
+            "HTML",
         )
 
     async def test_non_suspect_is_rejected(self) -> None:

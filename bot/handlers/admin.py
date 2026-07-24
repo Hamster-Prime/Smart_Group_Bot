@@ -8,6 +8,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from aiogram import F, Router
 from aiogram.exceptions import (
@@ -98,6 +99,11 @@ from bot.services.raid_guard import (
     normalize_manual_lockdown_minutes,
 )
 from bot.services.group_settings import acquire_group_settings_write_intent
+from bot.services.message_templates import (
+    render_action_notice,
+    render_data_brief,
+    render_progress_notice,
+)
 from bot.services.skills import SkillService
 from bot.utils.telegram import (
     answer_with_auto_delete,
@@ -111,6 +117,10 @@ log = logging.getLogger(__name__)
 
 _MUTE_ALL_REPLIES_KEY = "mute_all_replies"
 _LIST_PAGE_SIZE = 5
+_LEGACY_ACTION_RESPONSE_RE = re.compile(
+    r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
+)
+_TaskResultStatus = Literal["completed", "failed", "rejected", "duplicate"]
 _MUTE_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /mute\n"
@@ -169,6 +179,83 @@ _MIMIC_USAGE = (
 )
 
 
+def _render_action_response(text: str) -> str:
+    """Render remaining synchronous command replies in the shared layout.
+
+    Most legacy administration results already expose a bold heading followed
+    by trusted HTML details.  Translating that shape here keeps ordinary
+    successes, denials, and usage messages visually consistent while letting
+    data briefs and task-progress messages opt out by carrying a blockquote.
+    """
+    rendered = str(text or "").strip()
+    if not rendered or "<blockquote" in rendered.lower():
+        return rendered
+    match = _LEGACY_ACTION_RESPONSE_RE.match(rendered)
+    if match:
+        title = html.unescape(match.group("title").strip()) or "操作结果"
+        return render_action_notice(title, action=match.group("body").strip())
+    return render_action_notice("操作结果", action=rendered)
+
+
+def _render_task_result(
+    text: str,
+    *,
+    status: _TaskResultStatus,
+    default_title: str = "后台任务",
+) -> str:
+    """Convert an explicitly classified privileged-job result into a terminal flow."""
+    rendered = str(text or "").strip()
+    match = (
+        None
+        if "<blockquote" in rendered.lower()
+        else _LEGACY_ACTION_RESPONSE_RE.match(rendered)
+    )
+    if match:
+        title = html.unescape(match.group("title").strip()) or default_title
+        body = match.group("body").strip()
+    else:
+        title = default_title
+        body = rendered
+
+    state_fields: dict[str, object | None]
+    if status == "rejected":
+        state_fields = {
+            "completed": None,
+            "current": "未能进入后台队列",
+            "next_step": "请按下方说明重试",
+        }
+    elif status == "duplicate":
+        state_fields = {
+            "completed": "已受理请求",
+            "current": "已有相同任务正在执行",
+            "next_step": "完成后会更新原任务消息",
+        }
+    elif status == "failed":
+        state_fields = {
+            "completed": "已受理请求",
+            "current": "后台处理未完成",
+            "next_step": "请按下方说明重试",
+        }
+    elif status == "completed":
+        state_fields = {
+            "completed": ["已受理请求", "已结束后台处理"],
+            "current": "处理结果已返回",
+            "next_step": "请查看下方处理结果",
+        }
+    else:
+        raise ValueError(f"unsupported privileged task result status: {status}")
+
+    structured_body = bool(body and "<blockquote" in body.lower())
+    notice = render_progress_notice(
+        title,
+        completed=state_fields["completed"],
+        current=state_fields["current"],
+        next_step=state_fields["next_step"],
+        action=None if structured_body else body,
+    )
+    return f"{notice}\n\n{body}" if structured_body else notice
+
+
 async def _answer(
     message: Message,
     settings: Settings,
@@ -177,7 +264,7 @@ async def _answer(
 ) -> None:
     await answer_with_auto_delete(
         message,
-        text,
+        _render_action_response(text),
         auto_delete_seconds=configured_auto_delete_seconds(settings, "management"),
         **kwargs,
     )
@@ -334,16 +421,15 @@ def _build_auth_group_list_page(
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
 
-    lines = [
-        "<b>已授权群组</b>",
-        f"共 {total} 个 | 页码: {page + 1}/{total_pages}",
-        "",
-    ]
+    lines: list[str] = []
     for idx, row in enumerate(rows[start:end], start=start + 1):
         reachability = "可用" if bool(getattr(row, "bot_present", True)) else "Bot 不可达/暂停"
-        lines.append(
-            f"{idx}. <b>群ID</b>: {row.group_id} | 授权人: "
-            f"{row.authorized_by or 0} | 状态: {reachability}"
+        lines.extend(
+            [
+                f"<b>{idx}.</b> <code>{row.group_id}</code>",
+                f"授权人　<code>{row.authorized_by or 0}</code>　状态　{reachability}",
+                "",
+            ]
         )
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
@@ -365,7 +451,17 @@ def _build_auth_group_list_page(
     if nav_row:
         keyboard_rows.append(nav_row)
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
-    return "\n".join(lines), keyboard
+    return (
+        render_data_brief(
+            "已授权群组",
+            metadata={
+                "总数": f"<code>{total}</code> 个",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+        ),
+        keyboard,
+    )
 
 
 def _build_admin_list_page(
@@ -380,13 +476,15 @@ def _build_admin_list_page(
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
 
-    lines = [
-        "<b>群管理授权列表</b>",
-        f"群ID: {group_id} | 共 {total} 人 | 页码: {page + 1}/{total_pages}",
-        "",
-    ]
+    lines: list[str] = []
     for idx, row in enumerate(rows[start:end], start=start + 1):
-        lines.append(f"{idx}. <b>用户ID</b>: {row.user_id} | 角色: {html.escape(row.role)}")
+        lines.extend(
+            [
+                f"<b>{idx}.</b> <code>{row.user_id}</code>",
+                f"角色　{html.escape(row.role)}",
+                "",
+            ]
+        )
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     nav_row: list[InlineKeyboardButton] = []
@@ -407,7 +505,18 @@ def _build_admin_list_page(
     if nav_row:
         keyboard_rows.append(nav_row)
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
-    return "\n".join(lines), keyboard
+    return (
+        render_data_brief(
+            "群管理授权列表",
+            metadata={
+                "群组": f"<code>{group_id}</code>",
+                "总数": f"<code>{total}</code> 人",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+        ),
+        keyboard,
+    )
 
 
 def _build_warning_list_page(
@@ -423,16 +532,16 @@ def _build_warning_list_page(
     end = min(start + _LIST_PAGE_SIZE, total)
     banned_count = sum(1 for row in rows if row.is_banned)
 
-    lines = [
-        "<b>当前群组警告/封禁名单</b>",
-        f"<b>总人数</b>: {total} | 页码: {page + 1}/{total_pages}",
-        f"<b>已封禁</b>: {banned_count}",
-        f"<b>警告中</b>: {total - banned_count}",
-        "",
-    ]
+    lines: list[str] = []
     for idx, row in enumerate(rows[start:end], start=start + 1):
         status = "已封禁" if row.is_banned else "警告中"
-        lines.append(f"{idx}. 用户ID: {row.user_id} | 次数: {row.count}/{threshold} | 状态: {status}")
+        lines.extend(
+            [
+                f"<b>{idx}.</b> <code>{row.user_id}</code>",
+                f"警告　<code>{row.count} / {threshold}</code>　状态　{status}",
+                "",
+            ]
+        )
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     nav_row: list[InlineKeyboardButton] = []
@@ -453,7 +562,19 @@ def _build_warning_list_page(
     if nav_row:
         keyboard_rows.append(nav_row)
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
-    return "\n".join(lines), keyboard
+    return (
+        render_data_brief(
+            "当前群组警告名单",
+            metadata={
+                "总数": f"<code>{total}</code> 人",
+                "已封禁": f"<code>{banned_count}</code> 人",
+                "警告中": f"<code>{total - banned_count}</code> 人",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+        ),
+        keyboard,
+    )
 
 
 def _build_rule_list_page(
@@ -467,22 +588,18 @@ def _build_rule_list_page(
     start = page * _LIST_PAGE_SIZE
     end = min(start + _LIST_PAGE_SIZE, total)
 
-    lines = [
-        "<b>群审核规则</b>",
-        f"共 {total} 条 | 页码: {page + 1}/{total_pages}",
-        "",
-        "点击下方按钮可删除对应规则：",
-        "",
-    ]
+    lines: list[str] = []
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     for idx, rule in enumerate(rules[start:end], start=start + 1):
         status = "启用" if rule.enabled else "关闭"
         pattern_preview = html.escape(_truncate_text(rule.pattern or "", 120))
-        lines.append(
-            f"{idx}. <b>#{rule.id}</b> [{_rule_type_label(rule.rule_type)}] {_action_label(rule.action)} | {status}"
+        lines.extend(
+            [
+                f"<b>{idx}.</b> <code>#{rule.id}</code>　{_rule_type_label(rule.rule_type)} · {_action_label(rule.action)} · {status}",
+                pattern_preview,
+                "",
+            ]
         )
-        lines.append(f"规则: {pattern_preview}")
-        lines.append("")
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
@@ -510,7 +627,18 @@ def _build_rule_list_page(
     if nav_row:
         keyboard_rows.append(nav_row)
 
-    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return (
+        render_data_brief(
+            "群审核规则",
+            metadata={
+                "总数": f"<code>{total}</code> 条",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+            footer="使用下方按钮删除对应规则。",
+        ),
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
 
 
 async def _callback_user_can_manage_rules(
@@ -573,7 +701,15 @@ async def _reply_rules(message: Message, session: AsyncSession, settings: Settin
     await session.commit()
 
     if not rules:
-        await _answer(message, settings, "<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。")
+        await _answer(
+            message,
+            settings,
+            render_data_brief(
+                "群审核规则",
+                empty="当前没有规则。",
+                footer="可使用 <code>/addrule</code> 添加规则。",
+            ),
+        )
         return
 
     text, keyboard = _build_rule_list_page(rules, page=0)
@@ -657,7 +793,11 @@ async def cmd_authlist(message: Message, session: AsyncSession, settings: Settin
     rows = await list_authorized_groups(session, include_inactive=True)
     await session.commit()
     if not rows:
-        await _answer(message, settings, "<b>已授权群组</b>\n当前为空。")
+        await _answer(
+            message,
+            settings,
+            render_data_brief("已授权群组", empty="当前没有已授权群组。"),
+        )
         return
 
     text, keyboard = _build_auth_group_list_page(rows, page=0)
@@ -796,10 +936,14 @@ async def cmd_adminlist(message: Message, session: AsyncSession, settings: Setti
     rows = await list_group_admins(session, group_id)
     await session.commit()
     if not rows:
-        await _answer(message, settings, 
-            "<b>群管理授权列表</b>\n"
-            f"<b>群ID</b>: {group_id}\n"
-            "<b>结果</b>: 当前无已授权群管理"
+        await _answer(
+            message,
+            settings,
+            render_data_brief(
+                "群管理授权列表",
+                metadata={"群组": f"<code>{group_id}</code>"},
+                empty="当前没有已授权群管理。",
+            ),
         )
         return
 
@@ -972,7 +1116,8 @@ def _failure_summary(outcomes: list[_GroupActionOutcome]) -> str:
     )
 
 
-async def _publish_privileged_result(message: Message, text: str) -> None:
+async def _publish_privileged_text(message: Message, text: str) -> None:
+    """Edit a task message in place, with a best-effort reply fallback."""
     try:
         await message.edit_text(text, parse_mode="HTML", reply_markup=None)
         return
@@ -982,6 +1127,43 @@ async def _publish_privileged_result(message: Message, text: str) -> None:
         await message.answer(text, parse_mode="HTML")
     except Exception:
         log.exception("privileged result delivery failed")
+
+
+async def _publish_privileged_result(
+    message: Message,
+    text: str,
+    *,
+    status: _TaskResultStatus,
+    default_title: str = "后台任务",
+) -> None:
+    await _publish_privileged_text(
+        message,
+        _render_task_result(text, status=status, default_title=default_title),
+    )
+
+
+async def _publish_privileged_progress(
+    message: Message,
+    *,
+    title: str,
+    current: str,
+    next_step: str,
+    completed: object | None = "已受理请求",
+    action: object | None = None,
+    details: object | None = None,
+) -> None:
+    """Keep long-running administration work in its flow-oriented state."""
+    await _publish_privileged_text(
+        message,
+        render_progress_notice(
+            title,
+            completed=completed,
+            current=current,
+            next_step=next_step,
+            action=action,
+            details=details,
+        ),
+    )
 
 
 async def _ack_callback_fast(
@@ -1668,10 +1850,13 @@ async def _perform_global_ban_locked(
             if item.private_message_id > 0
         )
         await session.commit()
-    await _publish_privileged_result(
+    await _publish_privileged_progress(
         message,
-        "<b>全局封禁执行中</b>\n"
-        f"全局策略已持久化，正在并发处理 {len(group_ids)} 个授权群。",
+        title="全局封禁 · 执行中",
+        current=f"处理 <code>{len(group_ids)}</code> 个授权群",
+        next_step="写入汇总结果并更新本消息",
+        action="全局策略已持久化，正在并发执行群内封禁。",
+        details=f"<b>目标</b>　<code>{target_id}</code>",
     )
 
     recovery_by_group = {int(item.group_id): item for item in recoveries}
@@ -1809,10 +1994,13 @@ async def _perform_global_unban_locked(
             cleared_total += cleared_count
         await session.commit()
     activate_manual_unban_recoveries(recoveries)
-    await _publish_privileged_result(
+    await _publish_privileged_progress(
         message,
-        "<b>全局解封执行中</b>\n"
-        f"恢复工单已持久化，正在并发处理 {len(group_ids)} 个授权群。",
+        title="全局解封 · 执行中",
+        current=f"处理 <code>{len(group_ids)}</code> 个授权群",
+        next_step="恢复权限并更新本消息",
+        action="恢复工单已持久化，正在并发执行群内解封。",
+        details=f"<b>目标</b>　<code>{target_id}</code>",
     )
     recovery_by_group = {int(item.group_id): item for item in recoveries}
     restored_group_ids: set[int] = set()
@@ -1934,7 +2122,10 @@ def _scope_request_from_durable_callback(
         return None
     reason = ""
     text = str(getattr(message, "text", "") or "")
-    match = re.search(r"(?:^|\n)原因\s*[:：]\s*(.+)", text)
+    match = re.search(
+        r"(?:^|\n)(?:<b>)?原因(?:</b>)?(?:\s*[:：]\s*|　+)([^\n]+)",
+        text,
+    )
     if match:
         reason = match.group(1).strip()[:1000]
     return _BanScopeRequest(
@@ -1953,16 +2144,18 @@ async def _ask_super_admin_scope(
     reason: str = "",
 ) -> None:
     verb = "封禁" if action == "ban" else "解封"
-    lines = [
-        f"<b>请选择{verb}范围</b>",
-        f"<b>用户ID</b>: <code>{target_id}</code>",
-        "「仅本群」只修改当前群；「全局」会作用于全部授权群和全局名单。",
-    ]
+    details = ["「仅本群」只修改当前群；「全局」会作用于全部授权群和全局名单。"]
     if reason:
-        lines.insert(2, f"<b>原因</b>: {html.escape(reason)}")
+        details.insert(0, f"<b>原因</b>　{html.escape(reason)}")
+    text = render_action_notice(
+        f"选择{verb}范围",
+        context=f"目标　<code>{target_id}</code>",
+        action="请使用下方按钮选择处理范围。",
+        details=details,
+    )
     with privileged_request_scope():
         sent = await message.answer(
-            "\n".join(lines),
+            text,
             parse_mode="HTML",
             reply_markup=_scope_keyboard(action, target_id),
         )
@@ -1990,6 +2183,7 @@ async def _run_result_job(
     *,
     progress_message: Message,
     operation: Callable[[], Awaitable[str]],
+    task_title: str = "后台任务",
 ) -> None:
     try:
         result_text = await operation()
@@ -2000,9 +2194,16 @@ async def _run_result_job(
         await _publish_privileged_result(
             progress_message,
             "<b>操作未完成</b>\n后台任务发生异常，幂等状态已保留，请稍后重试。",
+            status="failed",
+            default_title=task_title,
         )
         raise
-    await _publish_privileged_result(progress_message, result_text)
+    await _publish_privileged_result(
+        progress_message,
+        result_text,
+        status="completed",
+        default_title=task_title,
+    )
 
 
 @router.message(Command("ban"))
@@ -2039,7 +2240,13 @@ async def cmd_ban(
         await session.commit()
         with privileged_request_scope():
             progress = await message.answer(
-                "<b>本群封禁已受理</b>\n正在后台执行，完成后会更新本消息。",
+                render_progress_notice(
+                    "本群封禁 · 执行中",
+                    completed="已受理请求",
+                    current="执行 Telegram 封禁",
+                    next_step="写入结果并更新本消息",
+                    details=f"<b>目标</b>　<code>{target_id}</code>",
+                ),
                 parse_mode="HTML",
             )
 
@@ -2069,6 +2276,7 @@ async def cmd_ban(
             operation=lambda: _run_result_job(
                 progress_message=progress,
                 operation=operation,
+                task_title="本群封禁",
             ),
             lane="critical",
             priority=0,
@@ -2078,11 +2286,13 @@ async def cmd_ban(
             await _publish_privileged_result(
                 progress,
                 "<b>本群封禁未入队</b>\n权限任务队列正忙，请立即重试。",
+                status="rejected",
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
                 "<b>本群封禁正在执行</b>\n相同目标已有任务，未重复提交。",
+                status="duplicate",
             )
         return
     text = await _perform_group_ban(
@@ -2125,7 +2335,13 @@ async def cmd_unban(
         await session.commit()
         with privileged_request_scope():
             progress = await message.answer(
-                "<b>本群解封已受理</b>\n正在后台执行，完成后会更新本消息。",
+                render_progress_notice(
+                    "本群解封 · 执行中",
+                    completed="已受理请求",
+                    current="解除 Telegram 封禁",
+                    next_step="恢复权限并更新本消息",
+                    details=f"<b>目标</b>　<code>{target_id}</code>",
+                ),
                 parse_mode="HTML",
             )
 
@@ -2153,6 +2369,7 @@ async def cmd_unban(
             operation=lambda: _run_result_job(
                 progress_message=progress,
                 operation=operation,
+                task_title="本群解封",
             ),
             lane="critical",
             priority=0,
@@ -2162,11 +2379,13 @@ async def cmd_unban(
             await _publish_privileged_result(
                 progress,
                 "<b>本群解封未入队</b>\n权限任务队列正忙，请立即重试。",
+                status="rejected",
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
                 "<b>本群解封正在执行</b>\n相同目标已有任务，未重复提交。",
+                status="duplicate",
             )
         return
     text = await _perform_group_unban(
@@ -2246,6 +2465,15 @@ async def on_ban_scope_choice(
         return
     assert request is not None
     reason = request.reason
+    verb = "封禁" if action == "ban" else "解封"
+    scope_label = "全局" if scope == "g" else "本群"
+    task_title = f"{scope_label}{verb}"
+    task_details = [
+        f"<b>目标</b>　<code>{target_id}</code>",
+        f"<b>范围</b>　{scope_label}",
+    ]
+    if reason:
+        task_details.append(f"<b>原因</b>　{html.escape(reason)}")
     await session.commit()
     if session_factory is not None:
         ack_gate = asyncio.Event()
@@ -2304,6 +2532,7 @@ async def on_ban_scope_choice(
                 await _run_result_job(
                     progress_message=message,
                     operation=operation,
+                    task_title=task_title,
                 )
             except BaseException:
                 async with _BAN_SCOPE_LOCK:
@@ -2340,11 +2569,26 @@ async def on_ban_scope_choice(
                 callback,
                 "任务已受理，正在后台执行" if submission.created else "相同任务正在执行",
             )
+            if submission.created:
+                await _publish_privileged_progress(
+                    message,
+                    title=f"{task_title} · 执行中",
+                    current=f"执行 {scope_label}{verb}",
+                    next_step="写入结果并更新本消息",
+                    details=task_details,
+                )
         finally:
             ack_gate.set()
         return
 
     await _ack_callback_fast(callback, "正在执行…")
+    await _publish_privileged_progress(
+        message,
+        title=f"{task_title} · 执行中",
+        current=f"执行 {scope_label}{verb}",
+        next_step="写入结果并更新本消息",
+        details=task_details,
+    )
     try:
         if action == "ban" and scope == "l":
             result_text = await _perform_group_ban(
@@ -2399,7 +2643,12 @@ async def on_ban_scope_choice(
         async with _BAN_SCOPE_LOCK:
             if _BAN_SCOPE_REQUESTS.get(key) is request:
                 _BAN_SCOPE_REQUESTS.pop(key, None)
-    await _publish_privileged_result(message, result_text)
+    await _publish_privileged_result(
+        message,
+        result_text,
+        status="completed",
+        default_title=task_title,
+    )
 
 
 _RAID_GUARD_USAGE = (
@@ -2455,7 +2704,13 @@ async def cmd_raidguard(
             await session.commit()
             with privileged_request_scope():
                 progress = await message.answer(
-                    "<b>爆破防护操作已受理</b>\n正在后台解除锁定。",
+                    render_progress_notice(
+                        "爆破防护 · 执行中",
+                        completed="已受理请求",
+                        current="解除手动锁定",
+                        next_step="写入结果并更新本消息",
+                        details=f"<b>群组</b>　<code>{group_id}</code>",
+                    ),
                     parse_mode="HTML",
                 )
 
@@ -2477,6 +2732,7 @@ async def cmd_raidguard(
                 operation=lambda: _run_result_job(
                     progress_message=progress,
                     operation=disable_operation,
+                    task_title="爆破防护",
                 ),
                 lane="critical",
                 priority=0,
@@ -2486,11 +2742,13 @@ async def cmd_raidguard(
                 await _publish_privileged_result(
                     progress,
                     "<b>爆破防护操作未入队</b>\n权限任务队列正忙，请立即重试。",
+                    status="rejected",
                 )
             elif not submission.created:
                 await _publish_privileged_result(
                     progress,
                     "<b>爆破防护操作正在执行</b>\n相同任务已在队列中。",
+                    status="duplicate",
                 )
             return
         try:
@@ -2527,7 +2785,13 @@ async def cmd_raidguard(
         await session.commit()
         with privileged_request_scope():
             progress = await message.answer(
-                "<b>爆破防护操作已受理</b>\n正在后台开启锁定。",
+                render_progress_notice(
+                    "爆破防护 · 执行中",
+                    completed="已受理请求",
+                    current="开启手动锁定",
+                    next_step="写入结果并更新本消息",
+                    details=f"<b>群组</b>　<code>{group_id}</code>",
+                ),
                 parse_mode="HTML",
             )
 
@@ -2556,6 +2820,7 @@ async def cmd_raidguard(
             operation=lambda: _run_result_job(
                 progress_message=progress,
                 operation=enable_operation,
+                task_title="爆破防护",
             ),
             lane="critical",
             priority=0,
@@ -2565,11 +2830,13 @@ async def cmd_raidguard(
             await _publish_privileged_result(
                 progress,
                 "<b>爆破防护操作未入队</b>\n权限任务队列正忙，请立即重试。",
+                status="rejected",
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
                 "<b>爆破防护操作正在执行</b>\n相同任务已在队列中。",
+                status="duplicate",
             )
         return
     try:
@@ -2680,18 +2947,34 @@ async def cmd_banlist(message: Message, session: AsyncSession, settings: Setting
     rows = await list_global_bans(session, limit=30)
     await session.commit()
     if not rows:
-        await _answer(message, settings, "<b>封禁名单</b>\n当前为空。")
+        await _answer(
+            message,
+            settings,
+            render_data_brief("全局封禁名单", empty="当前没有全局封禁记录。"),
+        )
         return
 
-    lines = ["<b>封禁名单</b>（最近 30 条）"]
-    for row in rows:
+    lines: list[str] = []
+    for index, row in enumerate(rows, start=1):
         reason = _truncate_text(row.reason or "-", 40)
         source = "资料审查" if row.source == "join_screening" else "手动"
-        lines.append(
-            f"• <code>{row.user_id}</code> | {source} | {html.escape(reason)}"
+        lines.extend(
+            [
+                f"<b>{index}.</b> <code>{row.user_id}</code>　{source}",
+                html.escape(reason),
+                "",
+            ]
         )
-    lines.append("\n解封请使用 /unban &lt;用户ID&gt;")
-    await _answer(message, settings, "\n".join(lines))
+    await _answer(
+        message,
+        settings,
+        render_data_brief(
+            "全局封禁名单",
+            metadata={"范围": f"最近 <code>{len(rows)}</code> 条"},
+            items=lines,
+            footer="解封请使用 <code>/unban &lt;用户ID&gt;</code>。",
+        ),
+    )
 
 
 @router.message(Command("addrule"))
@@ -2727,7 +3010,13 @@ async def cmd_addrule(
     sender_username = (getattr(message.from_user, "username", "") or "").strip()
     with privileged_request_scope(background=True):
         progress = await message.answer(
-            "<b>规则任务已受理</b>\n正在后台解析并更新规则。",
+            render_progress_notice(
+                "规则任务 · 执行中",
+                completed="已受理请求",
+                current="解析并更新群审核规则",
+                next_step="写入结果并更新本消息",
+                details=f"<b>请求</b>　{html.escape(_truncate_text(args, 160))}",
+            ),
             parse_mode="HTML",
         )
 
@@ -2764,6 +3053,7 @@ async def cmd_addrule(
         operation=lambda: _run_result_job(
             progress_message=progress,
             operation=operation,
+            task_title="规则任务",
         ),
         lane="policy",
         priority=100,
@@ -2773,11 +3063,13 @@ async def cmd_addrule(
         await _publish_privileged_result(
             progress,
             "<b>规则任务未入队</b>\n规则处理队列正忙，请稍后重试。",
+            status="rejected",
         )
     elif not submission.created:
         await _publish_privileged_result(
             progress,
             "<b>规则任务正在执行</b>\n相同请求未重复提交。",
+            status="duplicate",
         )
 
 
@@ -2825,7 +3117,14 @@ async def on_rule_list_paging(
     rules = list(result.scalars().all())
     await session.commit()
     if not rules:
-        await msg.edit_text("<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。", reply_markup=None)
+        await msg.edit_text(
+            render_data_brief(
+                "群审核规则",
+                empty="当前没有规则。",
+                footer="可使用 <code>/addrule</code> 添加规则。",
+            ),
+            reply_markup=None,
+        )
         await callback.answer("列表已空")
         return
 
@@ -2892,7 +3191,14 @@ async def on_rule_delete(
     rules = list(result.scalars().all())
     await session.commit()
     if not rules:
-        await msg.edit_text("<b>群审核规则</b>\n当前没有规则，可使用 /addrule 添加。", reply_markup=None)
+        await msg.edit_text(
+            render_data_brief(
+                "群审核规则",
+                empty="当前没有规则。",
+                footer="可使用 <code>/addrule</code> 添加规则。",
+            ),
+            reply_markup=None,
+        )
         await callback.answer(f"已删除: {pattern_label}")
         return
 
@@ -2936,7 +3242,10 @@ async def on_authlist_paging(
     rows = await list_authorized_groups(session, include_inactive=True)
     await session.commit()
     if not rows:
-        await msg.edit_text("<b>已授权群组</b>\n当前为空。", reply_markup=None)
+        await msg.edit_text(
+            render_data_brief("已授权群组", empty="当前没有已授权群组。"),
+            reply_markup=None,
+        )
         await callback.answer("列表已空")
         return
 
@@ -2991,9 +3300,11 @@ async def on_adminlist_paging(
     await session.commit()
     if not rows:
         await msg.edit_text(
-            "<b>群管理授权列表</b>\n"
-            f"<b>群ID</b>: {group_id}\n"
-            "<b>结果</b>: 当前无已授权群管理",
+            render_data_brief(
+                "群管理授权列表",
+                metadata={"群组": f"<code>{group_id}</code>"},
+                empty="当前没有已授权群管理。",
+            ),
             reply_markup=None,
         )
         await callback.answer("列表已空")
@@ -3051,8 +3362,10 @@ async def on_warnings_paging(
     await session.commit()
     if not rows:
         await msg.edit_text(
-            "<b>当前群组警告/封禁名单</b>\n"
-            "<b>结果</b>: 暂无被警告或封禁用户",
+            render_data_brief(
+                "当前群组警告名单",
+                empty="暂无被警告或封禁用户。",
+            ),
             reply_markup=None,
         )
         await callback.answer("列表已空")
@@ -3483,9 +3796,13 @@ async def cmd_warnings(message: Message, session: AsyncSession, settings: Settin
     await session.commit()
 
     if not rows:
-        await _answer(message, settings, 
-            "<b>当前群组警告/封禁名单</b>\n"
-            "<b>结果</b>: 暂无被警告或封禁用户"
+        await _answer(
+            message,
+            settings,
+            render_data_brief(
+                "当前群组警告名单",
+                empty="暂无被警告或封禁用户。",
+            ),
         )
         return
 

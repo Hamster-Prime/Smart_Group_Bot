@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings
 from bot.db.models import Admin, GroupMember
-from bot.services.message_templates import card_field, render_notice_card
+from bot.services.message_templates import card_field, render_summary_notice
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     is_reply_target_missing_error,
@@ -193,23 +193,28 @@ def build_call_admin_text(
     batch_count: int = 1,
 ) -> str:
     shown = html.escape(str(caller_name or "").strip() or str(caller_id))
-    body = [" ".join(mentions)]
+    summary = [" ".join(mentions)]
     if batch_count > 1:
-        body.append(card_field("管理员通知批次", f"{int(batch_index)}/{int(batch_count)}"))
-    body.append(
+        summary.append(card_field("管理员通知批次", f"{int(batch_index)}/{int(batch_count)}"))
+    summary.append(
         card_field("发起人", f'<a href="tg://user?id={int(caller_id)}">{shown}</a>')
     )
+    details: list[str] = []
     clean_reason = str(reason or "").strip()
     if clean_reason:
-        body.append(
+        details.append(
             card_field("补充说明", html.escape(_break_user_mentions(clean_reason[:200])))
         )
     clean_reported = str(reported_text or "").strip()
     if clean_reported:
-        body.append(
+        details.append(
             card_field("被举报消息", html.escape(_break_user_mentions(clean_reported[:200])))
         )
-    return render_notice_card("呼叫管理员", body)
+    return render_summary_notice(
+        "呼叫管理员 · 需要处理",
+        summary,
+        details=details,
+    )
 
 
 async def handle_call_admin(

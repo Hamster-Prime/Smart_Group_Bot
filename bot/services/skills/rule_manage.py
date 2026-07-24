@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from bot.db.models import ModerationRule
 from bot.services.manage_intent import GroupIntentService
+from bot.services.message_templates import render_data_brief, truncate_telegram_text
 from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.utils.security import clean_text
 
@@ -38,25 +39,37 @@ def _action_label(action: str) -> str:
 
 def _format_rule_list(rules: list[ModerationRule]) -> str:
     if not rules:
-        return "<b>群审核规则</b>\n当前没有规则。\n\n删除请使用 /rules 打开列表后点按钮。"
+        return render_data_brief(
+            "群审核规则",
+            empty="当前没有规则。",
+            footer="删除请使用 <code>/rules</code> 打开列表后点按钮。",
+        )
 
-    lines = [
-        "<b>群审核规则</b>",
-        f"共 {len(rules)} 条",
-        "",
-    ]
+    lines: list[str] = []
     for idx, rule in enumerate(rules[:20], start=1):
         status = "启用" if rule.enabled else "关闭"
-        pattern = html.escape(_truncate_text(rule.pattern or "", 120))
-        lines.append(
-            f"{idx}. <b>#{rule.id}</b> [{_rule_type_label(rule.rule_type)}] {_action_label(rule.action)} | {status}"
+        pattern = html.escape(
+            truncate_telegram_text(
+                (rule.pattern or "").replace("\n", " ").strip(),
+                120,
+            )
         )
-        lines.append(f"规则: {pattern}")
-        lines.append("")
+        lines.extend(
+            [
+                f"<b>{idx}.</b> <code>#{rule.id}</code>　"
+                f"{_rule_type_label(rule.rule_type)} · {_action_label(rule.action)} · {status}",
+                pattern,
+                "",
+            ]
+        )
     if len(rules) > 20:
         lines.append(f"... 其余 {len(rules) - 20} 条请使用 /rules 查看")
-    lines.extend(["删除请使用 /rules 打开列表后点按钮。"])
-    return "\n".join(lines).rstrip()
+    return render_data_brief(
+        "群审核规则",
+        metadata={"总数": f"<code>{len(rules)}</code> 条"},
+        items=lines,
+        footer="删除请使用 <code>/rules</code> 打开列表后点按钮。",
+    )
 
 
 class RuleManageSkill:

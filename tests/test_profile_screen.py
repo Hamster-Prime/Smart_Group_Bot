@@ -502,6 +502,46 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.handler.assert_not_awaited()
         event.delete.assert_awaited_once()
 
+    async def test_profile_ban_notice_uses_expandable_audit_details(self) -> None:
+        patches = self._patch_screening(verdict=(True, "广告昵称 <危险>", True))
+        event = _event()
+        send_notice = AsyncMock()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
+                new=AsyncMock(return_value=BanEnforcementResult(final_banned=True)),
+            ),
+            patch(
+                "bot.middlewares.profile_screen.answer_with_auto_delete",
+                new=send_notice,
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                event,
+                {"settings": _settings()},
+            )
+
+        self.assertIsNone(result)
+        send_notice.assert_awaited_once()
+        rendered = send_notice.await_args.args[1]
+        self.assertIn("<b>成员资料审核 · 已处理</b>", rendered)
+        self.assertIn("<b>处理结果</b>", rendered)
+        self.assertIn("<blockquote expandable>", rendered)
+        self.assertIn("广告昵称 &lt;危险&gt;", rendered)
+        self.assertIn("<code>/unban</code>", rendered)
+        event.delete.assert_awaited_once()
+
     async def test_completion_loss_keeps_new_restriction_blocked(self) -> None:
         patches = self._patch_screening(verdict=(True, "广告昵称", True))
         event = _event()

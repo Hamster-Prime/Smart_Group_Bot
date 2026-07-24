@@ -47,7 +47,7 @@ from bot.db.models import (
 from bot.services.background_health import record_background_failure
 from bot.services.authz import is_group_authorized, list_authorized_groups
 from bot.services.group_settings import acquire_group_settings_write_intent
-from bot.services.message_templates import render_notice_card
+from bot.services.message_templates import render_progress_notice
 from bot.services.join_screening import (
     build_join_profile_text,
     is_globally_banned,
@@ -84,7 +84,11 @@ _PATROL_PASS_DEADLINE_SECONDS = 30 * 60.0
 
 # Violators mentioned per warning message: keeps each message far below the
 # 4096-char cap and within Telegram's per-message mention-notification limits.
-PATROL_MENTIONS_PER_MESSAGE = 15
+# A prompt repeats neither names nor reasons, but Telegram still caps parsed
+# message text at 4096 UTF-16 code units. Eight worst-case Telegram display
+# names plus 80-character reasons leave enough room for the flow copy.
+PATROL_MENTIONS_PER_MESSAGE = 8
+_PATROL_DISPLAY_NAME_LIMIT = 128
 # Gentle pacing between per-member Telegram calls (getChat / restrict).
 _PER_MEMBER_CALL_PAUSE = 0.05
 _PATROL_RUN_CONCURRENCY = 2
@@ -440,8 +444,11 @@ class PatrolViolator:
 
 def _mention(violator: PatrolViolator) -> str:
     if violator.username:
-        return f"@{violator.username}"
-    label = html.escape((violator.full_name or "").strip() or str(violator.user_id))
+        return f"@{html.escape(str(violator.username).strip()[:32])}"
+    raw_label = (violator.full_name or "").strip() or str(violator.user_id)
+    if len(raw_label) > _PATROL_DISPLAY_NAME_LIMIT:
+        raw_label = raw_label[: _PATROL_DISPLAY_NAME_LIMIT - 3].rstrip() + "..."
+    label = html.escape(raw_label)
     return f'<a href="tg://user?id={violator.user_id}">{label}</a>'
 
 
@@ -457,17 +464,23 @@ def build_patrol_warning_text(
     *,
     timeout_seconds: int,
 ) -> str:
-    body = ["以下成员的名字或简介涉嫌违反群规，已暂时禁言："]
-    for violator in violators:
+    members = list(violators)
+    details = ["涉及成员："]
+    for violator in members:
         reason = html.escape((violator.reason or "资料命中群规").strip()[:80])
-        body.append(f"• {_mention(violator)} — {reason}")
-    body.append("")
-    body.append(
-        f"请相关成员在 {_format_timeout(timeout_seconds)} 内点击下方「真人质询」按钮，"
-        "与我私聊完成人机验证；"
+        details.append(f"• {_mention(violator)}：{reason}")
+    details.append("超时处理：移出群聊（不会封禁，可重新加入）。")
+    return render_progress_notice(
+        "资料巡检 · 需要验证",
+        completed="已完成资料巡检",
+        current="已暂时限制相关成员发言",
+        next_step="完成人机验证后自动恢复权限",
+        action=(
+            f"请被点名成员在 {_format_timeout(timeout_seconds)} 内"
+            "点击下方「真人质询」按钮。"
+        ),
+        details=details,
     )
-    body.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
-    return render_notice_card("资料巡检警告", body)
 
 
 def build_patrol_challenge_keyboard() -> InlineKeyboardMarkup:

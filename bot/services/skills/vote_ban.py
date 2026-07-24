@@ -97,12 +97,14 @@ class VoteBanSkill:
             session_factory=context.session_factory,
         )
         if not result.ok:
+            payload = result.payload()
+            payload["telegram_text"] = result.telegram_text
             return SkillRunResult(
                 ok=False,
                 skill=self.name,
                 summary=result.summary,
                 error=result.code,
-                payload=result.payload(),
+                payload=payload,
             )
 
         # The poll itself is the delivered action. Suppress a redundant model

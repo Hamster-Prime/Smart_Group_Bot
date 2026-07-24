@@ -173,6 +173,11 @@ _TG_USER_LINK_MD_RE = re.compile(
     r"""\[([^\]]+)\]\(\s*tg://user\?id=\d+\s*\)""",
     flags=re.IGNORECASE,
 )
+_TG_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|tg-emoji|a|code|pre|blockquote)"
+    r"(?=[\s>/])[^>]*>",
+    flags=re.IGNORECASE,
+)
 _CODE_SPAN_RE = re.compile(
     r"```[\s\S]*?```|`[^`\n]*`|<code>[\s\S]*?</code>|<pre>[\s\S]*?</pre>",
     flags=re.IGNORECASE,
@@ -239,18 +244,64 @@ def sanitize_outgoing_mentions(text: str) -> str:
             segment,
         )
 
-    # Do not touch existing code spans; otherwise markdown/html formatting can break.
+    # Do not rewrite HTML tag attributes. Search/tool results can contain an
+    # ``@name`` inside a URL query; inserting ``<code>`` into that href would
+    # make the whole Telegram entity invalid. Visible text inside an existing
+    # HTML entity still gets a zero-width break, without nesting another entity.
+    protected: list[tuple[int, int, int, str]] = []
+    protected.extend(
+        (match.start(), match.end(), 0, match.group(0))
+        for match in _CODE_SPAN_RE.finditer(cleaned)
+    )
+    protected.extend(
+        (match.start(), match.end(), 1, match.group(0))
+        for match in _TG_HTML_TAG_RE.finditer(cleaned)
+    )
+    protected.sort(key=lambda item: (item[0], item[2], -(item[1] - item[0])))
+
     result_parts: list[str] = []
     cursor = 0
-    for code_match in _CODE_SPAN_RE.finditer(cleaned):
-        start, end = code_match.span()
+    open_tags: list[str] = []
+    for start, end, kind, token in protected:
+        # A complete code/pre span takes precedence over its individual tags.
+        if start < cursor:
+            continue
         if start > cursor:
-            result_parts.append(_replace_mentions(cleaned[cursor:start]))
-        result_parts.append(_replace_mentions_in_code(cleaned[start:end]))
+            visible = cleaned[cursor:start]
+            result_parts.append(
+                _replace_mentions_in_code(visible)
+                if open_tags
+                else _replace_mentions(visible)
+            )
+
+        if kind == 0:
+            result_parts.append(_replace_mentions_in_code(token))
+        else:
+            result_parts.append(token)
+            tag_match = re.match(r"<\s*(/?)\s*([A-Za-z-]+)", token)
+            if tag_match:
+                closing = bool(tag_match.group(1))
+                tag_name = tag_match.group(2).lower()
+                if closing:
+                    for index in range(len(open_tags) - 1, -1, -1):
+                        if open_tags[index] == tag_name:
+                            del open_tags[index:]
+                            break
+                elif not token.rstrip().endswith("/>"):
+                    open_tags.append(tag_name)
         cursor = end
     if cursor < len(cleaned):
-        result_parts.append(_replace_mentions(cleaned[cursor:]))
+        tail = cleaned[cursor:]
+        result_parts.append(
+            _replace_mentions_in_code(tail) if open_tags else _replace_mentions(tail)
+        )
     return "".join(result_parts)
+
+
+def _telegram_html_text_units(text: str) -> int:
+    """Count parsed Telegram HTML text in UTF-16 code units."""
+    visible = html.unescape(_TG_HTML_TAG_RE.sub("", str(text or "")))
+    return len(visible.encode("utf-16-le")) // 2
 
 
 def sanitize_outgoing_text(text: str) -> str:
@@ -771,7 +822,16 @@ async def ensure_admin(message: Message, settings: Settings | None = None) -> bo
     if ok:
         return True
 
-    sent = await message.answer("仅群管理员可使用该命令。")
+    # Deferred to avoid the template module's import of this utility module.
+    from bot.services.message_templates import render_action_notice
+
+    sent = await message.answer(
+        render_action_notice(
+            "权限不足",
+            action="仅群管理员可使用该命令。",
+        ),
+        parse_mode="HTML",
+    )
     if settings:
         await schedule_message_auto_delete_durable(
             sent,
@@ -1167,7 +1227,11 @@ async def send_reply(
     async def _finalize_stream_format(sent: Message, segment: str) -> bool:
         """Try to preserve markdown formatting after stream plain-text phase."""
         final_html = md_to_html(segment)
-        if final_html == segment:
+        # Streaming initially sends plain text so incremental edits cannot
+        # expose half-built entities. A pre-rendered Telegram HTML notice does
+        # not change in ``md_to_html``; it still needs one final HTML edit or
+        # clients will display its tags literally.
+        if final_html == segment and _TG_HTML_TAG_RE.search(segment) is None:
             return True
 
         html_ok = await _safe_edit(sent, final_html, parse_mode="HTML", retries=2)
@@ -1259,12 +1323,20 @@ async def send_reply(
 
     async def _deliver_payload() -> bool:
         async with semaphore:
-            if not stream:
-                parts = _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+            pre_rendered_html = _TG_HTML_TAG_RE.search(payload) is not None
+            # Pre-rendered HTML must not be streamed as literal, half-open tags.
+            # Send it once as HTML and retain the normal format fallbacks.
+            if not stream or pre_rendered_html:
+                parts = (
+                    [payload]
+                    if pre_rendered_html
+                    and _telegram_html_text_units(payload) <= TG_MESSAGE_LIMIT
+                    else _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+                )
                 ok = True
                 for part in parts:
-                    html = md_to_html(part)
-                    sent = await _safe_send(html, parse_mode="HTML", retries=3)
+                    html_body = part if pre_rendered_html else md_to_html(part)
+                    sent = await _safe_send(html_body, parse_mode="HTML", retries=3)
                     if not sent:
                         sent = await _safe_send(part, parse_mode="Markdown", retries=2)
                     if not sent:

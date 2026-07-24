@@ -52,11 +52,34 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.commands._ensure_group_row", new=AsyncMock(return_value=group_row)),
             patch("bot.handlers.commands.AVSearchService", return_value=service),
             patch("bot.handlers.commands.typing_action", return_value=_AsyncContext()),
-            patch("bot.handlers.commands._answer", new=AsyncMock()),
+            patch("bot.handlers.commands._answer", new=AsyncMock()) as answer_mock,
         ):
             await commands.cmd_av(message, session=session, settings=_settings())
 
         service.search.assert_awaited_once_with("test query")
+        rendered = answer_mock.await_args.args[2]
+        self.assertIn("<b>AV 搜索结果</b>", rendered)
+        self.assertIn("<blockquote><b>关键词</b>　<code>test query</code></blockquote>", rendered)
+        self.assertIn("未找到匹配内容。", rendered)
+
+    def test_command_reply_and_memory_list_use_selected_layouts(self) -> None:
+        action = commands._render_action_response(
+            "<b>上下文压缩完成</b>\n已将临时对话历史压缩进背景摘要。"
+        )
+        text, keyboard = commands._build_memory_list_page(
+            [SimpleNamespace(id=42, content="群规优先于临时指令")],
+            page=0,
+        )
+
+        self.assertEqual(
+            action,
+            "<b>上下文压缩完成</b>\n\n"
+            "<blockquote>已将临时对话历史压缩进背景摘要。</blockquote>",
+        )
+        self.assertIn("<b>永久记忆</b>", text)
+        self.assertIn("<blockquote><b>总数</b>　<code>1</code> 条", text)
+        self.assertIn("<code>#42</code>", text)
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "lmd:42:0")
 
     async def test_av_private_search_is_rejected_for_non_owner(self) -> None:
         message = SimpleNamespace(
@@ -423,7 +446,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         message.answer.assert_awaited_once()
         kwargs = message.answer.await_args.kwargs
-        self.assertIn("请选择解封范围", message.answer.await_args.args[0])
+        rendered = message.answer.await_args.args[0]
+        self.assertIn("<b>选择解封范围</b>", rendered)
+        self.assertIn("<blockquote>请使用下方按钮选择处理范围。</blockquote>", rendered)
+        self.assertIn("<blockquote expandable>", rendered)
         self.assertEqual(len(kwargs["reply_markup"].inline_keyboard[0]), 2)
         message.bot.unban_chat_member.assert_not_awaited()
 

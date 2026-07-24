@@ -36,6 +36,7 @@ from bot.services.join_verification import (
     verification_restriction_required,
 )
 from bot.services.llm import LLMService
+from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
 from bot.services.recent_messages import (
     member_join_marker,
@@ -492,10 +493,16 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
             # name so the ban notice does not passively reprint it. The ID
             # stays visible.
             shown = spoiler_display_name(full_name or username or "", int(user.id))
-            notice = (
-                f"已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）\n"
-                f"原因：{html.escape(reason or '资料命中群规')}\n"
-                "如需解封请管理员使用 /unban 命令。"
+            notice = render_summary_notice(
+                "成员资料审核 · 已处理",
+                card_field(
+                    "处理结果",
+                    f"已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）",
+                ),
+                details=[
+                    card_field("原因", html.escape(reason or "资料命中群规")),
+                    "如需解封，请管理员使用 <code>/unban</code> 命令。",
+                ],
             )
             try:
                 await answer_with_auto_delete(

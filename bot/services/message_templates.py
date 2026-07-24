@@ -296,11 +296,9 @@ def render_plain_template(
     return rendered.strip()
 
 
-# Unified notice-card style: a bold, emoji-free title followed by a single
-# blockquote body.  Field rows inside the body use a full-width ideographic
-# space to separate label and value instead of a colon, which reads cleaner in
-# the quoted block.  All moderation / verification / raid / vote notices share
-# this so a member sees one consistent card shape everywhere.
+# Shared field syntax for the four system-message layouts below. Field rows use
+# a full-width ideographic space between label and value so quoted metadata is
+# easy to scan without depending on fragile manual column alignment.
 CARD_FIELD_SPACE = "　"
 
 
@@ -315,7 +313,7 @@ def card_field(label: str, value: object) -> str:
 
 
 def render_notice_card(title: str, body: object) -> str:
-    """Render the unified notice card: a bold title above a blockquote body.
+    """Render the original one-quote card retained for compatibility.
 
     ``title`` is plain text and is escaped here.  ``body`` is trusted HTML —
     either a single pre-built string or an iterable of pre-built lines joined
@@ -324,6 +322,201 @@ def render_notice_card(title: str, body: object) -> str:
     if not isinstance(body, str):
         body = "\n".join(str(line) for line in body)
     return f"<b>{html.escape(str(title))}</b>\n<blockquote>{body}</blockquote>"
+
+
+def _coerce_html_body(body: object | None) -> str:
+    """Join pre-rendered HTML lines while preserving intentional blank rows."""
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body.strip()
+    try:
+        return "\n".join(str(line) for line in body).strip()
+    except TypeError:
+        return str(body).strip()
+
+
+def truncate_telegram_text(
+    value: object,
+    max_units: int,
+    *,
+    suffix: str = "...",
+) -> str:
+    """Truncate text using Telegram's UTF-16 message-length accounting."""
+    source = "" if value is None else str(value)
+    limit = max(0, int(max_units))
+
+    def units(text: str) -> int:
+        return len(text.encode("utf-16-le")) // 2
+
+    def take(text: str, budget: int) -> str:
+        used = 0
+        chars: list[str] = []
+        for char in text:
+            width = 2 if ord(char) > 0xFFFF else 1
+            if used + width > budget:
+                break
+            chars.append(char)
+            used += width
+        return "".join(chars)
+
+    if units(source) <= limit:
+        return source
+    ending = str(suffix or "")
+    ending_units = units(ending)
+    if ending_units >= limit:
+        return take(ending, limit)
+    return take(source, limit - ending_units).rstrip() + ending
+
+
+def render_expandable_blockquote(body: object | None) -> str:
+    """Render optional Telegram expandable-quote details.
+
+    The input follows the same convention as :func:`render_notice_card`:
+    it is already-safe Telegram HTML.  Returning an empty string for an empty
+    body lets callers append optional details without producing an invalid
+    empty quote entity.
+    """
+    rendered = _coerce_html_body(body)
+    if not rendered:
+        return ""
+    return f"<blockquote expandable>{rendered}</blockquote>"
+
+
+def render_summary_notice(
+    title: str,
+    summary: object | None = None,
+    *,
+    details: object | None = None,
+) -> str:
+    """Render a concise notice with optional expandable supporting detail.
+
+    This is intended for moderation, voting, raid, and escalation notices:
+    the group-visible outcome remains immediately readable while evidence,
+    rationale, and follow-up policy can be collapsed below it. ``summary``
+    and ``details`` are pre-rendered safe Telegram HTML.
+    """
+    parts = [f"<b>{html.escape(str(title))}</b>"]
+    summary_text = _coerce_html_body(summary)
+    if summary_text:
+        parts.append(f"<blockquote>{summary_text}</blockquote>")
+    detail_text = render_expandable_blockquote(details)
+    if detail_text:
+        parts.append(detail_text)
+    return "\n\n".join(parts)
+
+
+def render_progress_notice(
+    title: str,
+    *,
+    completed: object | None = None,
+    current: object | None = None,
+    next_step: object | None = None,
+    action: object | None = None,
+    details: object | None = None,
+) -> str:
+    """Render a flow-oriented notice for verification and background tasks.
+
+    ``completed`` accepts one line or an iterable of lines and is rendered
+    with strikethrough. ``current`` and ``next_step`` become stable field
+    rows in the progress quote. ``action`` stays outside the quote so the
+    member's next action remains prominent. All non-title arguments are
+    pre-rendered safe Telegram HTML, allowing links and code entities.
+    """
+    progress_lines: list[str] = []
+    completed_text = _coerce_html_body(completed)
+    if completed_text:
+        progress_lines.extend(
+            f"<s>{line}</s>"
+            for line in completed_text.split("\n")
+            if line.strip()
+        )
+    current_text = _coerce_html_body(current)
+    if current_text:
+        progress_lines.append(card_field("当前", current_text))
+    next_text = _coerce_html_body(next_step)
+    if next_text:
+        progress_lines.append(card_field("下一步", next_text))
+
+    parts = [f"<b>{html.escape(str(title))}</b>"]
+    if progress_lines:
+        parts.append(f"<blockquote>{'\n'.join(progress_lines)}</blockquote>")
+    action_text = _coerce_html_body(action)
+    if action_text:
+        parts.append(action_text)
+    detail_text = render_expandable_blockquote(details)
+    if detail_text:
+        parts.append(detail_text)
+    return "\n\n".join(parts)
+
+
+def render_action_notice(
+    title: str,
+    *,
+    context: object | None = None,
+    action: object | None = None,
+    details: object | None = None,
+) -> str:
+    """Render an action-first command response with optional detail.
+
+    ``context`` is a short, unquoted line such as a target mention and
+    deadline. ``action`` is placed in a quote for the result or required next
+    action. Use :func:`render_summary_notice` when the quote itself is the
+    primary content rather than a command response. All non-title arguments
+    are pre-rendered safe Telegram HTML.
+    """
+    parts = [f"<b>{html.escape(str(title))}</b>"]
+    context_text = _coerce_html_body(context)
+    if context_text:
+        parts.append(context_text)
+    action_text = _coerce_html_body(action)
+    if action_text:
+        parts.append(f"<blockquote>{action_text}</blockquote>")
+    detail_text = render_expandable_blockquote(details)
+    if detail_text:
+        parts.append(detail_text)
+    return "\n\n".join(parts)
+
+
+def render_data_brief(
+    title: str,
+    *,
+    metadata: object | None = None,
+    items: object | None = None,
+    empty: object | None = None,
+    footer: object | None = None,
+) -> str:
+    """Render a compact, scan-friendly paginated/search result view.
+
+    Metadata is shown as the project's standard quoted field rows, while
+    ``items`` remains ordinary text for readable lists on narrow Telegram
+    clients. Values must be pre-rendered safe Telegram HTML; callers normally
+    use ``<code>`` for identifiers, counts, and page positions.
+    """
+    parts = [f"<b>{html.escape(str(title))}</b>"]
+    metadata_lines: list[str] = []
+    if isinstance(metadata, Mapping):
+        metadata_lines = [
+            card_field(str(label), value) for label, value in metadata.items()
+        ]
+    elif metadata is not None:
+        metadata_text = _coerce_html_body(metadata)
+        if metadata_text:
+            metadata_lines = [metadata_text]
+    if metadata_lines:
+        parts.append(f"<blockquote>{'\n'.join(metadata_lines)}</blockquote>")
+
+    item_text = _coerce_html_body(items)
+    if item_text:
+        parts.append(item_text)
+    else:
+        empty_text = _coerce_html_body(empty)
+        if empty_text:
+            parts.append(f"<blockquote>{empty_text}</blockquote>")
+    footer_text = _coerce_html_body(footer)
+    if footer_text:
+        parts.append(footer_text)
+    return "\n\n".join(parts)
 
 
 def buttons_to_lines(value: object) -> str:
@@ -348,8 +541,14 @@ __all__ = [
     "buttons_to_lines",
     "card_field",
     "normalize_template_buttons",
+    "render_action_notice",
+    "render_data_brief",
+    "render_expandable_blockquote",
     "render_markdown_html",
     "render_notice_card",
     "render_plain_template",
+    "render_progress_notice",
+    "render_summary_notice",
     "send_template_with_fallback",
+    "truncate_telegram_text",
 ]

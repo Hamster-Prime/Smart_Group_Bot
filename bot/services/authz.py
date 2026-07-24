@@ -22,6 +22,25 @@ async def _schedule_auto_delete(sent: Message | None, settings: Settings) -> Non
     )
 
 
+async def _send_access_notice(
+    message: Message,
+    settings: Settings,
+    *,
+    title: str,
+    action: str,
+) -> None:
+    """Send an action-first access notice without creating an import cycle."""
+    # message_templates imports bot.utils.telegram, which imports this module.
+    # Keeping this import inside the send path preserves that dependency order.
+    from bot.services.message_templates import render_action_notice
+
+    sent = await message.answer(
+        render_action_notice(title, action=action),
+        parse_mode="HTML",
+    )
+    await _schedule_auto_delete(sent, settings)
+
+
 def is_super_admin_user_id(user_id: int, settings: Settings) -> bool:
     return bool(settings.super_admin_id) and user_id == settings.super_admin_id
 
@@ -38,8 +57,12 @@ async def ensure_super_admin(message: Message, settings: Settings) -> bool:
     if user and is_super_admin_user_id(user.id, settings):
         mark_privileged_operator(int(user.id))
         return True
-    sent = await message.answer("仅最高管理员可使用该命令。")
-    await _schedule_auto_delete(sent, settings)
+    await _send_access_notice(
+        message,
+        settings,
+        title="权限不足",
+        action="仅最高管理员可使用该命令。",
+    )
     return False
 
 
@@ -218,8 +241,12 @@ async def ensure_group_authorized(
     if ok:
         return True
 
-    sent = await message.answer("无授权,禁止使用")
-    await _schedule_auto_delete(sent, settings)
+    await _send_access_notice(
+        message,
+        settings,
+        title="当前群未授权",
+        action="请联系最高管理员完成群组授权。",
+    )
     return False
 
 
@@ -231,8 +258,12 @@ async def ensure_group_admin_permission(
     allow_super_admin: bool = True,
 ) -> bool:
     if not message.chat or message.chat.type not in ("group", "supergroup"):
-        sent = await message.answer("该命令仅可在群内使用。")
-        await _schedule_auto_delete(sent, settings)
+        await _send_access_notice(
+            message,
+            settings,
+            title="无法执行",
+            action="该命令仅可在群内使用。",
+        )
         return False
 
     user = message.from_user
@@ -241,8 +272,12 @@ async def ensure_group_admin_permission(
         return True
 
     if not user:
-        sent = await message.answer("无法识别操作者。")
-        await _schedule_auto_delete(sent, settings)
+        await _send_access_notice(
+            message,
+            settings,
+            title="无法执行",
+            action="无法识别操作者。",
+        )
         return False
 
     ok = await is_group_admin_authorized(session, message.chat.id, user.id)
@@ -251,6 +286,10 @@ async def ensure_group_admin_permission(
         mark_privileged_operator(int(user.id), group_id=int(message.chat.id))
         return True
 
-    sent = await message.answer("你没有群管理权限，请联系最高管理员授权。")
-    await _schedule_auto_delete(sent, settings)
+    await _send_access_notice(
+        message,
+        settings,
+        title="权限不足",
+        action="你没有群管理权限，请联系最高管理员授权。",
+    )
     return False

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
+from bot.services.message_templates import render_data_brief
 from bot.utils import telegram
 from bot.utils.telegram import answer_with_auto_delete, send_chat_message, send_reply, send_reply_messages
 
@@ -200,6 +201,94 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, [True])
         self.assertEqual(mocked.await_count, 1)
         self.assertTrue(mocked.await_args.kwargs["stream"])
+
+    async def test_streaming_sends_pre_rendered_data_brief_directly_as_html(self) -> None:
+        rendered = render_data_brief(
+            "永久记忆",
+            metadata={"总数": "<code>1</code> 条"},
+            items=(
+                '<b>1.</b> <a href="https://example.com/search?q=_alice_">'
+                "群规优先</a>"
+            ),
+        )
+        sent = SimpleNamespace(
+            message_id=77,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=sent),
+            answer=AsyncMock(),
+        )
+
+        ok = await send_reply(
+            message,
+            rendered,
+            delivery_mode="reply",
+            stream=True,
+            stream_interval=0,
+            auto_delete_seconds=0,
+        )
+
+        self.assertTrue(ok)
+        message.reply.assert_awaited_once_with(rendered, parse_mode="HTML")
+        sent.edit_text.assert_not_awaited()
+
+    async def test_pre_rendered_stream_keeps_markdown_fallback(self) -> None:
+        rendered = render_data_brief(
+            "搜索结果",
+            items="<b>1.</b> result",
+        )
+        sent = SimpleNamespace(message_id=77, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(
+                side_effect=[
+                    TelegramBadRequest(
+                        method=SimpleNamespace(),
+                        message="Bad Request: can't parse entities",
+                    ),
+                    sent,
+                ]
+            ),
+            answer=AsyncMock(),
+        )
+
+        ok = await send_reply(
+            message,
+            rendered,
+            delivery_mode="reply",
+            stream=True,
+            stream_interval=0,
+            auto_delete_seconds=0,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(message.reply.await_count, 2)
+        self.assertEqual(message.reply.await_args_list[0].kwargs["parse_mode"], "HTML")
+        self.assertEqual(message.reply.await_args_list[1].kwargs["parse_mode"], "Markdown")
+
+    async def test_html_entities_are_not_split_by_raw_source_length(self) -> None:
+        rendered = render_data_brief(
+            "搜索结果",
+            items="&amp;" * 900,
+        )
+        self.assertGreater(len(rendered), telegram.TG_STREAM_SAFE_LIMIT)
+        sent = SimpleNamespace(message_id=77, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=sent),
+            answer=AsyncMock(),
+        )
+
+        ok = await send_reply(message, rendered, stream=True)
+
+        self.assertTrue(ok)
+        message.reply.assert_awaited_once_with(rendered, parse_mode="HTML")
 
     async def test_send_reply_can_use_explicit_reply_target(self) -> None:
         bot = SimpleNamespace(

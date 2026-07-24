@@ -11,9 +11,15 @@ from bot.services.member_identity import (
 from bot.services.message_templates import (
     build_template_keyboard,
     normalize_template_buttons,
+    render_action_notice,
+    render_data_brief,
+    render_expandable_blockquote,
     render_markdown_html,
+    render_progress_notice,
     render_plain_template,
+    render_summary_notice,
     send_template_with_fallback,
+    truncate_telegram_text,
 )
 from bot.utils.telegram import DELETE_BUTTON_CALLBACK_DATA
 
@@ -39,6 +45,71 @@ class TemplateRenderTests(unittest.TestCase):
             render_plain_template("欢迎 {mention}", replacements={"{mention}": "Alice"}),
             "欢迎 Alice",
         )
+
+    def test_summary_notice_keeps_details_expandable(self) -> None:
+        rendered = render_summary_notice(
+            "内容审核 · 已处理",
+            "<b>处理结果</b>　已删除消息并发出警告",
+            details=["<b>原因</b>　命中群规 #3", "<b>后续</b>　再次违规将升级处理"],
+        )
+
+        self.assertEqual(
+            rendered,
+            "<b>内容审核 · 已处理</b>\n\n"
+            "<blockquote><b>处理结果</b>　已删除消息并发出警告</blockquote>\n\n"
+            "<blockquote expandable><b>原因</b>　命中群规 #3\n"
+            "<b>后续</b>　再次违规将升级处理</blockquote>",
+        )
+
+    def test_progress_notice_marks_completed_steps_and_promotes_action(self) -> None:
+        rendered = render_progress_notice(
+            "入群验证 · 待完成",
+            completed="已加入群聊",
+            current="完成人机验证",
+            next_step="恢复发言权限",
+            action="请在 10 分钟内点击下方「开始验证」。",
+        )
+
+        self.assertEqual(
+            rendered,
+            "<b>入群验证 · 待完成</b>\n\n"
+            "<blockquote><s>已加入群聊</s>\n"
+            "<b>当前</b>　完成人机验证\n"
+            "<b>下一步</b>　恢复发言权限</blockquote>\n\n"
+            "请在 10 分钟内点击下方「开始验证」。",
+        )
+
+    def test_action_notice_and_data_brief_keep_html_values_unescaped(self) -> None:
+        action = render_action_notice(
+            "永久记忆已保存",
+            context='<a href="tg://user?id=7">Alice</a> · <code>#42</code>',
+            action="已新增 1 条永久记忆。",
+        )
+        data = render_data_brief(
+            "AV 搜索结果",
+            metadata={"关键词": "<code>WANZ-530</code>", "页码": "<code>1 / 2</code>"},
+            items=["1. <code>WANZ-530</code> 标题"],
+        )
+
+        self.assertIn('<a href="tg://user?id=7">Alice</a>', action)
+        self.assertIn("<blockquote>已新增 1 条永久记忆。</blockquote>", action)
+        self.assertEqual(
+            data,
+            "<b>AV 搜索结果</b>\n\n"
+            "<blockquote><b>关键词</b>　<code>WANZ-530</code>\n"
+            "<b>页码</b>　<code>1 / 2</code></blockquote>\n\n"
+            "1. <code>WANZ-530</code> 标题",
+        )
+
+    def test_expandable_blockquote_omits_empty_body(self) -> None:
+        self.assertEqual(render_expandable_blockquote(None), "")
+        self.assertEqual(render_expandable_blockquote(["", "  "]), "")
+
+    def test_telegram_truncation_counts_non_bmp_characters_as_two_units(self) -> None:
+        rendered = truncate_telegram_text("😀" * 10, 11)
+
+        self.assertEqual(rendered, "😀" * 4 + "...")
+        self.assertLessEqual(len(rendered.encode("utf-16-le")) // 2, 11)
 
 
 class TemplateKeyboardTests(unittest.TestCase):

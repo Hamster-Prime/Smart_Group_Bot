@@ -51,7 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import Settings
 from bot.db.models import AuthorizedGroup, Group, JoinVerification
 from bot.services.authz import is_group_authorized
-from bot.services.message_templates import render_notice_card
+from bot.services.message_templates import render_progress_notice, render_summary_notice
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
@@ -100,7 +100,10 @@ log = logging.getLogger(__name__)
 
 # Suspects mentioned per challenge message: keeps each message far below the
 # 4096-char cap and within Telegram's per-message mention-notification limits.
-RAID_MENTIONS_PER_MESSAGE = 15
+# Bound parsed prompt text below Telegram's 4096 UTF-16-unit message limit even
+# when every member uses a maximum-length emoji display name.
+RAID_MENTIONS_PER_MESSAGE = 8
+_RAID_DISPLAY_NAME_LIMIT = 128
 # Upper bound on remembered joins per group; a raid larger than this still
 # triggers long before the cap is reached.
 _MAX_TRACKED_JOINS = 4096
@@ -442,8 +445,11 @@ class RaidSuspect:
 
 def _mention(suspect: RaidSuspect) -> str:
     if suspect.username:
-        return f"@{suspect.username}"
-    label = html.escape((suspect.full_name or "").strip() or str(suspect.user_id))
+        return f"@{html.escape(str(suspect.username).strip()[:32])}"
+    raw_label = (suspect.full_name or "").strip() or str(suspect.user_id)
+    if len(raw_label) > _RAID_DISPLAY_NAME_LIMIT:
+        raw_label = raw_label[: _RAID_DISPLAY_NAME_LIMIT - 3].rstrip() + "..."
+    label = html.escape(raw_label)
     return f'<a href="tg://user?id={suspect.user_id}">{label}</a>'
 
 
@@ -460,34 +466,40 @@ def build_raid_lockdown_text(
     window_seconds: int,
     lockdown_seconds: int,
 ) -> str:
-    return render_notice_card(
-        "爆破防护已触发",
+    return render_summary_notice(
+        "爆破防护 · 已触发",
         (
             f"检测到 {_format_duration(window_seconds)}内有 {joined_count} 名成员加入，"
+            "已临时锁定新成员入口。"
+        ),
+        details=(
             "疑似遭遇批量爆破。\n"
-            f"群组已临时锁定 {_format_duration(lockdown_seconds)}：期间任何新加入的成员"
-            "都会被自动移出（不封禁，解除后可重新加入）。"
+            f"锁定时长：{_format_duration(lockdown_seconds)}。期间新加入的成员"
+            "会被自动移出（不封禁，解除后可重新加入）。"
         ),
     )
 
 
 def build_manual_raid_lockdown_text(*, duration_minutes: int | None) -> str:
     if duration_minutes is None:
-        duration_text = "关闭前将持续拒绝新成员加入"
+        duration_text = "锁定时长：直到管理员手动关闭。"
     else:
-        duration_text = (
-            f"将在 {_format_duration(duration_minutes * 60)} 内拒绝新成员加入"
-        )
-    return render_notice_card(
-        "爆破防护已手动开启",
-        f"{duration_text}；被拒绝的成员不会封禁，解除后可以重新加入。",
+        duration_text = f"锁定时长：{_format_duration(duration_minutes * 60)}。"
+    return render_summary_notice(
+        "爆破防护 · 已开启",
+        "已手动锁定新成员入口。",
+        details=(
+            f"{duration_text}\n"
+            "期间新加入的成员会被自动移出（不封禁，解除后可重新加入）。"
+        ),
     )
 
 
 def build_raid_unlock_text() -> str:
-    return render_notice_card(
-        "爆破防护已解除",
-        "群组已恢复接收新成员；此前被临时移出的用户现在可以重新加入。",
+    return render_summary_notice(
+        "爆破防护 · 已解除",
+        "群组已恢复接收新成员。",
+        details="此前被临时移出的用户现在可以重新加入。",
     )
 
 
@@ -557,16 +569,21 @@ def build_raid_challenge_text(
     *,
     timeout_seconds: int,
 ) -> str:
-    body = ["以下近期加入的成员需要完成真人验证，已暂时禁言："]
-    for suspect in suspects:
-        body.append(f"• {_mention(suspect)}")
-    body.append("")
-    body.append(
-        f"请相关成员在 {_format_duration(timeout_seconds)} 内点击下方「真人质询」按钮，"
-        "与我私聊完成人机验证；"
+    members = list(suspects)
+    details = ["涉及成员："]
+    details.extend(f"• {_mention(suspect)}" for suspect in members)
+    details.append("超时处理：移出群聊（不会封禁，可重新加入）。")
+    return render_progress_notice(
+        "爆破防护 · 真人质询",
+        completed="已完成爆破风险识别",
+        current="已暂时限制相关成员发言",
+        next_step="完成人机验证后自动恢复权限",
+        action=(
+            f"请被点名成员在 {_format_duration(timeout_seconds)} 内"
+            "点击下方「真人质询」按钮。"
+        ),
+        details=details,
     )
-    body.append("通过后自动恢复发言权限，超时将被移出群聊（不会封禁，可重新加入）。")
-    return render_notice_card("爆破防护真人质询", body)
 
 
 def build_raid_challenge_keyboard() -> InlineKeyboardMarkup:

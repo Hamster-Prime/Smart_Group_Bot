@@ -8,6 +8,16 @@ from bot.services.skills.base import SkillContext, SkillRunResult
 from bot.services.skills.service import SkillService
 
 
+_VOTE_REFUSAL_SUMMARY = (
+    "你在 1 小时内最多只能发起 1 次民主投票；额度已用完，请 30 分钟后再试。"
+)
+_VOTE_REFUSAL_TELEGRAM_TEXT = (
+    "<b>民主投票封禁 · 未发起</b>\n\n"
+    "<blockquote><b>处理结果</b>　未创建投票</blockquote>\n\n"
+    f"<blockquote expandable><b>原因</b>　{_VOTE_REFUSAL_SUMMARY}</blockquote>"
+)
+
+
 def _resp(*, content: str = "", tool_calls: list[dict] | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[
@@ -101,9 +111,12 @@ class _PlannedSkillService(SkillService):
             return SkillRunResult(
                 ok=False,
                 skill=name,
-                summary="你在 1 小时内最多只能发起 1 次民主投票；额度已用完，请 30 分钟后再试。",
+                summary=_VOTE_REFUSAL_SUMMARY,
                 error="starter_quota_exhausted",
-                payload={"quota": {"limit": 1, "used": 1, "remaining": 0}},
+                payload={
+                    "quota": {"limit": 1, "used": 1, "remaining": 0},
+                    "telegram_text": _VOTE_REFUSAL_TELEGRAM_TEXT,
+                },
             )
 
         if name == "rule_manage":
@@ -213,6 +226,24 @@ class SkillServiceTTSPromptTests(unittest.TestCase):
 
 
 class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_mandatory_refusal_fallback_prefers_telegram_text(self) -> None:
+        service = _PlannedSkillService([])
+        result = SkillRunResult(
+            ok=False,
+            skill="vote_ban",
+            summary=_VOTE_REFUSAL_SUMMARY,
+            error="starter_quota_exhausted",
+            payload={"telegram_text": _VOTE_REFUSAL_TELEGRAM_TEXT},
+        )
+
+        text = service._build_tool_fallback_text(
+            recent_tool_results=[{"result": result}],
+            default_text="fallback",
+        )
+
+        self.assertEqual(text, _VOTE_REFUSAL_TELEGRAM_TEXT)
+        self.assertNotIn("<blockquote", result.summary)
+
     async def test_movie_info_summary_triggers_source_aware_followup(self) -> None:
         service = _PlannedSkillService([])
         recent_tool_results = [
@@ -399,6 +430,8 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("额度已用完", result.text)
         self.assertIn("30 分钟后", result.text)
+        self.assertIn("民主投票封禁 · 未发起", result.text)
+        self.assertIn("<blockquote expandable>", result.text)
         self.assertFalse(result.handled)
 
     async def test_vote_quota_error_instructs_main_model_to_refuse_without_bypass(self) -> None:
@@ -420,6 +453,8 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("额度已用完", result.text)
         self.assertIn("30 分钟后", result.text)
+        self.assertIn("民主投票封禁 · 未发起", result.text)
+        self.assertIn("<blockquote expandable>", result.text)
         self.assertNotIn("已经发起", result.text)
         self.assertNotIn("绕过", result.text)
         second_call = service.calls[1]
@@ -593,9 +628,54 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.answer_with_skill("查一下 mosdns", intent_type="casual")
 
-        self.assertIn("我先查到这些相关结果：", result.text)
+        self.assertIn("<b>搜索结果</b>", result.text)
+        self.assertIn("<b>关键词</b>　<code>mosdns</code>", result.text)
+        self.assertIn("<b>结果</b>　<code>2</code> 条", result.text)
         self.assertIn("MosDNS 官方文档", result.text)
         self.assertIn("https://example.com/mosdns", result.text)
+
+    async def test_websearch_fallback_escapes_result_html_and_urls(self) -> None:
+        rendered = SkillService._render_result_list_fallback(
+            {
+                "query": 'DNS <fast> & "safe"',
+                "results": [
+                    {
+                        "title": "<b>伪标题</b> & 说明",
+                        "snippet": "2 < 3 & 4 > 1",
+                        "url": 'https://example.com/search?q=a&label="x"',
+                    }
+                ],
+            }
+        )
+
+        self.assertIn(
+            "<code>DNS &lt;fast&gt; &amp; &quot;safe&quot;</code>",
+            rendered,
+        )
+        self.assertIn("&lt;b&gt;伪标题&lt;/b&gt; &amp; 说明", rendered)
+        self.assertIn("2 &lt; 3 &amp; 4 &gt; 1", rendered)
+        self.assertIn(
+            '<a href="https://example.com/search?q=a&amp;label=&quot;x&quot;">'
+            "https://example.com/search?q=a&amp;label=&quot;x&quot;</a>",
+            rendered,
+        )
+        self.assertNotIn("<b>伪标题</b>", rendered)
+
+    async def test_websearch_fallback_does_not_link_unsupported_url_scheme(self) -> None:
+        rendered = SkillService._render_result_list_fallback(
+            {
+                "query": "scheme test",
+                "results": [
+                    {
+                        "title": "unsafe result",
+                        "url": "javascript:alert(1)",
+                    }
+                ],
+            }
+        )
+
+        self.assertIn("<code>javascript:alert(1)</code>", rendered)
+        self.assertNotIn('href="javascript:', rendered)
 
     async def test_platform_entry_fallback_includes_author_link(self) -> None:
         service = _PlannedSkillService(

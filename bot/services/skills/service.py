@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_preference_context
 from bot.services.llm import LLMService
+from bot.services.message_templates import render_data_brief
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
@@ -742,12 +745,16 @@ class SkillService:
         return ""
 
     @staticmethod
-    def _render_result_list_fallback(payload: dict[str, Any], *, lead: str = "我先查到这些相关结果：") -> str:
+    def _render_result_list_fallback(
+        payload: dict[str, Any],
+        *,
+        lead: str = "搜索结果",
+    ) -> str:
         rows = payload.get("results")
         if not isinstance(rows, list):
             return ""
 
-        lines = [lead]
+        items: list[str] = []
         for idx, row in enumerate(rows[:3], start=1):
             if not isinstance(row, dict):
                 continue
@@ -755,16 +762,43 @@ class SkillService:
             snippet = clean_multiline_text(str(row.get("snippet") or ""), max_len=140).strip()
             url = clean_text(str(row.get("url") or ""), max_len=220).strip()
 
-            block = f"{idx}. {title or url or '未命名结果'}"
+            heading = html.escape(title or url or "未命名结果")
+            block = f"<b>{idx}.</b> {heading}"
             if snippet:
-                block = f"{block}\n{snippet}"
+                block = f"{block}\n{html.escape(snippet)}"
             if url:
-                block = f"{block}\n{url}"
-            lines.append(block)
+                escaped_url = html.escape(url, quote=True)
+                try:
+                    parsed_url = urlparse(url)
+                    linkable = (
+                        parsed_url.scheme.lower() in {"http", "https"}
+                        and bool(parsed_url.netloc)
+                    )
+                except ValueError:
+                    linkable = False
+                if linkable:
+                    block = f'{block}\n<a href="{escaped_url}">{html.escape(url)}</a>'
+                else:
+                    block = f"{block}\n<code>{html.escape(url)}</code>"
+            items.append(block)
 
-        if len(lines) <= 1:
+        if not items:
             return ""
-        return "\n\n".join(lines).strip()
+
+        metadata: dict[str, str] = {
+            "结果": f"<code>{len(items)}</code> 条",
+        }
+        query = clean_multiline_text(str(payload.get("query") or ""), max_len=120).strip()
+        if query:
+            metadata = {
+                "关键词": f"<code>{html.escape(query)}</code>",
+                **metadata,
+            }
+        return render_data_brief(
+            lead.rstrip("：:").strip() or "搜索结果",
+            metadata=metadata,
+            items="\n\n".join(items),
+        )
 
     @staticmethod
     def _render_entry_fallback(payload: dict[str, Any]) -> str:
@@ -1245,6 +1279,10 @@ class SkillService:
                 and result.error in _MANDATORY_REFUSAL_ERRORS
                 and result.summary
             ):
+                payload = result.payload if isinstance(result.payload, dict) else {}
+                telegram_text = str(payload.get("telegram_text") or "").strip()
+                if telegram_text:
+                    return telegram_text
                 return result.summary
         latest = cls._latest_successful_tool_result(
             recent_tool_results,
@@ -1464,11 +1502,16 @@ class SkillService:
 
             # The model has now received the structured tool error and the
             # mandatory-refusal system block.  Its prose is advisory only:
-            # return the trusted quota summary deterministically so it cannot
+            # return the trusted refusal rendering deterministically so it cannot
             # claim success, omit the reason, or offer a bypass.
             if mandatory_refusal_summary:
                 log.info("skill tool loop enforcing deterministic quota refusal")
-                return _build_answer_result(mandatory_refusal_summary)
+                return _build_answer_result(
+                    self._build_tool_fallback_text(
+                        recent_tool_results=recent_tool_results,
+                        default_text=mandatory_refusal_summary,
+                    )
+                )
 
             assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
@@ -1624,7 +1667,12 @@ class SkillService:
             if mandatory_refusal_summary:
                 if step < self.max_tool_rounds:
                     continue
-                return _build_answer_result(mandatory_refusal_summary)
+                return _build_answer_result(
+                    self._build_tool_fallback_text(
+                        recent_tool_results=recent_tool_results,
+                        default_text=mandatory_refusal_summary,
+                    )
+                )
             if side_effect_committed and not side_effect_notice_added:
                 side_effect_notice_added = True
                 messages.append(

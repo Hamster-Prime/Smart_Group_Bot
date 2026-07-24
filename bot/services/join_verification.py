@@ -82,7 +82,7 @@ from bot.services.request_priority import (
     current_execution_priority,
 )
 from bot.services.resource_health import register_resource_health_provider
-from bot.services.message_templates import card_field, render_notice_card
+from bot.services.message_templates import card_field, render_progress_notice
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -1190,6 +1190,42 @@ def spoiler_display_name(display_name: str, user_id: int) -> str:
     return f"<tg-spoiler>{html.escape(label)}</tg-spoiler>"
 
 
+_VERIFICATION_NOTICE_LABELS = {
+    VERIFICATION_KIND_JOIN: "入群验证",
+    VERIFICATION_KIND_MODERATION: "消息审查验证",
+    VERIFICATION_KIND_PATROL: "资料巡检质询",
+    VERIFICATION_KIND_RAID: "爆破防护质询",
+}
+
+
+def build_verification_progress_text(
+    *,
+    kind: str,
+    status: str,
+    completed: object | None = None,
+    current: object | None = None,
+    next_step: object | None = None,
+    action: object | None = None,
+    details: object | None = None,
+) -> str:
+    """Render a verification state with the shared flow-progress layout.
+
+    Inputs other than ``kind`` and ``status`` are already-safe Telegram HTML.
+    Keeping this wrapper here gives group prompts, private challenges, and
+    terminal outcomes one stable title vocabulary without coupling callers to
+    individual verification-kind labels.
+    """
+    label = _VERIFICATION_NOTICE_LABELS.get(str(kind or ""), "真人验证")
+    return render_progress_notice(
+        f"{label} · {status}",
+        completed=completed,
+        current=current,
+        next_step=next_step,
+        action=action,
+        details=details,
+    )
+
+
 def build_group_prompt_text(
     *,
     user_id: int,
@@ -1197,15 +1233,20 @@ def build_group_prompt_text(
     timeout_seconds: int,
 ) -> str:
     shown = spoiler_display_name(display_name, user_id)
-    return render_notice_card(
-        "入群验证",
-        (
-            f'欢迎 <a href="tg://user?id={user_id}">{shown}</a> 加入。\n'
-            "本群已开启入群真人验证，验证通过前你暂时无法发言。\n\n"
-            f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮，"
-            "与我私聊并完成人机验证；\n"
-            "超时将被移出群聊（可重新加入再试）。"
+    return build_verification_progress_text(
+        kind=VERIFICATION_KIND_JOIN,
+        status="待完成",
+        completed="已加入群聊",
+        current="完成人机验证",
+        next_step="恢复发言权限",
+        action=(
+            f'<a href="tg://user?id={user_id}">{shown}</a>，请在 '
+            f"{_format_timeout(timeout_seconds)} 内点击下方「开始验证」。"
         ),
+        details=[
+            "验证通过后会自动恢复发言权限。",
+            "超时将被移出群聊，可重新加入后再次验证。",
+        ],
     )
 
 
@@ -1271,15 +1312,19 @@ def build_moderation_prompt_text(
 ) -> str:
     shown = html.escape((display_name or "").strip() or str(user_id))
     safe_reason = html.escape((reason or "疑似命中群规").strip())
-    return render_notice_card(
-        "消息审查验证",
-        [
-            f'⚠️ <a href="tg://user?id={user_id}">{shown}</a> 的消息触发了低置信度违规判定。',
-            card_field("原因", safe_reason),
-            "",
-            "验证通过前你暂时无法继续发言。",
-            f"请在 {_format_timeout(timeout_seconds)} 内点击下方按钮完成真人验证；",
-            "验证成功后自动恢复发言权限，超时将被封禁。",
+    return build_verification_progress_text(
+        kind=VERIFICATION_KIND_MODERATION,
+        status="待完成",
+        completed="已暂停发言",
+        current="完成人机验证",
+        next_step="恢复发言权限",
+        action=(
+            f'<a href="tg://user?id={user_id}">{shown}</a>，请在 '
+            f"{_format_timeout(timeout_seconds)} 内点击下方「开始验证」。"
+        ),
+        details=[
+            card_field("待核验原因", safe_reason),
+            "验证通过后会自动恢复发言权限；超时将被封禁。",
         ],
     )
 
@@ -1291,53 +1336,51 @@ def build_private_challenge_text(
     reason: str = "",
 ) -> str:
     deadline = deadline_at.strftime("%H:%M:%S")
+    details: list[str] = []
+    completed = "已加入群聊"
     if kind == VERIFICATION_KIND_MODERATION:
+        completed = "已暂停发言"
         safe_reason = html.escape((reason or "疑似命中群规").strip())
-        return render_notice_card(
-            "消息审查真人验证",
-            [
-                card_field("待核验原因", safe_reason),
-                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
-                "",
-                f"请在今天 {deadline} 前完成，超时将被封禁。",
-            ],
-        )
-    if kind == VERIFICATION_KIND_PATROL:
+        details = [card_field("待核验原因", safe_reason), "超时将被封禁。"]
+    elif kind == VERIFICATION_KIND_PATROL:
+        completed = "已暂停发言"
         safe_reason = html.escape((reason or "资料疑似命中群规").strip())
-        return render_notice_card(
-            "资料巡检真人质询",
-            [
-                card_field("待核验原因", safe_reason),
-                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
-                "",
-                f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。",
-            ],
-        )
-    if kind == VERIFICATION_KIND_RAID:
+        details = [
+            card_field("待核验原因", safe_reason),
+            "超时将被移出群聊，之后可以重新加入。",
+        ]
+    elif kind == VERIFICATION_KIND_RAID:
+        completed = "已暂停发言"
         safe_reason = html.escape((reason or "群组正遭遇批量加入").strip())
-        return render_notice_card(
-            "爆破防护真人质询",
-            [
-                card_field("待核验原因", safe_reason),
-                "点击下方按钮完成人机验证，通过后即可恢复群内发言权限。",
-                "",
-                f"请在今天 {deadline} 前完成，超时将被移出群聊（可重新加入）。",
-            ],
-        )
-    return render_notice_card(
-        "入群真人验证",
-        [
-            "点击下方按钮，在弹出的窗口中完成人机验证，通过后即可在群内发言。",
-            "",
-            f"请在今天 {deadline} 前完成，超时将被移出群聊。",
-        ],
+        details = [
+            card_field("待核验原因", safe_reason),
+            "超时将被移出群聊，之后可以重新加入。",
+        ]
+    else:
+        details = ["超时将被移出群聊，之后可以重新加入。"]
+    return build_verification_progress_text(
+        kind=kind,
+        status="待完成",
+        completed=completed,
+        current="完成人机验证",
+        next_step="恢复群内发言权限",
+        action=f"请在今天 {deadline} 前点击下方「开始验证」。",
+        details=details,
     )
 
 
 # Private-chat challenge entries are rewritten once their record reaches a
 # terminal state so a stale WebApp button cannot keep reopening the challenge.
-PRIVATE_CHALLENGE_SUPERSEDED_TEXT = "此验证入口已更新，请使用最新的验证消息。"
-PRIVATE_CHALLENGE_CLOSED_TEXT = "本次验证流程已结束，无需再次验证。"
+PRIVATE_CHALLENGE_SUPERSEDED_TEXT = build_verification_progress_text(
+    kind="",
+    status="已更新",
+    current="请使用最新的验证入口",
+)
+PRIVATE_CHALLENGE_CLOSED_TEXT = build_verification_progress_text(
+    kind="",
+    status="已结束",
+    current="本次验证流程已结束，无需再次验证",
+)
 
 
 def build_private_challenge_keyboard(
@@ -3759,6 +3802,7 @@ async def close_private_challenge_message(
                 chat_id=int(user_id),
                 message_id=message_id,
                 text=text,
+                parse_mode="HTML",
                 reply_markup=None,
             ),
             timeout_seconds=4.0,
@@ -4832,7 +4876,13 @@ class JoinVerificationSweeper:
                     return
                 await self._finalize_prompt(
                     record,
-                    f"<b>{shown}</b> 最高管理员无需消息审查验证，发言权限已恢复。",
+                    build_verification_progress_text(
+                        kind=record.kind,
+                        status="已通过",
+                        completed="已确认最高管理员身份",
+                        current="发言权限已恢复",
+                        action=f"<b>{shown}</b> 无需完成消息审查验证。",
+                    ),
                 )
                 return
             if globally_banned:
@@ -4910,7 +4960,14 @@ class JoinVerificationSweeper:
                 )
                 if not await self._complete_enforcement(record, mark_banned=True):
                     return
-                text = f"<b>{shown}</b> 消息审查验证超时，已封禁。请联系管理员处理。"
+                text = build_verification_progress_text(
+                    kind=record.kind,
+                    status="已超时",
+                    completed="已暂停发言",
+                    current="已在当前群封禁",
+                    action=f"<b>{shown}</b> 未在时限内完成验证。",
+                    details="请联系管理员处理。",
+                )
             else:
                 async def preserve_ban() -> bool:
                     async with self.session_factory() as session:
@@ -4964,14 +5021,22 @@ class JoinVerificationSweeper:
                     )
                     return
                 if record.kind == VERIFICATION_KIND_PATROL:
-                    text = (
-                        f"<b>{shown}</b> 资料巡检质询超时，"
-                        "已移出群聊（未封禁，可重新加入）。"
+                    text = build_verification_progress_text(
+                        kind=record.kind,
+                        status="已超时",
+                        completed="已暂停发言",
+                        current="已移出群聊",
+                        action=f"<b>{shown}</b> 未在时限内完成资料巡检质询。",
+                        details="未封禁，可重新加入后再次验证。",
                     )
                 elif record.kind == VERIFICATION_KIND_RAID:
-                    text = (
-                        f"<b>{shown}</b> 爆破防护质询超时，"
-                        "已移出群聊（未封禁，可重新加入）。"
+                    text = build_verification_progress_text(
+                        kind=record.kind,
+                        status="已超时",
+                        completed="已暂停发言",
+                        current="已移出群聊",
+                        action=f"<b>{shown}</b> 未在时限内完成爆破防护质询。",
+                        details="未封禁，可重新加入后再次验证。",
                     )
                 else:
                     # A timed-out joiner never verified: spoiler the name like
@@ -4981,9 +5046,16 @@ class JoinVerificationSweeper:
                     spoilered = spoiler_display_name(
                         record.display_name or "", record.user_id
                     )
-                    text = (
-                        f"<b>{spoilered}</b>（ID: <code>{record.user_id}</code>）"
-                        "验证超时，已移出群聊。可重新加入再次验证。"
+                    text = build_verification_progress_text(
+                        kind=record.kind,
+                        status="已超时",
+                        completed="已加入群聊",
+                        current="已移出群聊",
+                        action=(
+                            f"<b>{spoilered}</b>（ID: <code>{record.user_id}</code>）"
+                            "未在时限内完成验证。"
+                        ),
+                        details="可重新加入后再次验证。",
                     )
             await self._finalize_prompt(record, text)
 

@@ -57,6 +57,7 @@ from bot.services.join_verification import (
     ban_member_result,
     build_group_prompt_keyboard,
     build_group_prompt_text,
+    build_verification_progress_text,
     build_private_deep_link,
     claim_join_verification,
     close_private_challenge_message,
@@ -97,6 +98,11 @@ from bot.services.join_verification import (
     verification_timeout_seconds_for_kind,
 )
 from bot.services.llm import LLMService
+from bot.services.message_templates import (
+    card_field,
+    render_progress_notice,
+    render_summary_notice,
+)
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
 from bot.services.raid_guard import (
@@ -202,17 +208,30 @@ async def _publish_raid_removal_result(
                 exc_info=True,
             )
     if result.pending_count == 0:
-        text = "该批追溯用户已全部处理。"
+        status = "已完成"
+        current = "该批追溯用户已全部处理"
     elif failed_count:
-        text = f"爆破防护批量移除完成：已移除 {removed_count} 人，{failed_count} 人待重试。"
+        status = "待重试"
+        current = f"已移除 {removed_count} 人，仍有 {failed_count} 人待重试"
     else:
-        text = f"爆破防护批量移除完成：已移除 {removed_count} 名被追溯用户。"
+        status = "已完成"
+        current = f"已移除 {removed_count} 名被追溯用户"
+    details = [card_field("已移除", f"<code>{removed_count}</code> 人")]
+    if failed_count:
+        details.append(card_field("待重试", f"<code>{failed_count}</code> 人"))
+    text = render_progress_notice(
+        f"爆破防护批量移除 · {status}",
+        completed="已提交批量移除",
+        current=current,
+        next_step=("等待后台重试" if failed_count else "无需进一步操作"),
+        details=details,
+    )
     message = callback.message
     try:
         if message is not None and hasattr(message, "answer"):
-            await message.answer(text)
+            await message.answer(text, parse_mode="HTML")
         else:
-            await callback.bot.send_message(group_id, text)
+            await callback.bot.send_message(group_id, text, parse_mode="HTML")
     except Exception:
         log.exception(
             "raid bulk-remove result delivery failed | group=%s message=%s",
@@ -373,8 +392,19 @@ async def _ban_and_notify(
     try:
         sent = await event.bot.send_message(
             event.chat.id,
-            f"已封禁新成员 <b>{shown}</b>（ID: <code>{user_id}</code>）\n原因：{reason_text}\n"
-            "如需解封请管理员使用 /unban 命令。",
+            render_summary_notice(
+                "成员资料审核 · 已处理",
+                [
+                    card_field(
+                        "处理结果",
+                        f"已封禁成员 <b>{shown}</b>（ID: <code>{user_id}</code>）",
+                    ),
+                ],
+                details=[
+                    card_field("原因", reason_text),
+                    "如需解封请管理员使用 <code>/unban</code> 命令。",
+                ],
+            ),
             parse_mode="HTML",
         )
         # This is a moderation outcome ("审核通知"): honor the group's
@@ -1544,10 +1574,21 @@ async def _handle_verification_admin_callback(
                 show_alert=True,
             )
             return
-        approved_text = (
-            f"<b>{shown}</b> 已由管理员直接通过消息审查验证，发言权限已恢复。"
-            if kind == VERIFICATION_KIND_MODERATION
-            else f"<b>{shown}</b> 已由管理员直接通过入群验证，欢迎加入！"
+        approved_text = build_verification_progress_text(
+            kind=kind,
+            status="已通过",
+            completed="已由管理员确认",
+            current="发言权限已恢复",
+            action=(
+                f"<b>{shown}</b> 已由管理员直接通过消息审查验证。"
+                if kind == VERIFICATION_KIND_MODERATION
+                else f"<b>{shown}</b> 已由管理员直接通过入群验证。"
+            ),
+            details=(
+                None
+                if kind == VERIFICATION_KIND_MODERATION
+                else "欢迎加入。"
+            ),
         )
         await _edit_verification_prompt(callback, settings, text=approved_text)
         await close_private_challenge_message(
@@ -1641,13 +1682,20 @@ async def _handle_verification_admin_callback(
     # display name gets no passive exposure even in the terminal notice. The
     # numeric ID stays visible so admins can still identify the account.
     spoilered = spoiler_display_name(display_name, target_user_id)
-    rejected_text = (
-        f"<b>{shown}</b> 的消息审查验证已被管理员拒绝，已在当前群封禁。"
-        if kind == VERIFICATION_KIND_MODERATION
-        else (
-            f"<b>{spoilered}</b>（ID: <code>{target_user_id}</code>）"
-            "的入群验证已被管理员拒绝，已在当前群封禁。"
-        )
+    rejected_text = build_verification_progress_text(
+        kind=kind,
+        status="已拒绝",
+        completed="已由管理员审核",
+        current="已在当前群封禁",
+        action=(
+            f"<b>{shown}</b> 的消息审查验证已被管理员拒绝。"
+            if kind == VERIFICATION_KIND_MODERATION
+            else (
+                f"<b>{spoilered}</b>（ID: <code>{target_user_id}</code>）"
+                "的入群验证已被管理员拒绝。"
+            )
+        ),
+        details="如需解封请管理员使用 <code>/unban</code> 命令。",
     )
     completed = await _complete_moderation_enforcement_or_reconcile(
         callback.bot,

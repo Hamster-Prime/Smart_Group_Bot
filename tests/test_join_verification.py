@@ -27,6 +27,8 @@ from bot.services.request_priority import (
 from bot.services.join_verification import (
     COMBINED_VERIFICATION_PROVIDER,
     JoinVerificationSweeper,
+    PRIVATE_CHALLENGE_CLOSED_TEXT,
+    PRIVATE_CHALLENGE_SUPERSEDED_TEXT,
     VERIFICATION_CALLBACK_APPROVE,
     CHALLENGE_SUBMIT_GRACE,
     VERIFICATION_CALLBACK_REJECT,
@@ -202,6 +204,9 @@ class HelperTests(unittest.TestCase):
             '<a href="tg://user?id=42"><tg-spoiler>加微信xw123领福利</tg-spoiler></a>',
             text,
         )
+        self.assertIn("<b>入群验证 · 待完成</b>", text)
+        self.assertIn("<s>已加入群聊</s>", text)
+        self.assertIn("<blockquote expandable>", text)
 
     def test_moderation_challenge_ready_does_not_require_join_feature(self) -> None:
         settings = _settings(join_verification_enabled=False)
@@ -341,6 +346,11 @@ class HelperTests(unittest.TestCase):
         button = keyboard.inline_keyboard[0][0]
         self.assertIsNone(getattr(button, "url", None))
         self.assertEqual(button.web_app.url, "https://verify.example.com/verify")
+
+    def test_private_terminal_notices_do_not_mislabel_challenge_kind(self) -> None:
+        self.assertIn("<b>真人验证 · 已结束</b>", PRIVATE_CHALLENGE_CLOSED_TEXT)
+        self.assertIn("<b>真人验证 · 已更新</b>", PRIVATE_CHALLENGE_SUPERSEDED_TEXT)
+        self.assertNotIn("入群验证", PRIVATE_CHALLENGE_CLOSED_TEXT)
 
 
 class _NoopSession:
@@ -3631,7 +3641,9 @@ class PrivateStartTests(_DbTestCase):
 
             self.assertTrue(handled)
             text = message.answer.await_args.args[0]
-            self.assertIn("<b>入群真人验证</b>", text)
+            self.assertIn("<b>入群验证 · 待完成</b>", text)
+            self.assertIn("<s>已加入群聊</s>", text)
+            self.assertIn("<blockquote expandable>", text)
             self.assertIn("超时将被移出群聊", text)
             self.assertNotIn("消息审查真人验证", text)
             markup = message.answer.await_args.kwargs.get("reply_markup")
@@ -3664,7 +3676,9 @@ class PrivateStartTests(_DbTestCase):
 
             self.assertTrue(handled)
             text = message.answer.await_args.args[0]
-            self.assertIn("<b>消息审查真人验证</b>", text)
+            self.assertIn("<b>消息审查验证 · 待完成</b>", text)
+            self.assertIn("<s>已暂停发言</s>", text)
+            self.assertIn("<blockquote expandable>", text)
             self.assertIn("疑似广告 &lt;链接&gt;", text)
             self.assertIn("超时将被封禁", text)
             self.assertNotIn("超时将被移出群聊", text)
@@ -4387,7 +4401,7 @@ class SweeperTests(_DbTestCase):
         # identifiable; the outcome auto-deletes.
         self.assertIn("<b><tg-spoiler>张三</tg-spoiler></b>", edit_kwargs["text"])
         self.assertIn("<code>940</code>", edit_kwargs["text"])
-        self.assertIn("验证超时", edit_kwargs["text"])
+        self.assertIn("<b>入群验证 · 已超时</b>", edit_kwargs["text"])
         schedule_mock.assert_awaited_once_with(edited, 30)
 
     async def test_failed_moderation_timeout_ban_keeps_enforcing_intent(self) -> None:

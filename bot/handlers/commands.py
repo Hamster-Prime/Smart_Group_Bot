@@ -45,6 +45,7 @@ from bot.services.join_verification import (
 )
 from bot.services.llm import LLMService
 from bot.services.group_settings import acquire_group_settings_write_intent
+from bot.services.message_templates import render_action_notice, render_data_brief
 from bot.services.skills import SkillService
 from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
@@ -63,6 +64,28 @@ _AV_SEED_PAGE_SIZE = 1
 _LIST_PAGE_SIZE = 5
 _AV_SESSION_STORE = AVQuerySessionStore(ttl_seconds=15 * 60, max_sessions=256)
 _AV_GROUP_ENABLE_KEY = "av_enabled"
+_LEGACY_ACTION_RESPONSE_RE = re.compile(
+    r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
+)
+
+
+def _render_action_response(text: str) -> str:
+    """Give legacy command replies the shared action-first treatment.
+
+    Commands still return a few short strings from service layers.  Keeping
+    this adapter at the send boundary lets those replies gain the selected
+    layout without duplicating parsing and escaping rules in every command.
+    Fully rendered notices and data briefs already contain blockquotes and
+    intentionally pass through unchanged.
+    """
+    rendered = str(text or "").strip()
+    if not rendered or "<blockquote" in rendered.lower():
+        return rendered
+    match = _LEGACY_ACTION_RESPONSE_RE.match(rendered)
+    if match:
+        title = html.unescape(match.group("title").strip()) or "操作结果"
+        return render_action_notice(title, action=match.group("body").strip())
+    return render_action_notice("操作结果", action=rendered)
 
 
 async def _answer(
@@ -73,9 +96,10 @@ async def _answer(
     auto_delete_seconds: int | None = None,
     **kwargs: object,
 ) -> None:
+    formatted_text = _render_action_response(text)
     await answer_with_auto_delete(
         message,
-        text,
+        formatted_text,
         auto_delete_seconds=(
             configured_auto_delete_seconds(settings, "management")
             if auto_delete_seconds is None
@@ -188,21 +212,14 @@ def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, Inl
     end = min(start + _LIST_PAGE_SIZE, total)
 
     if not items:
-        return "<b>永久记忆</b>\n当前为空。", None
+        return render_data_brief("永久记忆", empty="当前没有保存的永久记忆。"), None
 
-    lines = [
-        "<b>永久记忆</b>",
-        f"共 {total} 条 | 页码: {page + 1}/{total_pages}",
-        "",
-        "点击下方按钮可删除对应记忆：",
-        "",
-    ]
+    lines: list[str] = []
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     for idx, item in enumerate(items[start:end], start=start + 1):
         memory_id = int(getattr(item, "id", 0) or 0)
         preview = html.escape(_truncate_text(str(getattr(item, "content", "") or ""), 120))
-        lines.append(f"{idx}. <b>#{memory_id}</b> {preview}")
-        lines.append("")
+        lines.append(f"<b>{idx}.</b> <code>#{memory_id}</code>　{preview}")
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
@@ -219,7 +236,18 @@ def _build_memory_list_page(items: list[object], *, page: int) -> tuple[str, Inl
         nav_row.append(InlineKeyboardButton(text="下一页", callback_data=f"lml:{page + 1}"))
     if nav_row:
         keyboard_rows.append(nav_row)
-    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return (
+        render_data_brief(
+            "永久记忆",
+            metadata={
+                "总数": f"<code>{total}</code> 条",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+            footer="使用下方按钮删除对应记录。",
+        ),
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
 
 
 async def _callback_user_can_manage_memories(
@@ -316,24 +344,15 @@ def _build_av_search_page(
     start = page * _AV_SEARCH_PAGE_SIZE
     end = min(start + _AV_SEARCH_PAGE_SIZE, total)
 
-    lines = [
-        "<b>AV 搜索结果</b>",
-        f"关键词: {html.escape(_truncate_text(session.query, 80))}",
-        f"结果: {total} 条",
-        f"页码: {page + 1}/{total_pages}",
-        "",
-        "点击下方按钮查看详情：",
-        "",
-    ]
+    lines: list[str] = []
     for idx, item in enumerate(session.results[start:end], start=start + 1):
         code = html.escape(item.code or "-")
         title = html.escape(_truncate_text(item.title or "-", 56))
         source = html.escape(_source_name(item.source))
         date = html.escape(item.date or "-")
-        lines.append(f"<b>#{idx}</b> [{source}] {code}")
+        lines.append(f"<b>{idx}.</b> <code>{code}</code> · <code>{source}</code>")
         lines.append(f"{title}")
-        lines.append(f"日期: {date}")
-        lines.append("")
+        lines.append(f"<code>{date}</code>")
 
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     for idx, item in enumerate(session.results[start:end], start=start):
@@ -377,76 +396,96 @@ def _build_av_search_page(
     if nav_row:
         keyboard_rows.append(nav_row)
 
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return (
+        render_data_brief(
+            "AV 搜索结果",
+            metadata={
+                "关键词": f"<code>{html.escape(_truncate_text(session.query, 80))}</code>",
+                "结果": f"<code>{total}</code> 条",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+            footer="使用下方按钮查看详情。",
+        ),
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
 
 
 def _build_av_detail_caption(detail: AVDetail) -> str:
-    lines = [
-        "<b>影片详情</b>",
-        f"<b>来源</b>: {html.escape(_source_name(detail.source))}",
-        f"<b>番号</b>: {html.escape(detail.code or '未知')}",
-        f"<b>标题</b>: {html.escape(_truncate_text(detail.title or '-', 70))}",
-    ]
+    metadata: dict[str, object] = {
+        "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
+        "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
+    }
     if detail.date:
-        lines.append(f"<b>发行日期</b>: {html.escape(detail.date)}")
+        metadata["发行日期"] = f"<code>{html.escape(detail.date)}</code>"
     if detail.runtime:
-        lines.append(f"<b>时长</b>: {html.escape(detail.runtime)}")
+        metadata["时长"] = html.escape(detail.runtime)
     if detail.score:
-        lines.append(f"<b>评分</b>: {html.escape(detail.score)}")
+        metadata["评分"] = f"<code>{html.escape(detail.score)}</code>"
     if detail.studio:
-        lines.append(f"<b>制作商</b>: {html.escape(_truncate_text(detail.studio, 60))}")
+        metadata["制作商"] = html.escape(_truncate_text(detail.studio, 60))
     if detail.publisher:
-        lines.append(f"<b>发行商</b>: {html.escape(_truncate_text(detail.publisher, 60))}")
+        metadata["发行商"] = html.escape(_truncate_text(detail.publisher, 60))
     if detail.series:
-        lines.append(f"<b>系列</b>: {html.escape(_truncate_text(detail.series, 60))}")
+        metadata["系列"] = html.escape(_truncate_text(detail.series, 60))
     if detail.actors:
-        lines.append(f"<b>演员</b>: {html.escape(_truncate_text(' / '.join(detail.actors), 80))}")
+        metadata["演员"] = html.escape(_truncate_text(" / ".join(detail.actors), 80))
     if detail.genres:
-        lines.append(f"<b>类型</b>: {html.escape(_truncate_text(' / '.join(detail.genres), 80))}")
+        metadata["类型"] = html.escape(_truncate_text(" / ".join(detail.genres), 80))
     if detail.seeds:
-        lines.append(f"<b>种子</b>: {len(detail.seeds)} 条（可翻页）")
+        metadata["种子"] = f"<code>{len(detail.seeds)}</code> 条（可翻页）"
     else:
-        lines.append("<b>种子</b>: 无")
+        metadata["种子"] = "无"
     if detail.url:
-        lines.append(f"<b>详情页</b>: {html.escape(_truncate_text(detail.url, 100))}")
-    return "\n".join(lines)
+        metadata["详情页"] = (
+            f'<a href="{html.escape(detail.url, quote=True)}">打开详情页</a>'
+        )
+    return render_data_brief(
+        "影片详情",
+        metadata=metadata,
+        items=f"<b>{html.escape(_truncate_text(detail.title or '-', 70))}</b>",
+    )
 
 
 def _build_av_detail_text(detail: AVDetail) -> str:
-    lines = [
-        "<b>影片详情</b>",
-        f"<b>来源</b>: {html.escape(_source_name(detail.source))}",
-        f"<b>番号</b>: {html.escape(detail.code or '未知')}",
-        f"<b>标题</b>: {html.escape(detail.title or '-')}",
-    ]
+    metadata: dict[str, object] = {
+        "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
+        "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
+    }
 
     if detail.date:
-        lines.append(f"<b>发行日期</b>: {html.escape(detail.date)}")
+        metadata["发行日期"] = f"<code>{html.escape(detail.date)}</code>"
     if detail.runtime:
-        lines.append(f"<b>时长</b>: {html.escape(detail.runtime)}")
+        metadata["时长"] = html.escape(detail.runtime)
     if detail.score:
-        lines.append(f"<b>评分</b>: {html.escape(detail.score)}")
+        metadata["评分"] = f"<code>{html.escape(detail.score)}</code>"
     if detail.director:
-        lines.append(f"<b>导演</b>: {html.escape(detail.director)}")
+        metadata["导演"] = html.escape(detail.director)
     if detail.studio:
-        lines.append(f"<b>制作商</b>: {html.escape(detail.studio)}")
+        metadata["制作商"] = html.escape(detail.studio)
     if detail.publisher:
-        lines.append(f"<b>发行商</b>: {html.escape(detail.publisher)}")
+        metadata["发行商"] = html.escape(detail.publisher)
     if detail.series:
-        lines.append(f"<b>系列</b>: {html.escape(detail.series)}")
+        metadata["系列"] = html.escape(detail.series)
     if detail.actors:
-        lines.append(f"<b>演员</b>: {html.escape(' / '.join(detail.actors))}")
+        metadata["演员"] = html.escape(" / ".join(detail.actors))
     if detail.genres:
-        lines.append(f"<b>类型</b>: {html.escape(' / '.join(detail.genres))}")
-    if detail.summary:
-        lines.append(f"<b>简介</b>: {html.escape(_truncate_text(detail.summary, 360))}")
+        metadata["类型"] = html.escape(" / ".join(detail.genres))
 
     if detail.seeds:
-        lines.append(f"<b>种子</b>: {len(detail.seeds)} 条（点下方按钮浏览）")
+        metadata["种子"] = f"<code>{len(detail.seeds)}</code> 条（点下方按钮浏览）"
     else:
-        lines.append("<b>种子</b>: 无")
-    lines.append(f"<b>详情页</b>: {html.escape(detail.url)}")
-    return "\n".join(lines)
+        metadata["种子"] = "无"
+    if detail.url:
+        metadata["详情页"] = (
+            f'<a href="{html.escape(detail.url, quote=True)}">打开详情页</a>'
+        )
+    item_lines = [f"<b>{html.escape(detail.title or '-')}</b>"]
+    if detail.summary:
+        item_lines.extend(
+            ["", html.escape(_truncate_text(detail.summary, 360))]
+        )
+    return render_data_brief("影片详情", metadata=metadata, items=item_lines)
 
 
 def _build_av_detail_keyboard(
@@ -480,7 +519,7 @@ def _build_av_seed_page(
     page: int,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     if not detail.seeds:
-        return "<b>种子列表</b>\n无", None
+        return render_data_brief("种子列表", empty="当前没有可用种子。"), None
 
     total = len(detail.seeds)
     total_pages = max(1, (total + _AV_SEED_PAGE_SIZE - 1) // _AV_SEED_PAGE_SIZE)
@@ -489,22 +528,16 @@ def _build_av_seed_page(
     end = min(start + _AV_SEED_PAGE_SIZE, total)
 
     seed = detail.seeds[start] if start < len(detail.seeds) else None
-    lines = [
-        "<b>种子列表</b>",
-        f"<b>番号</b>: {html.escape(detail.code or '未知')}",
-        f"<b>来源</b>: {html.escape(_source_name(detail.source))}",
-        f"<b>页码</b>: {page + 1}/{total_pages}",
-        "",
-    ]
+    lines: list[str] = []
     if seed:
         title = html.escape(_truncate_text(seed.title or "Magnet", 120))
         size = html.escape(seed.size or "-")
         date = html.escape(seed.date or "-")
-        lines.append(f"{start + 1}. <b>{title}</b>")
-        lines.append(f"大小: {size} | 日期: {date}")
+        lines.append(f"<b>{start + 1}.</b> {title}")
+        lines.append(f"大小　<code>{size}</code>　日期　<code>{date}</code>")
         lines.append(f"<code>{html.escape(_truncate_text(seed.magnet or '-', 260))}</code>")
     else:
-        lines.append("无")
+        lines.append("当前没有可用种子。")
 
     rows: list[list[InlineKeyboardButton]] = []
     nav_row: list[InlineKeyboardButton] = []
@@ -538,7 +571,18 @@ def _build_av_seed_page(
         rows.append([InlineKeyboardButton(text="打开详情页", url=detail.url)])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-    return "\n".join(lines).rstrip(), keyboard
+    return (
+        render_data_brief(
+            "种子列表",
+            metadata={
+                "番号": f"<code>{html.escape(detail.code or '未知')}</code>",
+                "来源": f"<code>{html.escape(_source_name(detail.source))}</code>",
+                "页码": f"<code>{page + 1} / {total_pages}</code>",
+            },
+            items=lines,
+        ),
+        keyboard,
+    )
 
 
 async def _download_cover_input_file(cover_url: str, referer: str = "") -> BufferedInputFile | None:
@@ -810,7 +854,7 @@ async def cmd_voteban(
         session_factory=session_factory,
     )
     if not result.ok:
-        await _answer(message, settings, result.summary)
+        await _answer(message, settings, result.telegram_text)
 
 
 @router.message(Command("settings"))
@@ -1076,7 +1120,10 @@ async def on_memory_delete(
 
     items = await memory_holder.get().list_permanent_memories(msg.chat.id, limit=200)
     if not items:
-        await msg.edit_text("<b>永久记忆</b>\n当前为空。", reply_markup=None)
+        await msg.edit_text(
+            render_data_brief("永久记忆", empty="当前没有保存的永久记忆。"),
+            reply_markup=None,
+        )
         await callback.answer(f"已删除记忆 #{memory_id}")
         return
 
@@ -1230,9 +1277,11 @@ async def cmd_av(message: Message, session: AsyncSession, settings: Settings) ->
         await _answer(
             message,
             settings,
-            "<b>AV 查询结果</b>\n"
-            f"关键词: {html.escape(query)}\n"
-            "未找到匹配内容。",
+            render_data_brief(
+                "AV 搜索结果",
+                metadata={"关键词": f"<code>{html.escape(query)}</code>"},
+                empty="未找到匹配内容。",
+            ),
         )
         return
 

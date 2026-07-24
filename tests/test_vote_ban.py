@@ -23,6 +23,7 @@ from bot.services import vote_ban
 from bot.services.authz import authorize_group
 from bot.services.vote_ban import (
     apply_vote_ban,
+    build_vote_text,
     claim_session_status,
     count_approvals,
     open_vote_session,
@@ -150,6 +151,71 @@ class VoteBanConfigTests(unittest.TestCase):
         settings.vote_ban_threshold = 1
         config = resolve_vote_ban_config(settings, {})
         self.assertEqual(config.threshold, 2)
+
+
+class VoteBanMessageLayoutTests(unittest.TestCase):
+    def test_active_vote_uses_summary_and_expandable_details(self) -> None:
+        record = SimpleNamespace(
+            target_user_id=42,
+            target_display="被举报者",
+            starter_user_id=7,
+            starter_display="发起人",
+            reason="疑似&lt;广告&gt;",
+            evidence="推广链接",
+            threshold=3,
+            deadline_at=now_shanghai_naive() + timedelta(minutes=10),
+        )
+
+        text = build_vote_text(record, approvals=1)
+
+        self.assertIn("<b>民主投票封禁 · 进行中</b>", text)
+        self.assertIn("<b>当前票数</b>　<code>1/3</code>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertIn("疑似&amp;lt;广告&amp;gt;", text)
+
+    def test_start_failures_render_as_not_started_without_changing_summary(self) -> None:
+        now = now_shanghai_naive()
+        quota = vote_ban.VoteBanQuotaState(
+            allowed=False,
+            limit=1,
+            used=1,
+            remaining=0,
+            window_seconds=3600,
+            window_started_at=now,
+            reset_at=now + timedelta(hours=1),
+            retry_after_seconds=3600,
+        )
+        cases = (
+            ("disabled", "本群未启用民主投票封禁。", None),
+            (
+                "starter_quota_exhausted",
+                "额度已用完，请 1 小时后再试。",
+                quota,
+            ),
+            (
+                "send_failed",
+                "投票消息发送失败，本次未扣除额度，请稍后重试。",
+                quota,
+            ),
+        )
+
+        for code, summary, result_quota in cases:
+            with self.subTest(code=code):
+                result = vote_ban.VoteBanStartResult(
+                    False,
+                    code,
+                    summary,
+                    quota=result_quota,
+                )
+
+                self.assertEqual(result.summary, summary)
+                self.assertNotIn("<blockquote", result.summary)
+                self.assertIn(
+                    "<b>民主投票封禁 · 未发起</b>",
+                    result.telegram_text,
+                )
+                self.assertIn("<blockquote expandable>", result.telegram_text)
+                self.assertIn(summary, result.telegram_text)
 
 
 class VoteBanGenerationGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -329,6 +395,8 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         callback.bot.edit_message_text.assert_awaited()
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("2/3", kwargs["text"])
+        self.assertIn("民主投票封禁 · 进行中", kwargs["text"])
+        self.assertIn("<blockquote expandable>", kwargs["text"])
         self.assertIsNotNone(kwargs["reply_markup"])
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
@@ -375,6 +443,8 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("已封禁", kwargs["text"])
+        self.assertIn("民主投票封禁 · 已结束", kwargs["text"])
+        self.assertIn("<blockquote expandable>", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
@@ -1196,7 +1266,11 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                     session_factory=None,
                 )
         second.bot.send_message.assert_not_awaited()
-        self.assertIn("最多只能发起 1 次", answer_mock.await_args.args[2])
+        answer_text = answer_mock.await_args.args[2]
+        self.assertIn("<b>民主投票封禁 · 未发起</b>", answer_text)
+        self.assertIn("<blockquote expandable>", answer_text)
+        self.assertIn("最多只能发起 1 次", answer_text)
+        self.assertIn("<b>已用额度</b>　<code>1 / 1</code>", answer_text)
         async with self.session_factory() as session:
             bucket = await session.get(VoteBanQuotaBucket, (-100, 10))
             self.assertEqual(bucket.used_count, 1)
@@ -1215,7 +1289,11 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                     settings=self.settings,
                     session_factory=None,
                 )
-        self.assertIn("未扣除额度", answer_mock.await_args.args[2])
+        answer_text = answer_mock.await_args.args[2]
+        self.assertIn("<b>民主投票封禁 · 未发起</b>", answer_text)
+        self.assertIn("<blockquote expandable>", answer_text)
+        self.assertIn("未扣除额度", answer_text)
+        self.assertIn("<b>剩余额度</b>　<code>3</code>", answer_text)
         async with self.session_factory() as session:
             bucket = await session.get(VoteBanQuotaBucket, (-100, 10))
             record = await session.scalar(select(VoteBanSession))
@@ -1312,7 +1390,10 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                     session_factory=None,
                 )
         message.bot.send_message.assert_not_awaited()
-        self.assertIn("未启用", answer_mock.await_args.args[2])
+        answer_text = answer_mock.await_args.args[2]
+        self.assertIn("<b>民主投票封禁 · 未发起</b>", answer_text)
+        self.assertIn("<blockquote expandable>", answer_text)
+        self.assertIn("未启用", answer_text)
 
 
 if __name__ == "__main__":
