@@ -301,6 +301,7 @@ class Settings(BaseSettings):
 
     # 爆破防护：短窗口内大量入群自动锁群，并追溯质询爆破前入群的成员。
     raid_guard_enabled: bool = False
+    raid_guard_pin_message: bool = True
     raid_guard_join_threshold: int = 8
     raid_guard_window_seconds: int = 60
     raid_guard_lockdown_seconds: int = 600
@@ -309,10 +310,12 @@ class Settings(BaseSettings):
 
     # 呼叫管理员：群成员发送 @admin 时 @ 全部（或选定）群管理员。
     call_admin_enabled: bool = True
+    call_admin_pin_message: bool = False
     call_admin_cooldown_seconds: int = 60
 
     # 骚扰民主投票封禁：回复消息发起投票，达到阈值即封禁被回复用户。
     vote_ban_enabled: bool = False
+    vote_ban_pin_message: bool = True
     vote_ban_threshold: int = 5
     vote_ban_duration_seconds: int = 1800
     vote_ban_trigger_limit: int = 3

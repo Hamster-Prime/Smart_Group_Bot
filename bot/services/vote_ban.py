@@ -37,6 +37,11 @@ from bot.services.message_templates import (
     render_expandable_blockquote,
     render_summary_notice,
 )
+from bot.services.notification_pins import (
+    notification_pin_enabled,
+    pin_notification_message,
+    unpin_notification_message,
+)
 from bot.services.join_verification import (
     UnbanRecovery,
     ban_member,
@@ -62,6 +67,7 @@ VOTE_BAN_CALLBACK_PREFIX = "vban"
 VOTE_BAN_ADMIN_RESOLUTION_BAN = "admin_ban"
 VOTE_BAN_ADMIN_RESOLUTION_CANCEL = "admin_cancel"
 VOTE_BAN_MANUAL_UNBAN_RESOLUTION = "manual_unban"
+VOTE_BAN_MANUAL_UNBAN_FINALIZED_RESOLUTION = "unban_finalized"
 VOTE_BAN_ENABLED_KEY = "vote_ban_enabled"
 VOTE_BAN_THRESHOLD_KEY = "vote_ban_threshold"
 VOTE_BAN_DURATION_KEY = "vote_ban_duration_seconds"
@@ -73,11 +79,19 @@ VOTE_BAN_TRIGGER_WINDOW_KEY = "vote_ban_trigger_window_seconds"
 # publish a competing failure while the original ban is still completing.
 VOTE_BAN_ENFORCEMENT_LEASE_SECONDS = 180
 VOTE_BAN_COUNTDOWN_REFRESH_SECONDS = 60
+VOTE_BAN_UNPIN_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
+VOTE_BAN_TERMINAL_STATUSES = ("passed", "failed", "expired", "cancelled")
 
 _expiry_tasks: dict[int, asyncio.Task] = {}
 _enforcement_tasks: dict[int, asyncio.Task] = {}
+_manual_unban_finalization_tasks: dict[int, asyncio.Task] = {}
+_terminal_unpin_retry_tasks: dict[int, asyncio.Task] = {}
+_manual_unban_finalization_pending: set[int] = set()
 _start_locks: dict[tuple[int, int], asyncio.Lock] = {}
 _vote_message_edit_locks: dict[int, asyncio.Lock] = {}
+_runtime_session_factory: Any | None = None
+_runtime_bot: Bot | None = None
+_runtime_settings: Settings | None = None
 
 
 def _consume_vote_task_result(task: asyncio.Task[Any]) -> None:
@@ -98,10 +112,16 @@ async def flush_vote_ban_tasks(*, timeout_seconds: float = 15.0) -> None:
     shutdown.
     """
 
+    global _runtime_session_factory, _runtime_bot, _runtime_settings
     current = asyncio.current_task()
     tasks = {
         task
-        for task in (*_expiry_tasks.values(), *_enforcement_tasks.values())
+        for task in (
+            *_expiry_tasks.values(),
+            *_enforcement_tasks.values(),
+            *_manual_unban_finalization_tasks.values(),
+            *_terminal_unpin_retry_tasks.values(),
+        )
         if task is not current and not task.done()
     }
     for task in tasks:
@@ -124,10 +144,20 @@ async def flush_vote_ban_tasks(*, timeout_seconds: float = 15.0) -> None:
     # A task's finally block normally retires itself.  Clean completed entries
     # defensively, but never remove a newer replacement that reused the same
     # session id while an older cancelled task was unwinding.
-    for registry in (_expiry_tasks, _enforcement_tasks):
+    for registry in (
+        _expiry_tasks,
+        _enforcement_tasks,
+        _manual_unban_finalization_tasks,
+        _terminal_unpin_retry_tasks,
+    ):
         for session_id, task in tuple(registry.items()):
             if task.done() and registry.get(session_id) is task:
                 registry.pop(session_id, None)
+    if not _manual_unban_finalization_tasks and not _terminal_unpin_retry_tasks:
+        _manual_unban_finalization_pending.clear()
+        _runtime_session_factory = None
+        _runtime_bot = None
+        _runtime_settings = None
     for session_id, lock in tuple(_vote_message_edit_locks.items()):
         if not lock.locked():
             _vote_message_edit_locks.pop(session_id, None)
@@ -136,6 +166,7 @@ async def flush_vote_ban_tasks(*, timeout_seconds: float = 15.0) -> None:
 @dataclass(slots=True)
 class VoteBanConfig:
     enabled: bool
+    pin_message: bool
     threshold: int
     duration_seconds: int
     trigger_limit: int
@@ -252,6 +283,11 @@ def resolve_vote_ban_config(
     )
     return VoteBanConfig(
         enabled=enabled,
+        pin_message=notification_pin_enabled(
+            settings,
+            group_settings,
+            "vote_ban",
+        ),
         threshold=min(1000, max(2, threshold)),
         duration_seconds=min(86400, max(60, duration)),
         trigger_limit=min(1000, max(1, trigger_limit)),
@@ -344,6 +380,170 @@ def _vote_message_edit_lock(session_id: int) -> asyncio.Lock:
     return _vote_message_edit_locks.setdefault(int(session_id), asyncio.Lock())
 
 
+def _configure_vote_ban_runtime(
+    *,
+    session_factory: Any,
+    bot: Bot,
+    settings: Settings,
+) -> None:
+    """Remember runtime dependencies needed by post-commit cleanup hooks."""
+
+    global _runtime_session_factory, _runtime_bot, _runtime_settings
+    if not callable(session_factory):
+        return
+    _runtime_session_factory = session_factory
+    _runtime_bot = bot
+    _runtime_settings = settings
+
+
+async def _pin_open_vote_message(
+    bot: Bot,
+    *,
+    settings: Settings,
+    session_id: int,
+    session: AsyncSession | None = None,
+    session_factory: Any | None = None,
+) -> bool:
+    """Publish the delivered prompt's pin state against fresh durable state.
+
+    The message lock is shared with every live/final vote edit. A terminal
+    transition may happen while the pin request is in flight, but its finalizer
+    then waits for this lock and unpins afterwards. Conversely, a transition
+    that already committed is observed before any pin call is made. If that
+    transition completed before ``message_id`` was available, close the newly
+    delivered prompt here so it cannot remain as a live-looking historical poll.
+    """
+
+    session_id = int(session_id)
+
+    async def _fresh_state(
+        active_session: AsyncSession,
+    ) -> tuple[VoteBanSession | None, int]:
+        record = await active_session.get(
+            VoteBanSession,
+            session_id,
+            populate_existing=True,
+        )
+        approvals = 0
+        if record is not None and record.status not in {"active", "enforcing"}:
+            approvals = await count_approvals(active_session, session_id)
+        if active_session.in_transaction():
+            await active_session.commit()
+        return record, approvals
+
+    async def _load_fresh_state() -> tuple[VoteBanSession | None, int]:
+        if callable(session_factory):
+            async with session_factory() as owned_session:
+                return await _fresh_state(owned_session)
+        if session is not None:
+            return await _fresh_state(session)
+        return None, 0
+
+    async with _vote_message_edit_lock(session_id):
+        try:
+            record, approvals = await _load_fresh_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "vote pin preflight state read failed | session=%s",
+                session_id,
+            )
+            return False
+        if record is None or int(record.message_id or 0) <= 0:
+            return False
+        if record.status not in {"active", "enforcing"}:
+            await _finalize_vote_message_unlocked(
+                bot,
+                settings,
+                record,
+                outcome_line=terminal_vote_outcome_line(record),
+                approvals=approvals,
+            )
+            return False
+        if not bool(getattr(record, "pin_message", False)):
+            return False
+        pinned_group_id = int(record.group_id)
+        pinned_message_id = int(record.message_id)
+
+        async def _release_late_pin() -> bool:
+            return await unpin_notification_message(
+                bot,
+                chat_id=pinned_group_id,
+                message_id=pinned_message_id,
+                kind="vote_ban",
+            )
+
+        try:
+            pinned = await pin_notification_message(
+                bot,
+                chat_id=pinned_group_id,
+                message_id=pinned_message_id,
+                kind="vote_ban",
+            )
+        except asyncio.CancelledError:
+            # Bot API cancellation is outcome-ambiguous: the server may have
+            # accepted the request just before local cancellation arrived.
+            released = await _release_late_pin()
+            if not released:
+                _schedule_terminal_unpin_retry(bot, record)
+                await _persist_vote_pin_outstanding(record)
+            raise
+
+        # The in-process message lock cannot serialize another bot process. A
+        # terminal worker there may have committed and unpinned while this pin
+        # API request was still in flight, leaving our late/timeout-ambiguous pin
+        # as the final Telegram action. Re-read after the attempt and unwind
+        # unless the exact prompt still owns an open managed pin.
+        try:
+            current, _ = await _load_fresh_state()
+            same_current_message = bool(
+                current is not None
+                and int(current.group_id) == pinned_group_id
+                and int(current.message_id or 0) == pinned_message_id
+            )
+            still_open = bool(
+                same_current_message
+                and current.status in {"active", "enforcing"}
+                and bool(getattr(current, "pin_message", False))
+            )
+        except asyncio.CancelledError:
+            released = await _release_late_pin()
+            if not released:
+                _schedule_terminal_unpin_retry(bot, record)
+                await _persist_vote_pin_outstanding(record)
+            raise
+        except Exception:
+            current = None
+            same_current_message = False
+            still_open = False
+            log.exception(
+                "vote pin postflight state read failed; unpinning conservatively "
+                "| session=%s group=%s message=%s pin_result=%s",
+                session_id,
+                pinned_group_id,
+                pinned_message_id,
+                pinned,
+            )
+        if still_open:
+            return bool(pinned)
+
+        released = await _release_late_pin()
+        if released and same_current_message and current is not None:
+            persisted = await _persist_vote_message_release(
+                current,
+                message_finalized=False,
+                pin_released=True,
+            )
+            if not persisted:
+                _schedule_terminal_unpin_retry(bot, current)
+        elif not released:
+            retry_record = current if current is not None else record
+            _schedule_terminal_unpin_retry(bot, retry_record)
+            await _persist_vote_pin_outstanding(retry_record)
+        return False
+
+
 async def _edit_vote_message_unlocked(
     bot: Bot,
     *,
@@ -359,6 +559,194 @@ async def _edit_vote_message_unlocked(
         parse_mode="HTML",
         reply_markup=reply_markup,
     )
+
+
+async def _persist_vote_message_release(
+    record: VoteBanSession,
+    *,
+    message_finalized: bool,
+    pin_released: bool,
+) -> bool:
+    """Persist external terminal-message progress for crash compensation."""
+
+    values: dict[str, Any] = {}
+    if pin_released and bool(getattr(record, "pin_message", False)):
+        values["pin_message"] = False
+    if (
+        message_finalized
+        and str(getattr(record, "resolution", "") or "")
+        == VOTE_BAN_MANUAL_UNBAN_RESOLUTION
+    ):
+        values["resolution"] = VOTE_BAN_MANUAL_UNBAN_FINALIZED_RESOLUTION
+    if not values:
+        return True
+
+    session_factory = _runtime_session_factory
+    if not callable(session_factory):
+        return False
+    try:
+        async with session_factory() as session:
+            await session.execute(
+                update(VoteBanSession)
+                .where(VoteBanSession.id == int(record.id))
+                .values(**values)
+            )
+            await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "vote message release persistence failed | session=%s values=%s",
+            record.id,
+            sorted(values),
+        )
+        return False
+
+    if "pin_message" in values:
+        record.pin_message = False
+    if "resolution" in values:
+        record.resolution = str(values["resolution"])
+    return True
+
+
+async def _persist_vote_pin_outstanding(record: VoteBanSession) -> bool:
+    """Keep terminal pin ownership durable after an ambiguous/failed unpin."""
+
+    session_factory = _runtime_session_factory
+    message_id = int(getattr(record, "message_id", 0) or 0)
+    if not callable(session_factory) or message_id <= 0:
+        return False
+    try:
+        async with session_factory() as session:
+            result = await session.execute(
+                update(VoteBanSession)
+                .where(
+                    VoteBanSession.id == int(record.id),
+                    VoteBanSession.group_id == int(record.group_id),
+                    VoteBanSession.message_id == message_id,
+                    VoteBanSession.status.in_(VOTE_BAN_TERMINAL_STATUSES),
+                    VoteBanSession.pin_message.is_(True),
+                )
+                .values(pin_message=True)
+            )
+            await session.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "vote pin ownership persistence failed | session=%s group=%s message=%s",
+            record.id,
+            record.group_id,
+            message_id,
+        )
+        return False
+    persisted = int(result.rowcount or 0) == 1
+    if persisted:
+        record.pin_message = True
+    return persisted
+
+
+def _schedule_terminal_unpin_retry(bot: Bot, record: VoteBanSession) -> None:
+    """Retry one terminal exact-unpin with finite exponential backoff."""
+
+    session_id = int(getattr(record, "id", 0) or 0)
+    group_id = int(getattr(record, "group_id", 0) or 0)
+    message_id = int(getattr(record, "message_id", 0) or 0)
+    session_factory = _runtime_session_factory
+    if (
+        session_id <= 0
+        or message_id <= 0
+        or not callable(session_factory)
+    ):
+        return
+    existing = _terminal_unpin_retry_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    delays = tuple(
+        max(0.0, float(delay))
+        for delay in VOTE_BAN_UNPIN_RETRY_DELAYS_SECONDS
+    )
+    if not delays:
+        return
+
+    async def _retry() -> None:
+        try:
+            for attempt, delay in enumerate(delays, start=1):
+                await asyncio.sleep(delay)
+                try:
+                    async with session_factory() as session:
+                        fresh = await session.get(
+                            VoteBanSession,
+                            session_id,
+                            populate_existing=True,
+                        )
+                        valid_target = bool(
+                            fresh is not None
+                            and fresh.status in VOTE_BAN_TERMINAL_STATUSES
+                            and bool(getattr(fresh, "pin_message", False))
+                            and int(fresh.group_id) == group_id
+                            and int(fresh.message_id or 0) == message_id
+                        )
+                        await session.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "vote terminal unpin retry state read failed | "
+                        "session=%s attempt=%s",
+                        session_id,
+                        attempt,
+                    )
+                    continue
+                if not valid_target or fresh is None:
+                    return
+
+                released = await unpin_notification_message(
+                    bot,
+                    chat_id=group_id,
+                    message_id=message_id,
+                    kind="vote_ban",
+                )
+                if released:
+                    persisted = await _persist_vote_message_release(
+                        fresh,
+                        message_finalized=False,
+                        pin_released=True,
+                    )
+                    if persisted:
+                        return
+                    continue
+                await _persist_vote_pin_outstanding(fresh)
+            log.warning(
+                "vote terminal unpin retries exhausted | session=%s group=%s "
+                "message=%s attempts=%s",
+                session_id,
+                group_id,
+                message_id,
+                len(delays),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "vote terminal unpin retry failed | session=%s",
+                session_id,
+            )
+        finally:
+            current = asyncio.current_task()
+            if _terminal_unpin_retry_tasks.get(session_id) is current:
+                _terminal_unpin_retry_tasks.pop(session_id, None)
+
+    try:
+        _terminal_unpin_retry_tasks[session_id] = asyncio.create_task(
+            _retry(),
+            name=f"vote-ban-terminal-unpin-retry:{session_id}",
+        )
+    except RuntimeError:
+        log.debug(
+            "vote terminal unpin retry scheduling failed | session=%s",
+            session_id,
+        )
 
 
 async def edit_vote_message(
@@ -500,6 +888,7 @@ async def open_vote_session(
         source=str(source or "command")[:32],
         target_message_id=int(target_message_id or 0),
         threshold=int(config.threshold),
+        pin_message=bool(config.pin_message),
         status="active",
         deadline_at=now_shanghai_naive() + timedelta(seconds=config.duration_seconds),
     )
@@ -853,6 +1242,12 @@ async def start_vote_ban(
     on_delivery: Callable[[], None] | None = None,
 ) -> VoteBanStartResult:
     """Validate, reserve quota, open, and deliver a vote-ban poll."""
+    if callable(session_factory):
+        _configure_vote_ban_runtime(
+            session_factory=session_factory,
+            bot=request_message.bot,
+            settings=settings,
+        )
     chat = getattr(request_message, "chat", None)
     if chat is None or getattr(chat, "type", "") not in {"group", "supergroup"}:
         return VoteBanStartResult(False, "group_only", "该操作只能在群内使用。")
@@ -1009,6 +1404,9 @@ async def start_vote_ban(
                 exc_info=(type(error), error, error.__traceback__),
             )
             record.status = "cancelled"
+            # No Telegram prompt exists, so this row must not retain outstanding
+            # ownership of a pin for startup compensation to retry forever.
+            record.pin_message = False
             await release_vote_ban_quota(
                 session,
                 group_id=group_id,
@@ -1129,6 +1527,14 @@ async def start_vote_ban(
             )
             if recovered_record is not None:
                 record = recovered_record
+        if delivered_message_id > 0:
+            await _pin_open_vote_message(
+                request_message.bot,
+                settings=settings,
+                session_id=record_id,
+                session=session if not callable(session_factory) else None,
+                session_factory=session_factory,
+            )
         log.info(
             "[%s] democratic vote opened | target=%s starter=%s threshold=%s source=%s quota=%s/%s",
             group_id,
@@ -1382,6 +1788,27 @@ def enforcement_outcome_line(record: VoteBanSession, *, banned: bool) -> str:
     return "票数达标，但 Telegram 封禁失败，请管理员手动处理"
 
 
+def terminal_vote_outcome_line(record: VoteBanSession) -> str:
+    """Render a durable terminal row during recovery/compensation."""
+
+    status = str(getattr(record, "status", "") or "")
+    resolution = str(getattr(record, "resolution", "") or "")
+    if status == "cancelled":
+        if resolution == VOTE_BAN_ADMIN_RESOLUTION_CANCEL:
+            return admin_cancel_outcome_line(record)
+        if resolution in {
+            VOTE_BAN_MANUAL_UNBAN_RESOLUTION,
+            VOTE_BAN_MANUAL_UNBAN_FINALIZED_RESOLUTION,
+        }:
+            return "管理员解封后，本次投票已取消"
+        return "投票已取消"
+    if status == "expired":
+        return "投票超时，未达到封禁票数"
+    if status in {"passed", "failed"}:
+        return enforcement_outcome_line(record, banned=status == "passed")
+    return "投票已结束"
+
+
 async def recover_stale_vote_enforcement(
     *,
     bot: Bot,
@@ -1532,52 +1959,144 @@ async def _finalize_vote_message_unlocked(
     approvals: int,
 ) -> None:
     target_message_id = int(getattr(record, "target_message_id", 0) or 0)
-    if record.status == "passed" and target_message_id > 0:
-        try:
-            async with asyncio.timeout(5.0):
-                await bot.delete_message(
-                    chat_id=int(record.group_id),
-                    message_id=target_message_id,
+    message_id = int(record.message_id or 0)
+    if message_id <= 0:
+        if record.status == "passed" and target_message_id > 0:
+            try:
+                async with asyncio.timeout(5.0):
+                    await bot.delete_message(
+                        chat_id=int(record.group_id),
+                        message_id=target_message_id,
+                    )
+            except Exception:
+                log.debug(
+                    "passed vote-ban target message delete failed | group=%s "
+                    "session=%s message=%s",
+                    record.group_id,
+                    record.id,
+                    target_message_id,
+                    exc_info=True,
                 )
+        # This implementation never pins before the Telegram message id is
+        # durably stored. A terminal row without one therefore owns no possible
+        # external pin/message cleanup, and retaining the outstanding bits would
+        # make every startup retry an operation that can never succeed.
+        await _persist_vote_message_release(
+            record,
+            message_finalized=True,
+            pin_released=True,
+        )
+        return
+    message_finalized = False
+    edit_succeeded = False
+    pin_owned = bool(getattr(record, "pin_message", False))
+    pin_released = not pin_owned
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        if record.status == "passed" and target_message_id > 0:
+            try:
+                async with asyncio.timeout(5.0):
+                    await bot.delete_message(
+                        chat_id=int(record.group_id),
+                        message_id=target_message_id,
+                    )
+            except Exception:
+                log.debug(
+                    "passed vote-ban target message delete failed | group=%s "
+                    "session=%s message=%s",
+                    record.group_id,
+                    record.id,
+                    target_message_id,
+                    exc_info=True,
+                )
+        summary = [
+            card_field("目标", _mention(record.target_user_id, record.target_display)),
+            card_field("票数", f"<code>{approvals}/{record.threshold}</code>"),
+            card_field("处理结果", outcome_line),
+        ]
+        try:
+            # Once Telegram has been asked to close the prompt, do not keep a
+            # manual-unban row in the historical retry set merely because the
+            # edit was rejected or its outcome was ambiguous. Pin ownership is
+            # tracked independently and remains retryable until exact release.
+            message_finalized = True
+            edited = await _edit_vote_message_unlocked(
+                bot,
+                group_id=int(record.group_id),
+                message_id=message_id,
+                text=render_summary_notice(
+                    "民主投票封禁 · 已结束",
+                    summary,
+                    details="投票已关闭，不能再提交票数。",
+                ),
+                reply_markup=None,
+            )
+            edit_succeeded = True
         except Exception:
             log.debug(
-                "passed vote-ban target message delete failed | group=%s "
-                "session=%s message=%s",
+                "vote message finalize failed | group=%s message=%s",
                 record.group_id,
-                record.id,
-                target_message_id,
+                message_id,
                 exc_info=True,
             )
-    if not record.message_id:
-        return
-    summary = [
-        card_field("目标", _mention(record.target_user_id, record.target_display)),
-        card_field("票数", f"<code>{approvals}/{record.threshold}</code>"),
-        card_field("处理结果", outcome_line),
-    ]
+        if edit_succeeded:
+            try:
+                await schedule_message_auto_delete_durable(
+                    edited if not isinstance(edited, bool) else None,
+                    configured_auto_delete_seconds(settings, "vote"),
+                )
+            except Exception:
+                log.debug(
+                    "vote message terminal cleanup scheduling failed | group=%s message=%s",
+                    record.group_id,
+                    message_id,
+                    exc_info=True,
+                )
+    except asyncio.CancelledError as exc:
+        # Delay propagation until the exact pin ownership has either been
+        # released and persisted or handed to the bounded retry worker.
+        cancellation = exc
+    finally:
+        if pin_owned:
+            try:
+                pin_released = await unpin_notification_message(
+                    bot,
+                    chat_id=int(record.group_id),
+                    message_id=message_id,
+                    kind="vote_ban",
+                )
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+                pin_released = False
+    unpin_failed = pin_owned and not pin_released
+    if unpin_failed:
+        # Schedule before any further persistence await: if cancellation lands
+        # while saving the terminal message marker, the current process still
+        # owns a retry task and the durable pin bit remains uncleared.
+        _schedule_terminal_unpin_retry(bot, record)
     try:
-        edited = await _edit_vote_message_unlocked(
-            bot,
-            group_id=int(record.group_id),
-            message_id=int(record.message_id),
-            text=render_summary_notice(
-                "民主投票封禁 · 已结束",
-                summary,
-                details="投票已关闭，不能再提交票数。",
-            ),
-            reply_markup=None,
+        persisted = await _persist_vote_message_release(
+            record,
+            message_finalized=message_finalized,
+            pin_released=pin_released,
         )
-        await schedule_message_auto_delete_durable(
-            edited if not isinstance(edited, bool) else None,
-            configured_auto_delete_seconds(settings, "vote"),
-        )
-    except Exception:
-        log.debug(
-            "vote message finalize failed | group=%s message=%s",
-            record.group_id,
-            record.message_id,
-            exc_info=True,
-        )
+    except asyncio.CancelledError as exc:
+        cancellation = cancellation or exc
+        persisted = False
+        if pin_owned:
+            _schedule_terminal_unpin_retry(bot, record)
+    if unpin_failed:
+        try:
+            await _persist_vote_pin_outstanding(record)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+    elif pin_owned and not persisted:
+        # Telegram released the pin but the durable ownership clear failed.
+        # A deterministic already-unpinned retry also retries persistence now,
+        # instead of deferring that bookkeeping until process restart.
+        _schedule_terminal_unpin_retry(bot, record)
+    if cancellation is not None:
+        raise cancellation
 
 
 async def finalize_vote_message(
@@ -1806,6 +2325,105 @@ def cancel_vote_enforcement_recovery(session_id: int) -> None:
         task.cancel()
 
 
+def schedule_manual_unban_vote_finalization(user_id: int) -> None:
+    """Close vote prompts cancelled by a committed manual unban.
+
+    Manual group/global unban helpers intentionally know nothing about Bot API
+    dependencies. Their post-commit activation hook calls this scheduler, which
+    uses the runtime registered during vote restoration/startup. A pending bit
+    prevents an activation arriving during cleanup from being lost while still
+    deduplicating back-to-back group recoveries for the same user.
+    """
+
+    user_id = int(user_id)
+    if user_id <= 0:
+        return
+    session_factory = _runtime_session_factory
+    bot = _runtime_bot
+    settings = _runtime_settings
+    if not callable(session_factory) or bot is None or settings is None:
+        log.debug(
+            "manual-unban vote finalization skipped before runtime setup | user=%s",
+            user_id,
+        )
+        return
+
+    _manual_unban_finalization_pending.add(user_id)
+    existing = _manual_unban_finalization_tasks.get(user_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def _finalize() -> None:
+        try:
+            while user_id in _manual_unban_finalization_pending:
+                _manual_unban_finalization_pending.discard(user_id)
+                async with session_factory() as session:
+                    records = list(
+                        (
+                            await session.scalars(
+                                select(VoteBanSession).where(
+                                    VoteBanSession.target_user_id == user_id,
+                                    VoteBanSession.status == "cancelled",
+                                    or_(
+                                        VoteBanSession.resolution
+                                        == VOTE_BAN_MANUAL_UNBAN_RESOLUTION,
+                                        VoteBanSession.pin_message.is_(True),
+                                    ),
+                                )
+                            )
+                        ).all()
+                    )
+                    terminal_records: list[tuple[VoteBanSession, int]] = []
+                    for record in records:
+                        terminal_records.append(
+                            (
+                                record,
+                                await count_approvals(session, int(record.id)),
+                            )
+                        )
+                    await session.commit()
+
+                for record, approvals in terminal_records:
+                    cancel_vote_expiry(int(record.id))
+                    cancel_vote_enforcement_recovery(int(record.id))
+                    await finalize_vote_message(
+                        bot,
+                        settings,
+                        record,
+                        outcome_line=terminal_vote_outcome_line(record),
+                        approvals=approvals,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "manual-unban vote finalization failed | user=%s",
+                user_id,
+            )
+        finally:
+            current = asyncio.current_task()
+            if _manual_unban_finalization_tasks.get(user_id) is current:
+                _manual_unban_finalization_tasks.pop(user_id, None)
+            # An activation can arrive while the last Telegram operation is
+            # yielding. Removing our ownership before this check lets the new
+            # generation create a replacement instead of being stranded behind
+            # a task that is already returning.
+            if user_id in _manual_unban_finalization_pending:
+                schedule_manual_unban_vote_finalization(user_id)
+
+    try:
+        _manual_unban_finalization_tasks[user_id] = asyncio.create_task(
+            _finalize(),
+            name=f"vote-ban-manual-unban-finalize:{user_id}",
+        )
+    except RuntimeError:
+        _manual_unban_finalization_pending.discard(user_id)
+        log.debug(
+            "manual-unban vote finalization scheduling failed | user=%s",
+            user_id,
+        )
+
+
 async def restore_vote_ban_tasks(
     *,
     session_factory: Any,
@@ -1813,6 +2431,11 @@ async def restore_vote_ban_tasks(
     settings: Settings,
 ) -> None:
     """Restore active expiry timers and abandoned enforcement recovery."""
+    _configure_vote_ban_runtime(
+        session_factory=session_factory,
+        bot=bot,
+        settings=settings,
+    )
     async with session_factory() as session:
         rows = list(
             (
@@ -1823,11 +2446,50 @@ async def restore_vote_ban_tasks(
                 )
             ).all()
         )
+        terminal_rows = list(
+            (
+                await session.scalars(
+                    select(VoteBanSession).where(
+                        VoteBanSession.status.in_(
+                            ("passed", "failed", "expired", "cancelled")
+                        ),
+                        or_(
+                            VoteBanSession.pin_message.is_(True),
+                            VoteBanSession.resolution
+                            == VOTE_BAN_MANUAL_UNBAN_RESOLUTION,
+                        ),
+                    )
+                )
+            ).all()
+        )
+        terminal_records = [
+            (record, await count_approvals(session, int(record.id)))
+            for record in terminal_rows
+        ]
+        await session.commit()
+
+    for record, approvals in terminal_records:
+        cancel_vote_expiry(int(record.id))
+        cancel_vote_enforcement_recovery(int(record.id))
+        await finalize_vote_message(
+            bot,
+            settings,
+            record,
+            outcome_line=terminal_vote_outcome_line(record),
+            approvals=approvals,
+        )
 
     now = now_shanghai_naive()
     active_count = 0
     enforcing_count = 0
     for record in rows:
+        if bool(getattr(record, "pin_message", False)) and int(record.message_id or 0) > 0:
+            await _pin_open_vote_message(
+                bot,
+                settings=settings,
+                session_id=int(record.id),
+                session_factory=session_factory,
+            )
         if record.status == "active":
             delay = max(1, int((record.deadline_at - now).total_seconds()))
             schedule_vote_expiry(

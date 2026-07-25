@@ -1204,9 +1204,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         group_document = await self._group_document(-270)
+        self.assertIsNone(group_document["settings"]["raid_guard_pin_message"])
         self.assertIsNone(group_document["settings"]["call_admin_enabled"])
+        self.assertIsNone(group_document["settings"]["call_admin_pin_message"])
         self.assertEqual(group_document["settings"]["call_admin_targets"], [])
         self.assertIsNone(group_document["settings"]["vote_ban_enabled"])
+        self.assertIsNone(group_document["settings"]["vote_ban_pin_message"])
         self.assertIsNone(group_document["settings"]["vote_ban_trigger_limit"])
         self.assertIsNone(group_document["settings"]["vote_ban_trigger_window_seconds"])
 
@@ -1216,9 +1219,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={
                 "revision": group_document["revision"],
                 "settings": {
+                    "raid_guard_pin_message": True,
                     "call_admin_enabled": True,
+                    "call_admin_pin_message": True,
                     "call_admin_targets": [9, 7, 7],
                     "vote_ban_enabled": True,
+                    "vote_ban_pin_message": False,
                     "vote_ban_threshold": 8,
                     "vote_ban_duration_seconds": 900,
                     "vote_ban_trigger_limit": 4,
@@ -1228,9 +1234,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(saved.status, 200)
         public = (await saved.json())["group"]["settings"]
+        self.assertTrue(public["raid_guard_pin_message"])
         self.assertTrue(public["call_admin_enabled"])
+        self.assertTrue(public["call_admin_pin_message"])
         self.assertEqual(public["call_admin_targets"], [7, 9])
         self.assertTrue(public["vote_ban_enabled"])
+        self.assertFalse(public["vote_ban_pin_message"])
         self.assertEqual(public["vote_ban_threshold"], 8)
         self.assertEqual(public["vote_ban_duration_seconds"], 900)
         self.assertEqual(public["vote_ban_trigger_limit"], 4)
@@ -1244,9 +1253,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             json={
                 "revision": (await saved.json())["group"]["revision"],
                 "settings": {
+                    "raid_guard_pin_message": None,
                     "call_admin_enabled": None,
+                    "call_admin_pin_message": None,
                     "call_admin_targets": [],
                     "vote_ban_enabled": None,
+                    "vote_ban_pin_message": None,
                     "vote_ban_threshold": None,
                     "vote_ban_duration_seconds": None,
                     "vote_ban_trigger_limit": None,
@@ -1258,9 +1270,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as session:
             stored = await session.get(Group, -270)
             for key in (
+                "raid_guard_pin_message",
                 "call_admin_enabled",
+                "call_admin_pin_message",
                 "call_admin_targets",
                 "vote_ban_enabled",
+                "vote_ban_pin_message",
                 "vote_ban_threshold",
                 "vote_ban_duration_seconds",
                 "vote_ban_trigger_limit",
@@ -1283,6 +1298,19 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(response.status, 400)
+
+        response = await self.client.put(
+            "/api/v1/groups/-271/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_document["revision"],
+                "settings": {"vote_ban_pin_message_typo": True},
+            },
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(
+            (await response.json())["error"]["code"], "unknown_group_settings"
+        )
 
         response = await self.client.put(
             "/api/v1/groups/-271/settings",

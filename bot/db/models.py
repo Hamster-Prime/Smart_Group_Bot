@@ -246,11 +246,20 @@ class VoteBanSession(Base):
     target_message_id: Mapped[int] = mapped_column(BigInteger, default=0)
     threshold: Mapped[int] = mapped_column(Integer, default=5)
     message_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Persist outstanding ownership of the bot-managed pin. It starts true only
+    # when this poll requested pinning and is cleared after an exact unpin.
+    # Old rows default false so an upgrade never manages pins it did not create.
+    pin_message: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+    )
     # active / enforcing / passed / failed / expired / cancelled
     status: Mapped[str] = mapped_column(String(16), default="active")
     # "" = resolved by vote threshold / timeout; "admin_ban" / "admin_cancel"
     # = a group admin resolved the poll early via its admin buttons;
-    # "manual_unban" = a newer explicit unban cancelled open enforcement.
+    # "manual_unban" = a newer explicit unban cancelled open enforcement;
+    # "unban_finalized" marks its Telegram prompt as durably closed.
     resolution: Mapped[str] = mapped_column(
         String(16), default="", server_default=""
     )

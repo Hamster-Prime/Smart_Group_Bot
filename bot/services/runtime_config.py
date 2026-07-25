@@ -326,6 +326,7 @@ class RaidGuardSettingsConfig(StrictModel):
     """Join-flood lockdown with retroactive human challenges."""
 
     enabled: bool = False
+    pin_message: bool = True
     join_threshold: int = Field(default=8, ge=2, le=1000)
     window_seconds: int = Field(default=60, ge=5, le=3600)
     lockdown_seconds: int = Field(default=600, ge=60, le=86400)
@@ -337,6 +338,7 @@ class CallAdminSettingsConfig(StrictModel):
     """@admin trigger: report a situation by pinging the group's admins."""
 
     enabled: bool = True
+    pin_message: bool = False
     cooldown_seconds: int = Field(default=60, ge=0, le=86400)
 
 
@@ -344,6 +346,7 @@ class VoteBanSettingsConfig(StrictModel):
     """Democratic vote-ban defaults; groups may override in the Mini App."""
 
     enabled: bool = False
+    pin_message: bool = True
     vote_threshold: int = Field(default=5, ge=2, le=1000)
     duration_seconds: int = Field(default=1800, ge=60, le=86400)
     trigger_limit: int = Field(default=3, ge=1, le=1000)
@@ -828,6 +831,7 @@ class RuntimeConfig(StrictModel):
         settings.patrol_challenge_timeout_seconds = self.patrol.challenge_timeout_seconds
         settings.patrol_check_interval_seconds = self.patrol.check_interval_seconds
         settings.raid_guard_enabled = self.raid_guard.enabled
+        settings.raid_guard_pin_message = self.raid_guard.pin_message
         settings.raid_guard_join_threshold = self.raid_guard.join_threshold
         settings.raid_guard_window_seconds = self.raid_guard.window_seconds
         settings.raid_guard_lockdown_seconds = self.raid_guard.lockdown_seconds
@@ -836,8 +840,10 @@ class RuntimeConfig(StrictModel):
             self.raid_guard.challenge_timeout_seconds
         )
         settings.call_admin_enabled = self.call_admin.enabled
+        settings.call_admin_pin_message = self.call_admin.pin_message
         settings.call_admin_cooldown_seconds = self.call_admin.cooldown_seconds
         settings.vote_ban_enabled = self.vote_ban.enabled
+        settings.vote_ban_pin_message = self.vote_ban.pin_message
         settings.vote_ban_threshold = self.vote_ban.vote_threshold
         settings.vote_ban_duration_seconds = self.vote_ban.duration_seconds
         settings.vote_ban_trigger_limit = self.vote_ban.trigger_limit
@@ -1518,6 +1524,7 @@ def build_legacy_runtime_config(
         ),
         raid_guard=RaidGuardSettingsConfig(
             enabled=settings.raid_guard_enabled,
+            pin_message=settings.raid_guard_pin_message,
             join_threshold=settings.raid_guard_join_threshold,
             window_seconds=settings.raid_guard_window_seconds,
             lockdown_seconds=settings.raid_guard_lockdown_seconds,
@@ -1526,10 +1533,12 @@ def build_legacy_runtime_config(
         ),
         call_admin=CallAdminSettingsConfig(
             enabled=settings.call_admin_enabled,
+            pin_message=settings.call_admin_pin_message,
             cooldown_seconds=settings.call_admin_cooldown_seconds,
         ),
         vote_ban=VoteBanSettingsConfig(
             enabled=settings.vote_ban_enabled,
+            pin_message=settings.vote_ban_pin_message,
             vote_threshold=settings.vote_ban_threshold,
             duration_seconds=settings.vote_ban_duration_seconds,
             trigger_limit=settings.vote_ban_trigger_limit,

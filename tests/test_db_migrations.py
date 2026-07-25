@@ -74,7 +74,7 @@ class PerformanceIndexTests(unittest.TestCase):
 
 
 class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_vote_ban_admin_resolution_columns_upgrade_existing_rows(self) -> None:
+    async def test_vote_ban_terminal_and_pin_columns_upgrade_existing_rows(self) -> None:
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         engine = None
@@ -110,6 +110,7 @@ class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "resolution",
                 "resolver_user_id",
                 "resolver_display",
+                "pin_message",
             ):
                 connection.execute(
                     f"ALTER TABLE vote_ban_sessions DROP COLUMN {column}"
@@ -132,16 +133,17 @@ class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):
                 values = (
                     await session.execute(
                         text(
-                            "SELECT resolution, resolver_user_id, resolver_display "
+                            "SELECT resolution, resolver_user_id, resolver_display, "
+                            "pin_message "
                             "FROM vote_ban_sessions WHERE target_user_id=7"
                         )
                     )
                 ).one()
             self.assertTrue(
-                {"resolution", "resolver_user_id", "resolver_display"}
+                {"resolution", "resolver_user_id", "resolver_display", "pin_message"}
                 <= columns
             )
-            self.assertEqual(tuple(values), ("", 0, ""))
+            self.assertEqual(tuple(values), ("", 0, "", 0))
         finally:
             if engine is not None:
                 await engine.dispose()

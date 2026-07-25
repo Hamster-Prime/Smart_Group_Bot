@@ -25,6 +25,7 @@ from bot.services.join_verification import (
 )
 from bot.services.raid_guard import (
     MANUAL_LOCKDOWN_SETTINGS_KEY,
+    RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
     RAID_GUARD_DISABLE_CALLBACK_DATA,
     RAID_REMOVE_CALLBACK_DATA,
     RaidGuardService,
@@ -56,6 +57,7 @@ def _settings(**overrides):
     settings.raid_guard_lockdown_seconds = 600
     settings.raid_guard_lookback_seconds = 300
     settings.raid_guard_challenge_timeout_seconds = 600
+    settings.raid_guard_pin_message = True
     for key, value in overrides.items():
         setattr(settings, key, value)
     return settings
@@ -68,6 +70,8 @@ def _bot_mock() -> SimpleNamespace:
         unban_chat_member=AsyncMock(return_value=True),
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=777)),
         edit_message_text=AsyncMock(),
+        pin_chat_message=AsyncMock(return_value=True),
+        unpin_chat_message=AsyncMock(return_value=True),
         get_chat_administrators=AsyncMock(return_value=[]),
         get_chat_member=AsyncMock(
             return_value=SimpleNamespace(status="member", can_send_messages=True)
@@ -169,6 +173,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(config.join_threshold, 3)
         self.assertEqual(config.window_seconds, 60)
         self.assertEqual(config.lockdown_seconds, 600)
+
+    def test_resolve_config_includes_group_pin_override(self) -> None:
+        settings = _settings(raid_guard_pin_message=True)
+
+        self.assertTrue(resolve_raid_guard_config(settings).pin_message)
+        self.assertFalse(
+            resolve_raid_guard_config(
+                settings,
+                {"raid_guard_pin_message": False},
+            ).pin_message
+        )
 
     def test_raid_timeout_prefers_raid_setting(self) -> None:
         settings = _settings(
@@ -289,6 +304,39 @@ class MessageTests(unittest.TestCase):
 
 
 class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reset_clears_status_pin_intents(self) -> None:
+        service = RaidGuardService(
+            bot=_bot_mock(),
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        service._status_pin_intents[-100] = True
+        service._owned_pin_message_ids[-100] = {777}
+
+        service.reset()
+
+        self.assertEqual(service._status_pin_intents, {})
+        self.assertEqual(service._owned_pin_message_ids, {})
+
+    async def test_shutdown_unpins_active_automatic_status(self) -> None:
+        bot = _bot_mock()
+        service = RaidGuardService(
+            bot=bot,
+            settings=_settings(),
+            session_factory=None,  # type: ignore[arg-type]
+        )
+        service._lockdown_until[-100] = now_shanghai_naive() + timedelta(minutes=1)
+        service._lockdown_source[-100] = "automatic"
+        service._status_message_ids[-100] = 777
+        service._status_pin_intents[-100] = True
+
+        await service.shutdown()
+
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
     async def test_scheduled_unlock_ignores_a_new_lockdown(self) -> None:
         bot = _bot_mock()
         service = RaidGuardService(
@@ -297,6 +345,7 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
             session_factory=None,  # type: ignore[arg-type]
         )
         service._status_message_ids[-100] = 777
+        service._status_pin_intents[-100] = True
         service._schedule_unlock_notice(-100, source="automatic")
         service._lockdown_until[-100] = now_shanghai_naive() + timedelta(minutes=1)
         service._lockdown_source[-100] = "manual"
@@ -304,9 +353,10 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         bot.edit_message_text.assert_not_awaited()
+        bot.unpin_chat_message.assert_not_awaited()
         self.assertTrue(service.lockdown_status_message_matches(-100, 777))
 
-    async def test_passive_unlock_notice_is_tracked_and_drained_on_shutdown(self) -> None:
+    async def test_passive_expiry_is_tracked_and_drained_on_shutdown(self) -> None:
         bot = _bot_mock()
         service = RaidGuardService(
             bot=bot,
@@ -326,9 +376,9 @@ class RaidTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(service.lockdown_active(-100))
         await asyncio.wait_for(started.wait(), timeout=1.0)
-        self.assertIn(-100, service._unlock_notice_tasks)
+        self.assertIn(-100, service._lockdown_expiry_tasks)
         await service.shutdown()
-        self.assertEqual(service._unlock_notice_tasks, {})
+        self.assertEqual(service._lockdown_expiry_tasks, {})
 
     async def test_notice_capacity_and_shutdown_remain_bounded_when_cancel_is_ignored(
         self,
@@ -730,6 +780,11 @@ class DetectionTests(_DbTestCase):
             status_keyboard.inline_keyboard[0][0].callback_data,
             RAID_GUARD_DISABLE_CALLBACK_DATA,
         )
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
         challenge_call = bot.send_message.await_args_list[1]
         challenge = challenge_call.args[1]
         for handle in ("@one", "@two", "@three"):
@@ -848,6 +903,55 @@ class DetectionTests(_DbTestCase):
             parse_mode="HTML",
             reply_markup=None,
         )
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
+    async def test_automatic_publish_inflight_is_retired_by_concurrent_off(
+        self,
+    ) -> None:
+        service, bot = self._service()
+        config = resolve_raid_guard_config(service.settings)
+        service._arm_lockdown(
+            -100,
+            duration_seconds=config.lockdown_seconds,
+            source="automatic",
+            pin_message=True,
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def slow_send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return SimpleNamespace(message_id=777)
+
+        bot.send_message.side_effect = slow_send
+        activation = asyncio.create_task(
+            service._activate_lockdown(-100, [], config)
+        )
+        await asyncio.wait_for(send_started.wait(), timeout=1.0)
+        disable = asyncio.create_task(service.disable_manual_lockdown(-100))
+        await asyncio.sleep(0)
+        self.assertFalse(disable.done())
+
+        release_send.set()
+        self.assertEqual(await activation, [])
+        self.assertTrue(await disable)
+
+        self.assertFalse(service.lockdown_active(-100))
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        self.assertNotIn(-100, service._status_message_ids)
+        self.assertNotIn(-100, service._status_pin_intents)
 
     async def test_manual_lockdown_works_when_automatic_policy_is_off(self) -> None:
         settings = _settings(raid_guard_enabled=False)
@@ -860,6 +964,11 @@ class DetectionTests(_DbTestCase):
         self.assertIsNotNone(deadline)
         self.assertTrue(service.manual_lockdown_active(-100))
         self.assertIn("5 分钟", bot.send_message.await_args.args[1])
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
         self.assertEqual(
             bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text,
             "解除爆破防护",
@@ -887,6 +996,10 @@ class DetectionTests(_DbTestCase):
             parse_mode="HTML",
             reply_markup=None,
         )
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
 
     async def test_manual_reconfiguration_updates_existing_status_message(self) -> None:
         service, bot = self._service()
@@ -906,6 +1019,334 @@ class DetectionTests(_DbTestCase):
         )
         self.assertTrue(service.lockdown_status_message_matches(-100, 777))
 
+    async def test_concurrent_manual_on_then_off_cannot_leave_orphan_pin(self) -> None:
+        service, bot = self._service()
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def slow_send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return SimpleNamespace(message_id=777)
+
+        bot.send_message.side_effect = slow_send
+        enable = asyncio.create_task(
+            service.enable_manual_lockdown(-100, duration_minutes=5)
+        )
+        await asyncio.wait_for(send_started.wait(), timeout=1.0)
+        disable = asyncio.create_task(service.disable_manual_lockdown(-100))
+        await asyncio.sleep(0)
+        self.assertFalse(disable.done())
+
+        release_send.set()
+        self.assertIsNotNone(await enable)
+        self.assertTrue(await disable)
+
+        self.assertFalse(service.lockdown_active(-100))
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
+
+    async def test_two_concurrent_manual_on_calls_share_one_status_message(self) -> None:
+        service, bot = self._service()
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def slow_send(*_args, **_kwargs):
+            send_started.set()
+            await release_send.wait()
+            return SimpleNamespace(message_id=777)
+
+        bot.send_message.side_effect = slow_send
+        first = asyncio.create_task(
+            service.enable_manual_lockdown(-100, duration_minutes=5)
+        )
+        await asyncio.wait_for(send_started.wait(), timeout=1.0)
+        second = asyncio.create_task(
+            service.enable_manual_lockdown(-100, duration_minutes=10)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(second.done())
+        self.assertEqual(bot.send_message.await_count, 1)
+
+        release_send.set()
+        first_until, second_until = await asyncio.gather(first, second)
+
+        self.assertIsNotNone(first_until)
+        self.assertIsNotNone(second_until)
+        self.assertGreater(second_until, first_until)
+        self.assertEqual(bot.send_message.await_count, 1)
+        bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(bot.edit_message_text.await_args.kwargs["message_id"], 777)
+        self.assertIn("10 分钟", bot.edit_message_text.await_args.kwargs["text"])
+        self.assertEqual(bot.pin_chat_message.await_count, 2)
+        bot.unpin_chat_message.assert_not_awaited()
+        self.assertEqual(service.lockdown_status(-100)["until"], second_until)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            state = group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY]
+            self.assertEqual(state["status_message_id"], 777)
+            self.assertTrue(state["until"].startswith(second_until.isoformat()))
+        service.reset(-100)
+
+    async def test_manual_status_id_is_persisted_before_pin(self) -> None:
+        service, bot = self._service()
+
+        async def assert_persisted_before_pin(**kwargs):
+            async with self.session_factory() as session:
+                group = await session.get(Group, -100)
+                state = group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY]
+                self.assertEqual(state["status_message_id"], kwargs["message_id"])
+                ownership = group.settings[
+                    RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY
+                ]
+                self.assertEqual(ownership["message_ids"], [kwargs["message_id"]])
+            return True
+
+        bot.pin_chat_message.side_effect = assert_persisted_before_pin
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
+        service.reset(-100)
+
+    async def test_reconfigure_unpin_failure_is_retried_at_terminal(self) -> None:
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            group.settings = {
+                **dict(group.settings or {}),
+                "raid_guard_pin_message": False,
+            }
+            await session.commit()
+
+        bot.unpin_chat_message.side_effect = [RuntimeError("temporary"), True]
+        await service.enable_manual_lockdown(-100, duration_minutes=10)
+
+        self.assertFalse(service._status_pin_intents[-100])
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertEqual(
+                group.settings[RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY][
+                    "message_ids"
+                ],
+                [777],
+            )
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        self.assertEqual(bot.unpin_chat_message.await_count, 2)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
+            self.assertNotIn(
+                RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
+                group.settings,
+            )
+
+    async def test_delayed_cleanup_cannot_unpin_concurrent_reenable(self) -> None:
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            group.settings = {
+                **dict(group.settings or {}),
+                "raid_guard_pin_message": False,
+            }
+            await session.commit()
+
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        unpin_attempt = 0
+
+        async def controlled_unpin(**_kwargs):
+            nonlocal unpin_attempt
+            unpin_attempt += 1
+            if unpin_attempt == 1:
+                raise RuntimeError("temporary")
+            cleanup_started.set()
+            await release_cleanup.wait()
+            return True
+
+        bot.unpin_chat_message.side_effect = controlled_unpin
+        await service.enable_manual_lockdown(-100, duration_minutes=10)
+        self.assertFalse(service._status_pin_intents[-100])
+
+        # Replace the normal delayed retry with a deterministic in-flight
+        # cleanup, then re-enable pinning while that exact unpin owns the
+        # per-group pin-operation lock.
+        service._schedule_pin_cleanup(-100, delay_seconds=0.0)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            group.settings = {
+                **dict(group.settings or {}),
+                "raid_guard_pin_message": True,
+            }
+            await session.commit()
+
+        previous_until = service.lockdown_status(-100)["until"]
+        edit_count_before_reenable = bot.edit_message_text.await_count
+        reenable = asyncio.create_task(
+            service.enable_manual_lockdown(-100, duration_minutes=15)
+        )
+
+        async def wait_until_rearmed() -> None:
+            while service.lockdown_status(-100)["until"] == previous_until:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_until_rearmed(), timeout=1.0)
+        self.assertFalse(reenable.done())
+        self.assertEqual(
+            bot.edit_message_text.await_count,
+            edit_count_before_reenable,
+        )
+        self.assertEqual(bot.pin_chat_message.await_count, 1)
+
+        release_cleanup.set()
+        await asyncio.wait_for(reenable, timeout=2.0)
+
+        self.assertEqual(bot.unpin_chat_message.await_count, 2)
+        self.assertEqual(bot.pin_chat_message.await_count, 2)
+        self.assertTrue(service._status_pin_intents[-100])
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertEqual(
+                group.settings[RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY][
+                    "message_ids"
+                ],
+                [777],
+            )
+        service.reset(-100)
+
+    async def test_replacement_keeps_old_pin_ownership_until_release(self) -> None:
+        service, bot = self._service()
+        bot.send_message.side_effect = [
+            SimpleNamespace(message_id=777),
+            SimpleNamespace(message_id=888),
+        ]
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        bot.edit_message_text.side_effect = RuntimeError("edit failed")
+        bot.unpin_chat_message.side_effect = [
+            RuntimeError("temporary"),
+            True,
+            True,
+        ]
+
+        await service.enable_manual_lockdown(-100, duration_minutes=10)
+
+        self.assertEqual(service._status_message_ids[-100], 888)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertEqual(
+                group.settings[RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY][
+                    "message_ids"
+                ],
+                [777, 888],
+            )
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        self.assertEqual(bot.unpin_chat_message.await_count, 3)
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(
+                RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
+                group.settings,
+            )
+
+    async def test_terminal_unpin_failure_is_recovered_after_restart(self) -> None:
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100, duration_minutes=5)
+        bot.unpin_chat_message.side_effect = RuntimeError("temporary")
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
+            self.assertEqual(
+                group.settings[RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY][
+                    "message_ids"
+                ],
+                [777],
+            )
+        service.reset(-100)
+
+        restored, restored_bot = self._service()
+        self.assertEqual(
+            await restored.restore_manual_lockdowns(),
+            {"restored": 0, "expired": 0, "invalid": 0},
+        )
+        restored_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(
+                RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
+                group.settings,
+            )
+
+    async def test_automatic_pin_ownership_is_recovered_after_crash(self) -> None:
+        service, _bot = self._service()
+        for user_id in (1, 2, 3):
+            await self._join(service, user_id)
+        service.reset(-100)
+
+        restored, restored_bot = self._service()
+        self.assertEqual(
+            await restored.restore_manual_lockdowns(),
+            {"restored": 0, "expired": 0, "invalid": 0},
+        )
+        restored_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(
+                RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
+                group.settings,
+            )
+
+    async def test_manual_status_persistence_failure_does_not_pin(self) -> None:
+        service, bot = self._service()
+        original_update = service._update_persisted_manual_state
+        update_calls = 0
+
+        async def fail_status_id_update(*args, **kwargs):
+            nonlocal update_calls
+            update_calls += 1
+            if update_calls == 2:
+                return None
+            return await original_update(*args, **kwargs)
+
+        with patch.object(
+            service,
+            "_update_persisted_manual_state",
+            side_effect=fail_status_id_update,
+        ):
+            await service.enable_manual_lockdown(-100, duration_minutes=5)
+
+        bot.pin_chat_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            state = group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY]
+            self.assertNotIn("status_message_id", state)
+        service.reset(-100)
+
     async def test_unlock_edit_failure_does_not_post_a_second_status_message(self) -> None:
         service, bot = self._service()
 
@@ -916,17 +1357,34 @@ class DetectionTests(_DbTestCase):
         self.assertTrue(await service.disable_manual_lockdown(-100))
         bot.send_message.assert_not_awaited()
         bot.edit_message_text.assert_awaited_once()
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         self.assertFalse(service.lockdown_status_message_matches(-100, 777))
 
     async def test_active_status_edit_failure_replaces_the_release_control(self) -> None:
         service, bot = self._service()
 
+        bot.send_message.side_effect = [
+            SimpleNamespace(message_id=777),
+            SimpleNamespace(message_id=888),
+        ]
         await service.enable_manual_lockdown(-100, duration_minutes=5)
         bot.edit_message_text.side_effect = Exception("message is too old")
         await service.enable_manual_lockdown(-100, duration_minutes=10)
 
         self.assertEqual(bot.send_message.await_count, 2)
-        self.assertTrue(service.lockdown_status_message_matches(-100, 777))
+        self.assertTrue(service.lockdown_status_message_matches(-100, 888))
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        self.assertEqual(bot.pin_chat_message.await_count, 2)
+        self.assertEqual(
+            bot.pin_chat_message.await_args_list[-1].kwargs["message_id"],
+            888,
+        )
         replacement = bot.send_message.await_args
         self.assertIn("10 分钟", replacement.args[1])
         self.assertEqual(
@@ -953,7 +1411,12 @@ class DetectionTests(_DbTestCase):
             self.assertEqual(group.settings["nested"], {"ok": True})
             self.assertEqual(
                 group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY],
-                {"version": 1, "indefinite": True, "status_message_id": 777},
+                {
+                    "version": 1,
+                    "indefinite": True,
+                    "pin_message": True,
+                    "status_message_id": 777,
+                },
             )
 
         self.assertTrue(await service.disable_manual_lockdown(-100))
@@ -962,6 +1425,39 @@ class DetectionTests(_DbTestCase):
             self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
             self.assertEqual(group.settings["welcome_message"], "原有欢迎语")
             self.assertEqual(group.settings["nested"], {"ok": True})
+
+    async def test_manual_lockdown_reads_and_persists_disabled_pin_override(self) -> None:
+        async with self.session_factory() as session:
+            session.add(
+                Group(
+                    id=-100,
+                    title="测试群",
+                    settings={"raid_guard_pin_message": False},
+                )
+            )
+            await session.commit()
+
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100)
+
+        bot.pin_chat_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertFalse(
+                group.settings[MANUAL_LOCKDOWN_SETTINGS_KEY]["pin_message"]
+            )
+
+        service.reset()
+        restored, restored_bot = self._service()
+        self.assertEqual(
+            await restored.restore_manual_lockdowns(),
+            {"restored": 1, "expired": 0, "invalid": 0},
+        )
+        self.assertFalse(restored._status_pin_intents[-100])
+        restored_bot.pin_chat_message.assert_not_awaited()
+        self.assertTrue(await restored.disable_manual_lockdown(-100))
+        bot.unpin_chat_message.assert_not_awaited()
+        restored_bot.unpin_chat_message.assert_not_awaited()
 
     async def test_timed_manual_lockdown_is_restored_after_restart(self) -> None:
         first, _first_bot = self._service()
@@ -974,9 +1470,15 @@ class DetectionTests(_DbTestCase):
         self.assertEqual(summary, {"restored": 1, "expired": 0, "invalid": 0})
         self.assertTrue(restored.manual_lockdown_active(-100))
         self.assertEqual(restored.lockdown_status(-100)["until"], deadline)
+        self.assertTrue(restored._status_pin_intents[-100])
         # A restart restores state silently; the original activation notice is
         # not repeated.
         restored_bot.send_message.assert_not_awaited()
+        restored_bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
         await restored.disable_manual_lockdown(-100)
         restored_bot.edit_message_text.assert_awaited_once_with(
             chat_id=-100,
@@ -985,6 +1487,49 @@ class DetectionTests(_DbTestCase):
             parse_mode="HTML",
             reply_markup=None,
         )
+        restored_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
+    async def test_repeated_restore_resynchronizes_persisted_pin_intent(self) -> None:
+        first, _first_bot = self._service()
+        await first.enable_manual_lockdown(-100, duration_minutes=5)
+        first.reset()
+
+        restored, restored_bot = self._service()
+        await restored.restore_manual_lockdowns()
+        restored._status_pin_intents[-100] = False
+        await restored.restore_manual_lockdowns()
+
+        self.assertTrue(restored._status_pin_intents[-100])
+        self.assertEqual(restored_bot.pin_chat_message.await_count, 2)
+        restored_bot.unpin_chat_message.assert_not_awaited()
+
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            settings_data = dict(group.settings or {})
+            manual = dict(settings_data[MANUAL_LOCKDOWN_SETTINGS_KEY])
+            manual["pin_message"] = False
+            settings_data[MANUAL_LOCKDOWN_SETTINGS_KEY] = manual
+            group.settings = settings_data
+            await session.commit()
+        restored._status_pin_intents[-100] = True
+
+        await restored.restore_manual_lockdowns()
+
+        self.assertFalse(restored._status_pin_intents[-100])
+        restored_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            group = await session.get(Group, -100)
+            self.assertNotIn(
+                RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY,
+                group.settings,
+            )
+        restored.reset(-100)
 
     async def test_indefinite_manual_lockdown_is_restored_after_restart(self) -> None:
         first, _first_bot = self._service()
@@ -996,8 +1541,18 @@ class DetectionTests(_DbTestCase):
         self.assertEqual(summary["restored"], 1)
         self.assertTrue(restored.manual_lockdown_active(-100))
         self.assertIsNone(restored.lockdown_status(-100)["until"])
+        self.assertTrue(restored._status_pin_intents[-100])
         restored_bot.send_message.assert_not_awaited()
+        restored_bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
         await restored.disable_manual_lockdown(-100)
+        restored_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
 
     async def test_expired_persisted_lockdown_is_cleaned_and_updates_once(self) -> None:
         expired_until = (now_shanghai_naive() - timedelta(minutes=1)).isoformat()
@@ -1011,6 +1566,7 @@ class DetectionTests(_DbTestCase):
                         MANUAL_LOCKDOWN_SETTINGS_KEY: {
                             "version": 1,
                             "until": expired_until,
+                            "pin_message": True,
                             "status_message_id": 777,
                         },
                     },
@@ -1030,6 +1586,10 @@ class DetectionTests(_DbTestCase):
             text=build_raid_unlock_text(),
             parse_mode="HTML",
             reply_markup=None,
+        )
+        first_bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
         )
 
         second, second_bot = self._service()
@@ -1064,6 +1624,10 @@ class DetectionTests(_DbTestCase):
             parse_mode="HTML",
             reply_markup=None,
         )
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             group = await session.get(Group, -100)
             self.assertNotIn(MANUAL_LOCKDOWN_SETTINGS_KEY, group.settings)
@@ -1084,6 +1648,41 @@ class DetectionTests(_DbTestCase):
         self.assertFalse(await self._join(service, 1, group_settings=overrides))
         self.assertTrue(await self._join(service, 2, group_settings=overrides))
         self.assertTrue(service.lockdown_active(-100))
+
+    async def test_group_pin_override_disables_automatic_status_pin(self) -> None:
+        service, bot = self._service()
+        overrides = {"raid_guard_pin_message": False}
+
+        for user_id in (1, 2, 3):
+            await self._join(service, user_id, group_settings=overrides)
+
+        self.assertTrue(service.lockdown_active(-100))
+        bot.pin_chat_message.assert_not_awaited()
+
+    async def test_pin_failure_does_not_block_automatic_lockdown(self) -> None:
+        service, bot = self._service()
+        bot.pin_chat_message.side_effect = RuntimeError("no pin permission")
+
+        for user_id in (1, 2, 3):
+            await self._join(service, user_id)
+
+        self.assertTrue(service.lockdown_active(-100))
+        self.assertEqual(bot.send_message.await_count, 2)
+        bot.pin_chat_message.assert_awaited_once()
+
+    async def test_unpin_failure_does_not_block_manual_unlock(self) -> None:
+        service, bot = self._service()
+        await service.enable_manual_lockdown(-100)
+        bot.unpin_chat_message.side_effect = RuntimeError("no pin permission")
+
+        self.assertTrue(await service.disable_manual_lockdown(-100))
+
+        self.assertFalse(service.lockdown_active(-100))
+        bot.edit_message_text.assert_awaited_once()
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
 
     async def test_single_user_rejoin_loop_does_not_trigger(self) -> None:
         # One account bouncing leave/rejoin must not lock the group.

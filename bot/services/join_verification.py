@@ -692,6 +692,12 @@ def activate_manual_unban_recovery(recovery: UnbanRecovery | None) -> None:
         int(recovery.user_id),
         until=recovery.lease_until,
     )
+    # The database transaction that cancelled open vote-ban sessions has
+    # committed before this activation is published. Close their Telegram
+    # prompts asynchronously so no network call is held inside that transaction.
+    from bot.services.vote_ban import schedule_manual_unban_vote_finalization
+
+    schedule_manual_unban_vote_finalization(int(recovery.user_id))
 
 
 def activate_manual_unban_recoveries(

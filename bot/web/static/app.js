@@ -58,12 +58,13 @@
     onboarding: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
     permissions: ["default_permissions"],
     safety: [
-      "patrol_enabled", "raid_guard_enabled", "raid_guard_join_threshold",
+      "patrol_enabled", "raid_guard_enabled", "raid_guard_pin_message", "raid_guard_join_threshold",
       "raid_guard_window_seconds", "raid_guard_lockdown_seconds",
       "raid_guard_lookback_seconds", "raid_guard_challenge_timeout_seconds",
     ],
     management: [
-      "call_admin_enabled", "call_admin_targets", "vote_ban_enabled",
+      "call_admin_enabled", "call_admin_pin_message", "call_admin_targets", "vote_ban_enabled",
+      "vote_ban_pin_message",
       "vote_ban_threshold", "vote_ban_duration_seconds", "vote_ban_trigger_limit",
       "vote_ban_trigger_window_seconds",
     ],
@@ -115,14 +116,17 @@
     "default_permissions",
     "patrol_enabled",
     "raid_guard_enabled",
+    "raid_guard_pin_message",
     "raid_guard_join_threshold",
     "raid_guard_window_seconds",
     "raid_guard_lockdown_seconds",
     "raid_guard_lookback_seconds",
     "raid_guard_challenge_timeout_seconds",
     "call_admin_enabled",
+    "call_admin_pin_message",
     "call_admin_targets",
     "vote_ban_enabled",
+    "vote_ban_pin_message",
     "vote_ban_threshold",
     "vote_ban_duration_seconds",
     "vote_ban_trigger_limit",
@@ -955,6 +959,7 @@
           ${sectionHead("呼叫管理员", "群成员发送 @admin 时 @ 群管理员，用于举报或紧急呼叫；群组页可逐群覆盖开关并选择要 @ 的管理员（默认全部）。")}
           <div class="field-grid three">
             ${toggle("call_admin.enabled", "默认启用呼叫管理员", "群组管理员可在群组页覆盖")}
+            ${toggle("call_admin.pin_message", "呼叫管理员通知自动置顶", "默认关闭；管理员可标记已处理并取消置顶，群组管理员可在群组页覆盖")}
             ${field("call_admin.cooldown_seconds", "呼叫冷却（秒）", { type: "number", min: 0, max: 86400, step: 1, required: true, hint: "同群两次 @admin 之间的最小间隔，防刷屏" })}
           </div>
         </section>
@@ -962,6 +967,7 @@
           ${sectionHead("民主投票封禁", "群成员可回复消息发送 /voteban，或明确要求 Bot 调用技能发起投票；两个入口共享持久化的单用户次数额度。票数达标即在本群封禁，管理员与最高管理员不可被投票。群组页可逐群覆盖各项。")}
           <div class="field-grid three">
             ${toggle("vote_ban.enabled", "默认启用民主投票封禁", "群组管理员可在群组页覆盖")}
+            ${toggle("vote_ban.pin_message", "民主投票活动自动置顶", "默认开启；投票完成、管理员终止或超时后取消置顶，群组管理员可在群组页覆盖")}
             ${field("vote_ban.vote_threshold", "封禁票数阈值", { type: "number", min: 2, max: 1000, step: 1, required: true, hint: "含发起人自动投出的第一票" })}
             ${field("vote_ban.duration_seconds", "投票有效期（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "超时未达票数的投票自动失效" })}
             ${field("vote_ban.trigger_limit", "单用户触发上限", { type: "number", min: 1, max: 1000, step: 1, required: true, hint: "命令和 AI 技能共用同一额度" })}
@@ -972,6 +978,7 @@
           ${sectionHead("爆破防护", "短时间内大量成员加入时自动锁群：锁定期内任何新加入的成员都被移出（不封禁），并只发送一条防护提示；同时追溯锁定前进群的成员，统一 @ 要求真人质询，超时未通过将被移出（可重新加入）。群组页可逐群覆盖开关和各项阈值。")}
           <div class="field-grid three">
             ${toggle("raid_guard.enabled", "默认启用爆破防护", "需要已配置真人验证服务用于追溯质询；群组管理员可在群组页覆盖")}
+            ${toggle("raid_guard.pin_message", "爆破防护活动自动置顶", "默认开启；自动或手动结束防护时取消置顶，群组管理员可在群组页覆盖")}
             ${field("raid_guard.join_threshold", "触发阈值（人数）", { type: "number", min: 2, max: 1000, step: 1, required: true, hint: "检测窗口内加入人数达到该值即触发锁定" })}
             ${field("raid_guard.window_seconds", "检测窗口（秒）", { type: "number", min: 5, max: 3600, step: 1, required: true })}
             ${field("raid_guard.lockdown_seconds", "锁定时长（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true, hint: "锁定期内的新加入会刷新锁定时间" })}
@@ -1132,15 +1139,18 @@
       default_permissions: normalizeDefaultPermissions(settings.default_permissions),
       patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
       raid_guard_enabled: settings.raid_guard_enabled == null ? null : Boolean(settings.raid_guard_enabled),
+      raid_guard_pin_message: settings.raid_guard_pin_message == null ? null : Boolean(settings.raid_guard_pin_message),
       ...Object.fromEntries(RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => [
         key,
         settings[key] == null ? null : Number(settings[key]),
       ])),
       call_admin_enabled: settings.call_admin_enabled == null ? null : Boolean(settings.call_admin_enabled),
+      call_admin_pin_message: settings.call_admin_pin_message == null ? null : Boolean(settings.call_admin_pin_message),
       call_admin_targets: Array.isArray(settings.call_admin_targets)
         ? settings.call_admin_targets.map(Number).filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b)
         : [],
       vote_ban_enabled: settings.vote_ban_enabled == null ? null : Boolean(settings.vote_ban_enabled),
+      vote_ban_pin_message: settings.vote_ban_pin_message == null ? null : Boolean(settings.vote_ban_pin_message),
       ...Object.fromEntries(VOTE_BAN_GROUP_INT_FIELDS.map(({ key }) => [
         key,
         settings[key] == null ? null : Number(settings[key]),
@@ -1689,8 +1699,8 @@
               title: "巡检与爆破防护",
               description: "成员巡检、入群爆破检测与锁群参数",
               iconName: "shield-check",
-              itemLabel: "7 项",
-              settingKeys: ["patrol_enabled", "raid_guard_enabled", ...RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => key)],
+              itemLabel: "8 项",
+              settingKeys: ["patrol_enabled", "raid_guard_enabled", "raid_guard_pin_message", ...RAID_GUARD_GROUP_INT_FIELDS.map(({ key }) => key)],
               content: `
                 <div class="group-settings-grid">
                   <div class="field">
@@ -1714,6 +1724,15 @@
                     </select>
                     <span class="field-hint">锁群阈值与超时可在下方逐群覆盖</span>
                   </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-raid-guard-pin-message">爆破防护活动自动置顶</label>
+                    <select id="group-${attr(group.id)}-raid-guard-pin-message" data-group-id="${attr(group.id)}" data-group-key="raid_guard_pin_message" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.raid_guard_pin_message == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.raid_guard_pin_message === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.raid_guard_pin_message === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">触发防护时置顶通知，自动或手动结束防护时取消置顶</span>
+                  </div>
                   ${RAID_GUARD_GROUP_INT_FIELDS.map(({ key, label, min, max }) => `
                   <div class="field">
                     <label class="field-label" for="group-${attr(group.id)}-${key.replaceAll("_", "-")}">${escapeHtml(label)}</label>
@@ -1726,8 +1745,8 @@
               title: "管理员与投票",
               description: "呼叫管理员与民主投票封禁策略",
               iconName: "users",
-              itemLabel: "7 项",
-              settingKeys: ["call_admin_enabled", "call_admin_targets", "vote_ban_enabled", ...VOTE_BAN_GROUP_INT_FIELDS.map(({ key }) => key)],
+              itemLabel: "9 项",
+              settingKeys: ["call_admin_enabled", "call_admin_pin_message", "call_admin_targets", "vote_ban_enabled", "vote_ban_pin_message", ...VOTE_BAN_GROUP_INT_FIELDS.map(({ key }) => key)],
               content: `
                 <div class="group-settings-grid">
                   <div class="field">
@@ -1740,6 +1759,15 @@
                     <span class="field-hint">群成员发送 @admin 时 @ 下方勾选的管理员；可回复消息举报</span>
                   </div>
                   <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-call-admin-pin-message">呼叫管理员通知自动置顶</label>
+                    <select id="group-${attr(group.id)}-call-admin-pin-message" data-group-id="${attr(group.id)}" data-group-key="call_admin_pin_message" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.call_admin_pin_message == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.call_admin_pin_message === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.call_admin_pin_message === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">开启后置顶呼叫通知；管理员可标记已处理并取消置顶</span>
+                  </div>
+                  <div class="field">
                     <label class="field-label" for="group-${attr(group.id)}-vote-ban-enabled">民主投票封禁</label>
                     <select id="group-${attr(group.id)}-vote-ban-enabled" data-group-id="${attr(group.id)}" data-group-key="vote_ban_enabled" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
                       <option value=""${group.settings.vote_ban_enabled == null ? " selected" : ""}>继承全局默认</option>
@@ -1747,6 +1775,15 @@
                       <option value="false"${group.settings.vote_ban_enabled === false ? " selected" : ""}>关闭</option>
                     </select>
                     <span class="field-hint">命令和 Bot 技能共享下方单用户额度；票数达标即封禁被回复用户</span>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-vote-ban-pin-message">民主投票活动自动置顶</label>
+                    <select id="group-${attr(group.id)}-vote-ban-pin-message" data-group-id="${attr(group.id)}" data-group-key="vote_ban_pin_message" data-kind="nullable-boolean"${saving ? " disabled" : ""}>
+                      <option value=""${group.settings.vote_ban_pin_message == null ? " selected" : ""}>继承全局默认</option>
+                      <option value="true"${group.settings.vote_ban_pin_message === true ? " selected" : ""}>开启</option>
+                      <option value="false"${group.settings.vote_ban_pin_message === false ? " selected" : ""}>关闭</option>
+                    </select>
+                    <span class="field-hint">投票完成、管理员中止或直接封禁、票数不足超时后取消置顶</span>
                   </div>
                   <div class="field call-admin-targets">
                     <label class="field-label">呼叫目标管理员</label>

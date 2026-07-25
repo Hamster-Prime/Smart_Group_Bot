@@ -44,7 +44,12 @@ from bot.services.authz import (
 )
 from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.ban_audit import record_ban_event
-from bot.services.call_admin import handle_call_admin, is_call_admin_trigger
+from bot.services.call_admin import (
+    CALL_ADMIN_RESOLVE_CALLBACK_DATA,
+    handle_call_admin,
+    is_call_admin_trigger,
+    remove_call_admin_resolution_button,
+)
 from bot.services.api_model_query import api_model_query_tool_enabled
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.vote_ban import (
@@ -120,6 +125,7 @@ from bot.services.member_identity import member_display_name
 from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
 from bot.services.moderation import ModerationVerdict
+from bot.services.notification_pins import unpin_notification_message
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
 from bot.services.proactive import note_group_activity, record_group_activity
@@ -2327,6 +2333,79 @@ async def on_delete_button(
         await callback.answer("删除失败，消息可能已被删除", show_alert=True)
         return
     await callback.answer("已删除")
+
+
+@router.callback_query(F.data == CALL_ADMIN_RESOLVE_CALLBACK_DATA)
+async def on_call_admin_resolved(
+    callback: CallbackQuery,
+    settings: Settings,
+    session: AsyncSession | None = None,
+) -> None:
+    """Let an administrator close and unpin one urgent @admin notice."""
+
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    user = callback.from_user
+    if session is None:
+        await callback.answer("会话未就绪，请稍后重试", show_alert=True)
+        return
+    if (
+        message is None
+        or chat is None
+        or user is None
+        or getattr(chat, "type", "") not in {"group", "supergroup"}
+    ):
+        await callback.answer("操作参数无效", show_alert=True)
+        return
+    group_id = int(chat.id)
+    authorized = await is_group_authorized(session, group_id)
+    await session.commit()
+    if not authorized:
+        await callback.answer("当前群组未授权", show_alert=True)
+        return
+    if not await is_group_admin_or_higher(
+        bot=callback.bot,
+        session=session,
+        settings=settings,
+        group_id=group_id,
+        user_id=int(user.id),
+    ):
+        if session.in_transaction():
+            await session.commit()
+        await callback.answer("仅群管理员可标记已处理", show_alert=True)
+        return
+    if session.in_transaction():
+        await session.commit()
+
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    unpinned = await unpin_notification_message(
+        callback.bot,
+        chat_id=group_id,
+        message_id=message_id,
+        kind="call_admin",
+    )
+    if not unpinned:
+        await callback.answer(
+            "取消置顶失败，请稍后重试",
+            show_alert=True,
+        )
+        return
+    try:
+        await callback.bot.edit_message_reply_markup(
+            chat_id=group_id,
+            message_id=message_id,
+            reply_markup=remove_call_admin_resolution_button(
+                getattr(message, "reply_markup", None)
+            ),
+        )
+    except Exception:
+        log.debug(
+            "call-admin resolved keyboard cleanup failed | group=%s message=%s",
+            group_id,
+            message_id,
+            exc_info=True,
+        )
+    await callback.answer("已标记处理并取消置顶", show_alert=False)
 
 
 async def _finalize_vote_enforcement(

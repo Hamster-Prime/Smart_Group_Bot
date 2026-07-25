@@ -152,14 +152,17 @@ _GROUP_SETTING_FIELDS = {
     GROUP_PERMISSIONS_SETTINGS_KEY,
     "patrol_enabled",
     "raid_guard_enabled",
+    "raid_guard_pin_message",
     "raid_guard_join_threshold",
     "raid_guard_window_seconds",
     "raid_guard_lockdown_seconds",
     "raid_guard_lookback_seconds",
     "raid_guard_challenge_timeout_seconds",
     "call_admin_enabled",
+    "call_admin_pin_message",
     "call_admin_targets",
     "vote_ban_enabled",
+    "vote_ban_pin_message",
     "vote_ban_threshold",
     "vote_ban_duration_seconds",
     "vote_ban_trigger_limit",
@@ -248,6 +251,7 @@ class _GroupSettingsUpdate(BaseModel):
     default_permissions: dict[str, Any] | None = None
     patrol_enabled: StrictBool | None = None
     raid_guard_enabled: StrictBool | None = None
+    raid_guard_pin_message: StrictBool | None = None
     raid_guard_join_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
     raid_guard_window_seconds: StrictInt | None = Field(default=None, ge=5, le=3600)
     raid_guard_lockdown_seconds: StrictInt | None = Field(
@@ -261,11 +265,13 @@ class _GroupSettingsUpdate(BaseModel):
     )
     # None inherits the global default; targets [] or missing = all admins.
     call_admin_enabled: StrictBool | None = None
+    call_admin_pin_message: StrictBool | None = None
     call_admin_targets: list[Annotated[StrictInt, Field(gt=0)]] | None = Field(
         default=None,
         max_length=100,
     )
     vote_ban_enabled: StrictBool | None = None
+    vote_ban_pin_message: StrictBool | None = None
     vote_ban_threshold: StrictInt | None = Field(default=None, ge=2, le=1000)
     vote_ban_duration_seconds: StrictInt | None = Field(
         default=None, ge=60, le=86400
@@ -585,6 +591,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
             if settings_data.get("raid_guard_enabled") is not None
             else None
         ),
+        "raid_guard_pin_message": (
+            _setting_bool(settings_data, "raid_guard_pin_message")
+            if settings_data.get("raid_guard_pin_message") is not None
+            else None
+        ),
         **{
             key: _setting_int(settings_data, key)
             for key in _RAID_GUARD_GROUP_INT_FIELDS
@@ -592,6 +603,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         "call_admin_enabled": (
             _setting_bool(settings_data, "call_admin_enabled")
             if settings_data.get("call_admin_enabled") is not None
+            else None
+        ),
+        "call_admin_pin_message": (
+            _setting_bool(settings_data, "call_admin_pin_message")
+            if settings_data.get("call_admin_pin_message") is not None
             else None
         ),
         "call_admin_targets": sorted({
@@ -602,6 +618,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         "vote_ban_enabled": (
             _setting_bool(settings_data, "vote_ban_enabled")
             if settings_data.get("vote_ban_enabled") is not None
+            else None
+        ),
+        "vote_ban_pin_message": (
+            _setting_bool(settings_data, "vote_ban_pin_message")
+            if settings_data.get("vote_ban_pin_message") is not None
             else None
         ),
         **{
@@ -1285,10 +1306,13 @@ def _apply_group_settings(
             GROUP_PERMISSIONS_SETTINGS_KEY,
             "patrol_enabled",
             "raid_guard_enabled",
+            "raid_guard_pin_message",
             *_RAID_GUARD_GROUP_INT_FIELDS,
             "call_admin_enabled",
+            "call_admin_pin_message",
             "call_admin_targets",
             "vote_ban_enabled",
+            "vote_ban_pin_message",
             *_VOTE_BAN_GROUP_INT_FIELDS,
         }
         and getattr(update, name) is None
@@ -1391,6 +1415,11 @@ def _apply_group_settings(
                     "真人质询验证服务未配置，暂时不能启用爆破防护。",
                 )
             updated["raid_guard_enabled"] = bool(update.raid_guard_enabled)
+    if "raid_guard_pin_message" in fields:
+        if update.raid_guard_pin_message is None:
+            updated.pop("raid_guard_pin_message", None)
+        else:
+            updated["raid_guard_pin_message"] = bool(update.raid_guard_pin_message)
     for key in _RAID_GUARD_GROUP_INT_FIELDS:
         if key not in fields:
             continue
@@ -1404,6 +1433,11 @@ def _apply_group_settings(
             updated.pop("call_admin_enabled", None)
         else:
             updated["call_admin_enabled"] = bool(update.call_admin_enabled)
+    if "call_admin_pin_message" in fields:
+        if update.call_admin_pin_message is None:
+            updated.pop("call_admin_pin_message", None)
+        else:
+            updated["call_admin_pin_message"] = bool(update.call_admin_pin_message)
     if "call_admin_targets" in fields:
         targets = sorted(
             {int(item) for item in (update.call_admin_targets or []) if int(item) > 0}
@@ -1419,6 +1453,11 @@ def _apply_group_settings(
             updated.pop("vote_ban_enabled", None)
         else:
             updated["vote_ban_enabled"] = bool(update.vote_ban_enabled)
+    if "vote_ban_pin_message" in fields:
+        if update.vote_ban_pin_message is None:
+            updated.pop("vote_ban_pin_message", None)
+        else:
+            updated["vote_ban_pin_message"] = bool(update.vote_ban_pin_message)
     for key in _VOTE_BAN_GROUP_INT_FIELDS:
         if key not in fields:
             continue

@@ -52,6 +52,12 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.max_context_tokens, 256000)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
         self.assertEqual(self.settings.bot.reply_batch_timeout_seconds, 45.0)
+        self.assertTrue(self.settings.raid_guard_pin_message)
+        self.assertFalse(self.settings.call_admin_pin_message)
+        self.assertTrue(self.settings.vote_ban_pin_message)
+        self.assertTrue(self.manager.config.raid_guard.pin_message)
+        self.assertFalse(self.manager.config.call_admin.pin_message)
+        self.assertTrue(self.manager.config.vote_ban.pin_message)
         self.assertEqual(self.settings.vote_ban_trigger_limit, 3)
         self.assertEqual(self.settings.vote_ban_trigger_window_seconds, 3600)
         self.assertFalse(self.manager.config.movie_info.enabled)
@@ -67,11 +73,14 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.payload["models"]["providers"][0]["api_key"], "")
             self.assertEqual(row.payload["movie_info"]["tmdb_read_access_token"], "")
 
-    async def test_first_start_imports_call_vote_and_auto_delete_settings(self) -> None:
+    async def test_first_start_imports_activity_pin_and_auto_delete_settings(self) -> None:
         legacy = Settings(_env_file=None)
+        legacy.raid_guard_pin_message = False
         legacy.call_admin_enabled = False
+        legacy.call_admin_pin_message = True
         legacy.call_admin_cooldown_seconds = 123
         legacy.vote_ban_enabled = True
+        legacy.vote_ban_pin_message = False
         legacy.vote_ban_threshold = 9
         legacy.vote_ban_duration_seconds = 2400
         legacy.vote_ban_trigger_limit = 7
@@ -87,9 +96,12 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             raw_env={},
         )
 
+        self.assertFalse(imported.raid_guard.pin_message)
         self.assertFalse(imported.call_admin.enabled)
+        self.assertTrue(imported.call_admin.pin_message)
         self.assertEqual(imported.call_admin.cooldown_seconds, 123)
         self.assertTrue(imported.vote_ban.enabled)
+        self.assertFalse(imported.vote_ban.pin_message)
         self.assertEqual(imported.vote_ban.vote_threshold, 9)
         self.assertEqual(imported.vote_ban.duration_seconds, 2400)
         self.assertEqual(imported.vote_ban.trigger_limit, 7)
@@ -104,6 +116,28 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             {"call_admin": "button"},
         )
         self.assertFalse(imported.bot.drop_pending_updates)
+
+    async def test_activity_pin_settings_save_apply_and_stay_strict(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["raid_guard"]["pin_message"] = False
+        payload["call_admin"]["pin_message"] = True
+        payload["vote_ban"]["pin_message"] = False
+
+        await self.manager.save(payload, expected_revision=1, updated_by=42)
+
+        self.assertFalse(self.settings.raid_guard_pin_message)
+        self.assertTrue(self.settings.call_admin_pin_message)
+        self.assertFalse(self.settings.vote_ban_pin_message)
+        document = self.manager.api_document()["config"]
+        self.assertFalse(document["raid_guard"]["pin_message"])
+        self.assertTrue(document["call_admin"]["pin_message"])
+        self.assertFalse(document["vote_ban"]["pin_message"])
+
+        invalid = self.manager.config.public_payload()
+        invalid["vote_ban"]["pin_message_typo"] = True
+        with self.assertRaises(ValueError):
+            await self.manager.save(invalid, expected_revision=2, updated_by=42)
+        self.assertEqual(self.manager.revision, 2)
 
     async def test_legacy_movie_info_settings_are_imported(self) -> None:
         legacy = Settings(

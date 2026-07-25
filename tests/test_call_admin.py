@@ -1,22 +1,28 @@
+import asyncio
 import html
 import re
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.config import Settings
 from bot.db.models import Admin, Base, GroupMember
+from bot.handlers import group
 from bot.services import call_admin
 from bot.services.call_admin import (
+    CALL_ADMIN_RESOLVE_CALLBACK_DATA,
+    build_call_admin_keyboard,
     build_call_admin_text,
     call_admin_policy,
     call_admin_targets,
     handle_call_admin,
     is_call_admin_trigger,
+    remove_call_admin_resolution_button,
 )
+from bot.utils.telegram import DELETE_BUTTON_CALLBACK_DATA, build_delete_button_markup
 
 
 def _settings(**overrides) -> Settings:
@@ -77,6 +83,19 @@ class CallAdminTriggerTests(unittest.TestCase):
         self.assertIn("有人&lt;刷屏&gt;", text)
         self.assertIn("买片加微信", text)
 
+    def test_resolving_preserves_other_message_controls(self) -> None:
+        combined = build_call_admin_keyboard(build_delete_button_markup())
+
+        remaining = remove_call_admin_resolution_button(combined)
+
+        self.assertIsNotNone(remaining)
+        callbacks = [
+            button.callback_data
+            for row in remaining.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(callbacks, [DELETE_BUTTON_CALLBACK_DATA])
+
 
 class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -98,6 +117,9 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
                     chat=SimpleNamespace(id=-100), message_id=1
                 )
             ),
+            pin_chat_message=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+            edit_message_reply_markup=AsyncMock(return_value=True),
         )
 
     @staticmethod
@@ -300,6 +322,383 @@ class CallAdminSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("卖片广告", bot.send_message.await_args.args[1])
         self.assertEqual(
             bot.send_message.await_args.kwargs.get("reply_to_message_id"), 42
+        )
+
+    async def test_pin_option_adds_resolution_button_and_pins_notice(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        async with self.session_factory() as session:
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                _settings(),
+                group_settings={"call_admin_pin_message": True},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        self.assertIsNone(bot.send_message.await_args.kwargs["reply_markup"])
+        markup = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            markup.inline_keyboard[0][0].callback_data,
+            CALL_ADMIN_RESOLVE_CALLBACK_DATA,
+        )
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=1,
+            disable_notification=True,
+        )
+
+    async def test_pin_failure_does_not_fail_admin_notice(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        bot.pin_chat_message = AsyncMock(side_effect=RuntimeError("no rights"))
+        async with self.session_factory() as session:
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                _settings(),
+                group_settings={"call_admin_pin_message": True},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        bot.send_message.assert_awaited_once()
+        bot.edit_message_reply_markup.assert_not_awaited()
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=1,
+        )
+
+    async def test_resolution_button_failure_retires_successful_pin(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        bot.edit_message_reply_markup = AsyncMock(side_effect=RuntimeError("edit failed"))
+        async with self.session_factory() as session:
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                _settings(),
+                group_settings={"call_admin_pin_message": True},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=1,
+        )
+
+    async def test_failed_retirement_retries_resolution_button(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        bot.edit_message_reply_markup = AsyncMock(
+            side_effect=[RuntimeError("edit failed"), True]
+        )
+        bot.unpin_chat_message = AsyncMock(side_effect=RuntimeError("temporary"))
+        with patch("bot.services.call_admin.asyncio.sleep", new=AsyncMock()) as delay:
+            async with self.session_factory() as session:
+                sent = await handle_call_admin(
+                    self._message(bot),
+                    session,
+                    _settings(),
+                    group_settings={"call_admin_pin_message": True},
+                    caller_id=5,
+                    caller_name="小明",
+                )
+
+        self.assertTrue(sent)
+        delay.assert_awaited_once_with(
+            call_admin._CALL_ADMIN_RECONCILE_RETRY_SECONDS
+        )
+        self.assertEqual(bot.edit_message_reply_markup.await_count, 2)
+        recovery = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            recovery.inline_keyboard[0][0].callback_data,
+            CALL_ADMIN_RESOLVE_CALLBACK_DATA,
+        )
+
+    async def test_double_failure_retries_then_retires_exact_pin(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        bot.edit_message_reply_markup = AsyncMock(
+            side_effect=[RuntimeError("edit one"), RuntimeError("edit two")]
+        )
+        bot.unpin_chat_message = AsyncMock(
+            side_effect=[RuntimeError("unpin one"), True]
+        )
+
+        with patch("bot.services.call_admin.asyncio.sleep", new=AsyncMock()) as delay:
+            async with self.session_factory() as session:
+                sent = await handle_call_admin(
+                    self._message(bot),
+                    session,
+                    _settings(),
+                    group_settings={"call_admin_pin_message": True},
+                    caller_id=5,
+                    caller_name="小明",
+                )
+
+        self.assertTrue(sent)
+        delay.assert_awaited_once_with(
+            call_admin._CALL_ADMIN_RECONCILE_RETRY_SECONDS
+        )
+        self.assertEqual(bot.edit_message_reply_markup.await_count, 2)
+        self.assertEqual(bot.unpin_chat_message.await_count, 2)
+        bot.unpin_chat_message.assert_awaited_with(chat_id=-100, message_id=1)
+
+    async def test_cancellation_during_pin_waits_for_owned_button(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        pin_started = asyncio.Event()
+        release_pin = asyncio.Event()
+        operations: list[str] = []
+
+        async def slow_pin(**_kwargs):
+            pin_started.set()
+            await release_pin.wait()
+            operations.append("pin")
+            return True
+
+        async def attach_button(**_kwargs):
+            operations.append("button")
+            return True
+
+        bot.pin_chat_message = AsyncMock(side_effect=slow_pin)
+        bot.edit_message_reply_markup = AsyncMock(side_effect=attach_button)
+
+        async with self.session_factory() as session:
+            task = asyncio.create_task(
+                handle_call_admin(
+                    self._message(bot),
+                    session,
+                    _settings(),
+                    group_settings={"call_admin_pin_message": True},
+                    caller_id=5,
+                    caller_name="小明",
+                )
+            )
+            await asyncio.wait_for(pin_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release_pin.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(operations, ["pin", "button"])
+        bot.unpin_chat_message.assert_not_awaited()
+
+    async def test_cancellation_during_button_attach_finishes_ownership(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        edit_started = asyncio.Event()
+        release_edit = asyncio.Event()
+
+        async def slow_attach(**_kwargs):
+            edit_started.set()
+            await release_edit.wait()
+            return True
+
+        bot.edit_message_reply_markup = AsyncMock(side_effect=slow_attach)
+
+        async with self.session_factory() as session:
+            task = asyncio.create_task(
+                handle_call_admin(
+                    self._message(bot),
+                    session,
+                    _settings(),
+                    group_settings={"call_admin_pin_message": True},
+                    caller_id=5,
+                    caller_name="小明",
+                )
+            )
+            await asyncio.wait_for(edit_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release_edit.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        bot.edit_message_reply_markup.assert_awaited_once()
+        bot.unpin_chat_message.assert_not_awaited()
+
+    async def test_ambiguous_pin_and_unpin_adds_resolution_button(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        bot.pin_chat_message = AsyncMock(side_effect=TimeoutError("ambiguous"))
+        bot.unpin_chat_message = AsyncMock(side_effect=RuntimeError("temporary"))
+        async with self.session_factory() as session:
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                _settings(),
+                group_settings={"call_admin_pin_message": True},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        recovery = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            recovery.inline_keyboard[0][0].callback_data,
+            CALL_ADMIN_RESOLVE_CALLBACK_DATA,
+        )
+
+    async def test_button_cleanup_is_merged_after_pin_without_attach_race(self) -> None:
+        bot = self._bot([self._admin_member(7)])
+        settings = _settings()
+        settings.bot.auto_delete_categories = ["call_admin"]
+        settings.bot.auto_delete_category_mode = {"call_admin": "button"}
+
+        async with self.session_factory() as session:
+            sent = await handle_call_admin(
+                self._message(bot),
+                session,
+                settings,
+                group_settings={"call_admin_pin_message": True},
+                caller_id=5,
+                caller_name="小明",
+            )
+
+        self.assertTrue(sent)
+        initial = bot.send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.callback_data for row in initial.inline_keyboard for button in row],
+            [DELETE_BUTTON_CALLBACK_DATA],
+        )
+        final = bot.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(
+            [button.callback_data for row in final.inline_keyboard for button in row],
+            [CALL_ADMIN_RESOLVE_CALLBACK_DATA, DELETE_BUTTON_CALLBACK_DATA],
+        )
+
+
+class CallAdminResolveCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_marks_notice_handled_and_unpins_exact_message(self) -> None:
+        bot = SimpleNamespace(
+            unpin_chat_message=AsyncMock(return_value=True),
+            edit_message_reply_markup=AsyncMock(return_value=True),
+        )
+        callback = SimpleNamespace(
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                message_id=77,
+                reply_markup=build_call_admin_keyboard(),
+            ),
+            from_user=SimpleNamespace(id=9),
+            bot=bot,
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(
+            commit=AsyncMock(),
+            in_transaction=lambda: True,
+        )
+        with (
+            patch(
+                "bot.handlers.group.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await group.on_call_admin_resolved(
+                callback,
+                settings=_settings(),
+                session=session,
+            )
+
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=77,
+        )
+        bot.edit_message_reply_markup.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=77,
+            reply_markup=None,
+        )
+        callback.answer.assert_awaited_once_with(
+            "已标记处理并取消置顶",
+            show_alert=False,
+        )
+
+    async def test_unpin_failure_keeps_resolution_button_for_retry(self) -> None:
+        bot = SimpleNamespace(
+            unpin_chat_message=AsyncMock(side_effect=RuntimeError("temporary")),
+            edit_message_reply_markup=AsyncMock(return_value=True),
+        )
+        callback = SimpleNamespace(
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                message_id=77,
+                reply_markup=build_call_admin_keyboard(),
+            ),
+            from_user=SimpleNamespace(id=9),
+            bot=bot,
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(
+            commit=AsyncMock(),
+            in_transaction=lambda: True,
+        )
+        with (
+            patch(
+                "bot.handlers.group.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.is_group_admin_or_higher",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await group.on_call_admin_resolved(
+                callback,
+                settings=_settings(),
+                session=session,
+            )
+
+        bot.edit_message_reply_markup.assert_not_awaited()
+        callback.answer.assert_awaited_once_with(
+            "取消置顶失败，请稍后重试",
+            show_alert=True,
+        )
+
+    async def test_non_admin_cannot_resolve_notice(self) -> None:
+        bot = SimpleNamespace(
+            unpin_chat_message=AsyncMock(return_value=True),
+            edit_message_reply_markup=AsyncMock(return_value=True),
+        )
+        callback = SimpleNamespace(
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=-100, type="supergroup"),
+                message_id=77,
+            ),
+            from_user=SimpleNamespace(id=9),
+            bot=bot,
+            answer=AsyncMock(),
+        )
+        session = SimpleNamespace(
+            commit=AsyncMock(),
+            in_transaction=lambda: True,
+        )
+        with (
+            patch(
+                "bot.handlers.group.is_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.group.is_group_admin_or_higher",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            await group.on_call_admin_resolved(
+                callback,
+                settings=_settings(),
+                session=session,
+            )
+
+        bot.unpin_chat_message.assert_not_awaited()
+        callback.answer.assert_awaited_once_with(
+            "仅群管理员可标记已处理",
+            show_alert=True,
         )
 
 

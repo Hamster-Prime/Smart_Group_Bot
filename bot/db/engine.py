@@ -1326,6 +1326,12 @@ async def init_db(
             await _sqlite_ensure_column(
                 conn,
                 "vote_ban_sessions",
+                "pin_message",
+                "pin_message BOOLEAN NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "vote_ban_sessions",
                 "enforcing_started_at",
                 "enforcing_started_at DATETIME",
             )

@@ -101,6 +101,45 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         for key in section_keys:
             self.assertIn(f'key: "{key}"', source)
 
+    def test_activity_pin_options_have_global_defaults_and_group_inheritance(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        normalize = source.split("function normalizeGroupSettings", 1)[1].split(
+            "function normalizeDefaultPermissions", 1
+        )[0]
+        editable = source.split("const GROUP_EDITABLE_KEYS", 1)[1].split(
+            "]);", 1
+        )[0]
+
+        controls = {
+            "raid_guard_pin_message": (
+                "raid_guard.pin_message",
+                "爆破防护活动自动置顶",
+            ),
+            "call_admin_pin_message": (
+                "call_admin.pin_message",
+                "呼叫管理员通知自动置顶",
+            ),
+            "vote_ban_pin_message": (
+                "vote_ban.pin_message",
+                "民主投票活动自动置顶",
+            ),
+        }
+        for key, (global_path, label) in controls.items():
+            self.assertIn(f'toggle("{global_path}"', source)
+            self.assertIn(f'"{key}"', editable)
+            self.assertIn(
+                f'{key}: settings.{key} == null ? null : Boolean(settings.{key})',
+                normalize,
+            )
+            self.assertIn(
+                f'data-group-key="{key}" data-kind="nullable-boolean"', source
+            )
+            self.assertIn(label, source)
+
+        self.assertIn("管理员可标记已处理并取消置顶", source)
+        self.assertIn("投票完成、管理员中止或直接封禁、票数不足超时后取消置顶", source)
+        self.assertIn("自动或手动结束防护时取消置顶", source)
+
     def test_group_disclosure_state_is_captured_before_rerender(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
         render_content = source.split("function renderContent", 1)[1].split(

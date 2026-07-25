@@ -23,8 +23,9 @@ lockdown:
   use it). Passing the private Mini App challenge restores permissions;
   missing the deadline kicks WITHOUT banning.
 
-Automatically detected lockdowns are intentionally in-memory only. Manual
-lockdowns are persisted in ``Group.settings`` so both indefinite and timed
+Automatically detected lockdown state is intentionally in-memory only, while
+its exact pin-ownership cleanup ledger is persisted so a restart can retire a
+stale status pin. Manual lockdowns are persisted in ``Group.settings`` so both indefinite and timed
 administrator locks survive a restart; startup restores their timers and
 atomically claims expired records before updating their status message. Issued
 challenges live in join_verifications and stay enforced by the deadline
@@ -52,7 +53,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.config import Settings
 from bot.db.models import AuthorizedGroup, Group, JoinVerification
 from bot.services.authz import is_group_authorized
-from bot.services.message_templates import render_progress_notice, render_summary_notice
 from bot.services.join_screening import is_globally_banned
 from bot.services.join_verification import (
     RAID_VERIFY_CALLBACK_DATA,
@@ -85,6 +85,12 @@ from bot.services.join_verification import (
     verification_restriction_required,
     verification_service_ready,
     verification_timeout_seconds_for_kind,
+)
+from bot.services.message_templates import render_progress_notice, render_summary_notice
+from bot.services.notification_pins import (
+    notification_pin_enabled,
+    pin_notification_message,
+    unpin_notification_message,
 )
 from bot.services.recent_messages import (
     delete_messages_since_join,
@@ -122,8 +128,18 @@ MAX_MANUAL_LOCKDOWN_MINUTES = 7 * 24 * 60
 # editable group-settings schema, while sharing the same JSON document with
 # the group's other settings.
 MANUAL_LOCKDOWN_SETTINGS_KEY = "raid_guard_manual_lockdown"
+# Durable exact-message ownership ledger. Every message ID is recorded before
+# a pin request is issued and removed only after Telegram confirms an exact
+# unpin (or confirms the message no longer exists). This survives both manual
+# terminal-state deletion and an automatic-lockdown process crash.
+RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY = "raid_guard_pin_ownership"
 _MANUAL_LOCKDOWN_STATE_VERSION = 1
 _MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY = "status_message_id"
+_MANUAL_LOCKDOWN_PIN_MESSAGE_KEY = "pin_message"
+_PIN_OWNERSHIP_STATE_VERSION = 1
+_PIN_OWNERSHIP_MESSAGE_IDS_KEY = "message_ids"
+_MAX_PIN_OWNERSHIP_IDS = 64
+_PIN_CLEANUP_RETRY_SECONDS = 30.0
 _PERSISTENCE_RETRIES = 5
 _PERSISTENCE_ANY = object()
 _PERSISTENCE_DELETE = object()
@@ -349,6 +365,7 @@ def get_raid_guard_service() -> "RaidGuardService | None":
 @dataclass(slots=True)
 class RaidGuardConfig:
     enabled: bool
+    pin_message: bool
     join_threshold: int
     window_seconds: int
     lockdown_seconds: int
@@ -427,6 +444,11 @@ def resolve_raid_guard_config(
     ) or int(getattr(settings, "raid_guard_challenge_timeout_seconds", 600))
     return RaidGuardConfig(
         enabled=raid_guard_policy(settings, group_settings),
+        pin_message=notification_pin_enabled(
+            settings,
+            group_settings,
+            "raid_guard",
+        ),
         join_threshold=max(2, threshold),
         window_seconds=max(5, window),
         lockdown_seconds=max(60, lockdown),
@@ -546,6 +568,7 @@ def _manual_lockdown_state(
     until: datetime | None,
     *,
     status_message_id: int | None = None,
+    pin_message: bool | None = None,
 ) -> dict[str, object]:
     """Return the canonical JSON document stored for one manual lockdown."""
     state: dict[str, object]
@@ -564,6 +587,8 @@ def _manual_lockdown_state(
         }
     if status_message_id is not None and int(status_message_id) > 0:
         state[_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY] = int(status_message_id)
+    if pin_message is not None:
+        state[_MANUAL_LOCKDOWN_PIN_MESSAGE_KEY] = bool(pin_message)
     return state
 
 
@@ -578,6 +603,59 @@ def _manual_lockdown_status_message_id(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return message_id if message_id > 0 else None
+
+
+def _manual_lockdown_pin_message(value: object, *, default: bool) -> bool:
+    if not isinstance(value, Mapping):
+        return bool(default)
+    raw = value.get(_MANUAL_LOCKDOWN_PIN_MESSAGE_KEY)
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        return bool(default)
+    return bool(raw)
+
+
+def _pin_ownership_message_ids(value: object) -> set[int]:
+    """Parse the private durable exact-unpin ledger defensively."""
+
+    if not isinstance(value, Mapping):
+        return set()
+    if value.get("version") != _PIN_OWNERSHIP_STATE_VERSION:
+        return set()
+    raw_ids = value.get(_PIN_OWNERSHIP_MESSAGE_IDS_KEY)
+    if not isinstance(raw_ids, list):
+        return set()
+    message_ids: set[int] = set()
+    for raw in raw_ids[:_MAX_PIN_OWNERSHIP_IDS]:
+        if isinstance(raw, bool):
+            continue
+        try:
+            message_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if message_id > 0:
+            message_ids.add(message_id)
+    return message_ids
+
+
+def _pin_ownership_state(message_ids: Iterable[int]) -> dict[str, object]:
+    normalized = sorted(
+        {
+            int(message_id)
+            for message_id in message_ids
+            if not isinstance(message_id, bool) and int(message_id) > 0
+        }
+    )[-_MAX_PIN_OWNERSHIP_IDS:]
+    return {
+        "version": _PIN_OWNERSHIP_STATE_VERSION,
+        _PIN_OWNERSHIP_MESSAGE_IDS_KEY: normalized,
+    }
 
 
 def _parse_manual_lockdown_state(value: object) -> datetime | None | object:
@@ -971,22 +1049,49 @@ class RaidGuardService:
         self._lockdown_timers: dict[int, asyncio.TimerHandle] = {}
         self._lockdown_expiry_tasks: dict[int, asyncio.Task[bool]] = {}
         self._unlock_notice_tasks: dict[int, asyncio.Task[None]] = {}
+        self._pin_cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         # One status message represents one protection lifecycle. Its ID is
         # retained in the manual state as well, so an unlock after restart can
         # still retire the same message instead of posting a second notice.
         self._status_message_ids: dict[int, int] = {}
+        # Whether this lifecycle asked the bot to pin its status message.  The
+        # intent is retained even when Telegram rejected the original pin so a
+        # later exact unpin remains safe and lifecycle-complete.
+        self._status_pin_intents: dict[int, bool] = {}
+        # Exact message IDs whose pin ownership has been durably claimed but
+        # not yet durably released. Multiple IDs are possible when Telegram
+        # rejects an edit and the old exact unpin is temporarily unavailable.
+        self._owned_pin_message_ids: dict[int, set[int]] = {}
+        # Serialize Telegram pin/unpin calls and their durable ledger changes
+        # independently from the broader lifecycle lock. Cleanup retries must
+        # not race a reconfiguration that is re-pinning the same exact status
+        # message, while terminal paths may safely await cleanup while already
+        # holding the lifecycle lock.
+        self._pin_operation_locks: dict[int, asyncio.Lock] = {}
         # Exact raw JSON values are retained so expiry/disable can use an
         # optimistic compare-and-delete. Only the process that removes the
         # matching record updates the terminal state.
         self._manual_persisted_state: dict[int, dict[str, object]] = {}
-        self._manual_state_locks: dict[int, asyncio.Lock] = {}
+        # Serialize every visible lockdown lifecycle transition for one group.
+        # Telegram publication/retirement stays inside this lock so an
+        # automatic activation cannot finish pinning after a concurrent off
+        # action has already cleared the in-memory state.
+        self._lifecycle_locks: dict[int, asyncio.Lock] = {}
 
-    def _manual_state_lock(self, group_id: int) -> asyncio.Lock:
+    def _lifecycle_lock(self, group_id: int) -> asyncio.Lock:
         group_id = int(group_id)
-        lock = self._manual_state_locks.get(group_id)
+        lock = self._lifecycle_locks.get(group_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._manual_state_locks[group_id] = lock
+            self._lifecycle_locks[group_id] = lock
+        return lock
+
+    def _pin_operation_lock(self, group_id: int) -> asyncio.Lock:
+        group_id = int(group_id)
+        lock = self._pin_operation_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pin_operation_locks[group_id] = lock
         return lock
 
     def _cancel_lockdown_timer(self, group_id: int) -> None:
@@ -1000,6 +1105,7 @@ class RaidGuardService:
         *,
         duration_seconds: int | None,
         source: str,
+        pin_message: bool,
     ) -> datetime | None:
         until = (
             None
@@ -1010,6 +1116,7 @@ class RaidGuardService:
             int(group_id),
             until=until,
             source=source,
+            pin_message=pin_message,
         )
         return until
 
@@ -1019,6 +1126,7 @@ class RaidGuardService:
         *,
         until: datetime | None,
         source: str,
+        pin_message: bool,
         persisted_state: Mapping[str, object] | None = None,
         schedule_expiry: bool = True,
     ) -> None:
@@ -1027,6 +1135,11 @@ class RaidGuardService:
         self._cancel_lockdown_timer(group_id)
         self._lockdown_until[group_id] = until
         self._lockdown_source[group_id] = str(source or "automatic")
+        # Preserve the previous lifecycle's intent while reusing its status
+        # message.  _publish_lockdown_status updates it after the edit succeeds
+        # (and can then unpin when a newly resolved setting turns the option off).
+        if group_id not in self._status_pin_intents:
+            self._status_pin_intents[group_id] = bool(pin_message)
         if source == "manual" and persisted_state is not None:
             persisted = dict(persisted_state)
             self._manual_persisted_state[group_id] = persisted
@@ -1161,6 +1274,91 @@ class RaidGuardService:
         )
         return None
 
+    async def _update_persisted_pin_ownership(
+        self,
+        group_id: int,
+        *,
+        add: Iterable[int] = (),
+        remove: Iterable[int] = (),
+    ) -> bool:
+        """CAS-update the private exact-unpin ledger without losing settings."""
+
+        group_id = int(group_id)
+        add_ids = {int(value) for value in add if int(value) > 0}
+        remove_ids = {int(value) for value in remove if int(value) > 0}
+
+        # A few lifecycle unit tests intentionally construct the service
+        # without a database. Keep their exact-message ownership semantics in
+        # memory; production always supplies the async session factory.
+        if not callable(self.session_factory):
+            current = set(self._owned_pin_message_ids.get(group_id, set()))
+            updated = (current | add_ids) - remove_ids
+            if updated:
+                self._owned_pin_message_ids[group_id] = updated
+            else:
+                self._owned_pin_message_ids.pop(group_id, None)
+            return True
+
+        for _attempt in range(_PERSISTENCE_RETRIES):
+            async with self.session_factory() as session:
+                row = await session.get(Group, group_id)
+                stored_settings = dict(row.settings or {}) if row is not None else {}
+                current = _pin_ownership_message_ids(
+                    stored_settings.get(RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY)
+                )
+                updated = (current | add_ids) - remove_ids
+                if len(updated) > _MAX_PIN_OWNERSHIP_IDS:
+                    updated = set(sorted(updated)[-_MAX_PIN_OWNERSHIP_IDS:])
+
+                next_settings = dict(stored_settings)
+                if updated:
+                    next_settings[RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY] = (
+                        _pin_ownership_state(updated)
+                    )
+                else:
+                    next_settings.pop(RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY, None)
+
+                if next_settings == stored_settings:
+                    if updated:
+                        self._owned_pin_message_ids[group_id] = set(updated)
+                    else:
+                        self._owned_pin_message_ids.pop(group_id, None)
+                    return True
+
+                if row is None:
+                    session.add(Group(id=group_id, title="", settings=next_settings))
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        await session.rollback()
+                        continue
+                else:
+                    result = await session.execute(
+                        update(Group)
+                        .where(
+                            Group.id == group_id,
+                            Group.settings == row.settings,
+                        )
+                        .values(settings=next_settings)
+                        .execution_options(synchronize_session=False)
+                    )
+                    if int(result.rowcount or 0) != 1:
+                        await session.rollback()
+                        continue
+                    await session.commit()
+
+                if updated:
+                    self._owned_pin_message_ids[group_id] = set(updated)
+                else:
+                    self._owned_pin_message_ids.pop(group_id, None)
+                return True
+
+        log.warning(
+            "[%s] raid pin ownership update lost repeated concurrent races",
+            group_id,
+        )
+        return False
+
     async def restore_manual_lockdowns(self) -> dict[str, int]:
         """Restore persisted manual lockdowns for every authorized group.
 
@@ -1184,7 +1382,16 @@ class RaidGuardService:
         for raw_group_id, raw_settings in rows:
             group_id = int(raw_group_id)
             group_settings = dict(raw_settings or {})
+            owned_pin_ids = _pin_ownership_message_ids(
+                group_settings.get(RAID_GUARD_PIN_OWNERSHIP_SETTINGS_KEY)
+            )
+            if owned_pin_ids:
+                self._owned_pin_message_ids[group_id] = set(owned_pin_ids)
+            else:
+                self._owned_pin_message_ids.pop(group_id, None)
             if MANUAL_LOCKDOWN_SETTINGS_KEY not in group_settings:
+                await self._release_owned_status_pins(group_id)
+                self._schedule_pin_cleanup(group_id)
                 continue
             raw_state = group_settings[MANUAL_LOCKDOWN_SETTINGS_KEY]
             parsed_until = _parse_manual_lockdown_state(raw_state)
@@ -1209,7 +1416,18 @@ class RaidGuardService:
                     "[%s] discarded malformed persisted manual raid state",
                     group_id,
                 )
+                await self._release_owned_status_pins(group_id)
+                self._schedule_pin_cleanup(group_id)
                 continue
+
+            pin_message = _manual_lockdown_pin_message(
+                raw_state,
+                default=notification_pin_enabled(
+                    self.settings,
+                    group_settings,
+                    "raid_guard",
+                ),
+            )
 
             if isinstance(parsed_until, datetime) and parsed_until <= now:
                 canonical = (
@@ -1219,9 +1437,11 @@ class RaidGuardService:
                     group_id,
                     until=parsed_until,
                     source="manual",
+                    pin_message=pin_message,
                     persisted_state=canonical,
                     schedule_expiry=False,
                 )
+                self._status_pin_intents[group_id] = bool(pin_message)
                 if await self._expire_lockdown(group_id, parsed_until):
                     expired += 1
                 continue
@@ -1231,8 +1451,21 @@ class RaidGuardService:
                 group_id,
                 until=parsed_until if isinstance(parsed_until, datetime) else None,
                 source="manual",
+                pin_message=pin_message,
                 persisted_state=canonical,
             )
+            # Repeated restore calls must follow the persisted lifecycle, not
+            # preserve an older in-memory intent from a previous generation.
+            self._status_pin_intents[group_id] = bool(pin_message)
+            status_message_id = _manual_lockdown_status_message_id(canonical)
+            if pin_message and status_message_id is not None:
+                # Telegram normally preserves pins across a restart, but an
+                # administrator may have removed it or the original pin call
+                # may have failed ambiguously. Re-applying the exact persisted
+                # message is idempotent and restores the active-state contract.
+                await self._pin_status_message(group_id, status_message_id)
+            await self._release_owned_status_pins(group_id)
+            self._schedule_pin_cleanup(group_id)
             restored += 1
 
         if restored or expired or invalid:
@@ -1258,27 +1491,253 @@ class RaidGuardService:
         self._manual_persisted_state.pop(group_id, None)
         return self._lockdown_source.pop(group_id, "automatic")
 
+    async def _pin_status_message(self, group_id: int, message_id: int) -> bool:
+        async with self._pin_operation_lock(group_id):
+            return await self._pin_status_message_locked(group_id, message_id)
+
+    async def _pin_status_message_locked(
+        self,
+        group_id: int,
+        message_id: int,
+    ) -> bool:
+        """Pin while the caller owns this group's pin-operation lock."""
+
+        try:
+            claimed = await self._update_persisted_pin_ownership(
+                group_id,
+                add=(int(message_id),),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            claimed = False
+            log.exception(
+                "[%s] raid status pin ownership persistence failed | message=%s",
+                group_id,
+                message_id,
+            )
+        if not claimed:
+            # Never issue an outcome-ambiguous pin that cannot be recovered
+            # after this process exits.
+            return False
+        operation = asyncio.create_task(
+            _bounded_notice_call(
+                pin_notification_message(
+                    self.bot,
+                    chat_id=group_id,
+                    message_id=message_id,
+                    kind="raid_guard",
+                ),
+                timeout_seconds=10.0,
+            ),
+            name=f"raid-pin:{group_id}:{message_id}",
+        )
+        try:
+            pinned = await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Do not release the lifecycle lock while a pin request can still
+            # land after a concurrent terminal exact-unpin. The durable ledger
+            # remains owned and shutdown/startup recovery can reconcile it.
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "[%s] raid status pin completed ambiguously during cancellation "
+                    "| message=%s",
+                    group_id,
+                    message_id,
+                    exc_info=True,
+                )
+            raise
+        except Exception:
+            log.warning(
+                "[%s] raid status pin call failed | message=%s",
+                group_id,
+                message_id,
+                exc_info=True,
+            )
+            return False
+        return bool(pinned)
+
+    async def _unpin_status_message(
+        self,
+        group_id: int,
+        message_id: int,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> bool:
+        async with self._pin_operation_lock(group_id):
+            return await self._unpin_status_message_locked(
+                group_id,
+                message_id,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def _unpin_status_message_locked(
+        self,
+        group_id: int,
+        message_id: int,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> bool:
+        """Unpin and release ownership under the pin-operation lock."""
+
+        try:
+            unpinned = await _bounded_notice_call(
+                unpin_notification_message(
+                    self.bot,
+                    chat_id=group_id,
+                    message_id=message_id,
+                    kind="raid_guard",
+                ),
+                timeout_seconds=max(0.1, float(timeout_seconds)),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "[%s] raid status unpin call failed | message=%s",
+                group_id,
+                message_id,
+                exc_info=True,
+            )
+            return False
+        if not unpinned:
+            return False
+        try:
+            released = await self._update_persisted_pin_ownership(
+                group_id,
+                remove=(int(message_id),),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            released = False
+            log.exception(
+                "[%s] raid status pin release persistence failed | message=%s",
+                group_id,
+                message_id,
+            )
+        return bool(released)
+
+    def _pin_cleanup_candidates(self, group_id: int) -> tuple[int, ...]:
+        group_id = int(group_id)
+        candidates = set(self._owned_pin_message_ids.get(group_id, set()))
+        current_message_id = self._status_message_ids.get(group_id)
+        if (
+            group_id in self._lockdown_until
+            and self._status_pin_intents.get(group_id, False)
+            and current_message_id is not None
+        ):
+            candidates.discard(int(current_message_id))
+        return tuple(sorted(candidates))
+
+    async def _release_owned_status_pins(self, group_id: int) -> bool:
+        """Release every non-active exact pin owned by this raid guard."""
+
+        group_id = int(group_id)
+        async with self._pin_operation_lock(group_id):
+            # Recompute only after serialization: a delayed cleanup task may
+            # have been queued while the status was configured unpinned, then
+            # wake after a newer /raidguard on has made that same ID active.
+            for message_id in self._pin_cleanup_candidates(group_id):
+                await self._unpin_status_message_locked(group_id, message_id)
+            return not self._pin_cleanup_candidates(group_id)
+
+    def _schedule_pin_cleanup(
+        self,
+        group_id: int,
+        *,
+        delay_seconds: float = _PIN_CLEANUP_RETRY_SECONDS,
+    ) -> None:
+        group_id = int(group_id)
+        if not self._pin_cleanup_candidates(group_id):
+            return
+        existing = self._pin_cleanup_tasks.get(group_id)
+        if existing is not None and not existing.done():
+            if delay_seconds > 0:
+                return
+            # A terminal transition must not wait behind an earlier delayed
+            # stale-ID retry. Replace it with an immediate cleanup generation.
+            existing.cancel()
+            if self._pin_cleanup_tasks.get(group_id) is existing:
+                self._pin_cleanup_tasks.pop(group_id, None)
+
+        async def cleanup() -> None:
+            if delay_seconds > 0:
+                await asyncio.sleep(float(delay_seconds))
+            await self._release_owned_status_pins(group_id)
+
+        try:
+            task = asyncio.create_task(
+                cleanup(),
+                name=f"raid-pin-cleanup:{group_id}",
+            )
+        except RuntimeError:
+            log.debug("[%s] raid pin cleanup could not be scheduled", group_id)
+            return
+        self._pin_cleanup_tasks[group_id] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._pin_cleanup_tasks.get(group_id) is done:
+                self._pin_cleanup_tasks.pop(group_id, None)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                log.exception("[%s] raid pin cleanup task failed", group_id)
+            if self._pin_cleanup_candidates(group_id):
+                self._schedule_pin_cleanup(group_id)
+
+        task.add_done_callback(finished)
+
     async def _publish_lockdown_status(
         self,
         group_id: int,
         text: str,
+        *,
+        pin_message: bool,
+        defer_pin: bool = False,
     ) -> int | None:
         """Create or refresh the one visible status message for a lockdown."""
         group_id = int(group_id)
         message_id = self._status_message_ids.get(group_id)
+        previous_pin_intent = bool(self._status_pin_intents.get(group_id, False))
         keyboard = build_raid_lockdown_keyboard()
         if message_id is not None:
             try:
-                await _bounded_notice_call(
-                    self.bot.edit_message_text(
-                        chat_id=group_id,
-                        message_id=message_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=keyboard,
-                    ),
-                    timeout_seconds=10.0,
-                )
+                async with self._pin_operation_lock(group_id):
+                    await _bounded_notice_call(
+                        self.bot.edit_message_text(
+                            chat_id=group_id,
+                            message_id=message_id,
+                            text=text,
+                            parse_mode="HTML",
+                            reply_markup=keyboard,
+                        ),
+                        timeout_seconds=10.0,
+                    )
+                    # Publish the newer desired state before reconciling the
+                    # exact pin. A delayed cleanup that runs next will therefore
+                    # protect this active ID, while non-deferred pin/unpin calls
+                    # remain serialized under the same operation lock.
+                    self._status_pin_intents[group_id] = bool(pin_message)
+                    if pin_message:
+                        if not defer_pin:
+                            await self._pin_status_message_locked(
+                                group_id,
+                                message_id,
+                            )
+                    elif previous_pin_intent:
+                        await self._unpin_status_message_locked(
+                            group_id,
+                            message_id,
+                        )
+                if not pin_message:
+                    self._schedule_pin_cleanup(group_id)
                 return message_id
             except asyncio.CancelledError:
                 raise
@@ -1288,6 +1747,9 @@ class RaidGuardService:
                 # to leaving the group with no visible way to release it.
                 if self._status_message_ids.get(group_id) == message_id:
                     self._status_message_ids.pop(group_id, None)
+                if previous_pin_intent:
+                    await self._unpin_status_message(group_id, message_id)
+                    self._schedule_pin_cleanup(group_id)
                 log.warning(
                     "[%s] raid status update failed; replacing message",
                     group_id,
@@ -1311,52 +1773,62 @@ class RaidGuardService:
             return None
         message_id = int(getattr(sent, "message_id", 0) or 0)
         if message_id > 0:
-            self._status_message_ids[group_id] = message_id
+            async with self._pin_operation_lock(group_id):
+                self._status_message_ids[group_id] = message_id
+                self._status_pin_intents[group_id] = bool(pin_message)
+                if pin_message and not defer_pin:
+                    await self._pin_status_message_locked(group_id, message_id)
             return message_id
         log.warning("[%s] raid lockdown status has no message ID", group_id)
         return None
 
-    async def _remember_manual_status_message(
+    async def _remember_manual_status_message_locked(
         self,
         group_id: int,
         message_id: int | None,
-    ) -> None:
-        """Persist a manual lockdown's status ID for post-restart updates."""
+    ) -> bool:
+        """Persist a manual status ID while the caller owns the group lock."""
         if message_id is None or int(message_id) <= 0:
-            return
+            return False
         group_id = int(group_id)
         message_id = int(message_id)
-        async with self._manual_state_lock(group_id):
-            if self._lockdown_source.get(group_id) != "manual":
-                return
-            persisted = self._manual_persisted_state.get(group_id)
-            if persisted is None:
-                return
-            if _manual_lockdown_status_message_id(persisted) == message_id:
-                return
-            updated = dict(persisted)
-            updated[_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY] = message_id
-            try:
-                saved = await self._update_persisted_manual_state(
-                    group_id,
-                    value=updated,
-                    expected=persisted,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception(
-                    "[%s] manual raid status message persistence failed",
-                    group_id,
-                )
-                return
-            if saved:
-                self._manual_persisted_state[group_id] = updated
-            elif saved is None:
-                log.warning(
-                    "[%s] manual raid status message persistence lost races",
-                    group_id,
-                )
+        if self._lockdown_source.get(group_id) != "manual":
+            return False
+        persisted = self._manual_persisted_state.get(group_id)
+        if persisted is None:
+            return False
+        if _manual_lockdown_status_message_id(persisted) == message_id:
+            return True
+        updated = dict(persisted)
+        updated[_MANUAL_LOCKDOWN_STATUS_MESSAGE_ID_KEY] = message_id
+        try:
+            saved = await self._update_persisted_manual_state(
+                group_id,
+                value=updated,
+                expected=persisted,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "[%s] manual raid status message persistence failed",
+                group_id,
+            )
+            return False
+        if saved:
+            self._manual_persisted_state[group_id] = updated
+            return True
+        if saved is None:
+            log.warning(
+                "[%s] manual raid status message persistence lost races",
+                group_id,
+            )
+        else:
+            log.warning(
+                "[%s] manual raid status message persistence changed generation",
+                group_id,
+            )
+        return False
 
     async def _send_unlock_notice(
         self,
@@ -1373,13 +1845,16 @@ class RaidGuardService:
                 or self._status_message_ids.get(group_id) != expected_message_id
             ):
                 return
-        message_id = self._status_message_ids.pop(group_id, None)
+        message_id = self._status_message_ids.get(group_id)
+        pin_message = bool(self._status_pin_intents.get(group_id, False))
         if message_id is None:
             log.debug(
                 "[%s] raid unlock status has no tracked message | source=%s",
                 group_id,
                 source,
             )
+            self._status_pin_intents.pop(group_id, None)
+            self._schedule_pin_cleanup(group_id, delay_seconds=0.0)
             return
         try:
             # Protection state notices are intentionally persistent and do not
@@ -1402,6 +1877,49 @@ class RaidGuardService:
                 group_id,
                 source,
             )
+        finally:
+            if self._status_message_ids.get(group_id) == message_id:
+                self._status_message_ids.pop(group_id, None)
+            self._status_pin_intents.pop(group_id, None)
+            if pin_message:
+                try:
+                    async with self._pin_operation_lock(group_id):
+                        if message_id not in self._owned_pin_message_ids.get(
+                            group_id,
+                            set(),
+                        ):
+                            await self._update_persisted_pin_ownership(
+                                group_id,
+                                add=(message_id,),
+                            )
+                except asyncio.CancelledError:
+                    # The durable manual/automatic ledger is preferable, but
+                    # cancellation must still leave an in-memory cleanup owner.
+                    self._owned_pin_message_ids.setdefault(group_id, set()).add(
+                        message_id
+                    )
+                except Exception:
+                    self._owned_pin_message_ids.setdefault(group_id, set()).add(
+                        message_id
+                    )
+                    log.exception(
+                        "[%s] raid terminal pin ownership recovery failed | message=%s",
+                        group_id,
+                        message_id,
+                    )
+            self._schedule_pin_cleanup(group_id, delay_seconds=0.0)
+            cleanup_task = self._pin_cleanup_tasks.get(group_id)
+            if cleanup_task is not None and cleanup_task is not asyncio.current_task():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "[%s] raid immediate pin cleanup failed | source=%s",
+                        group_id,
+                        source,
+                    )
 
     def _schedule_unlock_notice(self, group_id: int, *, source: str) -> None:
         group_id = int(group_id)
@@ -1410,6 +1928,7 @@ class RaidGuardService:
             return
         message_id = self._status_message_ids.get(group_id)
         if message_id is None:
+            self._status_pin_intents.pop(group_id, None)
             return
         try:
             task = asyncio.get_running_loop().create_task(
@@ -1443,38 +1962,36 @@ class RaidGuardService:
         expected_until: datetime,
     ) -> bool:
         group_id = int(group_id)
-        current = self._lockdown_until.get(group_id)
-        if current != expected_until:
-            return False
-        now = now_shanghai_naive()
-        if now < expected_until:
-            # Wall-clock adjustments may make call_later fire early; re-arm
-            # for the remaining interval without changing the deadline.
-            self._cancel_lockdown_timer(group_id)
-            try:
-                loop = asyncio.get_running_loop()
-                self._lockdown_timers[group_id] = loop.call_later(
-                    max(0.0, (expected_until - now).total_seconds()),
-                    self._schedule_lockdown_expiry,
-                    group_id,
-                    expected_until,
-                )
-            except RuntimeError:
-                pass
-            return False
-        source = self._lockdown_source.get(group_id)
-        if source == "manual":
-            async with self._manual_state_lock(group_id):
-                # A concurrent /raidguard on/off may have replaced the state
-                # while this expiry task waited for the per-group lock.
-                if (
-                    self._lockdown_until.get(group_id) != expected_until
-                    or self._lockdown_source.get(group_id) != "manual"
-                ):
-                    return False
+        async with self._lifecycle_lock(group_id):
+            # A concurrent activation, reconfiguration, or off action may have
+            # replaced the state while this expiry task waited for the lock.
+            current = self._lockdown_until.get(group_id)
+            if current != expected_until:
+                return False
+            now = now_shanghai_naive()
+            if now < expected_until:
+                # Wall-clock adjustments may make call_later fire early; re-arm
+                # for the remaining interval without changing the deadline.
+                self._cancel_lockdown_timer(group_id)
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._lockdown_timers[group_id] = loop.call_later(
+                        max(0.0, (expected_until - now).total_seconds()),
+                        self._schedule_lockdown_expiry,
+                        group_id,
+                        expected_until,
+                    )
+                except RuntimeError:
+                    pass
+                return False
+            source = self._lockdown_source.get(group_id)
+            if source == "manual":
                 persisted = self._manual_persisted_state.get(
                     group_id,
-                    _manual_lockdown_state(expected_until),
+                    _manual_lockdown_state(
+                        expected_until,
+                        pin_message=self._status_pin_intents.get(group_id, False),
+                    ),
                 )
                 try:
                     removed = await self._update_persisted_manual_state(
@@ -1510,14 +2027,14 @@ class RaidGuardService:
                     # Another expiry/disable already changed this exact
                     # persisted state and owns the recovery notification.
                     return False
-            await self._send_unlock_notice(group_id, source="manual")
-            return True
+                await self._send_unlock_notice(group_id, source="manual")
+                return True
 
-        source = self._clear_lockdown(group_id)
-        if source is None:
-            return False
-        await self._send_unlock_notice(group_id, source=source)
-        return True
+            source = self._clear_lockdown(group_id)
+            if source is None:
+                return False
+            await self._send_unlock_notice(group_id, source=source)
+            return True
 
     def lockdown_active(self, group_id: int, *, now: datetime | None = None) -> bool:
         group_id = int(group_id)
@@ -1529,16 +2046,11 @@ class RaidGuardService:
         current = now if now is not None else now_shanghai_naive()
         if current < until:
             return True
-        if self._lockdown_source.get(group_id) == "manual":
-            # Persistence cleanup and the exactly-once recovery notice require
-            # async I/O. Treat the deadline as expired immediately, but let the
-            # compare-and-delete task own state removal and notification.
-            self._cancel_lockdown_timer(group_id)
-            self._schedule_lockdown_expiry(group_id, until)
-            return False
-        source = self._clear_lockdown(group_id)
-        if source is not None:
-            self._schedule_unlock_notice(group_id, source=source)
+        # State removal and exact status retirement require async I/O and must
+        # share the lifecycle lock with activation/off. Treat the deadline as
+        # expired immediately, but let the expiry task own the transition.
+        self._cancel_lockdown_timer(group_id)
+        self._schedule_lockdown_expiry(group_id, until)
         return False
 
     async def enable_manual_lockdown(
@@ -1555,8 +2067,27 @@ class RaidGuardService:
             if minutes is None
             else now_shanghai_naive() + timedelta(minutes=minutes)
         )
-        persisted = _manual_lockdown_state(until)
-        async with self._manual_state_lock(group_id):
+        async with self._lifecycle_lock(group_id):
+            async with self.session_factory() as session:
+                group = await session.get(Group, group_id)
+                group_settings = (
+                    dict(group.settings or {}) if group is not None else None
+                )
+            pin_message = notification_pin_enabled(
+                self.settings,
+                group_settings,
+                "raid_guard",
+            )
+            existing_status_message_id = self._status_message_ids.get(group_id)
+            if existing_status_message_id is None:
+                existing_status_message_id = _manual_lockdown_status_message_id(
+                    self._manual_persisted_state.get(group_id)
+                )
+            persisted = _manual_lockdown_state(
+                until,
+                status_message_id=existing_status_message_id,
+                pin_message=pin_message,
+            )
             saved = await self._update_persisted_manual_state(
                 group_id,
                 value=persisted,
@@ -1567,27 +2098,38 @@ class RaidGuardService:
                 group_id,
                 until=until,
                 source="manual",
+                pin_message=pin_message,
                 persisted_state=persisted,
             )
             self._recent_joins.pop(group_id, None)
-        status_message_id = await self._publish_lockdown_status(
-            group_id,
-            build_manual_raid_lockdown_text(duration_minutes=minutes),
-        )
-        await self._remember_manual_status_message(group_id, status_message_id)
-        return until
+            status_message_id = await self._publish_lockdown_status(
+                group_id,
+                build_manual_raid_lockdown_text(duration_minutes=minutes),
+                pin_message=pin_message,
+                defer_pin=True,
+            )
+            remembered = await self._remember_manual_status_message_locked(
+                group_id,
+                status_message_id,
+            )
+            if remembered and pin_message and status_message_id is not None:
+                await self._pin_status_message(group_id, status_message_id)
+            return until
 
     async def disable_manual_lockdown(self, group_id: int) -> bool:
         """End the current lockdown immediately and announce the recovery."""
         group_id = int(group_id)
-        async with self._manual_state_lock(group_id):
+        async with self._lifecycle_lock(group_id):
             source = self._lockdown_source.get(group_id)
             if source is None:
                 return False
             if source == "manual":
                 expected = self._manual_persisted_state.get(
                     group_id,
-                    _manual_lockdown_state(self._lockdown_until.get(group_id)),
+                    _manual_lockdown_state(
+                        self._lockdown_until.get(group_id),
+                        pin_message=self._status_pin_intents.get(group_id, False),
+                    ),
                 )
                 removed = await self._update_persisted_manual_state(
                     group_id,
@@ -1603,8 +2145,8 @@ class RaidGuardService:
                     return True
             else:
                 self._clear_lockdown(group_id)
-        await self._send_unlock_notice(group_id, source=source)
-        return True
+            await self._send_unlock_notice(group_id, source=source)
+            return True
 
     def manual_lockdown_active(self, group_id: int) -> bool:
         return bool(
@@ -1646,12 +2188,20 @@ class RaidGuardService:
             for task in tuple(self._unlock_notice_tasks.values()):
                 task.cancel()
             self._unlock_notice_tasks.clear()
+            for task in tuple(self._pin_cleanup_tasks.values()):
+                task.cancel()
+            self._pin_cleanup_tasks.clear()
             self._recent_joins.clear()
             self._lockdown_until.clear()
             self._lockdown_source.clear()
             self._status_message_ids.clear()
+            self._status_pin_intents.clear()
+            self._owned_pin_message_ids.clear()
             self._manual_persisted_state.clear()
-            self._manual_state_locks.clear()
+            self._lifecycle_locks.clear()
+            for tracked_group, lock in tuple(self._pin_operation_locks.items()):
+                if not lock.locked():
+                    self._pin_operation_locks.pop(tracked_group, None)
             return
         self._cancel_lockdown_timer(int(group_id))
         task = self._lockdown_expiry_tasks.pop(int(group_id), None)
@@ -1660,12 +2210,20 @@ class RaidGuardService:
         notice_task = self._unlock_notice_tasks.pop(int(group_id), None)
         if notice_task is not None:
             notice_task.cancel()
+        cleanup_task = self._pin_cleanup_tasks.pop(int(group_id), None)
+        if cleanup_task is not None:
+            cleanup_task.cancel()
         self._recent_joins.pop(int(group_id), None)
         self._lockdown_until.pop(int(group_id), None)
         self._lockdown_source.pop(int(group_id), None)
         self._status_message_ids.pop(int(group_id), None)
+        self._status_pin_intents.pop(int(group_id), None)
+        self._owned_pin_message_ids.pop(int(group_id), None)
         self._manual_persisted_state.pop(int(group_id), None)
-        self._manual_state_locks.pop(int(group_id), None)
+        self._lifecycle_locks.pop(int(group_id), None)
+        pin_lock = self._pin_operation_locks.get(int(group_id))
+        if pin_lock is not None and not pin_lock.locked():
+            self._pin_operation_locks.pop(int(group_id), None)
 
     async def shutdown(self, *, timeout_seconds: float = 2.0) -> None:
         """Cancel service-owned tasks without trusting them to cooperate."""
@@ -1673,7 +2231,33 @@ class RaidGuardService:
         tasks = {
             *self._lockdown_expiry_tasks.values(),
             *self._unlock_notice_tasks.values(),
+            *self._pin_cleanup_tasks.values(),
         }
+        # Automatic lockdowns are intentionally not restored after a process
+        # restart.  Retire their exact pinned status messages during a graceful
+        # shutdown so a lost in-memory lifecycle does not leave stale pins.
+        shutdown_pins: set[tuple[int, int]] = set()
+        for group_id, message_ids in self._owned_pin_message_ids.items():
+            protected_manual_id = (
+                self._status_message_ids.get(group_id)
+                if self._lockdown_source.get(group_id) == "manual"
+                and group_id in self._lockdown_until
+                and self._status_pin_intents.get(group_id, False)
+                else None
+            )
+            shutdown_pins.update(
+                (group_id, message_id)
+                for message_id in message_ids
+                if message_id != protected_manual_id
+            )
+        # Backward-compatible in-memory state from before the durable ledger
+        # may still own an automatic current pin.
+        shutdown_pins.update(
+            (group_id, message_id)
+            for group_id, message_id in self._status_message_ids.items()
+            if self._lockdown_source.get(group_id) != "manual"
+            and self._status_pin_intents.get(group_id, False)
+        )
         self.reset()
 
         async def drain_service_tasks() -> None:
@@ -1689,8 +2273,24 @@ class RaidGuardService:
                     len(pending),
                 )
 
-        # Both branches are individually bounded and run in parallel, so the
-        # method's own deadline is not multiplied by the number of registries.
+        async def retire_shutdown_pins() -> None:
+            if not shutdown_pins:
+                return
+            await asyncio.gather(
+                *(
+                    self._unpin_status_message(
+                        group_id,
+                        message_id,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    for group_id, message_id in shutdown_pins
+                ),
+                return_exceptions=True,
+            )
+
+        # Automatic pins retire in parallel before the global Telegram notice
+        # drain starts. The two remaining bounded drains then run in parallel.
+        await retire_shutdown_pins()
         await asyncio.gather(
             drain_service_tasks(),
             flush_raid_guard_telegram_tasks(timeout_seconds=timeout_seconds),
@@ -1774,6 +2374,7 @@ class RaidGuardService:
             group_id,
             duration_seconds=config.lockdown_seconds,
             source="automatic",
+            pin_message=config.pin_message,
         )
 
         log.warning(
@@ -2032,14 +2633,24 @@ class RaidGuardService:
     ) -> list[RaidSuspect]:
         if not await self._group_authorized(group_id):
             return []
-        await self._publish_lockdown_status(
-            group_id,
-            build_raid_lockdown_text(
-                joined_count=config.join_threshold,
-                window_seconds=config.window_seconds,
-                lockdown_seconds=config.lockdown_seconds,
-            ),
-        )
+        async with self._lifecycle_lock(group_id):
+            # The detector arms before doing Telegram I/O. A concurrent button
+            # or command may have ended/replaced that lifecycle while the
+            # authorization check was in flight; never publish a late orphan.
+            if (
+                group_id not in self._lockdown_until
+                or self._lockdown_source.get(group_id) != "automatic"
+            ):
+                return []
+            await self._publish_lockdown_status(
+                group_id,
+                build_raid_lockdown_text(
+                    joined_count=config.join_threshold,
+                    window_seconds=config.window_seconds,
+                    lockdown_seconds=config.lockdown_seconds,
+                ),
+                pin_message=config.pin_message,
+            )
 
         provider = verification_provider(self.settings)
         if not verification_service_ready(self.settings, provider):

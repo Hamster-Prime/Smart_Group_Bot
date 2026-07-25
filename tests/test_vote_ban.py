@@ -22,6 +22,7 @@ from bot.db.models import (
 from bot.handlers import commands, group
 from bot.services import vote_ban
 from bot.services.authz import authorize_group
+from bot.services.join_verification import activate_manual_unban_recovery
 from bot.services.vote_ban import (
     apply_vote_ban,
     build_vote_text,
@@ -40,6 +41,7 @@ def _settings(**overrides) -> SimpleNamespace:
     values = {
         "super_admin_id": 1,
         "vote_ban_enabled": True,
+        "vote_ban_pin_message": True,
         "vote_ban_threshold": 3,
         "vote_ban_duration_seconds": 600,
         "vote_ban_trigger_limit": 3,
@@ -80,6 +82,8 @@ class VoteBanTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(flush, timeout=0.5)
         self.assertFalse(vote_ban._expiry_tasks)
         self.assertFalse(vote_ban._enforcement_tasks)
+        self.assertFalse(vote_ban._manual_unban_finalization_tasks)
+        self.assertFalse(vote_ban._terminal_unpin_retry_tasks)
 
     async def test_shutdown_timeout_keeps_cancellation_resistant_task_registered(self) -> None:
         release = asyncio.Event()
@@ -140,12 +144,45 @@ class VoteBanTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(654, vote_ban._expiry_tasks)
         self.assertTrue(task.cancelled())
 
+    async def test_shutdown_flush_joins_manual_unban_finalization_tasks(self) -> None:
+        started = asyncio.Event()
+
+        async def pending_finalizer() -> None:
+            started.set()
+            await asyncio.Future()
+
+        task = asyncio.create_task(pending_finalizer())
+        vote_ban._manual_unban_finalization_tasks[777] = task
+        await started.wait()
+
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.5)
+
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(777, vote_ban._manual_unban_finalization_tasks)
+
+    async def test_shutdown_flush_joins_terminal_unpin_retry_tasks(self) -> None:
+        started = asyncio.Event()
+
+        async def pending_retry() -> None:
+            started.set()
+            await asyncio.Future()
+
+        task = asyncio.create_task(pending_retry())
+        vote_ban._terminal_unpin_retry_tasks[778] = task
+        await started.wait()
+
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.5)
+
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(778, vote_ban._terminal_unpin_retry_tasks)
+
 
 class VoteBanConfigTests(unittest.TestCase):
     def test_group_overrides_and_clamping(self) -> None:
         settings = _settings()
         config = resolve_vote_ban_config(settings, None)
         self.assertTrue(config.enabled)
+        self.assertTrue(config.pin_message)
         self.assertEqual(config.threshold, 3)
         self.assertEqual(config.duration_seconds, 600)
         self.assertEqual(config.trigger_limit, 3)
@@ -155,6 +192,7 @@ class VoteBanConfigTests(unittest.TestCase):
             settings,
             {
                 "vote_ban_enabled": False,
+                "vote_ban_pin_message": False,
                 "vote_ban_threshold": 10,
                 "vote_ban_duration_seconds": 120,
                 "vote_ban_trigger_limit": 2,
@@ -162,6 +200,7 @@ class VoteBanConfigTests(unittest.TestCase):
             },
         )
         self.assertFalse(config.enabled)
+        self.assertFalse(config.pin_message)
         self.assertEqual(config.threshold, 10)
         self.assertEqual(config.duration_seconds, 120)
         self.assertEqual(config.trigger_limit, 2)
@@ -358,6 +397,8 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 ban_chat_member=AsyncMock(return_value=True),
                 delete_message=AsyncMock(return_value=True),
                 edit_message_text=AsyncMock(),
+                pin_chat_message=AsyncMock(return_value=True),
+                unpin_chat_message=AsyncMock(return_value=True),
                 get_chat_member=AsyncMock(
                     return_value=SimpleNamespace(status="member")
                 ),
@@ -431,6 +472,34 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             "投票封禁（1/3）",
         )
 
+    async def test_countdown_expiry_finalizes_and_unpins(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.deadline_at = now_shanghai_naive() - timedelta(seconds=1)
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        remaining = await vote_ban._refresh_active_vote_message(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+            session_id=session_id,
+        )
+
+        self.assertIsNone(remaining)
+        self.assertIn("投票超时", bot.edit_message_text.await_args.kwargs["text"])
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "expired")
+
     async def test_restore_active_vote_resumes_countdown_refresh(self) -> None:
         session_id = await self._open_session(threshold=3)
         refreshed = asyncio.Event()
@@ -439,7 +508,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             refreshed.set()
             return True
 
-        bot = SimpleNamespace(edit_message_text=AsyncMock(side_effect=record_refresh))
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(side_effect=record_refresh),
+            pin_chat_message=AsyncMock(return_value=True),
+        )
         with patch.object(vote_ban, "VOTE_BAN_COUNTDOWN_REFRESH_SECONDS", 0.01):
             await vote_ban.restore_vote_ban_tasks(
                 session_factory=self.session_factory,
@@ -449,7 +521,173 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(refreshed.wait(), timeout=0.5)
 
         self.assertIn(session_id, vote_ban._expiry_tasks)
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
         vote_ban.cancel_vote_expiry(session_id)
+
+    async def test_restore_enforcing_vote_repins_prompt(self) -> None:
+        session_id = await self._open_session(threshold=2)
+        async with self.session_factory() as session:
+            self.assertTrue(
+                await claim_session_status(
+                    session,
+                    session_id,
+                    expected="active",
+                    new_status="enforcing",
+                )
+            )
+            await session.commit()
+        bot = SimpleNamespace(pin_chat_message=AsyncMock(return_value=True))
+
+        await vote_ban.restore_vote_ban_tasks(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+            disable_notification=True,
+        )
+        self.assertIn(session_id, vote_ban._enforcement_tasks)
+        vote_ban.cancel_vote_enforcement_recovery(session_id)
+
+    async def test_restore_compensates_terminal_vote_with_outstanding_pin(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            pin_chat_message=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        await vote_ban.restore_vote_ban_tasks(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        bot.pin_chat_message.assert_not_awaited()
+        self.assertIn("投票超时", bot.edit_message_text.await_args.kwargs["text"])
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertFalse(record.pin_message)
+
+    async def test_restore_releases_terminal_row_without_message_id_once(self) -> None:
+        session_id = await self._open_session(threshold=3)
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "cancelled"
+            record.resolution = "manual_unban"
+            record.message_id = 0
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            pin_chat_message=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        await vote_ban.restore_vote_ban_tasks(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        bot.edit_message_text.assert_not_awaited()
+        bot.pin_chat_message.assert_not_awaited()
+        bot.unpin_chat_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertFalse(record.pin_message)
+            self.assertEqual(record.resolution, "unban_finalized")
+
+        await vote_ban.restore_vote_ban_tasks(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+        bot.edit_message_text.assert_not_awaited()
+        bot.unpin_chat_message.assert_not_awaited()
+
+    async def test_pin_postflight_db_failure_unpins_even_after_false_pin_result(
+        self,
+    ) -> None:
+        session_id = await self._open_session()
+        calls = 0
+
+        def failing_second_factory():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self.session_factory()
+            raise RuntimeError("postflight database unavailable")
+
+        bot = SimpleNamespace(
+            pin_chat_message=AsyncMock(side_effect=RuntimeError("pin timeout")),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        pinned = await vote_ban._pin_open_vote_message(
+            bot,
+            settings=self.settings,
+            session_id=session_id,
+            session_factory=failing_second_factory,
+        )
+
+        self.assertFalse(pinned)
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
+    async def test_pin_postflight_cancellation_unpins_after_false_pin_result(
+        self,
+    ) -> None:
+        session_id = await self._open_session()
+        calls = 0
+
+        class CancelledContext:
+            async def __aenter__(self):
+                raise asyncio.CancelledError
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def cancelled_second_factory():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self.session_factory()
+            return CancelledContext()
+
+        bot = SimpleNamespace(
+            pin_chat_message=AsyncMock(side_effect=RuntimeError("pin timeout")),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await vote_ban._pin_open_vote_message(
+                bot,
+                settings=self.settings,
+                session_id=session_id,
+                session_factory=cancelled_second_factory,
+            )
+
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
 
     async def test_countdown_refresh_cannot_overwrite_newer_vote_edit(self) -> None:
         session_id = await self._open_session(threshold=3)
@@ -584,6 +822,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("民主投票封禁 · 已结束", kwargs["text"])
         self.assertIn("<blockquote expandable>", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
+        callback.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "passed")
@@ -690,6 +932,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("取消本次投票", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
+        callback.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "cancelled")
@@ -770,6 +1016,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("直接封禁", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
+        callback.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "passed")
@@ -797,6 +1047,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(
             ban_chat_member=AsyncMock(side_effect=RuntimeError("api down")),
             edit_message_text=AsyncMock(),
+            unpin_chat_message=AsyncMock(return_value=True),
             get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
         )
         callback = self._callback(session_id, voter_id=42, action="ban", bot=bot)
@@ -806,6 +1057,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             async with self.session_factory() as session:
                 await group.on_vote_ban_action(callback, self.settings, session=session)
         self.assertIn("失败", callback.answer.await_args.args[0])
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "failed")
@@ -831,6 +1086,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 await group.on_vote_ban_action(callback, self.settings, session=session)
         callback.bot.ban_chat_member.assert_not_awaited()
         self.assertIn("超时", callback.answer.await_args.args[0])
+        callback.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             self.assertEqual(record.status, "expired")
@@ -859,6 +1118,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             ),
             ban_chat_member=AsyncMock(return_value=True),
             edit_message_text=AsyncMock(),
+            unpin_chat_message=AsyncMock(return_value=True),
         )
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
@@ -871,6 +1131,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "passed")
         kwargs = bot.edit_message_text.await_args.kwargs
         self.assertIn("直接封禁", kwargs["text"])
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
         async with self.session_factory() as session:
             event = await session.scalar(
                 select(BanAuditEvent).where(
@@ -910,6 +1174,241 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("超时", kwargs["text"])
         self.assertIsNone(kwargs["reply_markup"])
+        callback.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
+    async def test_finalize_unpins_even_when_terminal_edit_fails(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(side_effect=RuntimeError("edit denied")),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        await vote_ban.finalize_vote_message(
+            bot,
+            self.settings,
+            record,
+            outcome_line="投票超时，未达到封禁票数",
+            approvals=1,
+        )
+
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+
+    async def test_finalize_cancellation_settles_pin_before_propagating(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        edit_started = asyncio.Event()
+
+        async def slow_edit(**_kwargs):
+            edit_started.set()
+            await asyncio.sleep(60)
+
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(side_effect=slow_edit),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+        vote_ban._configure_vote_ban_runtime(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        task = asyncio.create_task(
+            vote_ban.finalize_vote_message(
+                bot,
+                self.settings,
+                record,
+                outcome_line="投票超时，未达到封禁票数",
+                approvals=1,
+            )
+        )
+        await asyncio.wait_for(edit_started.wait(), timeout=1.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        self.assertNotIn(session_id, vote_ban._terminal_unpin_retry_tasks)
+        async with self.session_factory() as session:
+            stored = await session.get(VoteBanSession, session_id)
+            self.assertFalse(stored.pin_message)
+
+    async def test_terminal_unpin_failure_retries_once_and_clears_ownership(
+        self,
+    ) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(
+                side_effect=[RuntimeError("temporary failure"), True]
+            ),
+        )
+        vote_ban._configure_vote_ban_runtime(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        with patch.object(
+            vote_ban,
+            "VOTE_BAN_UNPIN_RETRY_DELAYS_SECONDS",
+            (0.1,),
+        ):
+            await vote_ban.finalize_vote_message(
+                bot,
+                self.settings,
+                record,
+                outcome_line="投票超时，未达到封禁票数",
+                approvals=1,
+            )
+            retry_task = vote_ban._terminal_unpin_retry_tasks[session_id]
+            vote_ban._schedule_terminal_unpin_retry(bot, record)
+            self.assertIs(
+                vote_ban._terminal_unpin_retry_tasks[session_id],
+                retry_task,
+            )
+
+        self.assertTrue(record.pin_message)
+        await asyncio.wait_for(retry_task, timeout=1.0)
+
+        self.assertEqual(bot.unpin_chat_message.await_count, 2)
+        self.assertNotIn(session_id, vote_ban._terminal_unpin_retry_tasks)
+        async with self.session_factory() as session:
+            fresh = await session.get(VoteBanSession, session_id)
+            self.assertFalse(fresh.pin_message)
+
+    async def test_terminal_unpin_retry_is_bounded_and_keeps_ownership(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(side_effect=RuntimeError("denied")),
+        )
+        vote_ban._configure_vote_ban_runtime(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        with patch.object(
+            vote_ban,
+            "VOTE_BAN_UNPIN_RETRY_DELAYS_SECONDS",
+            (0.05, 0.05),
+        ):
+            await vote_ban.finalize_vote_message(
+                bot,
+                self.settings,
+                record,
+                outcome_line="投票超时，未达到封禁票数",
+                approvals=1,
+            )
+            retry_task = vote_ban._terminal_unpin_retry_tasks[session_id]
+
+        await asyncio.wait_for(retry_task, timeout=1.0)
+
+        self.assertEqual(bot.unpin_chat_message.await_count, 3)
+        self.assertNotIn(session_id, vote_ban._terminal_unpin_retry_tasks)
+        async with self.session_factory() as session:
+            fresh = await session.get(VoteBanSession, session_id)
+            self.assertTrue(fresh.pin_message)
+
+    async def test_terminal_retry_stops_after_ownership_was_cleared(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        bot = SimpleNamespace(
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+        vote_ban._configure_vote_ban_runtime(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+
+        with patch.object(
+            vote_ban,
+            "VOTE_BAN_UNPIN_RETRY_DELAYS_SECONDS",
+            (0.1,),
+        ):
+            vote_ban._schedule_terminal_unpin_retry(bot, record)
+            retry_task = vote_ban._terminal_unpin_retry_tasks[session_id]
+            async with self.session_factory() as session:
+                stored = await session.get(VoteBanSession, session_id)
+                stored.pin_message = False
+                await session.commit()
+
+        await asyncio.wait_for(retry_task, timeout=1.0)
+
+        bot.unpin_chat_message.assert_not_awaited()
+        self.assertNotIn(session_id, vote_ban._terminal_unpin_retry_tasks)
+
+    async def test_failed_worker_cannot_resurrect_cleared_pin_ownership(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            await session.commit()
+        vote_ban._configure_vote_ban_runtime(
+            session_factory=self.session_factory,
+            bot=SimpleNamespace(),
+            settings=self.settings,
+        )
+        async with self.session_factory() as session:
+            stored = await session.get(VoteBanSession, session_id)
+            stored.pin_message = False
+            await session.commit()
+
+        self.assertFalse(await vote_ban._persist_vote_pin_outstanding(record))
+
+        async with self.session_factory() as session:
+            stored = await session.get(VoteBanSession, session_id)
+            self.assertFalse(stored.pin_message)
+
+    async def test_finalize_does_not_unpin_unmanaged_legacy_vote(self) -> None:
+        session_id = await self._open_session()
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            record.status = "expired"
+            record.pin_message = False
+            await session.commit()
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+
+        await vote_ban.finalize_vote_message(
+            bot,
+            self.settings,
+            record,
+            outcome_line="投票超时，未达到封禁票数",
+            approvals=1,
+        )
+
+        bot.unpin_chat_message.assert_not_awaited()
 
     async def test_ban_failure_rolls_back_warning_flag(self) -> None:
         async with self.session_factory() as session:
@@ -1074,6 +1573,56 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(current.lease_until, newer_recovery.lease_until)
 
+    async def test_manual_unban_activation_finalizes_and_unpins_once(self) -> None:
+        session_id = await self._open_session(target_user_id=555)
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(return_value=True),
+            pin_chat_message=AsyncMock(return_value=True),
+            unpin_chat_message=AsyncMock(return_value=True),
+        )
+        await vote_ban.restore_vote_ban_tasks(
+            session_factory=self.session_factory,
+            bot=bot,
+            settings=self.settings,
+        )
+        bot.edit_message_text.reset_mock()
+        bot.unpin_chat_message.reset_mock()
+
+        async with self.session_factory() as session:
+            recovery = await vote_ban.lease_join_verification_for_unban(
+                session,
+                -100,
+                555,
+            )
+            self.assertIsNotNone(recovery)
+            await session.commit()
+
+        activate_manual_unban_recovery(recovery)
+        activate_manual_unban_recovery(recovery)
+        task = vote_ban._manual_unban_finalization_tasks[555]
+        await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertNotIn(session_id, vote_ban._expiry_tasks)
+        self.assertNotIn(555, vote_ban._manual_unban_finalization_tasks)
+        bot.edit_message_text.assert_awaited_once()
+        self.assertIn("管理员解封后", bot.edit_message_text.await_args.kwargs["text"])
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertFalse(record.pin_message)
+            self.assertEqual(record.resolution, "unban_finalized")
+
+        bot.edit_message_text.reset_mock()
+        bot.unpin_chat_message.reset_mock()
+        activate_manual_unban_recovery(recovery)
+        repeat_task = vote_ban._manual_unban_finalization_tasks[555]
+        await asyncio.wait_for(repeat_task, timeout=1.0)
+        bot.edit_message_text.assert_not_awaited()
+        bot.unpin_chat_message.assert_not_awaited()
+
     async def test_old_vote_generation_cannot_publish_after_manual_unban(self) -> None:
         session_id = await self._open_session(threshold=2)
         async with self.session_factory() as session:
@@ -1229,6 +1778,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             ban_chat_member=AsyncMock(side_effect=RuntimeError("api down")),
             delete_message=AsyncMock(return_value=True),
             edit_message_text=AsyncMock(),
+            unpin_chat_message=AsyncMock(return_value=True),
             get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
         )
         callback = self._callback(session_id, voter_id=11, bot=bot)
@@ -1252,6 +1802,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(bool(warning.is_banned) if warning else False)
         bot.delete_message.assert_not_awaited()
+        bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=777,
+        )
 
     async def test_threshold_rechecks_target_and_refuses_new_admin(self) -> None:
         session_id = await self._open_session(threshold=2)
@@ -1317,6 +1871,7 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.settings = _settings()
 
     async def asyncTearDown(self) -> None:
+        await vote_ban.flush_vote_ban_tasks(timeout_seconds=0.5)
         await self.engine.dispose()
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -1335,6 +1890,9 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
                 send_message=AsyncMock(
                     return_value=SimpleNamespace(message_id=888)
                 ),
+                pin_chat_message=AsyncMock(return_value=True),
+                unpin_chat_message=AsyncMock(return_value=True),
+                edit_message_text=AsyncMock(return_value=True),
                 get_chat_member=AsyncMock(
                     return_value=SimpleNamespace(status="member")
                 ),
@@ -1375,13 +1933,149 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("1/3", text)
         markup = message.bot.send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].text, "投票封禁（1/3）")
+        message.bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=888,
+            disable_notification=True,
+        )
         async with self.session_factory() as session:
             record = await session.scalar(select(VoteBanSession))
             self.assertEqual(record.target_user_id, 555)
             self.assertEqual(record.message_id, 888)
+            self.assertTrue(record.pin_message)
             self.assertEqual(record.status, "active")
             votes = (await session.scalars(select(VoteBanVote))).all()
             self.assertEqual([vote.user_id for vote in votes], [10])
+
+    async def test_group_pin_override_disables_vote_pin(self) -> None:
+        async with self.session_factory() as session:
+            row = await session.get(Group, -100)
+            row.settings = {
+                "vote_ban_enabled": True,
+                "vote_ban_pin_message": False,
+            }
+            await session.commit()
+        message = self._message(reply=self._reply())
+
+        async with self.session_factory() as session:
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertTrue(result.ok)
+        message.bot.pin_chat_message.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await session.scalar(select(VoteBanSession))
+            self.assertFalse(record.pin_message)
+
+    async def test_pin_failure_does_not_cancel_delivered_vote(self) -> None:
+        message = self._message(reply=self._reply())
+        message.bot.pin_chat_message = AsyncMock(
+            side_effect=RuntimeError("pin denied")
+        )
+
+        async with self.session_factory() as session:
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertTrue(result.ok)
+        async with self.session_factory() as session:
+            record = await session.scalar(select(VoteBanSession))
+            self.assertEqual(record.status, "active")
+            self.assertTrue(record.pin_message)
+
+    async def test_terminal_transition_before_pin_prevents_reverse_pin(self) -> None:
+        message = self._message(reply=self._reply())
+
+        async def send_then_cancel(*_args, **_kwargs) -> SimpleNamespace:
+            async with self.session_factory() as competing_session:
+                record = await competing_session.scalar(select(VoteBanSession))
+                self.assertTrue(
+                    await claim_session_status(
+                        competing_session,
+                        int(record.id),
+                        expected="active",
+                        new_status="cancelled",
+                        resolution="admin_cancel",
+                    )
+                )
+                await competing_session.commit()
+            return SimpleNamespace(message_id=888)
+
+        message.bot.send_message = AsyncMock(side_effect=send_then_cancel)
+        async with self.session_factory() as session:
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertTrue(result.ok)
+        message.bot.pin_chat_message.assert_not_awaited()
+        message.bot.edit_message_text.assert_awaited_once()
+        self.assertIn(
+            "已取消本次投票",
+            message.bot.edit_message_text.await_args.kwargs["text"],
+        )
+        message.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=888,
+        )
+        async with self.session_factory() as session:
+            record = await session.scalar(select(VoteBanSession))
+            self.assertEqual(record.status, "cancelled")
+
+    async def test_terminal_transition_during_pin_unpins_late_pin(self) -> None:
+        message = self._message(reply=self._reply())
+
+        async def terminal_wins_while_pin_is_in_flight(**_kwargs) -> bool:
+            async with self.session_factory() as competing_session:
+                record = await competing_session.scalar(select(VoteBanSession))
+                self.assertTrue(
+                    await claim_session_status(
+                        competing_session,
+                        int(record.id),
+                        expected="active",
+                        new_status="cancelled",
+                        resolution="admin_cancel",
+                    )
+                )
+                # Simulate the other process completing its earlier exact
+                # unpin before this delayed pin API call lands.
+                record.pin_message = False
+                await competing_session.commit()
+            return True
+
+        message.bot.pin_chat_message = AsyncMock(
+            side_effect=terminal_wins_while_pin_is_in_flight
+        )
+        async with self.session_factory() as session:
+            result = await vote_ban.start_vote_ban(
+                message,
+                session,
+                self.settings,
+            )
+
+        self.assertTrue(result.ok)
+        message.bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=888,
+            disable_notification=True,
+        )
+        message.bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=888,
+        )
+        message.bot.edit_message_text.assert_not_awaited()
+        async with self.session_factory() as session:
+            record = await session.scalar(select(VoteBanSession))
+            self.assertEqual(record.status, "cancelled")
+            self.assertFalse(record.pin_message)
 
     async def test_rejects_admin_target(self) -> None:
         message = self._message(reply=self._reply())
@@ -1580,6 +2274,7 @@ class VoteBanCommandTests(unittest.IsolatedAsyncioTestCase):
             record = await session.scalar(select(VoteBanSession))
             self.assertEqual(bucket.used_count, 0)
             self.assertEqual(record.status, "cancelled")
+            self.assertFalse(record.pin_message)
 
     async def test_missing_reply_target_retries_poll_without_reply_anchor(self) -> None:
         message = self._message(reply=self._reply())
