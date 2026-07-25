@@ -14,23 +14,66 @@
   const sidebarStatus = document.getElementById("sidebar-status");
   const sidebar = document.querySelector(".sidebar");
   const sidebarToggle = document.getElementById("sidebar-toggle");
+  const sidebarClose = document.getElementById("sidebar-close");
+  const topbarActions = document.querySelector(".topbar-actions");
+  const mobileSidebarMedia = window.matchMedia("(max-width: 820px)");
   const toastRegion = document.getElementById("toast-region");
   const confirmDialog = document.getElementById("confirm-dialog");
   const confirmTitle = document.getElementById("confirm-title");
   const confirmMessage = document.getElementById("confirm-message");
 
   const ALL_NAV_ITEMS = [
-    { id: "overview", label: "概览", icon: "layout-dashboard", subtitle: "运行状态与启动参数" },
-    { id: "models", label: "模型", icon: "boxes", subtitle: "供应商、角色与回退链" },
-    { id: "bot", label: "Bot", icon: "bot", subtitle: "消息、上下文与主动发言" },
-    { id: "safety", label: "审核验证", icon: "shield-check", subtitle: "内容审核与入群验证" },
-    { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸" },
-    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息与 Sub2API 接入" },
-    { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转" },
-    { id: "prompts", label: "Prompts", icon: "file-code-2", subtitle: "模型系统提示词" },
-    { id: "groups", label: "群组", icon: "users", subtitle: "逐群行为覆盖" },
-    { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局封禁" },
+    { id: "overview", label: "概览", icon: "layout-dashboard", subtitle: "运行状态与启动参数", group: "总览" },
+    { id: "models", label: "模型", icon: "boxes", subtitle: "供应商、角色与回退链", group: "AI 配置" },
+    { id: "prompts", label: "Prompts", icon: "file-code-2", subtitle: "模型系统提示词", group: "AI 配置" },
+    { id: "bot", label: "Bot 行为", icon: "bot", subtitle: "消息、上下文与主动发言", group: "Bot 能力" },
+    { id: "safety", label: "审核验证", icon: "shield-check", subtitle: "内容审核与入群验证", group: "Bot 能力" },
+    { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸", group: "Bot 能力" },
+    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息与 Sub2API 接入", group: "Bot 能力" },
+    { id: "groups", label: "群组设置", icon: "users", subtitle: "逐群行为、群规与自动化", group: "群组管理" },
+    { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局封禁", group: "群组管理" },
+    { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转", group: "系统" },
   ];
+
+  const GROUP_SECTION_NAV = [
+    { key: "reply-media", label: "回复与媒体", icon: "message-circle" },
+    { key: "onboarding", label: "入群欢迎", icon: "user-plus" },
+    { key: "permissions", label: "成员权限", icon: "key-round" },
+    { key: "safety", label: "安全防护", icon: "shield-check" },
+    { key: "management", label: "管理投票", icon: "badge-check" },
+    { key: "proactive-style", label: "主动与风格", icon: "sparkles" },
+    { key: "automation", label: "关键词与定时", icon: "timer" },
+    { key: "rules-memory", label: "群规与记忆", icon: "book-open-check" },
+    { key: "member-lists", label: "成员名单", icon: "contact-round" },
+  ];
+
+  const GROUP_SECTION_SETTING_KEYS = {
+    "reply-media": ["mute_all_replies", "at_reply_mode", "av_enabled", "tts_mode"],
+    onboarding: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
+    permissions: ["default_permissions"],
+    safety: [
+      "patrol_enabled", "raid_guard_enabled", "raid_guard_join_threshold",
+      "raid_guard_window_seconds", "raid_guard_lockdown_seconds",
+      "raid_guard_lookback_seconds", "raid_guard_challenge_timeout_seconds",
+    ],
+    management: [
+      "call_admin_enabled", "call_admin_targets", "vote_ban_enabled",
+      "vote_ban_threshold", "vote_ban_duration_seconds", "vote_ban_trigger_limit",
+      "vote_ban_trigger_window_seconds",
+    ],
+    "proactive-style": ["proactive_enabled", "proactive_task_brief", "mimic_target_user_id", "mimic_target_user_name", "mimic_profile_text"],
+  };
+
+  const RESOURCE_TYPE_META = {
+    "keyword-replies": { property: "keyword_replies", category: "automation", response: "keyword_reply", label: "关键词回复" },
+    "scheduled-messages": { property: "scheduled_messages", category: "automation", response: "scheduled_message", label: "定时消息" },
+    rules: { property: "rules", category: "rules-memory", response: "rule", label: "群规" },
+    memories: { property: "memories", category: "rules-memory", response: "memory", label: "永久记忆" },
+    warnings: { property: "warnings", category: "member-lists", response: "", label: "警告记录" },
+    bans: { property: "bans", category: "member-lists", response: "ban", label: "群内封禁" },
+    "moderation-exemptions": { property: "exemptions", category: "member-lists", response: "exemption", label: "审核豁免" },
+    "reply-mutes": { property: "reply_mutes", category: "member-lists", response: "reply_mute", label: "回复静默" },
+  };
 
   const ROLE_META = {
     main: { label: "主模型", icon: "message-square", parent: "", embed: false },
@@ -148,16 +191,26 @@
     groupsError: "",
     loading: true,
     saving: false,
+    reloadingGroups: false,
+    accessMutating: false,
+    immediateMutations: 0,
     groupSaving: new Set(),
     groupResources: new Map(),
+    groupResourceLoads: new Map(),
+    groupResourceMutationEpochs: new Map(),
+    groupPermissionLoads: new Map(),
     groupTelegramAdmins: new Map(),
     groupTemplateButtonDrafts: new Map(),
     groupCardOpen: new Map(),
     groupSectionOpen: new Map(),
     resourceFormDrafts: new Map(),
     resourceFormBaselines: new Map(),
+    pendingResourceCreates: new Map(),
+    pendingResourceDeletes: new Map(),
+    resourceDraftSequence: 0,
     permissionFields: PERMISSION_FIELD_FALLBACK,
     access: null,
+    accessLoadToken: null,
     accessAdminGroup: null,
     promptKey: "decision",
     listPages: new Map(),
@@ -169,7 +222,7 @@
     "[data-entry-edit-form]",
     "[data-rule-edit-form]",
     "[data-memory-edit-form]",
-    "[data-resource-form]",
+    '[data-resource-form][data-save-scope="deferred"]',
   ].join(", ");
 
   function paginate(items, key) {
@@ -264,12 +317,53 @@
   }
 
   function anyResourceFormDirty() {
-    return state.resourceFormDrafts.size > 0;
+    return state.resourceFormDrafts.size > 0
+      || state.pendingResourceCreates.size > 0
+      || state.pendingResourceDeletes.size > 0;
   }
 
-  function groupResourceDraftDirty(groupId) {
+  function resourceDraftType(key) {
+    const parts = String(key).split(":");
+    if (parts[0] === "entry" || parts[0] === "create") return parts[2] || "";
+    if (parts[0] === "rule") return "rules";
+    if (parts[0] === "memory") return "memories";
+    return "";
+  }
+
+  function resourceDraftGroupId(key) {
+    return String(key).split(":")[1] || "";
+  }
+
+  function groupResourceDraftDirty(groupId, category = "") {
     const target = String(groupId);
-    return [...state.resourceFormDrafts.keys()].some(key => String(key).split(":", 2)[1] === target);
+    const matches = operation => String(operation.groupId) === target
+      && (!category || RESOURCE_TYPE_META[operation.type]?.category === category);
+    return [...state.resourceFormDrafts.keys()].some(key => (
+      resourceDraftGroupId(key) === target
+      && (!category || RESOURCE_TYPE_META[resourceDraftType(key)]?.category === category)
+    ))
+      || [...state.pendingResourceCreates.values()].some(matches)
+      || [...state.pendingResourceDeletes.values()].some(matches);
+  }
+
+  function unsavedChangeCount() {
+    let count = configDirty() ? 1 : 0;
+    count += state.groups.filter(groupDirty).length;
+    const resourceKeys = new Set();
+    for (const key of state.resourceFormDrafts.keys()) {
+      const parts = String(key).split(":");
+      if (parts[0] === "entry") resourceKeys.add(resourceOperationKey(parts[1], parts[2], parts.slice(3).join(":")));
+      else if (parts[0] === "rule") resourceKeys.add(resourceOperationKey(parts[1], "rules", parts.slice(2).join(":")));
+      else if (parts[0] === "memory") resourceKeys.add(resourceOperationKey(parts[1], "memories", parts.slice(2).join(":")));
+      else resourceKeys.add(key);
+    }
+    for (const key of state.pendingResourceCreates.keys()) resourceKeys.add(key);
+    for (const key of state.pendingResourceDeletes.keys()) resourceKeys.add(key);
+    return count + resourceKeys.size;
+  }
+
+  function hasUnsavedChanges() {
+    return configDirty() || anyGroupDirty() || anyResourceFormDirty();
   }
 
   function restartChanges() {
@@ -349,6 +443,7 @@
     const toast = document.createElement("div");
     const iconName = type === "error" ? "circle-x" : type === "warning" ? "triangle-alert" : "circle-check";
     toast.className = `toast ${type}`;
+    toast.setAttribute("role", type === "error" ? "alert" : "status");
     toast.innerHTML = `${icon(iconName)}<span>${escapeHtml(message)}</span>`;
     toastRegion.appendChild(toast);
     refreshIcons();
@@ -374,10 +469,21 @@
       </button>`;
   }
 
+  function desktopNavMarkup(items) {
+    let lastGroup = "";
+    return items.map(item => {
+      const heading = item.group !== lastGroup
+        ? `<span class="nav-group-label">${escapeHtml(item.group)}</span>`
+        : "";
+      lastGroup = item.group;
+      return `${heading}${navMarkup(item)}`;
+    }).join("");
+  }
+
   function updateNavigation() {
     const items = navItems();
     const mobileScrollLeft = mobileNav.scrollLeft;
-    desktopNav.innerHTML = items.map(navMarkup).join("");
+    desktopNav.innerHTML = desktopNavMarkup(items);
     mobileNav.innerHTML = items.map(navMarkup).join("");
     mobileNav.scrollLeft = mobileScrollLeft;
     const active = items.find(item => item.id === state.activeTab) || items[0];
@@ -385,24 +491,65 @@
     pageSubtitle.textContent = active.subtitle;
   }
 
+  function syncWorkspaceInteractionLock() {
+    const locked = state.loading
+      || state.saving
+      || state.reloadingGroups
+      || state.accessMutating
+      || state.immediateMutations > 0;
+    const drawerOpen = mobileSidebarMedia.matches && app.classList.contains("sidebar-open");
+    content.inert = locked || drawerOpen;
+    desktopNav.inert = locked;
+    mobileNav.inert = locked || drawerOpen;
+    topbarActions.inert = locked || drawerOpen;
+    sidebarToggle.disabled = locked;
+  }
+
   function updateChrome() {
     updateNavigation();
-    const dirty = configDirty();
+    const dirty = hasUnsavedChanges();
+    const dirtyCount = unsavedChangeCount();
     const restart = restartChanges();
-    saveButton.hidden = !state.session?.can_manage_global;
-    saveButton.disabled = !dirty || state.saving || state.loading;
-    reloadButton.disabled = state.saving || state.loading || state.groupSaving.size > 0;
+    saveButton.hidden = !state.session;
+    saveButton.disabled = !dirty
+      || state.saving
+      || state.loading
+      || state.reloadingGroups
+      || state.accessMutating
+      || state.immediateMutations > 0
+      || state.groupPermissionLoads.size > 0;
+    reloadButton.disabled = state.saving
+      || state.loading
+      || state.reloadingGroups
+      || state.accessMutating
+      || state.immediateMutations > 0
+      || state.groupSaving.size > 0;
     saveButton.innerHTML = state.saving
       ? `<span class="spinner spinner-compact"></span><span>保存中</span>`
-      : `${icon("save")}<span>保存配置</span>`;
-    saveState.hidden = !state.session?.can_manage_global;
+      : `${icon("save")}<span>保存全部</span>`;
+    saveButton.setAttribute("aria-label", dirtyCount ? `保存全部 ${dirtyCount} 项更改` : "保存全部");
+    saveButton.title = dirtyCount ? `保存全部 ${dirtyCount} 项更改` : "所有更改均已保存";
+    saveState.hidden = !state.session;
     saveState.className = `save-state${dirty ? " dirty" : ""}`;
-    saveState.textContent = dirty ? (restart.length ? "有未保存更改，含重启项" : "有未保存更改") : `修订 ${state.document?.revision ?? "-"}`;
+    saveState.textContent = state.saving
+      ? "正在保存全部更改"
+      : state.reloadingGroups
+        ? "正在刷新群组数据"
+        : state.accessMutating
+          ? "正在更新访问权限"
+          : state.immediateMutations > 0
+            ? "正在执行即时操作"
+            : dirty
+              ? `${dirtyCount} 项更改待保存${restart.length ? " · 含重启项" : ""}`
+              : state.session?.can_manage_global
+                ? `全部已保存 · 修订 ${state.document?.revision ?? "-"}`
+                : "全部已保存";
     const masterKey = state.document?.bootstrap?.master_key_configured;
     sidebarStatus.innerHTML = state.session?.can_manage_global ? `
       <div class="status-line"><span class="status-dot"></span><span>运行时配置 · r${escapeHtml(state.document?.revision ?? "-")}</span></div>
       <div class="status-line"><span class="status-dot${masterKey ? "" : " warning"}"></span><span>密钥加密 ${masterKey ? "已就绪" : "未配置"}</span></div>`
       : `<div class="status-line"><span class="status-dot"></span><span>群管理员模式</span></div>`;
+    syncWorkspaceInteractionLock();
     refreshIcons();
   }
 
@@ -1187,13 +1334,14 @@
   }
 
   function renderGroupPermissions(group, saving) {
+    const loading = state.groupPermissionLoads.has(String(group.id));
     const config = group.settings.default_permissions;
     if (!config) {
       return `
         <div class="field group-permissions-editor">
           <div class="field-label-row"><span class="field-label">群默认用户权限与定时模式</span></div>
           <p class="field-hint">尚未接管此群的默认权限。先读取 Telegram 当前值，再按群配置完整权限和夜间时段。</p>
-          <button class="secondary-button" type="button" data-action="load-group-permissions" data-group-id="${attr(group.id)}"${saving ? " disabled" : ""}>${icon("download")}<span>读取当前群权限</span></button>
+          <button class="secondary-button" type="button" data-action="load-group-permissions" data-group-id="${attr(group.id)}"${saving || loading ? " disabled" : ""}>${loading ? `<span class="spinner spinner-small"></span><span>正在读取</span>` : `${icon("download")}<span>读取当前群权限</span>`}</button>
         </div>`;
     }
     const weekdays = ["一", "二", "三", "四", "五", "六", "日"];
@@ -1266,6 +1414,10 @@
     return state.groupSectionOpen.has(key) ? state.groupSectionOpen.get(key) : defaultOpen;
   }
 
+  function groupSectionSettingKeys(sectionKey) {
+    return GROUP_SECTION_SETTING_KEYS[sectionKey] || [];
+  }
+
   function groupSectionDirty(group, settingKeys = []) {
     const baseline = state.groupBaselines.get(String(group.id)) || {};
     if (settingKeys.includes("welcome_buttons") && state.groupTemplateButtonDrafts.get(String(group.id))?.error) {
@@ -1277,6 +1429,21 @@
   function updateRenderedGroupSectionDirty(section, dirty, label = "已修改") {
     if (!section) return;
     section.classList.toggle("dirty", dirty);
+    const quickButton = section.closest("[data-group-card]")?.querySelector(
+      `[data-action="jump-group-section"][data-group-section="${CSS.escape(section.dataset.groupSection || "")}"]`,
+    );
+    quickButton?.classList.toggle("dirty", dirty);
+    if (quickButton) {
+      let indicator = quickButton.querySelector("small");
+      if (dirty && !indicator) {
+        indicator = document.createElement("small");
+        indicator.textContent = "待保存";
+        quickButton.append(indicator);
+      } else if (!dirty && indicator) {
+        indicator.remove();
+      }
+      quickButton.setAttribute("aria-label", `${quickButton.querySelector("span")?.textContent || "分类"}${dirty ? "，有待保存更改" : ""}`);
+    }
     const meta = section.querySelector(".group-section-meta");
     let badge = meta?.querySelector("[data-group-section-dirty]");
     if (dirty && !badge && meta) {
@@ -1326,13 +1493,13 @@
   }
 
   function renderGroupCard(group) {
-    const dirty = groupDirty(group);
-    const saving = state.groupSaving.has(String(group.id));
+    const dirty = groupDirty(group) || groupResourceDraftDirty(group.id);
+    const saving = state.saving || state.groupSaving.has(String(group.id));
     const searchText = `${group.title || ""} ${group.id}`.toLowerCase();
     const cardOpen = groupCardIsOpen(group);
     const cardId = `group-${group.id}-settings`;
     return `
-      <article class="item-card group-card" data-group-card data-search="${attr(searchText)}">
+      <article class="item-card group-card" data-group-card data-group-id="${attr(group.id)}" data-search="${attr(searchText)}">
         <div class="item-card-header">
           <button class="group-card-toggle" id="${attr(cardId)}-toggle" type="button" data-action="toggle-group-card" data-group-id="${attr(group.id)}" aria-expanded="${cardOpen}" aria-controls="${attr(cardId)}-body">
             <span class="item-card-title">
@@ -1342,21 +1509,24 @@
             ${icon("chevron-down", "group-card-chevron")}
           </button>
           <div class="item-actions">
-            ${dirty ? `<span class="group-save-state" role="status">未保存</span>` : ""}
-            <button class="secondary-button" type="button" data-action="save-group" data-group-id="${attr(group.id)}"${dirty && !saving ? "" : " disabled"}>
-              ${saving ? `<span class="spinner spinner-small"></span>` : icon("save")}
-              <span>${saving ? "保存中" : "保存"}</span>
-            </button>
+            ${dirty ? `<span class="group-save-state" role="status">有未保存更改</span>` : ""}
           </div>
         </div>
-        <div class="item-card-body" id="${attr(cardId)}-body" role="region" aria-labelledby="${attr(cardId)}-toggle" data-group-card-body${cardOpen ? "" : " hidden"}>
+        <div class="item-card-body" id="${attr(cardId)}-body" role="region" aria-labelledby="${attr(cardId)}-toggle" data-group-card-body data-group-body-rendered="${cardOpen}"${cardOpen ? "" : " hidden"}>
+          ${cardOpen ? `
           <div class="group-settings-toolbar">
-            <div><strong>设置分类</strong><small>按需展开，修改状态会在分类标题中提示</small></div>
+            <div><strong>快速定位</strong><small>直接进入需要的功能，修改后统一点击页面右上角“保存全部”</small></div>
             <div class="group-settings-toolbar-actions">
               <button class="text-button" type="button" data-action="set-group-sections" data-group-id="${attr(group.id)}" data-open="true">全部展开</button>
               <button class="text-button" type="button" data-action="set-group-sections" data-group-id="${attr(group.id)}" data-open="false">全部收起</button>
             </div>
           </div>
+          <nav class="group-quick-nav" aria-label="${attr(group.title || group.id)} 功能分类">
+            ${GROUP_SECTION_NAV.map(item => `
+              <button class="group-quick-nav-button${groupResourceDraftDirty(group.id, item.key) || groupSectionDirty(group, groupSectionSettingKeys(item.key)) ? " dirty" : ""}" type="button" data-action="jump-group-section" data-group-id="${attr(group.id)}" data-group-section="${attr(item.key)}">
+                ${icon(item.icon)}<span>${escapeHtml(item.label)}</span>${groupResourceDraftDirty(group.id, item.key) || groupSectionDirty(group, groupSectionSettingKeys(item.key)) ? `<small>待保存</small>` : ""}
+              </button>`).join("")}
+          </nav>
           <div class="group-settings-sections">
             ${renderGroupSettingsSection(group, {
               key: "reply-media",
@@ -1542,30 +1712,135 @@
                 </div>`,
             })}
             ${renderGroupSettingsSection(group, {
-              key: "resources",
-              title: "群规、记忆与自动化",
-              description: "关键词回复、定时消息、群规、记忆与成员名单",
-              iconName: "list-tree",
-              itemLabel: "8 类数据",
-              additionalDirty: groupResourceDraftDirty(group.id),
-              dirtyLabel: "有草稿",
-              content: `
-                <div class="group-resource-panel" data-group-resource-panel="${attr(group.id)}">
-                  <div class="subsection-head">
-                    <span class="field-hint">按需加载群管理数据，不影响上方群设置的独立保存。</span>
-                    <button class="secondary-button" type="button" data-action="load-group-resources" data-group-id="${attr(group.id)}">${icon("list-tree")}管理</button>
-                  </div>
-                  ${renderGroupResources(group)}
-                </div>`,
+              key: "automation",
+              title: "关键词回复与定时消息",
+              description: "固定回复、消息计划与发送方式",
+              iconName: "timer",
+              itemLabel: resourceCategoryItemLabel(group.id, "automation"),
+              additionalDirty: groupResourceDraftDirty(group.id, "automation"),
+              dirtyLabel: "待保存",
+              content: renderGroupResourcePanel(group, "automation"),
             })}
-          </div>
+            ${renderGroupSettingsSection(group, {
+              key: "rules-memory",
+              title: "群规与永久记忆",
+              description: "内容治理规则与长期上下文",
+              iconName: "book-open-check",
+              itemLabel: resourceCategoryItemLabel(group.id, "rules-memory"),
+              additionalDirty: groupResourceDraftDirty(group.id, "rules-memory"),
+              dirtyLabel: "待保存",
+              content: renderGroupResourcePanel(group, "rules-memory"),
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "member-lists",
+              title: "成员记录与名单",
+              description: "警告、封禁、审核豁免与回复静默",
+              iconName: "contact-round",
+              itemLabel: resourceCategoryItemLabel(group.id, "member-lists"),
+              content: renderGroupResourcePanel(group, "member-lists"),
+            })}
+          </div>` : ""}
         </div>
       </article>`;
   }
 
-  function renderKeywordReplyRow(group, item) {
+  function resourceOperationKey(groupId, type, id) {
+    return `${String(groupId)}:${String(type)}:${String(id)}`;
+  }
+
+  function resourceEditDraftKey(groupId, type, id) {
+    if (type === "rules") return `rule:${groupId}:${id}`;
+    if (type === "memories") return `memory:${groupId}:${id}`;
+    return `entry:${groupId}:${type}:${id}`;
+  }
+
+  function resourceArray(groupId, type) {
+    const resource = state.groupResources.get(String(groupId));
+    const property = RESOURCE_TYPE_META[type]?.property;
+    return resource && property && Array.isArray(resource[property]) ? resource[property] : [];
+  }
+
+  function upsertResourceRow(groupId, type, document) {
+    if (!document) return;
+    const list = resourceArray(groupId, type);
+    const identity = document.id ?? document.user_id;
+    const index = list.findIndex(item => String(item.id ?? item.user_id) === String(identity));
+    if (index >= 0) list.splice(index, 1, document);
+    else list.unshift(document);
+  }
+
+  function applyImmediateResourceCreate(groupId, type, result) {
+    const responseKey = RESOURCE_TYPE_META[type]?.response;
+    const document = responseKey ? result?.[responseKey] : null;
+    upsertResourceRow(groupId, type, document);
+    if (type === "bans" && document) {
+      const warning = resourceArray(groupId, "warnings")
+        .find(item => String(item.user_id) === String(document.user_id));
+      if (warning) warning.is_banned = true;
+    }
+    bumpGroupResourceMutationEpoch(groupId);
+  }
+
+  function applyImmediateResourceDelete(groupId, type, id) {
+    const list = resourceArray(groupId, type);
+    const index = list.findIndex(item => String(item.id ?? item.user_id) === String(id));
+    if (index >= 0) list.splice(index, 1);
+    if (type === "bans") {
+      const warningList = resourceArray(groupId, "warnings");
+      const warningIndex = warningList.findIndex(item => String(item.user_id) === String(id));
+      if (warningIndex >= 0) warningList.splice(warningIndex, 1);
+    }
+    bumpGroupResourceMutationEpoch(groupId);
+  }
+
+  function bumpGroupResourceMutationEpoch(groupId) {
+    const key = String(groupId);
+    state.groupResourceMutationEpochs.set(key, (state.groupResourceMutationEpochs.get(key) || 0) + 1);
+  }
+
+  function resourcePendingDelete(groupId, type, id) {
+    return state.pendingResourceDeletes.has(resourceOperationKey(groupId, type, id));
+  }
+
+  function resourcePendingCreate(groupId, type, id) {
+    return state.pendingResourceCreates.has(resourceOperationKey(groupId, type, id));
+  }
+
+  function resourceCategoryItemLabel(groupId, category) {
+    const resource = state.groupResources.get(String(groupId));
+    if (!resource) return "按需加载";
+    if (resource.loading && !resource.loaded) return "正在加载";
+    if (resource.error && !resource.loaded) return "加载失败";
+    const total = Object.entries(RESOURCE_TYPE_META)
+      .filter(([, meta]) => meta.category === category)
+      .reduce((sum, [, meta]) => sum + (Array.isArray(resource[meta.property]) ? resource[meta.property].length : 0), 0);
+    return `${total} 条`;
+  }
+
+  function resourceEntryState(groupId, type, id) {
+    if (resourcePendingCreate(groupId, type, id)) return `<span class="badge info" data-resource-form-state>待新增</span>`;
+    if (state.resourceFormDrafts.has(resourceEditDraftKey(groupId, type, id))) {
+      return `<span class="badge warning" data-resource-form-state>已修改</span>`;
+    }
+    return `<span class="badge resource-clean-state" data-resource-form-state>已保存</span>`;
+  }
+
+  function pendingDeletionRow(group, type, item, label) {
     return `
-      <form class="rule-resource-form entry-edit-form" data-entry-edit-form="keyword-replies" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+      <div class="resource-row pending-delete" data-pending-resource-delete="${attr(resourceOperationKey(group.id, type, item.id ?? item.user_id))}">
+        <span>${escapeHtml(label)}<small>将在点击“保存全部”后删除</small></span>
+        <button class="text-button" type="button" data-action="undo-delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${attr(type)}" data-resource-id="${attr(item.id ?? item.user_id)}">${icon("undo-2")}撤销</button>
+      </div>`;
+  }
+
+  function renderKeywordReplyRow(group, item) {
+    if (resourcePendingDelete(group.id, "keyword-replies", item.id)) {
+      return pendingDeletionRow(group, "keyword-replies", item, `关键词回复：${item.keyword}`);
+    }
+    const pendingCreate = resourcePendingCreate(group.id, "keyword-replies", item.id);
+    return `
+      <form class="rule-resource-form entry-edit-form${pendingCreate ? " pending-create" : ""}" data-entry-edit-form="keyword-replies" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+        <div class="resource-form-head"><strong>${escapeHtml(item.keyword || "新关键词")}</strong>${resourceEntryState(group.id, "keyword-replies", item.id)}</div>
         <select name="match_type" aria-label="匹配方式">
           <option value="contains"${item.match_type === "contains" ? " selected" : ""}>包含</option>
           <option value="exact"${item.match_type === "exact" ? " selected" : ""}>完全匹配</option>
@@ -1576,148 +1851,212 @@
         <textarea name="buttons_text" maxlength="30000" rows="2" aria-label="内联按钮" placeholder="按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；内容中 | 写成 \\|">${escapeHtml(templateButtonsToText(item.buttons))}</textarea>
         <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
         <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
-        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled ? " checked" : ""}><span>启用</span></label>
-        <button class="mini-icon-button" type="submit" aria-label="保存" title="保存">${icon("save")}</button>
-        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="keyword-replies" data-resource-id="${attr(item.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
+        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled !== false ? " checked" : ""}><span>启用</span></label>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="keyword-replies" data-resource-id="${attr(item.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
       </form>`;
   }
 
   function renderScheduledMessageRow(group, item) {
+    if (resourcePendingDelete(group.id, "scheduled-messages", item.id)) {
+      return pendingDeletionRow(group, "scheduled-messages", item, `定时消息：${item.text}`);
+    }
+    const pendingCreate = resourcePendingCreate(group.id, "scheduled-messages", item.id);
     return `
-      <form class="rule-resource-form entry-edit-form" data-entry-edit-form="scheduled-messages" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+      <form class="rule-resource-form entry-edit-form${pendingCreate ? " pending-create" : ""}" data-entry-edit-form="scheduled-messages" data-group-id="${attr(group.id)}" data-entry-id="${attr(item.id)}">
+        <div class="resource-form-head"><strong>${item.schedule_type === "interval" ? "固定间隔" : "每天定时"}</strong>${resourceEntryState(group.id, "scheduled-messages", item.id)}</div>
         <textarea name="text" maxlength="4000" rows="3" aria-label="消息内容" required>${escapeHtml(item.text)}</textarea>
         <textarea name="buttons_text" maxlength="30000" rows="2" aria-label="内联按钮" placeholder="按钮名 | url/copy/share/dismiss | 内容 | 行号；内容中 | 写成 \\|">${escapeHtml(templateButtonsToText(item.buttons))}</textarea>
         <select name="schedule_type" aria-label="定时方式">
           <option value="daily"${item.schedule_type === "daily" ? " selected" : ""}>每天定时</option>
           <option value="interval"${item.schedule_type === "interval" ? " selected" : ""}>固定间隔</option>
         </select>
-        <input name="schedule_time" type="time" value="${attr(item.schedule_time)}" aria-label="发送时间" title="每天定时的发送时间">
-        <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="${attr(item.interval_minutes)}" aria-label="间隔分钟" title="固定间隔的分钟数" required>
+        <input name="schedule_time" type="time" value="${attr(item.schedule_time || "09:00")}" aria-label="发送时间" title="每天定时的发送时间">
+        <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="${attr(item.interval_minutes || 60)}" aria-label="间隔分钟" title="固定间隔的分钟数" required>
         <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
         <label class="compact-check"><input name="unpin_previous" type="checkbox"${item.unpin_previous ? " checked" : ""}><span>取消上次置顶</span></label>
         <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
-        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled ? " checked" : ""}><span>启用</span></label>
-        <button class="mini-icon-button" type="submit" aria-label="保存" title="保存">${icon("save")}</button>
-        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="scheduled-messages" data-resource-id="${attr(item.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
+        <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled !== false ? " checked" : ""}><span>启用</span></label>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="scheduled-messages" data-resource-id="${attr(item.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
       </form>`;
   }
 
-  function renderGroupResources(group) {
+  function renderRuleRow(group, rule) {
+    if (resourcePendingDelete(group.id, "rules", rule.id)) {
+      return pendingDeletionRow(group, "rules", rule, `群规：${rule.pattern}`);
+    }
+    const pendingCreate = resourcePendingCreate(group.id, "rules", rule.id);
+    return `
+      <form class="rule-resource-form${pendingCreate ? " pending-create" : ""}" data-rule-edit-form data-group-id="${attr(group.id)}" data-rule-id="${attr(rule.id)}">
+        <div class="resource-form-head"><strong>群规</strong>${resourceEntryState(group.id, "rules", rule.id)}</div>
+        <select name="rule_type" aria-label="群规类型">
+          <option value="keyword"${rule.rule_type === "keyword" ? " selected" : ""}>关键词</option>
+          <option value="regex"${rule.rule_type === "regex" ? " selected" : ""}>正则</option>
+          <option value="llm"${rule.rule_type === "llm" ? " selected" : ""}>语义</option>
+        </select>
+        <textarea name="pattern" maxlength="1000" rows="2" aria-label="群规内容" required>${escapeHtml(rule.pattern)}</textarea>
+        <select name="action" aria-label="命中动作">
+          <option value="warn"${rule.action === "warn" ? " selected" : ""}>警告</option>
+          <option value="delete"${rule.action === "delete" ? " selected" : ""}>删消息</option>
+          <option value="ban"${rule.action === "ban" ? " selected" : ""}>封禁</option>
+        </select>
+        <label class="compact-check"><input name="enabled" type="checkbox"${rule.enabled !== false ? " checked" : ""}><span>启用</span></label>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="rules" data-resource-id="${attr(rule.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
+      </form>`;
+  }
+
+  function renderMemoryRow(group, item) {
+    if (resourcePendingDelete(group.id, "memories", item.id)) {
+      return pendingDeletionRow(group, "memories", item, `永久记忆：${item.content}`);
+    }
+    const pendingCreate = resourcePendingCreate(group.id, "memories", item.id);
+    return `
+      <form class="rule-resource-form memory-edit-form${pendingCreate ? " pending-create" : ""}" data-memory-edit-form data-group-id="${attr(group.id)}" data-memory-id="${attr(item.id)}">
+        <div class="resource-form-head"><strong>永久记忆</strong>${resourceEntryState(group.id, "memories", item.id)}</div>
+        <textarea name="content" maxlength="4000" rows="3" aria-label="永久记忆内容" required>${escapeHtml(item.content)}</textarea>
+        <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="memories" data-resource-id="${attr(item.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
+      </form>`;
+  }
+
+  function resourcePanelShell(group, category, contentMarkup) {
     const resource = state.groupResources.get(String(group.id));
-    if (!resource) return `<p class="field-hint">打开后可直接管理关键词回复、定时消息、群规、永久记忆、警告记录、群内封禁、审核豁免和回复静默名单。</p>`;
-    if (resource.loading) return `<div class="loading-inline"><span class="spinner spinner-small"></span><span>正在加载</span></div>`;
-    if (resource.error) return `<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(resource.error)}</span></div>`;
+    const refreshing = Boolean(resource?.refreshing);
+    return `
+      <div class="group-resource-panel" data-group-resource-panel="${attr(group.id)}" data-resource-category="${attr(category)}">
+        <div class="resource-panel-toolbar">
+          <span class="field-hint">${category === "member-lists" ? "此处是即时管理操作，按钮会明确标注动作。" : "新增、编辑和删除会先成为草稿，最后统一保存。"}</span>
+          <button class="secondary-button" type="button" data-action="load-group-resources" data-group-id="${attr(group.id)}"${refreshing ? " disabled" : ""}>${refreshing ? `<span class="spinner spinner-small"></span>` : icon(resource?.loaded ? "refresh-cw" : "download")}${resource?.loaded ? "刷新数据" : "加载数据"}</button>
+        </div>
+        ${resource?.loaded && resource.error ? `<div class="notice warning resource-refresh-notice">${icon("triangle-alert")}<span>${escapeHtml(resource.error)}；已保留其余已加载数据。</span></div>` : ""}
+        ${contentMarkup}
+      </div>`;
+  }
+
+  function renderGroupResourcePanel(group, category) {
+    const resource = state.groupResources.get(String(group.id));
+    if (!resource) {
+      return resourcePanelShell(group, category, `
+        <div class="resource-empty-state">${icon(category === "automation" ? "timer" : category === "rules-memory" ? "book-open-check" : "contact-round")}
+          <div><strong>尚未加载此群数据</strong><span>点击右上角“加载数据”后即可管理。</span></div>
+        </div>`);
+    }
+    if (resource.loading && !resource.loaded) {
+      return resourcePanelShell(group, category, `<div class="loading-inline resource-loading"><span class="spinner spinner-small"></span><span>正在加载群管理数据</span></div>`);
+    }
+    if (resource.error && !resource.loaded) {
+      return resourcePanelShell(group, category, `<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(resource.error)}</span></div>`);
+    }
+    if (category === "automation") return resourcePanelShell(group, category, renderAutomationResources(group, resource));
+    if (category === "rules-memory") return resourcePanelShell(group, category, renderRulesMemoryResources(group, resource));
+    return resourcePanelShell(group, category, renderMemberListResources(group, resource));
+  }
+
+  function resourceCardHead(iconName, title, description, count) {
+    return `<div class="resource-card-head"><span class="resource-card-icon">${icon(iconName)}</span><div><h4>${escapeHtml(title)}</h4><p>${escapeHtml(description)}</p></div><span class="badge info">${count} 条</span></div>`;
+  }
+
+  function renderAutomationResources(group, resource) {
+    const listKey = type => `group:${group.id}:${type}`;
+    return `<div class="resource-category-grid">
+      <section class="resource-category-card accent-blue">
+        ${resourceCardHead("message-square-text", "关键词回复", "命中关键词后直接发送固定内容", resource.keyword_replies.length)}
+        <form class="inline-resource-form template-resource-form resource-create-form" data-resource-form="keyword-replies" data-save-scope="deferred" data-group-id="${attr(group.id)}">
+          <div class="resource-create-head"><strong>新建关键词回复</strong><span>填写后加入草稿列表</span></div>
+          <select name="match_type" aria-label="匹配方式"><option value="contains">包含</option><option value="exact">完全匹配</option><option value="regex">正则</option></select>
+          <input name="keyword" maxlength="255" placeholder="关键词" aria-label="关键词" required>
+          <textarea name="reply_text" maxlength="4000" rows="3" placeholder="回复内容（支持换行和 Markdown）" aria-label="回复内容" required></textarea>
+          <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；| 写成 \\|" aria-label="内联按钮"></textarea>
+          <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
+          <label class="compact-check"><input name="auto_delete" type="checkbox" checked><span>自动删除</span></label>
+          <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
+        </form>
+        <p class="field-hint">命中后跳过 AI；内容支持 Markdown。${templateButtonStyleLegend()}</p>
+        <div class="resource-entry-list">${paginatedRows(resource.keyword_replies, listKey("keyword-replies"), item => renderKeywordReplyRow(group, item), "暂无关键词回复")}</div>
+      </section>
+      <section class="resource-category-card accent-violet">
+        ${resourceCardHead("calendar-clock", "定时消息", "按每日时间或固定间隔自动发送", resource.scheduled_messages.length)}
+        <form class="inline-resource-form template-resource-form resource-create-form" data-resource-form="scheduled-messages" data-save-scope="deferred" data-group-id="${attr(group.id)}">
+          <div class="resource-create-head"><strong>新建定时消息</strong><span>填写后加入草稿列表</span></div>
+          <textarea name="text" maxlength="4000" rows="3" placeholder="消息内容（支持换行和 Markdown）" aria-label="定时消息内容" required></textarea>
+          <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号；| 写成 \\|" aria-label="内联按钮"></textarea>
+          <select name="schedule_type" aria-label="定时方式"><option value="daily">每天定时</option><option value="interval">固定间隔</option></select>
+          <input name="schedule_time" type="time" value="09:00" aria-label="发送时间" title="每天定时的发送时间">
+          <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="60" aria-label="间隔分钟" title="固定间隔的分钟数" required>
+          <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
+          <label class="compact-check"><input name="auto_delete" type="checkbox"><span>自动删除</span></label>
+          <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
+        </form>
+        <p class="field-hint">每天定时按 Asia/Shanghai 时间触发；固定间隔最短 5 分钟。</p>
+        <div class="resource-entry-list">${paginatedRows(resource.scheduled_messages, listKey("scheduled-messages"), item => renderScheduledMessageRow(group, item), "暂无定时消息")}</div>
+      </section>
+    </div>`;
+  }
+
+  function renderRulesMemoryResources(group, resource) {
+    const listKey = type => `group:${group.id}:${type}`;
+    return `<div class="resource-category-grid two-column">
+      <section class="resource-category-card accent-orange">
+        ${resourceCardHead("shield-alert", "群规", "关键词、正则或语义规则及命中动作", resource.rules.length)}
+        <form class="inline-resource-form multiline-resource-form resource-create-form" data-resource-form="rules" data-save-scope="deferred" data-group-id="${attr(group.id)}">
+          <div class="resource-create-head"><strong>新建群规</strong><span>填写后加入草稿列表</span></div>
+          <select name="rule_type" aria-label="群规类型"><option value="keyword">关键词</option><option value="regex">正则</option><option value="llm">语义</option></select>
+          <textarea name="pattern" maxlength="1000" rows="2" placeholder="规则内容" aria-label="群规内容" required></textarea>
+          <select name="action" aria-label="命中动作"><option value="warn">警告</option><option value="delete">删消息</option><option value="ban">封禁</option></select>
+          <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
+        </form>
+        <div class="resource-entry-list">${paginatedRows(resource.rules, listKey("rules"), rule => renderRuleRow(group, rule), "暂无群规")}</div>
+      </section>
+      <section class="resource-category-card accent-green">
+        ${resourceCardHead("brain", "永久记忆", "长期提供给 AI 的群组背景信息", resource.memories.length)}
+        <form class="inline-resource-form multiline-resource-form resource-create-form" data-resource-form="memories" data-save-scope="deferred" data-group-id="${attr(group.id)}">
+          <div class="resource-create-head"><strong>新建永久记忆</strong><span>填写后加入草稿列表</span></div>
+          <textarea name="content" maxlength="4000" rows="2" placeholder="新增永久记忆" aria-label="永久记忆内容" required></textarea>
+          <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
+        </form>
+        <div class="resource-entry-list">${paginatedRows(resource.memories, listKey("memories"), item => renderMemoryRow(group, item), "暂无永久记忆")}</div>
+      </section>
+    </div>`;
+  }
+
+  function renderMemberListResources(group, resource) {
     const listKey = type => `group:${group.id}:${type}`;
     const userLabel = item => {
       const name = String(item.display_name || item.username || `用户 ${item.user_id}`);
       const username = String(item.username || "").replace(/^@/, "");
-      const usernamePart = username && name !== `@${username}` ? ` · @${username}` : "";
-      return `${name}${usernamePart} · ${item.user_id}`;
+      return `${name}${username && name !== `@${username}` ? ` · @${username}` : ""} · ${item.user_id}`;
     };
+    const actionLabel = type => ({ warnings: "清零警告", bans: "立即解封", "moderation-exemptions": "取消豁免", "reply-mutes": "取消静默" })[type] || "移除";
     const itemRows = (items, type, text) => paginatedRows(items, listKey(type), item => `
       <div class="resource-row">
         <span>${escapeHtml(text(item))}</span>
-        <span class="resource-row-actions">
-          ${type === "memories" ? `<button class="mini-icon-button" type="button" data-action="edit-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id)}" aria-label="编辑" title="编辑">${icon("pencil")}</button>` : ""}
-          ${(type !== "warnings" || !item.is_banned) ? `<button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${type}" data-resource-id="${attr(item.id ?? item.user_id)}" aria-label="${type === "warnings" ? "清零警告" : "删除"}" title="${type === "warnings" ? "清零警告" : "删除"}">${icon("trash-2")}</button>` : ""}
-        </span>
-      </div>`);
-    return `
-      <div class="resource-grid">
-        <section class="resource-span">
-          <h4>关键词回复</h4>
-          <form class="inline-resource-form template-resource-form" data-resource-form="keyword-replies" data-group-id="${attr(group.id)}">
-            <select name="match_type" aria-label="匹配方式"><option value="contains">包含</option><option value="exact">完全匹配</option><option value="regex">正则</option></select>
-            <input name="keyword" maxlength="255" placeholder="关键词" required>
-            <textarea name="reply_text" maxlength="4000" rows="3" placeholder="回复内容（支持换行和 Markdown）" required></textarea>
-            <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；| 写成 \\|"></textarea>
-            <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
-            <label class="compact-check"><input name="auto_delete" type="checkbox" checked><span>自动删除</span></label>
-            <button class="icon-button" type="submit" aria-label="新增关键词回复" title="新增关键词回复">${icon("plus")}</button>
-          </form>
-          <p class="field-hint">命中后直接发送固定回复并跳过 AI；内容支持换行和 Markdown。按钮同一行号会横向排列；「自动删除」按全局关键词类别执行。${templateButtonStyleLegend()}</p>
-          ${paginatedRows(resource.keyword_replies, listKey("keyword-replies"), item => renderKeywordReplyRow(group, item))}
-        </section>
-        <section class="resource-span">
-          <h4>定时消息</h4>
-          <form class="inline-resource-form template-resource-form" data-resource-form="scheduled-messages" data-group-id="${attr(group.id)}">
-            <textarea name="text" maxlength="4000" rows="3" placeholder="消息内容（支持换行和 Markdown）" required></textarea>
-            <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号；| 写成 \\|"></textarea>
-            <select name="schedule_type" aria-label="定时方式"><option value="daily">每天定时</option><option value="interval">固定间隔</option></select>
-            <input name="schedule_time" type="time" value="09:00" aria-label="发送时间" title="每天定时的发送时间">
-            <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="60" aria-label="间隔分钟" title="固定间隔的分钟数" required>
-            <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
-            <label class="compact-check"><input name="auto_delete" type="checkbox"><span>自动删除</span></label>
-            <button class="icon-button" type="submit" aria-label="新增定时消息" title="新增定时消息">${icon("plus")}</button>
-          </form>
-          <p class="field-hint">内容支持换行和 Markdown；「每天定时」按发送时间触发，「固定间隔」按分钟循环。按钮同一行号会横向排列。</p>
-          ${paginatedRows(resource.scheduled_messages, listKey("scheduled-messages"), item => renderScheduledMessageRow(group, item))}
-        </section>
-        <section>
-          <h4>群规</h4>
-          <form class="inline-resource-form multiline-resource-form" data-resource-form="rules" data-group-id="${attr(group.id)}">
-            <select name="rule_type"><option value="keyword">关键词</option><option value="regex">正则</option><option value="llm">语义</option></select>
-            <textarea name="pattern" maxlength="1000" rows="2" placeholder="规则内容（支持换行，可拉伸）" required></textarea>
-            <select name="action"><option value="warn">警告</option><option value="delete">删消息</option><option value="ban">封禁</option></select>
-            <button class="icon-button" type="submit" aria-label="新增群规" title="新增群规">${icon("plus")}</button>
-          </form>
-          ${paginatedRows(resource.rules, listKey("rules"), rule => `
-            <form class="rule-resource-form" data-rule-edit-form data-group-id="${attr(group.id)}" data-rule-id="${attr(rule.id)}">
-              <select name="rule_type" aria-label="群规类型">
-                <option value="keyword"${rule.rule_type === "keyword" ? " selected" : ""}>关键词</option>
-                <option value="regex"${rule.rule_type === "regex" ? " selected" : ""}>正则</option>
-                <option value="llm"${rule.rule_type === "llm" ? " selected" : ""}>语义</option>
-              </select>
-              <textarea name="pattern" maxlength="1000" rows="2" aria-label="群规内容" required>${escapeHtml(rule.pattern)}</textarea>
-              <select name="action" aria-label="命中动作">
-                <option value="warn"${rule.action === "warn" ? " selected" : ""}>警告</option>
-                <option value="delete"${rule.action === "delete" ? " selected" : ""}>删消息</option>
-                <option value="ban"${rule.action === "ban" ? " selected" : ""}>封禁</option>
-              </select>
-              <label class="compact-check"><input name="enabled" type="checkbox"${rule.enabled ? " checked" : ""}><span>启用</span></label>
-              <button class="mini-icon-button" type="submit" aria-label="保存群规" title="保存群规">${icon("save")}</button>
-              <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="rules" data-resource-id="${attr(rule.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
-            </form>`)}
-        </section>
-        <section>
-          <h4>永久记忆</h4>
-          <form class="inline-resource-form multiline-resource-form" data-resource-form="memories" data-group-id="${attr(group.id)}">
-            <textarea name="content" maxlength="4000" rows="2" placeholder="新增永久记忆（支持换行，可拉伸）" required></textarea>
-            <button class="icon-button" type="submit" aria-label="新增记忆" title="新增记忆">${icon("plus")}</button>
-          </form>
-          ${paginatedRows(resource.memories, listKey("memories"), item => `
-            <form class="rule-resource-form memory-edit-form" data-memory-edit-form data-group-id="${attr(group.id)}" data-memory-id="${attr(item.id)}">
-              <textarea name="content" maxlength="4000" rows="3" aria-label="永久记忆内容" required>${escapeHtml(item.content)}</textarea>
-              <button class="mini-icon-button" type="submit" aria-label="保存记忆" title="保存记忆">${icon("save")}</button>
-              <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="memories" data-resource-id="${attr(item.id)}" aria-label="删除" title="删除">${icon("trash-2")}</button>
-            </form>`)}
-        </section>
-        <section>
-          <h4>警告与封禁记录</h4>
-          ${itemRows(resource.warnings, "warnings", item => `${userLabel(item)} · ${item.count} 次${item.is_banned ? " · 已封禁（请在下方解封）" : ""}`)}
-        </section>
-        <section>
-          <h4>群内封禁</h4>
-          ${userIdForm(group.id, "bans", "输入用户 ID 后封禁")}
-          ${itemRows(resource.bans, "bans", item => `${userLabel(item)} · 已封禁`)}
-        </section>
-        <section>
-          <h4>AI 审核豁免</h4>
-          ${userIdForm(group.id, "moderation-exemptions", "新增豁免用户 ID")}
-          ${itemRows(resource.exemptions, "moderation-exemptions", item => userLabel(item))}
-        </section>
-        <section>
-          <h4>回复静默名单</h4>
-          ${userIdForm(group.id, "reply-mutes", "新增静默用户 ID")}
-          ${itemRows(resource.reply_mutes, "reply-mutes", item => userLabel(item))}
-        </section>
-      </div>`;
+        ${(type !== "warnings" || !item.is_banned) ? `<button class="text-button danger immediate-action" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="${attr(type)}" data-resource-id="${attr(item.id ?? item.user_id)}">${actionLabel(type)}</button>` : ""}
+      </div>`, "暂无记录");
+    return `<div class="member-resource-grid">
+      <section class="resource-category-card compact accent-orange">
+        ${resourceCardHead("triangle-alert", "警告记录", "查看累计警告并清零", resource.warnings.length)}
+        ${itemRows(resource.warnings, "warnings", item => `${userLabel(item)} · ${item.count} 次${item.is_banned ? " · 已封禁" : ""}`)}
+      </section>
+      <section class="resource-category-card compact accent-red">
+        ${resourceCardHead("user-x", "群内封禁", "立即执行 Telegram 封禁或解封", resource.bans.length)}
+        ${userIdForm(group.id, "bans", "用户 ID", "立即封禁")}
+        ${itemRows(resource.bans, "bans", item => `${userLabel(item)} · 已封禁`)}
+      </section>
+      <section class="resource-category-card compact accent-blue">
+        ${resourceCardHead("shield-check", "AI 审核豁免", "跳过 AI 审核限制", resource.exemptions.length)}
+        ${userIdForm(group.id, "moderation-exemptions", "用户 ID", "立即豁免")}
+        ${itemRows(resource.exemptions, "moderation-exemptions", item => userLabel(item))}
+      </section>
+      <section class="resource-category-card compact accent-violet">
+        ${resourceCardHead("message-square-off", "回复静默名单", "Bot 不再回复名单中的成员", resource.reply_mutes.length)}
+        ${userIdForm(group.id, "reply-mutes", "用户 ID", "立即静默")}
+        ${itemRows(resource.reply_mutes, "reply-mutes", item => userLabel(item))}
+      </section>
+    </div>`;
   }
 
-  function userIdForm(groupId, type, placeholder) {
-    return `<form class="inline-resource-form" data-resource-form="${type}" data-group-id="${attr(groupId)}">
-      <input name="user_id" type="number" step="1" placeholder="${attr(placeholder)}" required>
-      <button class="icon-button" type="submit" aria-label="新增" title="新增">${icon("plus")}</button>
+  function userIdForm(groupId, type, placeholder, actionLabel) {
+    return `<form class="inline-resource-form immediate-resource-form" data-resource-form="${type}" data-group-id="${attr(groupId)}">
+      <input name="user_id" type="number" min="1" step="1" placeholder="${attr(placeholder)}" aria-label="${attr(placeholder)}" required>
+      <button class="secondary-button danger-outline" type="submit">${icon("zap")} ${escapeHtml(actionLabel)}</button>
     </form>`;
   }
 
@@ -1728,9 +2067,9 @@
         <div class="error-state">${icon("circle-x")}<p>${escapeHtml(state.groupsError)}</p></div>`;
     }
     return `
-      ${pageHead("群组设置", "逐群配置入群验证、回复、语音、主动发言与内容检索。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size ? " disabled" : ""}>${icon("refresh-cw")}刷新群组</button>`)}
+      ${pageHead("群组设置", "按群管理回复、入群、权限、关键词回复、定时消息、群规和成员名单；所有配置统一保存。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size || state.reloadingGroups ? " disabled" : ""}>${state.reloadingGroups ? `<span class="spinner spinner-small"></span>刷新中` : `${icon("refresh-cw")}刷新群组`}</button>`)}
       <div class="group-toolbar">
-        <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" autocomplete="off" value="${attr(state.groupSearch)}"></div>
+        <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" aria-label="搜索群名或群 ID" autocomplete="off" value="${attr(state.groupSearch)}"></div>
         <span class="badge info">${state.groups.length} 个群组</span>
       </div>
       <div class="group-list">
@@ -1745,13 +2084,18 @@
       <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
     if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
     if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
+    const removeLabel = type => ({
+      "authorized-groups": "取消授权",
+      admins: "移除管理员",
+      "global-bans": "立即解封",
+    })[type] || "移除";
     const rows = (items, type, label, idKey = "user_id", emptyText) => paginatedRows(items, `access:${type}`, item => {
       const resourceId = type === "admins"
         ? `${item.group_id}:${item.user_id}`
         : item[idKey];
       return `
       <div class="resource-row"><span>${escapeHtml(label(item))}</span>
-      <button class="mini-icon-button danger" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}" aria-label="删除" title="删除">${icon("trash-2")}</button></div>`;
+      <button class="text-button danger immediate-action" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}">${removeLabel(type)}</button></div>`;
     }, emptyText);
     const authGroups = access.authorized_groups || [];
     const adminGroupId = authGroups.some(group => String(group.group_id) === String(state.accessAdminGroup))
@@ -1762,29 +2106,29 @@
       ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
       <div class="resource-grid access-grid">
         <section class="settings-section">
-          ${sectionHead("授权群组")}
-          <form class="inline-resource-form" data-access-form="authorized-groups">
-            <input name="group_id" type="number" step="1" placeholder="群 ID" required>
-            <input name="title" maxlength="255" placeholder="群名称（可选）">
-            <button class="icon-button" type="submit" aria-label="授权群组" title="授权群组">${icon("plus")}</button>
+         ${sectionHead("授权群组")}
+         <form class="inline-resource-form" data-access-form="authorized-groups">
+            <input name="group_id" type="number" step="1" placeholder="群 ID" aria-label="群 ID" required>
+            <input name="title" maxlength="255" placeholder="群名称（可选）" aria-label="群名称（可选）">
+            <button class="secondary-button" type="submit">${icon("shield-check")}立即授权</button>
           </form>
           ${rows(access.authorized_groups, "authorized-groups", item => `${item.title || "未命名群组"} · ${item.group_id}`, "group_id")}
         </section>
         <section class="settings-section">
-          ${sectionHead("群管理员", "先选择群组，下方仅显示并管理该群的管理员。")}
-          <form class="inline-resource-form" data-access-form="admins">
-            <select name="group_id" data-access-admin-filter required>${authGroups.map(item => `<option value="${attr(item.group_id)}"${String(item.group_id) === adminGroupId ? " selected" : ""}>${escapeHtml(item.title || item.group_id)}</option>`).join("")}</select>
-            <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
-            <button class="icon-button" type="submit" aria-label="授权管理员" title="授权管理员">${icon("plus")}</button>
+         ${sectionHead("群管理员", "先选择群组，下方仅显示并管理该群的管理员。")}
+         <form class="inline-resource-form" data-access-form="admins">
+            <select name="group_id" data-access-admin-filter aria-label="选择授权群组" required>${authGroups.map(item => `<option value="${attr(item.group_id)}"${String(item.group_id) === adminGroupId ? " selected" : ""}>${escapeHtml(item.title || item.group_id)}</option>`).join("")}</select>
+            <input name="user_id" type="number" step="1" placeholder="用户 ID" aria-label="管理员用户 ID" required>
+            <button class="secondary-button" type="submit">${icon("user-check")}立即添加</button>
           </form>
           ${rows(groupAdmins, "admins", item => item.display_name ? `${item.display_name} · ${item.user_id}` : `${item.user_id}`, "user_id", "该群暂无管理员")}
         </section>
         <section class="settings-section">
-          ${sectionHead("全局封禁")}
-          <form class="inline-resource-form" data-access-form="global-bans">
-            <input name="user_id" type="number" step="1" placeholder="用户 ID" required>
-            <input name="reason" maxlength="1000" placeholder="封禁原因">
-            <button class="icon-button" type="submit" aria-label="封禁用户" title="封禁用户">${icon("plus")}</button>
+         ${sectionHead("全局封禁")}
+         <form class="inline-resource-form" data-access-form="global-bans">
+            <input name="user_id" type="number" step="1" placeholder="用户 ID" aria-label="全局封禁用户 ID" required>
+            <input name="reason" maxlength="1000" placeholder="封禁原因" aria-label="封禁原因">
+            <button class="secondary-button danger-outline" type="submit">${icon("ban")}立即封禁</button>
           </form>
           ${rows(access.global_bans, "global-bans", item => `${item.user_id} · ${item.reason || "手动封禁"}`)}
         </section>
@@ -1814,8 +2158,8 @@
     for (const control of form.elements) {
       if (!control.name) continue;
       snapshot[control.name] = control.type === "checkbox"
-        ? { type: "checkbox", value: control.checked }
-        : { type: control.type || control.tagName.toLowerCase(), value: control.value };
+        ? { type: "checkbox", value: control.checked, disabled: control.disabled }
+        : { type: control.type || control.tagName.toLowerCase(), value: control.value, disabled: control.disabled };
     }
     return snapshot;
   }
@@ -1826,6 +2170,7 @@
       const stored = snapshot[control.name];
       if (control.type === "checkbox") control.checked = Boolean(stored.value);
       else control.value = String(stored.value ?? "");
+      if (stored.disabled != null) control.disabled = Boolean(stored.disabled);
     }
   }
 
@@ -1853,11 +2198,28 @@
     if (baseline && sameValue(current, baseline)) state.resourceFormDrafts.delete(key);
     else if (baseline) state.resourceFormDrafts.set(key, current);
     else state.resourceFormBaselines.set(key, current);
+    const type = form.dataset.entryEditForm
+      || form.dataset.resourceForm
+      || (form.matches("[data-rule-edit-form]") ? "rules" : "memories");
+    const pendingCreate = state.pendingResourceCreates.has(resourceOperationKey(
+      form.dataset.groupId,
+      type,
+      form.dataset.entryId || form.dataset.ruleId || form.dataset.memoryId,
+    ));
+    const marker = form.querySelector("[data-resource-form-state]");
+    const dirty = state.resourceFormDrafts.has(key);
+    if (marker) {
+      marker.className = `badge ${pendingCreate ? "info" : dirty ? "warning" : "resource-clean-state"}`;
+      marker.textContent = pendingCreate ? "待新增" : dirty ? "已修改" : "已保存";
+    }
+    form.classList.toggle("is-dirty", pendingCreate || dirty);
     updateRenderedGroupSectionDirty(
-      form.closest('[data-group-section="resources"]'),
-      groupResourceDraftDirty(form.dataset.groupId),
-      "有草稿",
+      form.closest("[data-group-settings-section]"),
+      groupResourceDraftDirty(form.dataset.groupId, RESOURCE_TYPE_META[type]?.category),
+      "待保存",
     );
+    updateRenderedGroupDirty(form.dataset.groupId);
+    updateChrome();
   }
 
   function captureResourceFormDrafts() {
@@ -1868,6 +2230,7 @@
     content.querySelectorAll(RESOURCE_DRAFT_FORM_SELECTOR).forEach(form => {
       const key = resourceDraftFormKey(form);
       if (!key) return;
+      syncScheduledFormFields(form);
       state.resourceFormBaselines.set(key, resourceFormSnapshot(form));
       const draft = state.resourceFormDrafts.get(key);
       if (draft) applyResourceFormSnapshot(form, draft);
@@ -1875,21 +2238,39 @@
     });
   }
 
-  function markResourceFormClean(form) {
-    const key = resourceDraftFormKey(form);
-    if (!key) return;
-    state.resourceFormBaselines.set(key, resourceFormSnapshot(form));
-    state.resourceFormDrafts.delete(key);
-    updateRenderedGroupSectionDirty(
-      form.closest('[data-group-section="resources"]'),
-      groupResourceDraftDirty(form.dataset.groupId),
-      "有草稿",
-    );
-  }
-
-  function clearResourceFormDrafts() {
+  function clearResourceFormDrafts({ clearOperations = true } = {}) {
     state.resourceFormDrafts.clear();
     state.resourceFormBaselines.clear();
+    if (clearOperations) {
+      for (const operation of state.pendingResourceCreates.values()) {
+        const list = resourceArray(operation.groupId, operation.type);
+        const index = list.findIndex(item => String(item.id) === String(operation.id));
+        if (index >= 0) list.splice(index, 1);
+      }
+      state.pendingResourceCreates.clear();
+      state.pendingResourceDeletes.clear();
+    }
+  }
+
+  function discardGroupResourceDrafts(groupId) {
+    const target = String(groupId);
+    for (const key of [...state.resourceFormDrafts.keys()]) {
+      if (resourceDraftGroupId(key) === target) state.resourceFormDrafts.delete(key);
+    }
+    for (const key of [...state.resourceFormBaselines.keys()]) {
+      if (resourceDraftGroupId(key) === target) state.resourceFormBaselines.delete(key);
+    }
+    for (const [key, operation] of [...state.pendingResourceCreates.entries()]) {
+      if (String(operation.groupId) === target) {
+        const list = resourceArray(operation.groupId, operation.type);
+        const index = list.findIndex(item => String(item.id) === String(operation.id));
+        if (index >= 0) list.splice(index, 1);
+        state.pendingResourceCreates.delete(key);
+      }
+    }
+    for (const [key, operation] of [...state.pendingResourceDeletes.entries()]) {
+      if (String(operation.groupId) === target) state.pendingResourceDeletes.delete(key);
+    }
   }
 
   function restoreGroupTemplateButtonValidity() {
@@ -1908,6 +2289,10 @@
     state.groupCardOpen.set(groupId, open);
     toggle.setAttribute("aria-expanded", String(open));
     body.hidden = !open;
+    if (open && body.dataset.groupBodyRendered !== "true") {
+      renderContent();
+      return;
+    }
   }
 
   function setGroupSectionsDisclosure(card, open) {
@@ -1922,16 +2307,28 @@
   }
 
   function revealGroupSection(groupId, sectionKey) {
-    const toggle = content.querySelector(
+    const groupKey = String(groupId);
+    state.groupCardOpen.set(groupKey, true);
+    state.groupSectionOpen.set(groupSectionStateKey(groupKey, sectionKey), true);
+    let toggle = content.querySelector(
       `[data-action="toggle-group-card"][data-group-id="${CSS.escape(String(groupId))}"]`,
     );
-    const card = toggle?.closest("[data-group-card]");
-    setGroupCardDisclosure(card, true);
+    let card = toggle?.closest("[data-group-card]");
+    let body = card?.querySelector("[data-group-card-body]");
+    if (!card || body?.dataset.groupBodyRendered !== "true") {
+      renderContent();
+      toggle = content.querySelector(
+        `[data-action="toggle-group-card"][data-group-id="${CSS.escape(groupKey)}"]`,
+      );
+      card = toggle?.closest("[data-group-card]");
+      body = card?.querySelector("[data-group-card-body]");
+    }
+    if (toggle) toggle.setAttribute("aria-expanded", "true");
+    if (body) body.hidden = false;
     const section = [...(card?.querySelectorAll("[data-group-settings-section]") || [])]
       .find(item => item.dataset.groupSection === String(sectionKey));
     if (!section) return;
     section.open = true;
-    state.groupSectionOpen.set(groupSectionStateKey(groupId, sectionKey), true);
   }
 
   function revealGroupControl(control) {
@@ -1968,6 +2365,30 @@
     });
   }
 
+  function captureContentScrollAnchor() {
+    const stickyBottom = Math.max(
+      document.querySelector(".topbar")?.getBoundingClientRect().bottom || 0,
+      mobileNav.offsetParent ? mobileNav.getBoundingClientRect().bottom : 0,
+    );
+    const candidates = [...content.querySelectorAll(
+      "[data-group-settings-section], [data-resource-category], [data-group-card]",
+    )].map(element => ({ element, rect: element.getBoundingClientRect() }))
+      .filter(item => item.rect.bottom > stickyBottom + 8)
+      .sort((left, right) => Math.abs(left.rect.top - stickyBottom) - Math.abs(right.rect.top - stickyBottom));
+    const target = candidates[0];
+    if (!target) return null;
+    const element = target.element;
+    let selector = "";
+    if (element.matches("[data-group-settings-section]")) {
+      selector = `[data-group-settings-section][data-group-id="${CSS.escape(element.dataset.groupId)}"][data-group-section="${CSS.escape(element.dataset.groupSection)}"]`;
+    } else if (element.matches("[data-resource-category]")) {
+      selector = `[data-group-resource-panel="${CSS.escape(element.dataset.groupResourcePanel)}"][data-resource-category="${CSS.escape(element.dataset.resourceCategory)}"]`;
+    } else if (element.matches("[data-group-card]")) {
+      selector = `[data-group-card][data-group-id="${CSS.escape(element.dataset.groupId)}"]`;
+    }
+    return selector ? { selector, top: target.rect.top } : null;
+  }
+
   function renderContent({ resetScroll = false } = {}) {
     if (!state.config) return;
     captureGroupDisclosureStates();
@@ -1990,6 +2411,9 @@
     // group, loading resources) do not jump the page back to the top.
     const scrollX = window.scrollX;
     const scrollY = window.scrollY;
+    const scrollAnchor = resetScroll ? null : captureContentScrollAnchor();
+    const previousHeight = content.offsetHeight;
+    if (previousHeight > 0) content.style.minHeight = `${previousHeight}px`;
     content.innerHTML = renderer();
     restoreResourceFormDrafts();
     restoreGroupTemplateButtonValidity();
@@ -1999,7 +2423,13 @@
       window.scrollTo({ top: 0, left: 0, behavior: "auto" });
     } else {
       window.scrollTo(scrollX, scrollY);
+      const nextAnchor = scrollAnchor ? content.querySelector(scrollAnchor.selector) : null;
+      if (nextAnchor) {
+        const delta = nextAnchor.getBoundingClientRect().top - scrollAnchor.top;
+        if (Math.abs(delta) > 0.5) window.scrollBy({ top: delta, left: 0, behavior: "auto" });
+      }
     }
+    window.requestAnimationFrame(() => { content.style.minHeight = ""; });
   }
 
   function render() {
@@ -2011,6 +2441,7 @@
   function renderFatal(title, message) {
     state.loading = false;
     app.setAttribute("aria-busy", "false");
+    syncWorkspaceInteractionLock();
     content.innerHTML = `
       <div class="error-state">
         ${icon("shield-x")}
@@ -2068,6 +2499,12 @@
   async function loadAll({ keepTab = true } = {}) {
     captureGroupDisclosureStates();
     captureResourceFormDrafts();
+    state.groupResources.clear();
+    state.groupResourceLoads.clear();
+    state.groupPermissionLoads.clear();
+    state.groupTelegramAdmins.clear();
+    state.access = null;
+    state.accessLoadToken = null;
     state.loading = true;
     updateChrome();
     if (!tg?.initData) {
@@ -2108,42 +2545,61 @@
   }
 
   async function reloadGroups() {
+    if (state.loading || state.saving || state.reloadingGroups) return;
+    state.reloadingGroups = true;
+    content.setAttribute("aria-busy", "true");
+    updateChrome();
     try {
       const document = await apiFetch("/api/v1/groups");
       applyGroupsDocument(document);
-      if (state.activeTab === "groups") renderContent();
-      updateChrome();
     } catch (error) {
       state.groupsError = error.message || "群组列表加载失败";
-      if (state.activeTab === "groups") renderContent();
       showToast(state.groupsError, "error");
+    } finally {
+      state.reloadingGroups = false;
+      content.setAttribute("aria-busy", "false");
+      if (state.activeTab === "groups") renderContent();
+      updateChrome();
     }
   }
 
   async function loadCallAdminTargets(groupId) {
     const key = String(groupId);
-    state.groupTelegramAdmins.set(key, { loading: true });
+    const requestToken = Symbol("telegram-admins");
+    state.groupTelegramAdmins.set(key, { loading: true, requestToken });
     renderContent();
     try {
       const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/telegram-admins`);
+      if (state.groupTelegramAdmins.get(key)?.requestToken !== requestToken) return;
       state.groupTelegramAdmins.set(key, { items: result.admins || [] });
     } catch (error) {
+      if (state.groupTelegramAdmins.get(key)?.requestToken !== requestToken) return;
       state.groupTelegramAdmins.set(key, { error: error.message || "管理员列表加载失败" });
     }
     renderContent();
   }
 
   async function loadGroupPermissions(groupId) {
-    const group = state.groups.find(item => String(item.id) === String(groupId));
-    if (!group || state.groupSaving.has(String(group.id))) return;
+    const key = String(groupId);
+    const group = state.groups.find(item => String(item.id) === key);
+    if (!group || state.groupSaving.has(key) || state.groupPermissionLoads.has(key)) return;
+    const requestToken = Symbol("group-permissions");
+    const initialValue = clone(group.settings.default_permissions);
+    state.groupPermissionLoads.set(key, requestToken);
+    renderContent();
+    updateChrome();
     try {
       const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/default-permissions`);
+      const currentGroup = state.groups.find(item => String(item.id) === key);
+      if (
+        state.groupPermissionLoads.get(key) !== requestToken
+        || currentGroup !== group
+        || !sameValue(currentGroup.settings.default_permissions, initialValue)
+      ) return;
       if (Array.isArray(result.permission_fields) && result.permission_fields.length) {
         state.permissionFields = result.permission_fields;
       }
-      group.settings.default_permissions = normalizeDefaultPermissions(result.default_permissions);
-      renderContent();
-      updateChrome();
+      currentGroup.settings.default_permissions = normalizeDefaultPermissions(result.default_permissions);
       showToast(
         result.repaired
           ? "旧权限配置已兼容修复，请检查后保存"
@@ -2155,42 +2611,68 @@
       );
     } catch (error) {
       showToast(error.message || "读取群默认权限失败", "error", 6000);
+    } finally {
+      if (state.groupPermissionLoads.get(key) === requestToken) {
+        state.groupPermissionLoads.delete(key);
+        renderContent();
+        updateChrome();
+      }
     }
   }
 
   async function loadGroupResources(groupId) {
     const key = String(groupId);
-    state.groupResources.set(key, { loading: true });
+    const previous = state.groupResources.get(key);
+    const requestToken = Symbol("group-resources");
+    const mutationEpoch = state.groupResourceMutationEpochs.get(key) || 0;
+    state.groupResourceLoads.set(key, requestToken);
+    state.groupResources.set(key, previous?.loaded
+      ? { ...previous, refreshing: true, error: "" }
+      : { loading: true, loaded: false, refreshing: false, error: "" });
     renderContent();
-    try {
-      const base = `/api/v1/groups/${encodeURIComponent(groupId)}`;
-      const [rules, memories, warnings, bans, exemptions, replyMutes, keywordReplies, scheduledMessages] = await Promise.all([
-        apiFetch(`${base}/rules`),
-        apiFetch(`${base}/memories`),
-        apiFetch(`${base}/warnings`),
-        apiFetch(`${base}/bans`),
-        apiFetch(`${base}/moderation-exemptions`),
-        apiFetch(`${base}/reply-mutes`),
-        apiFetch(`${base}/keyword-replies`),
-        apiFetch(`${base}/scheduled-messages`),
-      ]);
-      state.groupResources.set(key, {
-        rules: rules.rules || [],
-        memories: memories.memories || [],
-        warnings: warnings.warnings || [],
-        bans: bans.bans || [],
-        exemptions: exemptions.exemptions || [],
-        reply_mutes: replyMutes.reply_mutes || [],
-        keyword_replies: keywordReplies.keyword_replies || [],
-        scheduled_messages: scheduledMessages.scheduled_messages || [],
-      });
-    } catch (error) {
-      state.groupResources.set(key, { error: error.message || "群管理数据加载失败" });
-    }
+    const base = `/api/v1/groups/${encodeURIComponent(groupId)}`;
+    const definitions = [
+      ["rules", "rules", `${base}/rules`],
+      ["memories", "memories", `${base}/memories`],
+      ["warnings", "warnings", `${base}/warnings`],
+      ["bans", "bans", `${base}/bans`],
+      ["exemptions", "exemptions", `${base}/moderation-exemptions`],
+      ["reply_mutes", "reply_mutes", `${base}/reply-mutes`],
+      ["keyword_replies", "keyword_replies", `${base}/keyword-replies`],
+      ["scheduled_messages", "scheduled_messages", `${base}/scheduled-messages`],
+    ];
+    const results = await Promise.allSettled(definitions.map(([, , url]) => apiFetch(url)));
+    if (state.groupResourceLoads.get(key) !== requestToken) return;
+    const current = state.groupResources.get(key) || {};
+    const staleAfterMutation = (state.groupResourceMutationEpochs.get(key) || 0) !== mutationEpoch;
+    const next = {
+      ...current,
+      loaded: true,
+      loading: false,
+      refreshing: false,
+      error: "",
+    };
+    const errors = [];
+    definitions.forEach(([property, responseKey], index) => {
+      const result = results[index];
+      const deferredType = Object.keys(RESOURCE_TYPE_META).find(type => RESOURCE_TYPE_META[type].property === property);
+      const preserveDrafts = deferredType
+        && ["automation", "rules-memory"].includes(RESOURCE_TYPE_META[deferredType].category)
+        && groupResourceDraftDirty(groupId, RESOURCE_TYPE_META[deferredType].category);
+      if (result.status === "fulfilled" && !preserveDrafts && !staleAfterMutation) next[property] = result.value?.[responseKey] || [];
+      else {
+        if (!Array.isArray(next[property])) next[property] = [];
+        if (result.status === "rejected") errors.push(result.reason?.message || `${RESOURCE_TYPE_META[deferredType]?.label || property}加载失败`);
+      }
+    });
+    if (errors.length) next.error = [...new Set(errors)].join("；");
+    state.groupResources.set(key, next);
     renderContent();
   }
 
   async function loadAccess() {
+    const requestToken = Symbol("access");
+    state.accessLoadToken = requestToken;
     state.access = { loading: true };
     renderContent();
     try {
@@ -2214,15 +2696,17 @@
         })),
         loadGlobalBans(),
       ]);
+      if (state.accessLoadToken !== requestToken) return;
       state.access = {
         authorized_groups: authorizedGroups,
         admins: adminResults.flat(),
         global_bans: bansResult,
       };
     } catch (error) {
+      if (state.accessLoadToken !== requestToken) return;
       state.access = { error: error.message || "权限数据加载失败", authorized_groups: [], admins: [], global_bans: [] };
     }
-    renderContent();
+    if (state.accessLoadToken === requestToken) renderContent();
   }
 
   function stripSecrets(config) {
@@ -2276,7 +2760,8 @@
     }
     const nullPath = findNullNumber(state.config);
     if (nullPath) return `${nullPath} 需要填写有效数字`;
-    const invalid = content.querySelector("input:invalid, select:invalid, textarea:invalid");
+    const invalid = [...content.querySelectorAll("[data-path], [data-secret-input], [data-prompt-input]")]
+      .find(control => !control.checkValidity());
     if (invalid) {
       invalid.reportValidity();
       return "请修正标记的字段";
@@ -2309,57 +2794,28 @@
     state.configuredSecrets = next;
   }
 
-  async function saveConfig() {
-    if (!configDirty() || state.saving) return;
-    const validationError = validateConfig();
-    if (validationError) {
-      showToast(validationError, "error", 5000);
-      return;
-    }
-    const requiresRestart = restartChanges().length > 0;
-    state.saving = true;
-    updateChrome();
-    try {
-      const result = await apiFetch("/api/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          revision: state.document.revision,
-          config: stripSecrets(state.config),
-          secret_changes: clone(state.secretChanges),
-        }),
+  async function validateGroupForSave(group) {
+    const groupId = String(group.id);
+    const templateDraft = state.groupTemplateButtonDrafts.get(groupId);
+    if (templateDraft?.error) {
+      state.activeTab = "groups";
+      state.groupCardOpen.set(groupId, true);
+      state.groupSectionOpen.set(groupSectionStateKey(groupId, "onboarding"), true);
+      const existingToggle = content.querySelector(`[data-action="toggle-group-card"][data-group-id="${CSS.escape(groupId)}"]`);
+      existingToggle?.setAttribute("aria-expanded", "true");
+      const existingSection = existingToggle?.closest("[data-group-card]")?.querySelector('[data-group-section="onboarding"]');
+      if (existingSection) existingSection.open = true;
+      updateChrome();
+      renderContent({ resetScroll: true });
+      window.requestAnimationFrame(() => {
+        const control = content.querySelector(`[data-template-buttons][data-group-id="${CSS.escape(groupId)}"]`);
+        control?.focus({ preventScroll: true });
+        control?.reportValidity();
+        control?.scrollIntoView({ block: "center", behavior: "smooth" });
       });
-      const savedDocument = result?.document || result;
-      if (savedDocument?.config) {
-        applySecretResults();
-        applySettingsDocument({
-          ...state.document,
-          ...savedDocument,
-          configured_secrets: savedDocument.configured_secrets || [...state.configuredSecrets],
-          bootstrap: savedDocument.bootstrap || state.document.bootstrap,
-          restart_required_paths: savedDocument.restart_required_paths || state.document.restart_required_paths,
-        });
-      } else {
-        applySecretResults();
-        state.document.revision = result?.revision ?? (Number(state.document.revision) + 1);
-        state.baseline = clone(state.config);
-        state.secretChanges = {};
-      }
-      showToast(requiresRestart ? "配置已保存，重启项将在 Bot 重启后生效" : "配置已保存", requiresRestart ? "warning" : "success", 5000);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 409) {
-        showToast("配置已被其他会话更新。请重新加载后再提交。", "warning", 6500);
-      } else {
-        showToast(error.message || "配置保存失败", "error", 6500);
-      }
-    } finally {
-      state.saving = false;
-      render();
+      showToast(`欢迎语按钮格式无效：${templateDraft.error}`, "error", 6500);
+      return false;
     }
-  }
-
-  async function saveGroup(groupId) {
-    const group = state.groups.find(item => String(item.id) === String(groupId));
-    if (!group || !groupDirty(group) || state.groupSaving.has(String(groupId))) return;
     const invalid = [...content.querySelectorAll("[data-group-key], [data-template-buttons], [data-permission-control]")].find(
       control => String(control.dataset.groupId) === String(groupId) && !control.checkValidity(),
     );
@@ -2371,7 +2827,7 @@
         invalid.scrollIntoView({ block: "center", behavior: "auto" });
       });
       showToast("请修正群组设置中标记的字段", "error", 5000);
-      return;
+      return false;
     }
     const permissionConfig = group.settings.default_permissions;
     if (permissionConfig) {
@@ -2379,13 +2835,13 @@
       if (emptyDays) {
         revealGroupSection(group.id, "permissions");
         showToast(`权限时段「${emptyDays.name || emptyDays.id}」至少选择一个星期`, "error", 6000);
-        return;
+        return false;
       }
       const emptyOverrides = permissionConfig.windows.find(window => !Object.keys(window.overrides || {}).length);
       if (emptyOverrides) {
         revealGroupSection(group.id, "permissions");
         showToast(`权限时段「${emptyOverrides.name || emptyOverrides.id}」至少覆盖一项权限`, "error", 6000);
-        return;
+        return false;
       }
     }
     const baseline = state.groupBaselines.get(String(group.id)) || {};
@@ -2399,50 +2855,306 @@
       );
       if (hasExistingStyle && !await askConfirmation(
         "更换风格目标",
-        "更换或清除目标用户 ID 会重置已有名称、画像、采样计数和样本。",
-      )) return;
+        `${group.title || group.id}：更换或清除目标用户 ID 会重置已有名称、画像、采样计数和样本。`,
+      )) return false;
     }
-    state.groupSaving.add(String(groupId));
-    renderContent();
-    try {
-      const changedSettings = Object.fromEntries(
-        Object.entries(group.settings).filter(
-          ([key, value]) => GROUP_EDITABLE_KEYS.has(key) && !sameValue(value, baseline[key]),
-        ),
-      );
-      const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.id)}/settings`, {
-        method: "PUT",
-        body: JSON.stringify({
-          revision: group.revision,
-          settings: clone(changedSettings),
-        }),
+    return true;
+  }
+
+  function snapshotField(snapshot, name, fallback = "") {
+    return Object.hasOwn(snapshot || {}, name) ? snapshot[name].value : fallback;
+  }
+
+  function valuesFromResourceSnapshot(type, snapshot, { includeEnabled = false } = {}) {
+    if (type === "keyword-replies") {
+      const values = {
+        keyword: String(snapshotField(snapshot, "keyword")).trim(),
+        match_type: String(snapshotField(snapshot, "match_type", "contains")),
+        reply_text: String(snapshotField(snapshot, "reply_text")).trim(),
+        buttons: parseTemplateButtonsText(snapshotField(snapshot, "buttons_text")),
+        pin_message: Boolean(snapshotField(snapshot, "pin_message", false)),
+        auto_delete: Boolean(snapshotField(snapshot, "auto_delete", true)),
+      };
+      if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
+      if (!values.keyword) throw new Error("关键词不能为空");
+      if (!values.reply_text) throw new Error("关键词回复内容不能为空");
+      return values;
+    }
+    if (type === "scheduled-messages") {
+      const scheduleType = String(snapshotField(snapshot, "schedule_type", "daily"));
+      const scheduleTime = String(snapshotField(snapshot, "schedule_time", "09:00"));
+      const intervalMinutes = Number(snapshotField(snapshot, "interval_minutes", 60));
+      const values = {
+        text: String(snapshotField(snapshot, "text")).trim(),
+        buttons: parseTemplateButtonsText(snapshotField(snapshot, "buttons_text")),
+        schedule_type: scheduleType,
+        schedule_time: scheduleTime,
+        interval_minutes: intervalMinutes,
+        pin_message: Boolean(snapshotField(snapshot, "pin_message", false)),
+        unpin_previous: Boolean(snapshotField(snapshot, "unpin_previous", false)),
+        auto_delete: Boolean(snapshotField(snapshot, "auto_delete", false)),
+      };
+      if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
+      if (!values.text) throw new Error("定时消息内容不能为空");
+      if (scheduleType === "daily" && !/^([01]\d|2[0-3]):[0-5]\d$/.test(scheduleTime)) throw new Error("定时消息发送时间格式无效");
+      if (scheduleType === "interval" && (!Number.isInteger(intervalMinutes) || intervalMinutes < 5 || intervalMinutes > 10080)) throw new Error("定时消息间隔需为 5-10080 分钟");
+      return values;
+    }
+    if (type === "rules") {
+      const values = {
+        rule_type: String(snapshotField(snapshot, "rule_type", "keyword")),
+        pattern: String(snapshotField(snapshot, "pattern")).trim(),
+        action: String(snapshotField(snapshot, "action", "warn")),
+      };
+      if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
+      if (!values.pattern) throw new Error("群规内容不能为空");
+      return values;
+    }
+    const contentValue = String(snapshotField(snapshot, "content")).trim();
+    if (!contentValue) throw new Error("永久记忆不能为空");
+    return { content: contentValue };
+  }
+
+  function parseResourceDraftDescriptor(key) {
+    const parts = String(key).split(":");
+    if (parts[0] === "entry") return { kind: "update", groupId: parts[1], type: parts[2], id: parts.slice(3).join(":") };
+    if (parts[0] === "rule") return { kind: "update", groupId: parts[1], type: "rules", id: parts.slice(2).join(":") };
+    if (parts[0] === "memory") return { kind: "update", groupId: parts[1], type: "memories", id: parts.slice(2).join(":") };
+    if (parts[0] === "create") return { kind: "create", groupId: parts[1], type: parts.slice(2).join(":"), id: "" };
+    return null;
+  }
+
+  function collectDeferredResourceOperations() {
+    captureResourceFormDrafts();
+    const operations = [...state.pendingResourceDeletes.values()].map(operation => ({ ...operation, kind: "delete" }));
+    const stagedEditKeys = new Set();
+    for (const [operationKey, operation] of state.pendingResourceCreates.entries()) {
+      const editKey = resourceEditDraftKey(operation.groupId, operation.type, operation.id);
+      stagedEditKeys.add(editKey);
+      const snapshot = state.resourceFormDrafts.get(editKey);
+      const values = snapshot
+        ? valuesFromResourceSnapshot(operation.type, snapshot, { includeEnabled: true })
+        : clone(operation.values);
+      operations.push({ ...operation, operationKey, editKey, kind: "create", values });
+    }
+    for (const [key, snapshot] of state.resourceFormDrafts.entries()) {
+      if (stagedEditKeys.has(key)) continue;
+      const descriptor = parseResourceDraftDescriptor(key);
+      if (!descriptor || !["keyword-replies", "scheduled-messages", "rules", "memories"].includes(descriptor.type)) continue;
+      if (descriptor.kind === "update" && state.pendingResourceDeletes.has(resourceOperationKey(descriptor.groupId, descriptor.type, descriptor.id))) continue;
+      operations.push({
+        ...descriptor,
+        sourceKey: key,
+        values: valuesFromResourceSnapshot(descriptor.type, snapshot, { includeEnabled: descriptor.kind === "update" }),
       });
-      const returnedSettings = result?.settings || result?.group?.settings;
-      if (returnedSettings) group.settings = normalizeGroupSettings(returnedSettings);
-      if (result?.group?.revision) group.revision = String(result.group.revision);
-      state.groupTemplateButtonDrafts.delete(String(group.id));
-      state.groupBaselines.set(String(group.id), clone(group.settings));
-      const permissionApply = result?.permission_apply;
-      if (permissionApply && !permissionApply.applied && !permissionApply.removed) {
-        showToast(
-          `${group.title || group.id} 的设置已保存，但 Telegram 权限下发失败；后台会自动重试${permissionApply.last_error ? `：${permissionApply.last_error}` : ""}`,
-          "warning",
-          7000,
-        );
-      } else {
-        showToast(`${group.title || group.id} 的设置已保存`);
-      }
+    }
+    const order = { delete: 0, update: 1, create: 2 };
+    return operations.sort((left, right) => order[left.kind] - order[right.kind]);
+  }
+
+  async function persistConfigChanges() {
+    const requiresRestart = restartChanges().length > 0;
+    const result = await apiFetch("/api/v1/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        revision: state.document.revision,
+        config: stripSecrets(state.config),
+        secret_changes: clone(state.secretChanges),
+      }),
+    });
+    const savedDocument = result?.document || result;
+    if (savedDocument?.config) {
+      applySecretResults();
+      applySettingsDocument({
+        ...state.document,
+        ...savedDocument,
+        configured_secrets: savedDocument.configured_secrets || [...state.configuredSecrets],
+        bootstrap: savedDocument.bootstrap || state.document.bootstrap,
+        restart_required_paths: savedDocument.restart_required_paths || state.document.restart_required_paths,
+      });
+    } else {
+      applySecretResults();
+      state.document.revision = result?.revision ?? (Number(state.document.revision) + 1);
+      state.baseline = clone(state.config);
+      state.secretChanges = {};
+    }
+    return requiresRestart;
+  }
+
+  async function persistGroupChanges(group) {
+    const baseline = state.groupBaselines.get(String(group.id)) || {};
+    const changedSettings = Object.fromEntries(
+      Object.entries(group.settings).filter(
+        ([key, value]) => GROUP_EDITABLE_KEYS.has(key) && !sameValue(value, baseline[key]),
+      ),
+    );
+    const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.id)}/settings`, {
+      method: "PUT",
+      body: JSON.stringify({ revision: group.revision, settings: clone(changedSettings) }),
+    });
+    const returnedSettings = result?.settings || result?.group?.settings;
+    if (returnedSettings) group.settings = normalizeGroupSettings(returnedSettings);
+    if (result?.group?.revision) group.revision = String(result.group.revision);
+    state.groupTemplateButtonDrafts.delete(String(group.id));
+    state.groupBaselines.set(String(group.id), clone(group.settings));
+    return result?.permission_apply;
+  }
+
+  function applySavedResourceOperation(operation, result) {
+    const meta = RESOURCE_TYPE_META[operation.type];
+    const list = resourceArray(operation.groupId, operation.type);
+    if (operation.kind === "delete") {
+      const index = list.findIndex(item => String(item.id) === String(operation.id));
+      if (index >= 0) list.splice(index, 1);
+      state.pendingResourceDeletes.delete(resourceOperationKey(operation.groupId, operation.type, operation.id));
+      const editKey = resourceEditDraftKey(operation.groupId, operation.type, operation.id);
+      state.resourceFormDrafts.delete(editKey);
+      state.resourceFormBaselines.delete(editKey);
+      bumpGroupResourceMutationEpoch(operation.groupId);
+      return;
+    }
+    const document = result?.[meta.response];
+    if (!document) throw new Error(`${meta.label}保存响应缺少数据`);
+    if (operation.kind === "update") {
+      const item = list.find(row => String(row.id) === String(operation.id));
+      if (item) Object.assign(item, document);
+      state.resourceFormDrafts.delete(operation.sourceKey);
+      state.resourceFormBaselines.delete(operation.sourceKey);
+      bumpGroupResourceMutationEpoch(operation.groupId);
+      return;
+    }
+    if (operation.operationKey) {
+      const temporaryIndex = list.findIndex(item => String(item.id) === String(operation.id));
+      if (temporaryIndex >= 0) list.splice(temporaryIndex, 1);
+      upsertResourceRow(operation.groupId, operation.type, document);
+      state.pendingResourceCreates.delete(operation.operationKey);
+      state.resourceFormDrafts.delete(operation.editKey);
+      state.resourceFormBaselines.delete(operation.editKey);
+    } else {
+      upsertResourceRow(operation.groupId, operation.type, document);
+      state.resourceFormDrafts.delete(operation.sourceKey);
+      state.resourceFormBaselines.delete(operation.sourceKey);
+    }
+    bumpGroupResourceMutationEpoch(operation.groupId);
+  }
+
+  async function persistResourceOperation(operation) {
+    const base = `/api/v1/groups/${encodeURIComponent(operation.groupId)}/${operation.type}`;
+    if (operation.kind === "delete") {
+      const result = await apiFetch(`${base}/${encodeURIComponent(operation.id)}`, { method: "DELETE" });
+      applySavedResourceOperation(operation, result);
+      return;
+    }
+    const url = operation.kind === "update" ? `${base}/${encodeURIComponent(operation.id)}` : base;
+    const result = await apiFetch(url, {
+      method: operation.kind === "update" ? "PATCH" : "POST",
+      body: JSON.stringify(clone(operation.values)),
+    });
+    applySavedResourceOperation(operation, result);
+  }
+
+  async function saveAllChanges() {
+    if (
+      state.loading
+      || state.saving
+      || state.reloadingGroups
+      || state.accessMutating
+      || state.immediateMutations > 0
+      || state.groupPermissionLoads.size > 0
+      || !hasUnsavedChanges()
+    ) return;
+    captureResourceFormDrafts();
+    const invalidResourceForm = [...content.querySelectorAll(RESOURCE_DRAFT_FORM_SELECTOR)].find(form => (
+      state.resourceFormDrafts.has(resourceDraftFormKey(form)) && !form.checkValidity()
+    ));
+    if (invalidResourceForm) {
+      const invalidControl = [...invalidResourceForm.elements].find(control => !control.checkValidity());
+      if (invalidControl) revealGroupControl(invalidControl);
+      window.requestAnimationFrame(() => {
+        invalidControl?.focus({ preventScroll: true });
+        invalidResourceForm.reportValidity();
+        invalidControl?.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
+      showToast("请先补全标记的群管理草稿", "error", 5000);
+      return;
+    }
+    let resourceOperations;
+    try {
+      resourceOperations = collectDeferredResourceOperations();
     } catch (error) {
-      const conflict = error instanceof ApiError && error.status === 409;
-      showToast(
-        conflict ? "群设置已发生变化，请刷新群组后重试" : error.message || "群组设置保存失败",
-        conflict ? "warning" : "error",
-        6000,
-      );
+      showToast(error.message || "请修正群管理草稿", "error", 6000);
+      return;
+    }
+    const configNeedsSave = state.session?.can_manage_global && configDirty();
+    if (configNeedsSave) {
+      const validationError = validateConfig();
+      if (validationError) {
+        showToast(validationError, "error", 5000);
+        return;
+      }
+    }
+    const groupsToSave = state.groups.filter(groupDirty);
+    for (const group of groupsToSave) {
+      if (!await validateGroupForSave(group)) return;
+    }
+
+    const failures = [];
+    const warnings = [];
+    let successCount = 0;
+    let restartSaved = false;
+    state.saving = true;
+    groupsToSave.forEach(group => state.groupSaving.add(String(group.id)));
+    app.classList.add("is-saving");
+    content.setAttribute("aria-busy", "true");
+    updateChrome();
+    try {
+      if (configNeedsSave) {
+        try {
+          restartSaved = await persistConfigChanges();
+          successCount += 1;
+        } catch (error) {
+          failures.push(error instanceof ApiError && error.status === 409
+            ? "全局配置已被其他会话更新"
+            : error.message || "全局配置保存失败");
+        }
+      }
+      for (const group of groupsToSave) {
+        try {
+          const permissionApply = await persistGroupChanges(group);
+          successCount += 1;
+          if (permissionApply && !permissionApply.applied && !permissionApply.removed) {
+            warnings.push(`${group.title || group.id} 已保存，但 Telegram 权限下发失败，后台会自动重试${permissionApply.last_error ? `：${permissionApply.last_error}` : ""}`);
+          }
+        } catch (error) {
+          failures.push(error instanceof ApiError && error.status === 409
+            ? `${group.title || group.id} 的群设置已发生变化`
+            : `${group.title || group.id}：${error.message || "群设置保存失败"}`);
+        }
+      }
+      for (const operation of resourceOperations) {
+        try {
+          await persistResourceOperation(operation);
+          successCount += 1;
+        } catch (error) {
+          failures.push(`${RESOURCE_TYPE_META[operation.type]?.label || operation.type}：${error.message || "保存失败"}`);
+        }
+      }
     } finally {
-      state.groupSaving.delete(String(groupId));
-      renderContent();
-      updateChrome();
+      state.saving = false;
+      state.groupSaving.clear();
+      app.classList.remove("is-saving");
+      content.setAttribute("aria-busy", "false");
+      render();
+    }
+
+    if (warnings.length) showToast(warnings.join("；"), "warning", 8000);
+    if (failures.length) {
+      const prefix = successCount ? `已保存 ${successCount} 项，` : "";
+      showToast(`${prefix}${failures.length} 项失败并已保留草稿：${failures.join("；")}`, "error", 9000);
+    } else if (successCount) {
+      showToast(restartSaved
+        ? `已保存全部 ${successCount} 项更改；重启项将在 Bot 重启后生效`
+        : `已保存全部 ${successCount} 项更改`, restartSaved ? "warning" : "success", 5600);
     }
   }
 
@@ -2510,12 +3222,11 @@
     return target.value;
   }
 
-  function updateGroupCardState(target, group) {
-    const card = target.closest("[data-group-card]");
-    if (!card) return;
-    const dirty = groupDirty(group);
-    const button = card.querySelector('[data-action="save-group"]');
-    if (button) button.disabled = !dirty;
+  function updateRenderedGroupDirty(groupId) {
+    const group = state.groups.find(item => String(item.id) === String(groupId));
+    const card = content.querySelector(`[data-group-card] [data-group-id="${CSS.escape(String(groupId))}"]`)?.closest("[data-group-card]");
+    if (!group || !card) return;
+    const dirty = groupDirty(group) || groupResourceDraftDirty(group.id);
     const headerActions = card.querySelector(".item-actions");
     let marker = headerActions?.querySelector(".group-save-state");
     if (dirty && !marker && headerActions) {
@@ -2527,12 +3238,19 @@
     } else if (!dirty && marker) {
       marker.remove();
     }
+  }
+
+  function updateGroupCardState(target, group) {
+    const card = target.closest("[data-group-card]");
+    if (!card) return;
+    updateRenderedGroupDirty(group.id);
     const section = target.closest("[data-group-settings-section]");
     if (section) {
       const settingKeys = String(section.dataset.groupSettingKeys || "").split(",").filter(Boolean);
       const sectionDirty = groupSectionDirty(group, settingKeys);
       updateRenderedGroupSectionDirty(section, sectionDirty);
     }
+    updateChrome();
   }
 
   function handlePermissionControl(target) {
@@ -2769,6 +3487,16 @@
       setGroupSectionsDisclosure(card, button.dataset.open === "true");
       return;
     }
+    if (action === "jump-group-section") {
+      revealGroupSection(button.dataset.groupId, button.dataset.groupSection);
+      window.requestAnimationFrame(() => {
+        const section = button.closest("[data-group-card]")?.querySelector(
+          `[data-group-section="${CSS.escape(button.dataset.groupSection)}"]`,
+        );
+        section?.scrollIntoView({ block: "start", behavior: "smooth" });
+      });
+      return;
+    }
     if (action === "list-page") {
       state.listPages.set(button.dataset.listKey, Number(button.dataset.page) || 1);
       renderContent();
@@ -2917,12 +3645,11 @@
       }
       return;
     }
-    if (action === "save-group") {
-      saveGroup(button.dataset.groupId);
-      return;
-    }
     if (action === "load-group-resources") {
-      loadGroupResources(button.dataset.groupId);
+      captureResourceFormDrafts();
+      const preservingDrafts = groupResourceDraftDirty(button.dataset.groupId);
+      await loadGroupResources(button.dataset.groupId);
+      if (preservingDrafts) showToast("数据已刷新；有待保存草稿的分类保留本地内容", "success", 4800);
       return;
     }
     if (action === "load-access") {
@@ -2932,19 +3659,65 @@
     if (action === "delete-access") {
       const type = button.dataset.accessType;
       const id = button.dataset.accessId;
+      captureResourceFormDrafts();
+      if (type === "authorized-groups") {
+        const targetGroup = state.groups.find(group => String(group.id) === String(id));
+        if ((targetGroup && groupDirty(targetGroup)) || groupResourceDraftDirty(id)) {
+          showToast("该群仍有待保存更改，请先“保存全部”或重新加载并丢弃草稿，再取消授权", "warning", 7000);
+          return;
+        }
+      }
       let url = `/api/v1/${type}/${encodeURIComponent(id)}`;
       if (type === "admins") {
         const [groupId, userId] = String(id).split(":", 2);
         url = `/api/v1/groups/${encodeURIComponent(groupId)}/admins/${encodeURIComponent(userId)}`;
       }
-      if (!await askConfirmation("确认操作", type === "global-bans" ? "确认解封该用户？" : "确认移除这条授权？")) return;
+      const accessDeleteMessage = type === "global-bans"
+        ? "立即解除该用户的全局封禁？"
+        : type === "admins"
+          ? "立即移除该群管理员？"
+          : "立即取消该群组授权？";
+      if (!await askConfirmation("确认即时操作", `${accessDeleteMessage} 此操作不会等待“保存全部”。`)) return;
+      button.disabled = true;
+      beginImmediateMutation();
+      const locksWorkspace = type === "authorized-groups";
+      if (locksWorkspace) {
+        state.accessMutating = true;
+        updateChrome();
+      }
       try {
         await apiFetch(url, { method: "DELETE" });
+        if (type === "authorized-groups") {
+          const groupKey = String(id);
+          const groupIndex = state.groups.findIndex(group => String(group.id) === groupKey);
+          if (groupIndex >= 0) state.groups.splice(groupIndex, 1);
+          state.groupBaselines.delete(groupKey);
+          state.groupTemplateButtonDrafts.delete(groupKey);
+          state.groupResources.delete(groupKey);
+          state.groupResourceLoads.delete(groupKey);
+          state.groupPermissionLoads.delete(groupKey);
+          state.groupTelegramAdmins.delete(groupKey);
+          state.groupCardOpen.delete(groupKey);
+          for (const key of [...state.groupSectionOpen.keys()]) {
+            if (key.startsWith(`${groupKey}:`)) state.groupSectionOpen.delete(key);
+          }
+        }
         await loadAccess();
-        await reloadGroups();
-        showToast("操作已完成");
+        if (type === "authorized-groups" && !anyGroupDirty() && !anyResourceFormDirty()) {
+          await reloadGroups();
+        }
+        showToast(type === "authorized-groups" && (anyGroupDirty() || anyResourceFormDirty())
+          ? "授权已更新；为保留未保存草稿，群组列表暂未刷新"
+          : "操作已完成");
       } catch (error) {
         showToast(error.message || "操作失败", "error");
+      } finally {
+        button.disabled = false;
+        if (locksWorkspace) {
+          state.accessMutating = false;
+          updateChrome();
+        }
+        endImmediateMutation();
       }
       return;
     }
@@ -2952,43 +3725,39 @@
       const groupId = button.dataset.groupId;
       const type = button.dataset.resourceType;
       const id = button.dataset.resourceId;
-      if (!await askConfirmation("删除记录", "确认删除这条群管理记录？")) return;
+      if (["keyword-replies", "scheduled-messages", "rules", "memories"].includes(type)) {
+        queueDeferredResourceDelete(groupId, type, id);
+        return;
+      }
+      const actionText = type === "warnings"
+        ? "清零此用户的警告记录"
+        : type === "bans"
+          ? "立即解除此用户的群内封禁"
+          : type === "moderation-exemptions"
+            ? "立即取消此用户的审核豁免"
+            : "立即取消此用户的回复静默";
+      if (!await askConfirmation("确认即时操作", `${actionText}？此操作会立即生效。`)) return;
+      button.disabled = true;
+      beginImmediateMutation();
       try {
         await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}/${encodeURIComponent(id)}`, { method: "DELETE" });
-        const deletedForm = button.closest(RESOURCE_DRAFT_FORM_SELECTOR);
-        if (deletedForm) markResourceFormClean(deletedForm);
-        await loadGroupResources(groupId);
-        showToast("已删除");
+        applyImmediateResourceDelete(groupId, type, id);
+        renderContent();
+        showToast("操作已完成");
       } catch (error) {
         showToast(error.message || "删除失败", "error");
+      } finally {
+        button.disabled = false;
+        endImmediateMutation();
       }
       return;
     }
-    if (action === "edit-group-resource") {
-      const groupId = button.dataset.groupId;
-      const type = button.dataset.resourceType;
-      const resource = state.groupResources.get(String(groupId));
-      const item = (resource?.[type] || []).find(row => String(row.id) === String(button.dataset.resourceId));
-      if (!item) return;
-      const nextValue = window.prompt(
-        type === "rules" ? "修改群规内容" : "修改永久记忆",
-        type === "rules" ? item.pattern : item.content,
-      );
-      if (nextValue == null || !nextValue.trim()) return;
-      try {
-        await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}/${encodeURIComponent(item.id)}`, {
-          method: "PATCH",
-          body: JSON.stringify(type === "rules" ? { pattern: nextValue } : { content: nextValue }),
-        });
-        await loadGroupResources(groupId);
-        showToast("已更新");
-      } catch (error) {
-        showToast(error.message || "更新失败", "error");
-      }
+    if (action === "undo-delete-group-resource") {
+      undoDeferredResourceDelete(button.dataset.groupId, button.dataset.resourceType, button.dataset.resourceId);
       return;
     }
     if (action === "reload-groups") {
-      if (state.groupSaving.size) return;
+      if (state.loading || state.saving || state.reloadingGroups || state.accessMutating || state.immediateMutations > 0 || state.groupSaving.size) return;
       captureResourceFormDrafts();
       if ((anyGroupDirty() || anyResourceFormDirty()) && !await askConfirmation(
         "刷新群组",
@@ -2996,7 +3765,7 @@
       )) return;
       state.groupTemplateButtonDrafts.clear();
       clearResourceFormDrafts();
-      reloadGroups();
+      await reloadGroups();
     }
   });
 
@@ -3035,6 +3804,135 @@
     return values;
   }
 
+  function readDeferredResourceFormValues(form, type, { includeEnabled = false } = {}) {
+    if (ENTRY_FORM_FIELDS[type]) return readEntryFormValues(form, type, { includeEnabled });
+    if (type === "rules") {
+      return {
+        rule_type: form.elements.rule_type.value,
+        pattern: form.elements.pattern.value,
+        action: form.elements.action.value,
+        ...(includeEnabled ? { enabled: form.elements.enabled?.checked !== false } : {}),
+      };
+    }
+    if (type === "memories") return { content: form.elements.content.value };
+    throw new Error("不支持的草稿类型");
+  }
+
+  function deferredResourceDraftItem(type, id, values) {
+    if (type === "keyword-replies") return {
+      id,
+      keyword: values.keyword,
+      match_type: values.match_type || "contains",
+      reply_text: values.reply_text,
+      buttons: clone(values.buttons || []),
+      pin_message: Boolean(values.pin_message),
+      auto_delete: values.auto_delete !== false,
+      enabled: values.enabled !== false,
+    };
+    if (type === "scheduled-messages") return {
+      id,
+      text: values.text,
+      buttons: clone(values.buttons || []),
+      schedule_type: values.schedule_type || "daily",
+      schedule_time: values.schedule_time || "09:00",
+      interval_minutes: Number(values.interval_minutes || 60),
+      pin_message: Boolean(values.pin_message),
+      unpin_previous: Boolean(values.unpin_previous),
+      auto_delete: Boolean(values.auto_delete),
+      enabled: values.enabled !== false,
+    };
+    if (type === "rules") return {
+      id,
+      rule_type: values.rule_type || "keyword",
+      pattern: values.pattern,
+      action: values.action || "warn",
+      enabled: values.enabled !== false,
+    };
+    return { id, content: values.content || "" };
+  }
+
+  function stageDeferredResource(form) {
+    const type = form.dataset.resourceForm;
+    const meta = RESOURCE_TYPE_META[type];
+    if (!meta || !["automation", "rules-memory"].includes(meta.category)) return false;
+    syncScheduledFormFields(form);
+    captureResourceFormDraft(form);
+    if (!form.reportValidity()) return true;
+    let values;
+    try {
+      values = readDeferredResourceFormValues(form, type);
+    } catch (error) {
+      showToast(error.message || "草稿格式无效", "error", 6000);
+      return true;
+    }
+    const id = `draft-${Date.now().toString(36)}-${++state.resourceDraftSequence}`;
+    const operation = { groupId: String(form.dataset.groupId), type, id, values: clone(values) };
+    const operationKey = resourceOperationKey(operation.groupId, type, id);
+    state.pendingResourceCreates.set(operationKey, operation);
+    const list = resourceArray(operation.groupId, type);
+    list.unshift(deferredResourceDraftItem(type, id, values));
+    const createKey = resourceDraftFormKey(form);
+    state.resourceFormDrafts.delete(createKey);
+    state.resourceFormBaselines.delete(createKey);
+    state.listPages.set(`group:${operation.groupId}:${type}`, 1);
+    renderContent();
+    updateChrome();
+    showToast(`${meta.label}已加入待保存列表`, "success", 2600);
+    return true;
+  }
+
+  function removePendingResourceCreate(groupId, type, id) {
+    const operationKey = resourceOperationKey(groupId, type, id);
+    if (!state.pendingResourceCreates.has(operationKey)) return false;
+    state.pendingResourceCreates.delete(operationKey);
+    state.pendingResourceDeletes.delete(operationKey);
+    const list = resourceArray(groupId, type);
+    const index = list.findIndex(item => String(item.id) === String(id));
+    if (index >= 0) list.splice(index, 1);
+    const editKey = resourceEditDraftKey(groupId, type, id);
+    state.resourceFormDrafts.delete(editKey);
+    state.resourceFormBaselines.delete(editKey);
+    renderContent();
+    updateChrome();
+    return true;
+  }
+
+  function queueDeferredResourceDelete(groupId, type, id) {
+    if (removePendingResourceCreate(groupId, type, id)) {
+      showToast("已移除待新增草稿", "success", 2400);
+      return;
+    }
+    const key = resourceOperationKey(groupId, type, id);
+    state.pendingResourceDeletes.set(key, { groupId: String(groupId), type, id: String(id) });
+    renderContent();
+    updateChrome();
+    showToast("已标记删除，点击“保存全部”后生效", "warning", 3600);
+  }
+
+  function undoDeferredResourceDelete(groupId, type, id) {
+    state.pendingResourceDeletes.delete(resourceOperationKey(groupId, type, id));
+    renderContent();
+    updateChrome();
+  }
+
+  function setRequestFormPending(form, pending) {
+    if (pending) form.dataset.requestPending = "true";
+    else delete form.dataset.requestPending;
+    form.setAttribute("aria-busy", String(pending));
+    const submitButton = form.querySelector('[type="submit"]');
+    if (submitButton) submitButton.disabled = pending;
+  }
+
+  function beginImmediateMutation() {
+    state.immediateMutations += 1;
+    updateChrome();
+  }
+
+  function endImmediateMutation() {
+    state.immediateMutations = Math.max(0, state.immediateMutations - 1);
+    updateChrome();
+  }
+
   content.addEventListener("submit", async event => {
     const entryEditForm = event.target.closest("[data-entry-edit-form]");
     if (entryEditForm) {
@@ -3042,25 +3940,13 @@
       syncScheduledFormFields(entryEditForm);
       captureResourceFormDraft(entryEditForm);
       if (!entryEditForm.reportValidity()) return;
-      const type = entryEditForm.dataset.entryEditForm;
-      let values;
       try {
-        values = readEntryFormValues(entryEditForm, type, { includeEnabled: true });
+        readEntryFormValues(entryEditForm, entryEditForm.dataset.entryEditForm, { includeEnabled: true });
       } catch (error) {
         showToast(error.message || "内联按钮格式无效", "error", 6000);
         return;
       }
-      try {
-        await apiFetch(`/api/v1/groups/${encodeURIComponent(entryEditForm.dataset.groupId)}/${type}/${encodeURIComponent(entryEditForm.dataset.entryId)}`, {
-          method: "PATCH",
-          body: JSON.stringify(values),
-        });
-        markResourceFormClean(entryEditForm);
-        await loadGroupResources(entryEditForm.dataset.groupId);
-        showToast("已更新");
-      } catch (error) {
-        showToast(error.message || "更新失败", "error");
-      }
+      showToast("修改已记录，点击“保存全部”后生效", "success", 2600);
       return;
     }
     const ruleEditForm = event.target.closest("[data-rule-edit-form]");
@@ -3068,19 +3954,7 @@
       event.preventDefault();
       captureResourceFormDraft(ruleEditForm);
       if (!ruleEditForm.reportValidity()) return;
-      const values = Object.fromEntries(new FormData(ruleEditForm).entries());
-      values.enabled = ruleEditForm.elements.enabled.checked;
-      try {
-        await apiFetch(`/api/v1/groups/${encodeURIComponent(ruleEditForm.dataset.groupId)}/rules/${encodeURIComponent(ruleEditForm.dataset.ruleId)}`, {
-          method: "PATCH",
-          body: JSON.stringify(values),
-        });
-        markResourceFormClean(ruleEditForm);
-        await loadGroupResources(ruleEditForm.dataset.groupId);
-        showToast("群规已更新");
-      } catch (error) {
-        showToast(error.message || "群规更新失败", "error");
-      }
+      showToast("群规修改已记录，点击“保存全部”后生效", "success", 2600);
       return;
     }
     const memoryEditForm = event.target.closest("[data-memory-edit-form]");
@@ -3088,22 +3962,13 @@
       event.preventDefault();
       captureResourceFormDraft(memoryEditForm);
       if (!memoryEditForm.reportValidity()) return;
-      try {
-        await apiFetch(`/api/v1/groups/${encodeURIComponent(memoryEditForm.dataset.groupId)}/memories/${encodeURIComponent(memoryEditForm.dataset.memoryId)}`, {
-          method: "PATCH",
-          body: JSON.stringify({ content: memoryEditForm.elements.content.value }),
-        });
-        markResourceFormClean(memoryEditForm);
-        await loadGroupResources(memoryEditForm.dataset.groupId);
-        showToast("永久记忆已更新");
-      } catch (error) {
-        showToast(error.message || "永久记忆更新失败", "error");
-      }
+      showToast("记忆修改已记录，点击“保存全部”后生效", "success", 2600);
       return;
     }
     const accessForm = event.target.closest("[data-access-form]");
     if (accessForm) {
       event.preventDefault();
+      if (accessForm.dataset.requestPending === "true") return;
       if (!accessForm.reportValidity()) return;
       const type = accessForm.dataset.accessForm;
       const values = Object.fromEntries(new FormData(accessForm).entries());
@@ -3113,21 +3978,40 @@
         url = `/api/v1/groups/${encodeURIComponent(values.group_id)}/admins`;
         delete values.group_id;
       }
+      const accessMessage = type === "authorized-groups"
+        ? `立即授权群组 ${values.group_id}？`
+        : type === "admins"
+          ? `立即添加管理员 ${values.user_id}？`
+          : `立即全局封禁用户 ${values.user_id}？`;
+      if (!await askConfirmation("确认即时操作", `${accessMessage} 此操作不会等待“保存全部”。`)) return;
+      setRequestFormPending(accessForm, true);
+      beginImmediateMutation();
       try {
         await apiFetch(url, { method: "POST", body: JSON.stringify(values) });
         await loadAccess();
-        await reloadGroups();
-        showToast("操作已完成");
+        if (type === "authorized-groups" && !anyGroupDirty() && !anyResourceFormDirty()) {
+          await reloadGroups();
+        }
+        showToast(type === "authorized-groups" && (anyGroupDirty() || anyResourceFormDirty())
+          ? "授权已更新；为保留未保存草稿，群组列表暂未刷新"
+          : "操作已完成");
       } catch (error) {
         showToast(error.message || "操作失败", "error");
+      } finally {
+        setRequestFormPending(accessForm, false);
+        endImmediateMutation();
       }
       return;
     }
     const form = event.target.closest("[data-resource-form]");
     if (!form) return;
     event.preventDefault();
+    if (form.dataset.requestPending === "true") return;
+    if (form.dataset.saveScope === "deferred") {
+      stageDeferredResource(form);
+      return;
+    }
     syncScheduledFormFields(form);
-    captureResourceFormDraft(form);
     if (!form.reportValidity()) return;
     const groupId = form.dataset.groupId;
     const type = form.dataset.resourceForm;
@@ -3141,26 +4025,42 @@
       return;
     }
     if (values.user_id != null) values.user_id = Number(values.user_id);
+    if (["bans", "moderation-exemptions", "reply-mutes"].includes(type)) {
+      const message = type === "bans"
+        ? `立即封禁用户 ${values.user_id}？`
+        : type === "moderation-exemptions"
+          ? `立即将用户 ${values.user_id} 加入审核豁免？`
+          : `立即将用户 ${values.user_id} 加入回复静默名单？`;
+      if (!await askConfirmation("确认即时操作", `${message} 此操作不会等待“保存全部”。`)) return;
+    }
+    setRequestFormPending(form, true);
+    beginImmediateMutation();
     try {
-      await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}`, {
+      const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(groupId)}/${type}`, {
         method: "POST",
         body: JSON.stringify(values),
       });
-      markResourceFormClean(form);
-      await loadGroupResources(groupId);
-      showToast("已新增");
+      applyImmediateResourceCreate(groupId, type, result);
+      form.reset();
+      renderContent();
+      showToast("操作已完成");
     } catch (error) {
       showToast(error.message || "新增失败", "error");
+    } finally {
+      setRequestFormPending(form, false);
+      endImmediateMutation();
     }
   });
 
   function switchTab(tab) {
+    if (state.loading || state.saving || state.reloadingGroups || state.accessMutating || state.immediateMutations > 0) return;
     if (!navItems().some(item => item.id === tab)) return;
+    const fromMobileDrawer = app.classList.contains("sidebar-open");
     state.activeTab = tab;
-    app.classList.remove("sidebar-open");
-    sidebar.classList.remove("mobile-open");
+    setMobileSidebarOpen(false);
     updateChrome();
     renderContent({ resetScroll: true });
+    if (fromMobileDrawer) window.requestAnimationFrame(() => content.focus({ preventScroll: true }));
     const activeMobile = mobileNav.querySelector(`[data-nav="${CSS.escape(tab)}"]`);
     if (activeMobile) {
       const left = activeMobile.offsetLeft - (mobileNav.clientWidth - activeMobile.offsetWidth) / 2;
@@ -3173,23 +4073,66 @@
     if (nav) switchTab(nav.dataset.nav);
   });
 
+  function setMobileSidebarOpen(open) {
+    const nextOpen = Boolean(open && mobileSidebarMedia.matches);
+    sidebar.classList.toggle("mobile-open", nextOpen);
+    app.classList.toggle("sidebar-open", nextOpen);
+    sidebarToggle.setAttribute("aria-expanded", String(nextOpen));
+    sidebarToggle.setAttribute("aria-label", nextOpen ? "关闭导航" : "打开导航");
+    sidebarToggle.title = nextOpen ? "关闭导航" : "打开导航";
+    syncWorkspaceInteractionLock();
+    if (nextOpen) {
+      window.requestAnimationFrame(() => {
+        (sidebar.querySelector(".nav-button.active") || sidebar.querySelector(".nav-button"))?.focus();
+      });
+    }
+  }
+
   sidebarToggle.addEventListener("click", () => {
-    const open = !sidebar.classList.contains("mobile-open");
-    sidebar.classList.toggle("mobile-open", open);
-    app.classList.toggle("sidebar-open", open);
+    setMobileSidebarOpen(!sidebar.classList.contains("mobile-open"));
   });
+
+  sidebarClose.addEventListener("click", () => {
+    setMobileSidebarOpen(false);
+    sidebarToggle.focus();
+  });
+
+  const handleMobileSidebarMediaChange = event => {
+    if (!event.matches && app.classList.contains("sidebar-open")) setMobileSidebarOpen(false);
+  };
+  if (mobileSidebarMedia.addEventListener) mobileSidebarMedia.addEventListener("change", handleMobileSidebarMediaChange);
+  else mobileSidebarMedia.addListener?.(handleMobileSidebarMediaChange);
 
   app.addEventListener("click", event => {
     if (event.target === app && app.classList.contains("sidebar-open")) {
-      app.classList.remove("sidebar-open");
-      sidebar.classList.remove("mobile-open");
+      setMobileSidebarOpen(false);
+      sidebarToggle.focus();
     }
   });
 
-  saveButton.addEventListener("click", saveConfig);
+  document.addEventListener("keydown", event => {
+    if (!app.classList.contains("sidebar-open")) return;
+    if (event.key === "Escape") {
+      setMobileSidebarOpen(false);
+      sidebarToggle.focus();
+      return;
+    }
+    if (event.key === "Tab") {
+      const focusable = [...sidebar.querySelectorAll("button:not([disabled])")];
+      if (!focusable.length) return;
+      const current = focusable.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? (current <= 0 ? focusable.length - 1 : current - 1)
+        : (current < 0 || current === focusable.length - 1 ? 0 : current + 1);
+      event.preventDefault();
+      focusable[next].focus();
+    }
+  });
+
+  saveButton.addEventListener("click", saveAllChanges);
 
   reloadButton.addEventListener("click", async () => {
-    if (state.groupSaving.size) return;
+    if (state.loading || state.saving || state.reloadingGroups || state.accessMutating || state.immediateMutations > 0 || state.groupSaving.size) return;
     captureResourceFormDrafts();
     if ((configDirty() || anyGroupDirty() || anyResourceFormDirty()) && !await askConfirmation(
       "重新加载",

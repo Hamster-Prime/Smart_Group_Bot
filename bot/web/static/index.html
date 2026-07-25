@@ -8,20 +8,23 @@
     <meta name="referrer" content="no-referrer">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
     <title>Smart Group Bot 设置</title>
-    <link rel="stylesheet" href="/settings-assets/styles.css?v=20260724-button-styles">
+    <link rel="stylesheet" href="/settings-assets/styles.css?v=20260725-unified-save-layout">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="/settings-assets/lucide.min.js"></script>
   </head>
   <body>
     <div id="app" class="app-shell" aria-busy="true">
-      <aside class="sidebar">
+      <aside id="settings-sidebar" class="sidebar">
         <div class="brand">
           <span class="brand-mark" aria-hidden="true"><i data-lucide="bot"></i></span>
-          <span class="brand-copy">
-            <strong>Smart Group Bot</strong>
-            <small>管理员设置</small>
-          </span>
-        </div>
+         <span class="brand-copy">
+           <strong>Smart Group Bot</strong>
+           <small>管理员设置</small>
+         </span>
+          <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="关闭导航" title="关闭导航">
+            <i data-lucide="x"></i>
+          </button>
+       </div>
         <nav id="desktop-nav" class="side-nav" aria-label="设置分类"></nav>
         <div id="sidebar-status" class="sidebar-status"></div>
       </aside>
@@ -29,7 +32,7 @@
       <div class="workspace">
         <header class="topbar">
           <div class="topbar-title">
-            <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="打开导航" title="打开导航">
+            <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="打开导航" aria-expanded="false" aria-controls="settings-sidebar" title="打开导航">
               <i data-lucide="menu"></i>
             </button>
             <div>
@@ -42,9 +45,9 @@
             <button id="reload-button" class="icon-button" type="button" aria-label="重新加载" title="重新加载">
               <i data-lucide="refresh-cw"></i>
             </button>
-            <button id="save-button" class="primary-button" type="button" aria-label="保存配置" title="保存配置" disabled>
+            <button id="save-button" class="primary-button" type="button" aria-label="保存全部" title="保存全部" disabled>
               <i data-lucide="save"></i>
-              <span>保存配置</span>
+              <span>保存全部</span>
             </button>
           </div>
         </header>
@@ -62,7 +65,7 @@
 
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
-    <dialog id="confirm-dialog" class="confirm-dialog">
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
       <form method="dialog">
         <div class="dialog-icon"><i data-lucide="triangle-alert"></i></div>
         <h2 id="confirm-title">确认操作</h2>
@@ -74,6 +77,6 @@
       </form>
     </dialog>
 
-    <script src="/settings-assets/app.js?v=20260724-button-styles" defer></script>
+    <script src="/settings-assets/app.js?v=20260725-unified-save-layout" defer></script>
   </body>
 </html>
