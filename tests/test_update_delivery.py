@@ -138,6 +138,7 @@ class UpdatePriorityClassificationTests(unittest.TestCase):
     def test_security_commands_are_privileged_without_aiogram_parsing(self) -> None:
         privileged = (
             "/ban 42 spam",
+            "/spam 42 phishing",
             "/UNBAN@SmartGroupBot 42",
             "/authadmin -100 42",
             "/raidguard on",

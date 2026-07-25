@@ -546,7 +546,8 @@ class GlobalBan(Base):
 
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     reason: Mapped[str] = mapped_column(Text, default="")
-    # manual / join_screening / profile_screening / moderation_challenge_timeout
+    # manual / spam_command / join_screening / profile_screening /
+    # moderation_challenge_timeout
     source: Mapped[str] = mapped_column(String(32), default="manual")
     created_by: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

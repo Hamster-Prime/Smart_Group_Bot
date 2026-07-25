@@ -80,6 +80,7 @@ _PRIVILEGED_COMMANDS = frozenset(
         "adminlist",
         # Enforcement and emergency controls.
         "ban",
+        "spam",
         "unban",
         "banlist",
         "voteban",

@@ -157,7 +157,14 @@ _BAN_USAGE = (
     "<b>命令用法</b>\n"
     "1. 回复目标用户消息后发送 /ban [原因]\n"
     "2. /ban &lt;用户ID&gt; [原因]\n\n"
-    "群管理员默认只在当前群封禁；最高管理员会收到「仅本群 / 全局」选择按钮。"
+    "群管理员默认只在当前群封禁；最高管理员会收到「仅本群 / 全局」选择按钮。\n"
+    "回复使用时，封禁成功后会同时删除被回复消息。"
+)
+_SPAM_USAGE = (
+    "<b>命令用法</b>\n"
+    "1. 回复垃圾消息后发送 /spam [原因]\n"
+    "2. /spam &lt;用户ID&gt; [原因]\n\n"
+    "此命令会封禁目标，并将其加入全局封禁名单。"
 )
 _UNBAN_USAGE = (
     "<b>命令用法</b>\n"
@@ -974,6 +981,41 @@ def _resolve_ban_target(message: Message, args: str) -> tuple[int | None, str]:
         return None, ""
 
 
+def _replied_message_id(message: Message) -> int:
+    reply = getattr(message, "reply_to_message", None)
+    return max(0, int(getattr(reply, "message_id", 0) or 0))
+
+
+async def _delete_ban_target_message(
+    bot: object,
+    *,
+    group_id: int,
+    message_id: int,
+) -> bool:
+    """Best-effort removal of the message that supplied a ban target."""
+
+    message_id = int(message_id or 0)
+    if message_id <= 0:
+        return False
+    try:
+        async with asyncio.timeout(5.0):
+            deleted = await bot.delete_message(
+                chat_id=int(group_id),
+                message_id=message_id,
+            )
+        return deleted is not False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug(
+            "ban target message delete failed | group=%s message=%s",
+            group_id,
+            message_id,
+            exc_info=True,
+        )
+        return False
+
+
 async def _authorized_group_ids(
     session: AsyncSession,
     *,
@@ -1024,6 +1066,7 @@ class _BanScopeRequest:
     target_id: int
     reason: str
     created_at: float
+    target_message_id: int = 0
     claimed_scope: str = ""
 
 
@@ -1346,6 +1389,21 @@ async def _target_is_group_admin(message: Message, target_id: int) -> bool | Non
     return status in {"administrator", "creator", "chatmemberstatus.administrator", "chatmemberstatus.creator"}
 
 
+async def _ban_target_rejection(
+    message: Message,
+    settings: Settings,
+    target_id: int,
+) -> str:
+    if is_super_admin_user_id(target_id, settings):
+        return "不能封禁最高管理员。"
+    target_admin = await _target_is_group_admin(message, target_id)
+    if target_admin is None:
+        return "暂时无法确认目标的管理员身份；为避免误封，请稍后重试。"
+    if target_admin:
+        return "不能直接封禁本群管理员，请先在 Telegram 中撤销其管理员身份。"
+    return ""
+
+
 async def _perform_group_ban(
     message: Message,
     session: AsyncSession,
@@ -1355,6 +1413,7 @@ async def _perform_group_ban(
     reason: str,
     operator_id: int = 0,
     operator_display: str = "",
+    target_message_id: int = 0,
 ) -> str:
     # Local and global policy changes for the same user must serialize. Group-
     # scoped keys allowed a local ban and global unban to race in different
@@ -1370,6 +1429,7 @@ async def _perform_group_ban(
             reason=reason,
             operator_id=operator_id,
             operator_display=operator_display,
+            target_message_id=target_message_id,
         )
 
 
@@ -1382,19 +1442,17 @@ async def _perform_group_ban_locked(
     reason: str,
     operator_id: int = 0,
     operator_display: str = "",
+    target_message_id: int = 0,
 ) -> str:
     group_id = int(message.chat.id)
+    replied_message_id = int(target_message_id or _replied_message_id(message))
     actor_id = int(operator_id or getattr(message.from_user, "id", 0) or 0)
     actor_display = operator_display or str(
         getattr(message.from_user, "full_name", "") or ""
     )
-    if is_super_admin_user_id(target_id, settings):
-        return "不能封禁最高管理员。"
-    target_admin = await _target_is_group_admin(message, target_id)
-    if target_admin is None:
-        return "暂时无法确认目标的管理员身份；为避免误封，请稍后重试。"
-    if target_admin:
-        return "不能直接封禁本群管理员，请先在 Telegram 中撤销其管理员身份。"
+    rejection = await _ban_target_rejection(message, settings, target_id)
+    if rejection:
+        return rejection
 
     prompts: set[tuple[int, int]] = set()
     private_prompts: set[tuple[int, int]] = set()
@@ -1543,6 +1601,12 @@ async def _perform_group_ban_locked(
             "封禁执行期间权限策略已被更新或数据库写入失败；"
             "已按最新持久化策略重新校准 Telegram 状态。"
         )
+
+    await _delete_ban_target_message(
+        message.bot,
+        group_id=group_id,
+        message_id=replied_message_id,
+    )
 
     lines = [
         "<b>本群封禁完成</b>",
@@ -1796,6 +1860,9 @@ async def _perform_global_ban(
     target_id: int,
     reason: str,
     operator_id: int,
+    source: str = "manual",
+    origin_group_id: int = 0,
+    target_message_id: int = 0,
 ) -> str:
     lock = _MANUAL_BAN_LOCKS.setdefault((0, int(target_id)), asyncio.Lock())
     async with lock:
@@ -1805,6 +1872,9 @@ async def _perform_global_ban(
             target_id=target_id,
             reason=reason,
             operator_id=operator_id,
+            source=source,
+            origin_group_id=origin_group_id,
+            target_message_id=target_message_id,
         )
 
 
@@ -1815,7 +1885,14 @@ async def _perform_global_ban_locked(
     target_id: int,
     reason: str,
     operator_id: int,
+    source: str = "manual",
+    origin_group_id: int = 0,
+    target_message_id: int = 0,
 ) -> str:
+    source_group_id = int(
+        origin_group_id or getattr(getattr(message, "chat", None), "id", 0) or 0
+    )
+    replied_message_id = int(target_message_id or _replied_message_id(message))
     async with session_factory() as session:
         # Persist one idempotent reconciliation journal per authorized group in
         # the same transaction as the global policy.  The existing unbanning
@@ -1834,11 +1911,14 @@ async def _perform_global_ban_locked(
             group_ids=journal_group_ids,
             manual_unban=False,
         )
+        default_reason = (
+            "管理员标记为垃圾用户" if source == "spam_command" else "手动封禁"
+        )
         created = await add_global_ban(
             session,
             target_id,
-            reason=reason or "手动封禁",
-            source="manual",
+            reason=reason or default_reason,
+            source=source,
             created_by=operator_id,
         )
         prompts = tuple(
@@ -1910,6 +1990,16 @@ async def _perform_global_ban_locked(
     )
     await delete_verification_prompts(message.bot, prompts)
     await close_private_challenge_messages(message.bot, private_prompts)
+    origin_banned = any(
+        outcome.succeeded and int(outcome.group_id) == source_group_id
+        for outcome in outcomes
+    )
+    if origin_banned:
+        await _delete_ban_target_message(
+            message.bot,
+            group_id=source_group_id,
+            message_id=replied_message_id,
+        )
     banned_groups = sum(outcome.succeeded for outcome in outcomes)
     status = "已加入全局封禁名单" if created else "已在全局封禁名单（信息已更新）"
     lines = [
@@ -2079,19 +2169,32 @@ async def _perform_global_unban_locked(
     return "\n".join(lines)
 
 
-def _scope_keyboard(action: str, target_id: int) -> InlineKeyboardMarkup:
+def _scope_keyboard(
+    action: str,
+    target_id: int,
+    target_message_id: int = 0,
+) -> InlineKeyboardMarkup:
     verb = "封禁" if action == "ban" else "解封"
     short = "b" if action == "ban" else "u"
+    message_suffix = (
+        f":{int(target_message_id)}" if int(target_message_id or 0) > 0 else ""
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text=f"仅本群{verb}",
-                    callback_data=f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:l:{target_id}",
+                    callback_data=(
+                        f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:l:{target_id}"
+                        f"{message_suffix}"
+                    ),
                 ),
                 InlineKeyboardButton(
                     text=f"全局{verb}",
-                    callback_data=f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:g:{target_id}",
+                    callback_data=(
+                        f"{_BAN_SCOPE_CALLBACK_PREFIX}:{short}:g:{target_id}"
+                        f"{message_suffix}"
+                    ),
                 ),
             ]
         ]
@@ -2103,6 +2206,7 @@ def _scope_request_from_durable_callback(
     *,
     action: str,
     target_id: int,
+    target_message_id: int = 0,
 ) -> _BanScopeRequest | None:
     """Rebuild a lost in-memory token from an authentic, recent bot message."""
 
@@ -2136,6 +2240,7 @@ def _scope_request_from_durable_callback(
         target_id=int(target_id),
         reason=reason,
         created_at=time.monotonic(),
+        target_message_id=int(target_message_id or 0),
     )
 
 
@@ -2147,6 +2252,7 @@ async def _ask_super_admin_scope(
     reason: str = "",
 ) -> None:
     verb = "封禁" if action == "ban" else "解封"
+    target_message_id = _replied_message_id(message) if action == "ban" else 0
     details = ["「仅本群」只修改当前群；「全局」会作用于全部授权群和全局名单。"]
     if reason:
         details.insert(0, f"<b>原因</b>　{html.escape(reason)}")
@@ -2160,7 +2266,7 @@ async def _ask_super_admin_scope(
         sent = await message.answer(
             text,
             parse_mode="HTML",
-            reply_markup=_scope_keyboard(action, target_id),
+            reply_markup=_scope_keyboard(action, target_id, target_message_id),
         )
     now = time.monotonic()
     for key, request in list(_BAN_SCOPE_REQUESTS.items()):
@@ -2179,6 +2285,7 @@ async def _ask_super_admin_scope(
         target_id=int(target_id),
         reason=str(reason or ""),
         created_at=now,
+        target_message_id=target_message_id,
     )
 
 
@@ -2308,6 +2415,123 @@ async def cmd_ban(
     await _answer(message, settings, text)
 
 
+@router.message(Command("spam"))
+async def cmd_spam(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """Ban a spammer and add the account to the global ban registry."""
+
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    if not await _ensure_ban_command_admin(message, session, settings):
+        return
+    await _commit_if_supported(session)
+
+    args = (message.text or "").partition(" ")[2].strip()
+    target_id, reason = _resolve_ban_target(message, args)
+    if target_id is None or target_id <= 0:
+        await _answer(message, settings, _SPAM_USAGE)
+        return
+    rejection = await _ban_target_rejection(message, settings, target_id)
+    if rejection:
+        await _answer(message, settings, rejection)
+        return
+
+    operator = message.from_user
+    operator_id = int(getattr(operator, "id", 0) or 0)
+    group_id = int(message.chat.id)
+    target_message_id = _replied_message_id(message)
+    effective_reason = reason or "管理员标记为垃圾用户"
+
+    effective_factory = session_factory
+    if effective_factory is None:
+        bind = getattr(session, "bind", None)
+        if bind is not None:
+            effective_factory = async_sessionmaker(
+                bind=bind,
+                class_=type(session),
+                expire_on_commit=False,
+                autoflush=False,
+            )
+    if effective_factory is None:
+        await _answer(message, settings, "数据库会话未就绪，请稍后重试。")
+        return
+
+    await session.commit()
+    with privileged_request_scope():
+        progress = await message.answer(
+            render_progress_notice(
+                "垃圾用户全局封禁 · 执行中",
+                completed="已受理请求",
+                current="写入全局封禁策略并执行 Telegram 封禁",
+                next_step="汇总各授权群结果并更新本消息",
+                context=f"<b>目标</b>　<code>{target_id}</code>",
+            ),
+            parse_mode="HTML",
+        )
+
+    async def operation() -> str:
+        if not await _queued_operator_can_manage_members(
+            bot=message.bot,
+            session_factory=effective_factory,
+            settings=settings,
+            group_id=group_id,
+            user_id=operator_id,
+        ):
+            return "<b>垃圾用户封禁已取消</b>\n操作者权限或群授权已发生变化。"
+        latest_rejection = await _ban_target_rejection(message, settings, target_id)
+        if latest_rejection:
+            return f"<b>垃圾用户封禁已取消</b>\n{latest_rejection}"
+        return await _perform_global_ban(
+            progress,
+            effective_factory,
+            target_id=target_id,
+            reason=effective_reason,
+            operator_id=operator_id,
+            source="spam_command",
+            origin_group_id=group_id,
+            target_message_id=target_message_id,
+        )
+
+    if session_factory is not None:
+        submission = submit_privileged_task(
+            key=f"ban:g:0:{target_id}",
+            label=f"global spam ban {target_id}",
+            operation=lambda: _run_result_job(
+                progress_message=progress,
+                operation=operation,
+                task_title="垃圾用户全局封禁",
+            ),
+            lane="critical_bulk",
+            priority=10,
+            timeout_seconds=_PRIVILEGED_JOB_DEADLINE_SECONDS,
+        )
+        if not submission.accepted:
+            await _publish_privileged_result(
+                progress,
+                "<b>垃圾用户封禁未入队</b>\n权限任务队列正忙，请立即重试。",
+                status="rejected",
+            )
+        elif not submission.created:
+            await _publish_privileged_result(
+                progress,
+                "<b>垃圾用户封禁正在执行</b>\n相同目标已有全局封禁任务，未重复提交。",
+                status="duplicate",
+            )
+        return
+
+    result_text = await operation()
+    await _publish_privileged_result(
+        progress,
+        result_text,
+        status="completed",
+        default_title="垃圾用户全局封禁",
+    )
+
+
 @router.message(Command("unban"))
 async def cmd_unban(
     message: Message,
@@ -2416,7 +2640,7 @@ async def on_ban_scope_choice(
         await callback.answer("操作消息已失效", show_alert=True)
         return
     parts = str(callback.data or "").split(":")
-    if len(parts) != 4 or parts[0] != _BAN_SCOPE_CALLBACK_PREFIX:
+    if len(parts) not in {4, 5} or parts[0] != _BAN_SCOPE_CALLBACK_PREFIX:
         await callback.answer("操作参数无效", show_alert=True)
         return
     action = "ban" if parts[1] == "b" else "unban" if parts[1] == "u" else ""
@@ -2425,7 +2649,16 @@ async def on_ban_scope_choice(
         target_id = int(parts[3])
     except (TypeError, ValueError):
         target_id = 0
-    if not action or scope not in {"l", "g"} or target_id <= 0:
+    try:
+        target_message_id = int(parts[4]) if len(parts) == 5 else 0
+    except (TypeError, ValueError):
+        target_message_id = -1
+    if (
+        not action
+        or scope not in {"l", "g"}
+        or target_id <= 0
+        or target_message_id < 0
+    ):
         await callback.answer("操作参数无效", show_alert=True)
         return
     if action == "ban" and is_super_admin_user_id(target_id, settings):
@@ -2442,6 +2675,7 @@ async def on_ban_scope_choice(
                 callback,
                 action=action,
                 target_id=target_id,
+                target_message_id=target_message_id,
             )
             if request is not None:
                 _BAN_SCOPE_REQUESTS[key] = request
@@ -2449,6 +2683,7 @@ async def on_ban_scope_choice(
             request is None
             or request.action != action
             or request.target_id != target_id
+            or int(request.target_message_id or 0) != target_message_id
             or time.monotonic() - request.created_at > _BAN_SCOPE_TTL_SECONDS
         ):
             invalid_request = True
@@ -2505,6 +2740,7 @@ async def on_ban_scope_choice(
                         reason=reason,
                         operator_id=int(operator.id),
                         operator_display=str(getattr(operator, "full_name", "") or ""),
+                        target_message_id=target_message_id,
                     )
             if action == "ban":
                 return await _perform_global_ban(
@@ -2513,6 +2749,8 @@ async def on_ban_scope_choice(
                     target_id=target_id,
                     reason=reason,
                     operator_id=int(operator.id),
+                    origin_group_id=int(chat.id),
+                    target_message_id=target_message_id,
                 )
             if scope == "l":
                 async with session_factory() as work_session:
@@ -2602,6 +2840,7 @@ async def on_ban_scope_choice(
                 reason=reason,
                 operator_id=int(operator.id),
                 operator_display=str(getattr(operator, "full_name", "") or ""),
+                target_message_id=target_message_id,
             )
         elif action == "ban":
             result_text = await _perform_global_ban(
@@ -2615,6 +2854,8 @@ async def on_ban_scope_choice(
                 target_id=target_id,
                 reason=reason,
                 operator_id=int(operator.id),
+                origin_group_id=int(chat.id),
+                target_message_id=target_message_id,
             )
         elif scope == "l":
             result_text = await _perform_group_unban(

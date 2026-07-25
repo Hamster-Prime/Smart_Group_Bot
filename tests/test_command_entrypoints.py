@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from bot.config import Settings
 from bot.handlers import admin, commands
@@ -318,6 +318,8 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("command: /clearwarnings", guide)
         self.assertIn("清空某用户的累计违规次数", guide)
         self.assertIn("command: /raidguard", guide)
+        self.assertIn("command: /spam", guide)
+        self.assertIn("封禁目标并加入全局封禁名单", guide)
 
     async def test_raidguard_numeric_argument_uses_minutes(self) -> None:
         message = SimpleNamespace(
@@ -553,14 +555,140 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(kwargs["reply_markup"].inline_keyboard[0]), 2)
         message.bot.unban_chat_member.assert_not_awaited()
 
+    async def test_super_admin_ban_scope_preserves_replied_message_id(self) -> None:
+        sent = SimpleNamespace(message_id=900)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            reply_to_message=SimpleNamespace(message_id=321),
+            answer=AsyncMock(return_value=sent),
+        )
+        key = (-10001, 900)
+        admin._BAN_SCOPE_REQUESTS.pop(key, None)
+        try:
+            await admin._ask_super_admin_scope(
+                message,
+                action="ban",
+                target_id=456,
+                reason="广告",
+            )
+
+            keyboard = message.answer.await_args.kwargs["reply_markup"]
+            callbacks = [
+                button.callback_data
+                for button in keyboard.inline_keyboard[0]
+            ]
+            self.assertEqual(
+                callbacks,
+                ["bsc:b:l:456:321", "bsc:b:g:456:321"],
+            )
+            request = admin._BAN_SCOPE_REQUESTS[key]
+            self.assertEqual(request.target_message_id, 321)
+        finally:
+            admin._BAN_SCOPE_REQUESTS.pop(key, None)
+
+    def test_spam_command_is_registered_on_router(self) -> None:
+        callbacks = [handler.callback for handler in admin.router.message.handlers]
+
+        self.assertIn(admin.cmd_spam, callbacks)
+
+    async def test_spam_command_enqueues_global_ban_with_reply_context(self) -> None:
+        progress = SimpleNamespace(message_id=901)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, username="admin", full_name="Admin"),
+            text="/spam 钓鱼广告",
+            reply_to_message=SimpleNamespace(
+                message_id=321,
+                from_user=SimpleNamespace(id=456, full_name="Spammer"),
+            ),
+            bot=SimpleNamespace(),
+            answer=AsyncMock(return_value=progress),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+        session_factory = object()
+
+        async def run_inline(*, progress_message, operation, task_title):
+            self.assertIs(progress_message, progress)
+            self.assertEqual(task_title, "垃圾用户全局封禁")
+            return await operation()
+
+        submission = SimpleNamespace(accepted=True, created=True)
+        with (
+            patch(
+                "bot.handlers.admin.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._ensure_ban_command_admin",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._ban_target_rejection",
+                new=AsyncMock(return_value=""),
+            ),
+            patch(
+                "bot.handlers.admin._queued_operator_can_manage_members",
+                new=AsyncMock(return_value=True),
+            ) as queued_permission,
+            patch(
+                "bot.handlers.admin._perform_global_ban",
+                new=AsyncMock(return_value="done"),
+            ) as perform_global_ban,
+            patch("bot.handlers.admin._run_result_job", new=run_inline),
+            patch(
+                "bot.handlers.admin.submit_privileged_task",
+                return_value=submission,
+            ) as submit,
+        ):
+            await admin.cmd_spam(
+                message,
+                session=session,
+                settings=_settings(),
+                session_factory=session_factory,
+            )
+
+            submit.assert_called_once()
+            queued_job = submit.call_args.kwargs["operation"]
+            await queued_job()
+
+        submit_kwargs = submit.call_args.kwargs
+        self.assertEqual(submit_kwargs["key"], "ban:g:0:456")
+        self.assertEqual(submit_kwargs["label"], "global spam ban 456")
+        self.assertEqual(submit_kwargs["lane"], "critical_bulk")
+        self.assertEqual(submit_kwargs["priority"], 10)
+        self.assertEqual(
+            submit_kwargs["timeout_seconds"],
+            admin._PRIVILEGED_JOB_DEADLINE_SECONDS,
+        )
+        queued_permission.assert_awaited_once_with(
+            bot=message.bot,
+            session_factory=session_factory,
+            settings=ANY,
+            group_id=-10001,
+            user_id=123,
+        )
+        perform_global_ban.assert_awaited_once_with(
+            progress,
+            session_factory,
+            target_id=456,
+            reason="钓鱼广告",
+            operator_id=123,
+            source="spam_command",
+            origin_group_id=-10001,
+            target_message_id=321,
+        )
+
     async def test_group_ban_failure_keeps_pending_verification(self) -> None:
         verification = SimpleNamespace(prompt_message_id=321)
         recovery = SimpleNamespace(verification_id=91, lease_until=object())
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),
             from_user=SimpleNamespace(id=123, full_name="Admin"),
-            reply_to_message=None,
-            bot=SimpleNamespace(),
+            reply_to_message=SimpleNamespace(
+                message_id=444,
+                from_user=SimpleNamespace(id=456),
+            ),
+            bot=SimpleNamespace(delete_message=AsyncMock(return_value=True)),
         )
         session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
 
@@ -594,6 +722,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         ban.assert_awaited_once_with(message.bot, -10001, 456)
         complete.assert_not_awaited()
         delete_prompts.assert_not_awaited()
+        message.bot.delete_message.assert_not_awaited()
 
     async def test_group_ban_fails_closed_when_admin_status_is_unavailable(self) -> None:
         message = SimpleNamespace(
@@ -623,8 +752,11 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(
             chat=SimpleNamespace(id=-10001, type="supergroup"),
             from_user=SimpleNamespace(id=123, full_name="Admin"),
-            reply_to_message=None,
-            bot=SimpleNamespace(),
+            reply_to_message=SimpleNamespace(
+                message_id=445,
+                from_user=SimpleNamespace(id=456),
+            ),
+            bot=SimpleNamespace(delete_message=AsyncMock(return_value=True)),
         )
         session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
 
@@ -665,6 +797,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         )
         mark_banned.assert_awaited_once()
         delete_prompts.assert_awaited_once_with(message.bot, {(-10001, 322)})
+        message.bot.delete_message.assert_awaited_once_with(
+            chat_id=-10001,
+            message_id=445,
+        )
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(

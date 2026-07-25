@@ -1531,6 +1531,23 @@ async def _finalize_vote_message_unlocked(
     outcome_line: str,
     approvals: int,
 ) -> None:
+    target_message_id = int(getattr(record, "target_message_id", 0) or 0)
+    if record.status == "passed" and target_message_id > 0:
+        try:
+            async with asyncio.timeout(5.0):
+                await bot.delete_message(
+                    chat_id=int(record.group_id),
+                    message_id=target_message_id,
+                )
+        except Exception:
+            log.debug(
+                "passed vote-ban target message delete failed | group=%s "
+                "session=%s message=%s",
+                record.group_id,
+                record.id,
+                target_message_id,
+                exc_info=True,
+            )
     if not record.message_id:
         return
     summary = [

@@ -31,6 +31,7 @@ _COMMANDS: tuple[CommandEntry, ...] = (
     CommandEntry("/warnings", "/warnings", "查看当前群警告/封禁名单", "管理员想查看审核处罚情况", "群审核管理"),
     CommandEntry("/clearwarnings", "回复用户后 /clearwarnings，或 /clearwarnings <用户ID>", "清空某用户的累计违规次数", "管理员要重置某用户的违规次数", "群审核管理"),
     CommandEntry("/ban", "回复用户后 /ban [原因]，或 /ban <用户ID> [原因]", "在当前群手动封禁；最高管理员可选择全局", "管理员要封禁某个用户", "群审核管理"),
+    CommandEntry("/spam", "回复垃圾消息后 /spam [原因]，或 /spam <用户ID> [原因]", "封禁目标并加入全局封禁名单", "管理员确认某用户是垃圾广告或骚扰账号", "群审核管理"),
     CommandEntry("/unban", "回复用户后 /unban，或 /unban <用户ID>", "解除当前群封禁；最高管理员可选择全局", "管理员要解封某个用户", "群审核管理"),
     CommandEntry("/raidguard", "/raidguard on [分钟]|off|status，或 /raidguard <分钟>", "手动开启、限时开启或解除爆破锁定", "管理员需要立即阻止新成员加入", "群审核管理"),
     CommandEntry("/aiexempt", "回复目标用户消息后发送 /aiexempt", "豁免某用户的 AI 审核", "管理员想让某用户跳过审核", "群审核管理"),
@@ -77,6 +78,7 @@ def build_help_text() -> str:
         "/warnings：查看警告/封禁名单\n"
         "/clearwarnings：回复用户或指定用户 ID，清空累计违规次数\n"
         "/ban / unban：群管理员手动本群封禁/解封；最高管理员可选择全局范围\n"
+        "/spam：封禁垃圾用户、删除被回复消息并加入全局封禁名单\n"
         "/raidguard on [分钟]|off|status：手动控制爆破防护，数字单位为分钟\n"
         "/aiexempt：回复目标用户消息后豁免审核\n"
         "/unaiexempt：回复目标用户消息后取消豁免\n"

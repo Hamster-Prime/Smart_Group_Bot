@@ -507,6 +507,77 @@ class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
         restore.assert_awaited_once()
         self.assertIn("0/1", text)
 
+    async def test_global_ban_deletes_target_only_when_origin_group_succeeds(
+        self,
+    ) -> None:
+        async def run_case(
+            outcomes: list[admin._GroupActionOutcome],
+        ) -> AsyncMock:
+            delete_message = AsyncMock(return_value=True)
+            message = SimpleNamespace(
+                chat=SimpleNamespace(id=-101, type="supergroup"),
+                bot=SimpleNamespace(delete_message=delete_message),
+            )
+            with (
+                patch(
+                    "bot.handlers.admin.add_global_ban",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch(
+                    "bot.handlers.admin.lease_join_verifications_for_user_unban",
+                    new=AsyncMock(return_value=()),
+                ),
+                patch(
+                    "bot.handlers.admin._authorized_group_ids",
+                    new=AsyncMock(return_value=[-101, -102]),
+                ),
+                patch(
+                    "bot.handlers.admin._run_group_actions_bounded",
+                    new=AsyncMock(return_value=outcomes),
+                ),
+                patch(
+                    "bot.handlers.admin._publish_privileged_progress",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "bot.handlers.admin.delete_verification_prompts",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "bot.handlers.admin.close_private_challenge_messages",
+                    new=AsyncMock(),
+                ),
+            ):
+                await admin._perform_global_ban_locked(
+                    message,
+                    _FakeSessionFactory(),
+                    target_id=77,
+                    reason="spam",
+                    operator_id=1,
+                    origin_group_id=-101,
+                    target_message_id=654,
+                )
+            return delete_message
+
+        origin_succeeded = await run_case(
+            [
+                admin._GroupActionOutcome(-101, True),
+                admin._GroupActionOutcome(-102, False, "unconfirmed"),
+            ]
+        )
+        origin_succeeded.assert_awaited_once_with(
+            chat_id=-101,
+            message_id=654,
+        )
+
+        origin_failed = await run_case(
+            [
+                admin._GroupActionOutcome(-101, False, "unconfirmed"),
+                admin._GroupActionOutcome(-102, True),
+            ]
+        )
+        origin_failed.assert_not_awaited()
+
     async def test_scope_token_is_retained_when_queue_rejects(self) -> None:
         settings = Settings(_env_file=None)
         settings.super_admin_id = 1

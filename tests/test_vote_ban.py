@@ -308,7 +308,13 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             except OSError:
                 pass
 
-    async def _open_session(self, threshold: int = 3, *, target_user_id: int = 555) -> int:
+    async def _open_session(
+        self,
+        threshold: int = 3,
+        *,
+        target_user_id: int = 555,
+        target_message_id: int = 0,
+    ) -> int:
         config = resolve_vote_ban_config(
             _settings(vote_ban_threshold=threshold), {}
         )
@@ -323,6 +329,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 starter_display="发起人",
                 reason="骚扰消息",
                 config=config,
+                target_message_id=target_message_id,
             )
             record.message_id = 777
             await session.commit()
@@ -349,6 +356,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             bot=bot
             or SimpleNamespace(
                 ban_chat_member=AsyncMock(return_value=True),
+                delete_message=AsyncMock(return_value=True),
                 edit_message_text=AsyncMock(),
                 get_chat_member=AsyncMock(
                     return_value=SimpleNamespace(status="member")
@@ -540,7 +548,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         callback.bot.get_chat_member.assert_awaited_once()
 
     async def test_threshold_reached_bans_and_finalizes(self) -> None:
-        session_id = await self._open_session(threshold=2)
+        session_id = await self._open_session(
+            threshold=2,
+            target_message_id=888,
+        )
         callback = self._callback(session_id, voter_id=11)
         async with self.session_factory() as session:
             async def ban_without_db_lease(*_args, **_kwargs):
@@ -564,6 +575,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             555,
             revoke_messages=True,
         )
+        callback.bot.delete_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=888,
+        )
         kwargs = callback.bot.edit_message_text.await_args.kwargs
         self.assertIn("已封禁", kwargs["text"])
         self.assertIn("民主投票封禁 · 已结束", kwargs["text"])
@@ -586,6 +601,32 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(event.outcome, "succeeded")
             self.assertEqual(event.target_user_id, 555)
+
+    async def test_target_message_delete_failure_does_not_change_passed_outcome(self) -> None:
+        session_id = await self._open_session(
+            threshold=2,
+            target_message_id=891,
+        )
+        callback = self._callback(session_id, voter_id=11)
+        callback.bot.delete_message = AsyncMock(
+            side_effect=RuntimeError("delete denied")
+        )
+
+        async with self.session_factory() as session:
+            await group.on_vote_ban_action(
+                callback,
+                self.settings,
+                session=session,
+            )
+
+        callback.bot.delete_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=891,
+        )
+        self.assertIn("已封禁", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            record = await session.get(VoteBanSession, session_id)
+            self.assertEqual(record.status, "passed")
 
     async def test_self_vote_rejected(self) -> None:
         session_id = await self._open_session()
@@ -706,7 +747,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("其他操作结束", callback.answer.await_args.args[0])
 
     async def test_admin_direct_ban_finalizes_with_audit(self) -> None:
-        session_id = await self._open_session(threshold=3)
+        session_id = await self._open_session(
+            threshold=3,
+            target_message_id=889,
+        )
         callback = self._callback(session_id, voter_id=42, action="ban")
         with patch.object(
             group, "is_group_admin_or_higher", new=AsyncMock(return_value=True)
@@ -717,6 +761,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             -100,
             555,
             revoke_messages=True,
+        )
+        callback.bot.delete_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=889,
         )
         self.assertIn("已直接封禁", callback.answer.await_args.args[0])
         kwargs = callback.bot.edit_message_text.await_args.kwargs
@@ -910,7 +958,10 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(warning)
 
     async def test_stale_enforcing_session_is_recovered_idempotently(self) -> None:
-        session_id = await self._open_session(threshold=2)
+        session_id = await self._open_session(
+            threshold=2,
+            target_message_id=890,
+        )
         async with self.session_factory() as session:
             self.assertTrue(await record_vote(session, session_id, 11))
             self.assertTrue(
@@ -923,6 +974,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             record = await session.get(VoteBanSession, session_id)
             record.enforcing_started_at = now_shanghai_naive() - timedelta(minutes=5)
+            record.message_id = 0
             await session.commit()
 
         bot = SimpleNamespace(
@@ -930,6 +982,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(status="member")
             ),
             ban_chat_member=AsyncMock(return_value=True),
+            delete_message=AsyncMock(return_value=True),
             edit_message_text=AsyncMock(),
         )
         async with self.session_factory() as session:
@@ -946,6 +999,11 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             555,
             revoke_messages=True,
         )
+        bot.delete_message.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=890,
+        )
+        bot.edit_message_text.assert_not_awaited()
         async with self.session_factory() as session:
             record = await session.get(VoteBanSession, session_id)
             warning = await session.scalar(
@@ -1163,9 +1221,13 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[0].outcome, "succeeded")
 
     async def test_threshold_ban_failure_is_persisted_as_failed_outcome(self) -> None:
-        session_id = await self._open_session(threshold=2)
+        session_id = await self._open_session(
+            threshold=2,
+            target_message_id=892,
+        )
         bot = SimpleNamespace(
             ban_chat_member=AsyncMock(side_effect=RuntimeError("api down")),
+            delete_message=AsyncMock(return_value=True),
             edit_message_text=AsyncMock(),
             get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
         )
@@ -1189,6 +1251,7 @@ class VoteBanFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertFalse(bool(warning.is_banned) if warning else False)
+        bot.delete_message.assert_not_awaited()
 
     async def test_threshold_rechecks_target_and_refuses_new_admin(self) -> None:
         session_id = await self._open_session(threshold=2)
