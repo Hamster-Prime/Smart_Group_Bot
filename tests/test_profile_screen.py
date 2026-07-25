@@ -6,9 +6,11 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy import select
+
 from bot.config import ModerationConfig, Settings
 from bot.db.engine import init_db
-from bot.db.models import ModerationRule
+from bot.db.models import ModerationRule, UserWarning
 from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.services.join_screening import (
     get_global_ban,
@@ -220,6 +222,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             commit=AsyncMock(),
             rollback=AsyncMock(),
             execute=AsyncMock(),
+            scalar=AsyncMock(return_value=None),
             get=AsyncMock(return_value=None),
             no_autoflush=_NoAutoflush(),
         )
@@ -241,10 +244,22 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             "bot.middlewares.profile_screen.complete_leased_join_verification",
             new=AsyncMock(return_value=True),
         )
+        local_ban_patcher = patch(
+            "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+            new=AsyncMock(return_value=None),
+        )
+        verification_state_patcher = patch(
+            "bot.middlewares.profile_screen.get_join_verification",
+            new=AsyncMock(return_value=None),
+        )
         lease_patcher.start()
         completion_patcher.start()
+        local_ban_patcher.start()
+        verification_state_patcher.start()
         self.addCleanup(lease_patcher.stop)
         self.addCleanup(completion_patcher.stop)
+        self.addCleanup(local_ban_patcher.stop)
+        self.addCleanup(verification_state_patcher.stop)
 
     def _patch_screening(self, *, verdict: tuple[bool, str, bool] = (False, "", True)):
         return (
@@ -404,7 +419,43 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         screen.assert_awaited_once()
         mark_screened.assert_awaited_once()
 
-    async def test_deauthorization_during_llm_discards_global_ban_verdict(self) -> None:
+    async def test_local_group_ban_fast_path_blocks_without_rescreening(self) -> None:
+        patches = self._patch_screening()
+        self.session.scalar.return_value = 1
+        event = _event()
+        send_notice = AsyncMock()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7] as screen,
+            patches[8],
+            patch(
+                "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
+                new=AsyncMock(return_value=BanEnforcementResult(final_banned=True)),
+            ),
+            patch(
+                "bot.middlewares.profile_screen.answer_with_auto_delete",
+                new=send_notice,
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                event,
+                {"settings": _settings()},
+            )
+
+        self.assertIsNone(result)
+        screen.assert_not_awaited()
+        self.handler.assert_not_awaited()
+        send_notice.assert_awaited_once()
+        event.delete.assert_awaited_once()
+
+    async def test_deauthorization_during_llm_discards_profile_ban_verdict(self) -> None:
         patches = list(self._patch_screening(verdict=(True, "广告昵称", True)))
         patches[0] = patch(
             "bot.middlewares.profile_screen.is_group_authorized",
@@ -422,7 +473,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[7],
             patches[8],
             patch(
-                "bot.middlewares.profile_screen.add_global_ban",
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
                 new=add_ban,
             ),
         ):
@@ -454,7 +505,39 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
                 return_value=True,
             ),
             patch(
-                "bot.middlewares.profile_screen.add_global_ban",
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+                new=add_ban,
+            ),
+        ):
+            result = await self.middleware(
+                self.handler,
+                _event(),
+                {"settings": _settings()},
+            )
+
+        self.assertEqual(result, "handled")
+        add_ban.assert_not_awaited()
+        self.handler.assert_awaited_once()
+
+    async def test_persistent_unban_recovery_discards_stale_profile_ban(self) -> None:
+        patches = list(self._patch_screening(verdict=(True, "广告昵称", True)))
+        add_ban = AsyncMock()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patches[8],
+            patch(
+                "bot.middlewares.profile_screen.get_join_verification",
+                new=AsyncMock(return_value=SimpleNamespace(status="unbanning")),
+            ),
+            patch(
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
                 new=add_ban,
             ),
         ):
@@ -481,7 +564,10 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[6],
             patches[7],
             patches[8],
-            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+                new=AsyncMock(),
+            ),
             patch(
                 "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
                 new=AsyncMock(
@@ -516,7 +602,10 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[6],
             patches[7],
             patches[8],
-            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+                new=AsyncMock(),
+            ),
             patch(
                 "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
                 new=AsyncMock(return_value=BanEnforcementResult(final_banned=True)),
@@ -538,6 +627,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<b>成员资料审核 · 已处理</b>", rendered)
         self.assertIn("<b>处理结果</b>", rendered)
         self.assertIn("<blockquote expandable>", rendered)
+        self.assertIn("已在当前群封禁成员", rendered)
         self.assertIn("广告昵称 &lt;危险&gt;", rendered)
         self.assertIn("<code>/unban</code>", rendered)
         event.delete.assert_awaited_once()
@@ -564,7 +654,10 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[6],
             patches[7],
             patches[8],
-            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+                new=AsyncMock(),
+            ),
             patch(
                 "bot.middlewares.profile_screen.enforce_ban_with_policy_reconciliation_result",
                 new=enforcement,
@@ -616,7 +709,7 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[7] as screen,
             patches[8],
             patch(
-                "bot.middlewares.profile_screen.add_global_ban",
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
                 new=AsyncMock(side_effect=RuntimeError("write failed")),
             ) as add_ban,
             patch(
@@ -692,7 +785,10 @@ class ProfileScreenMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             patches[6],
             patches[7] as screen,
             patches[8],
-            patch("bot.middlewares.profile_screen.add_global_ban", new=AsyncMock()),
+            patch(
+                "bot.middlewares.profile_screen.mark_profile_screening_group_ban",
+                new=AsyncMock(),
+            ),
             patch("bot.middlewares.profile_screen.answer_with_auto_delete", new=AsyncMock()),
             patch(
                 "bot.middlewares.profile_screen.verification_release_blocked_by_ban",
@@ -830,9 +926,16 @@ class ProfileScreenConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async with self.session_factory() as session:
-            row = await get_global_ban(session, 42)
-        self.assertIsNotNone(row)
-        self.assertIn("广告昵称", row.reason)
+            global_row = await get_global_ban(session, 42)
+            local_row = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 42,
+                )
+            )
+        self.assertIsNone(global_row)
+        self.assertIsNotNone(local_row)
+        self.assertTrue(local_row.is_banned)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ Profile screening runs in two places:
 - on join (membership handler);
 - on message, when the user's profile signature changed or was never checked
   (see ``bot.middlewares.profile_screen``).
+
+Profile-screening violations create a ban only in the current group. They do
+not write to the cross-group ``GlobalBan`` registry.
 """
 from __future__ import annotations
 

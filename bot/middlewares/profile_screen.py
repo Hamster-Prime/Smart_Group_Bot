@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -9,13 +8,14 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from bot.db.models import UserWarning
 from bot.services.admin_status import is_user_admin_cached
 from bot.services.authz import is_group_authorized, is_super_admin_user_id
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
-    add_global_ban,
     build_join_profile_text,
     get_global_ban,
     get_profile_screen_hash,
@@ -26,17 +26,20 @@ from bot.services.join_screening import (
     screen_member_profile_verbose,
 )
 from bot.services.join_verification import (
+    VERIFICATION_STATUS_RELEASING,
+    VERIFICATION_STATUS_UNBANNING,
+    build_profile_screening_ban_notice,
     close_private_challenge_message,
     complete_leased_join_verification,
     enforce_ban_with_policy_reconciliation_result,
+    get_join_verification,
     lease_join_verification_for_unban,
     manual_unban_generation_is_active,
-    spoiler_display_name,
+    mark_profile_screening_group_ban,
     verification_release_blocked_by_ban,
     verification_restriction_required,
 )
 from bot.services.llm import LLMService
-from bot.services.message_templates import card_field, render_summary_notice
 from bot.services.moderation import ModerationService
 from bot.services.recent_messages import (
     member_join_marker,
@@ -127,9 +130,20 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 == signature
             )
             ban = await get_global_ban(session, user_id)
-            ban_reason = (
-                str(ban.reason or "资料命中群规") if ban is not None else None
+            locally_banned = bool(
+                await session.scalar(
+                    select(UserWarning.id).where(
+                        UserWarning.group_id == int(group_id),
+                        UserWarning.user_id == int(user_id),
+                        UserWarning.is_banned.is_(True),
+                    )
+                )
             )
+            ban_reason = None
+            if ban is not None:
+                ban_reason = str(ban.reason or "资料命中群规")
+            elif locally_banned:
+                ban_reason = "该用户在本群封禁名单中"
             return True, signature, signature_matches, ban_reason
 
     async def __call__(
@@ -195,7 +209,7 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                     else:
                         # Double-check in a fresh session after acquiring the
                         # gate. The preceding task may have committed either a
-                        # passed signature or a global ban while we waited.
+                        # passed signature or a local/global ban while we waited.
                         authorized, signature, signature_matches, ban_reason = (
                             await self._read_screening_state(
                                 group_id=chat.id,
@@ -253,9 +267,9 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                         async with self.session_factory() as session:
                                             # Serialize the final policy decision
                                             # with /unban and exemption writes. An
-                                            # older LLM verdict must never delete a
-                                            # newer administrator exemption through
-                                            # add_global_ban().
+                                            # older LLM verdict must never override a
+                                            # newer administrator exemption or local
+                                            # unban decision.
                                             await acquire_group_settings_write_intent(
                                                 session,
                                                 chat.id,
@@ -267,11 +281,39 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                                 # Authorization was revoked while
                                                 # the LLM was running. Discard the
                                                 # verdict; a removed group's rules
-                                                # must never create a cross-group
-                                                # global ban.
+                                                # must never create a group ban.
                                                 violation_confirmed = False
                                                 gate.violation_confirmed = False
                                                 gate.reason = ""
+                                                return await handler(event, data)
+                                            current_verification = (
+                                                await get_join_verification(
+                                                    session,
+                                                    chat.id,
+                                                    user.id,
+                                                )
+                                            )
+                                            current_status = (
+                                                str(current_verification.status or "")
+                                                if current_verification is not None
+                                                else ""
+                                            )
+                                            if current_status in {
+                                                VERIFICATION_STATUS_RELEASING,
+                                                VERIFICATION_STATUS_UNBANNING,
+                                            }:
+                                                await session.commit()
+                                                violation_confirmed = False
+                                                gate.violation_confirmed = False
+                                                gate.reason = ""
+                                                log.info(
+                                                    "profile verdict discarded | "
+                                                    "reason=permission_recovery_%s "
+                                                    "chat=%s user=%s",
+                                                    current_status,
+                                                    chat.id,
+                                                    user.id,
+                                                )
                                                 return await handler(event, data)
                                             if (
                                                 manual_unban_generation_is_active(
@@ -318,12 +360,13 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                                     user.id,
                                                 )
                                                 return await handler(event, data)
-                                            await add_global_ban(
+                                            await mark_profile_screening_group_ban(
                                                 session,
+                                                chat.id,
                                                 user.id,
                                                 reason=f"资料命中群规: {reason}"[:500],
-                                                source="join_screening",
-                                                created_by=0,
+                                                target_display=full_name,
+                                                target_username=username,
                                             )
                                             await mark_profile_screened(
                                                 session,
@@ -333,7 +376,7 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                                             )
                                             await session.commit()
                                         # Telegram enforcement is authorized only
-                                        # after the global policy commit succeeds.
+                                        # after the group-local policy commit succeeds.
                                         # A DB outage retries screening next message
                                         # instead of creating an untracked ban.
                                         violation_confirmed = True
@@ -426,7 +469,7 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                     )
                     return "unenforced"
                 log.error(
-                    "[%s] profile screening ban unconfirmed; durable global policy retained | "
+                    "[%s] profile screening ban unconfirmed; durable group policy retained | "
                     "user=%s",
                     chat.id,
                     user.id,
@@ -489,18 +532,10 @@ class ProfileScreenEnforcementMiddleware(BaseMiddleware):
                 int(user.id),
                 marker=residue_marker,
             )
-            # The profile itself is the violation (ad name/bio): spoiler the
-            # name so the ban notice does not passively reprint it. The ID
-            # stays visible.
-            shown = spoiler_display_name(full_name or username or "", int(user.id))
-            notice = render_summary_notice(
-                "成员资料审核 · 已处理",
-                card_field(
-                    "处理结果",
-                    f"已封禁成员 <b>{shown}</b>（ID: <code>{user.id}</code>）",
-                ),
-                emphasis="如需解封，请管理员使用 <code>/unban</code> 命令。",
-                details=[card_field("原因", html.escape(reason or "资料命中群规"))],
+            notice = build_profile_screening_ban_notice(
+                user_id=int(user.id),
+                display_name=full_name or username or "",
+                reason=reason,
             )
             try:
                 await answer_with_auto_delete(

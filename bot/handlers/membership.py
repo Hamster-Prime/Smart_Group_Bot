@@ -26,7 +26,6 @@ from bot.services.authz import (
 from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.join_screening import (
-    add_global_ban,
     build_join_profile_text,
     is_globally_banned,
     is_join_screening_exempt,
@@ -55,6 +54,7 @@ from bot.services.join_verification import (
     BanEnforcementResult,
     ban_member,
     ban_member_result,
+    build_profile_screening_ban_notice,
     build_group_prompt_keyboard,
     build_group_prompt_text,
     build_verification_progress_text,
@@ -78,6 +78,7 @@ from bot.services.join_verification import (
     lease_expired_join_verification,
     lease_join_verification_for_unban,
     mark_group_banned,
+    mark_profile_screening_group_ban,
     parse_verification_callback_data,
     prepare_join_verification,
     reconcile_moderation_ban_after_lost_lease_result,
@@ -101,7 +102,6 @@ from bot.services.llm import LLMService
 from bot.services.message_templates import (
     card_field,
     render_progress_notice,
-    render_summary_notice,
 )
 from bot.services.moderation import ModerationService
 from bot.services.patrol import mark_group_member_left, track_group_member
@@ -338,6 +338,7 @@ async def _ban_and_notify(
     reason: str,
     preserve_ban: Callable[[], Awaitable[bool]] | None = None,
     restriction_required: Callable[[], Awaitable[bool]] | None = None,
+    publish_notice: bool = True,
 ) -> BanEnforcementResult:
     # Snapshot before the ban: the resulting leave update clears the live
     # join marker concurrently, and the post-ban residue sweep still needs
@@ -385,35 +386,103 @@ async def _ban_and_notify(
         int(user_id),
         marker=residue_marker,
     )
-    # A screened-out joiner never verified: spoiler the name so an ad display
-    # name gets no passive exposure through the ban notice. The ID stays visible.
-    shown = spoiler_display_name(display_name, user_id)
-    reason_text = html.escape(reason or "入群资料命中群规")
+    if publish_notice:
+        await _publish_profile_screening_ban_notice(
+            event,
+            settings,
+            user_id=user_id,
+            display_name=display_name,
+            reason=reason,
+        )
+    return enforcement
+
+
+async def _publish_profile_screening_ban_notice(
+    event: ChatMemberUpdated,
+    settings: Settings,
+    *,
+    user_id: int,
+    display_name: str,
+    reason: str,
+    prompt_message_id: int = 0,
+    require_existing_prompt: bool = False,
+) -> None:
+    notice = build_profile_screening_ban_notice(
+        user_id=user_id,
+        display_name=display_name,
+        reason=reason,
+    )
+    auto_delete_seconds = configured_auto_delete_seconds(settings, "moderation")
+    prompt_message_id = int(prompt_message_id or 0)
+    if prompt_message_id > 0:
+        try:
+            edited = await event.bot.edit_message_text(
+                chat_id=int(event.chat.id),
+                message_id=prompt_message_id,
+                text=notice,
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception:
+            log.warning(
+                "join screening prompt update failed; no standalone notice sent | "
+                "group=%s user=%s message=%s",
+                event.chat.id,
+                user_id,
+                prompt_message_id,
+                exc_info=True,
+            )
+            await delete_verification_prompt(
+                event.bot,
+                int(event.chat.id),
+                prompt_message_id,
+            )
+            return
+        else:
+            try:
+                await schedule_message_auto_delete_durable(
+                    edited if not isinstance(edited, bool) else None,
+                    auto_delete_seconds,
+                )
+            except Exception:
+                # The outcome is already visible. A cleanup scheduling failure
+                # must never delete it or create a duplicate fallback notice.
+                log.exception(
+                    "join screening prompt auto-delete scheduling failed | "
+                    "group=%s user=%s message=%s",
+                    event.chat.id,
+                    user_id,
+                    prompt_message_id,
+                )
+            return
+    if require_existing_prompt:
+        log.warning(
+            "join screening outcome has no verification prompt to update | "
+            "group=%s user=%s",
+            event.chat.id,
+            user_id,
+        )
+        return
     try:
         sent = await event.bot.send_message(
             event.chat.id,
-            render_summary_notice(
-                "成员资料审核 · 已处理",
-                [
-                    card_field(
-                        "处理结果",
-                        f"已封禁成员 <b>{shown}</b>（ID: <code>{user_id}</code>）",
-                    ),
-                ],
-                emphasis="如需解封请管理员使用 <code>/unban</code> 命令。",
-                details=[card_field("原因", reason_text)],
-            ),
+            notice,
             parse_mode="HTML",
-        )
-        # This is a moderation outcome ("审核通知"): honor the group's
-        # auto-delete retention like the on-message ban notice in
-        # profile_screen.py does.
-        await schedule_message_auto_delete_durable(
-            sent, configured_auto_delete_seconds(settings, "moderation")
         )
     except Exception:
         log.exception("join screening notice failed | group=%s", event.chat.id)
-    return enforcement
+        return
+    # This is a moderation outcome ("审核通知"): honor the group's
+    # auto-delete retention like the on-message ban notice in
+    # profile_screen.py does.
+    try:
+        await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
+    except Exception:
+        log.exception(
+            "join screening notice auto-delete scheduling failed | group=%s user=%s",
+            event.chat.id,
+            user_id,
+        )
 
 
 def _invalidate_admin_cache(event: ChatMemberUpdated) -> None:
@@ -2446,14 +2515,15 @@ async def _process_member_join(
             user_id,
         )
         return
-    await add_global_ban(
+    await mark_profile_screening_group_ban(
         session,
+        group_id,
         user_id,
         reason=f"入群资料命中群规: {reason}"[:500],
-        source="join_screening",
-        created_by=0,
+        target_display=user.full_name or "",
+        target_username=user.username or "",
     )
-    # The registry entry must be durable and the SQLite write lock released
+    # The group-local ban policy must be durable and the SQLite write lock released
     # before Telegram ban/notification calls.
     await session.commit()
 
@@ -2490,25 +2560,12 @@ async def _process_member_join(
         reason=reason,
         preserve_ban=current_profile_ban_policy,
         restriction_required=current_profile_restriction_required,
+        publish_notice=False,
     )
     if enforcement.final_banned is not True:
         if enforcement.retryable:
             raise RuntimeError("profile join ban enforcement requires durable retry")
         return
-    # Verification now starts before screening, so the absorbed record may
-    # still have a live challenge prompt in the group. The member is banned;
-    # retire that keyboard.
-    if int(recovery.prompt_message_id or 0) > 0:
-        await delete_verification_prompt(
-            event.bot,
-            group_id,
-            int(recovery.prompt_message_id),
-        )
-    await close_private_challenge_message(
-        event.bot,
-        user_id,
-        int(getattr(recovery, "private_message_id", 0) or 0),
-    )
     completed = await complete_leased_join_verification(
         session,
         verification_id=int(recovery.verification_id),
@@ -2517,6 +2574,22 @@ async def _process_member_join(
     )
     if completed:
         await session.commit()
+        # Consume the exact recovery generation before rewriting its prompt.
+        # A stale sweeper can no longer delete the terminal notice afterward.
+        await _publish_profile_screening_ban_notice(
+            event,
+            settings,
+            user_id=user_id,
+            display_name=user.full_name,
+            reason=reason,
+            prompt_message_id=int(recovery.prompt_message_id or 0),
+            require_existing_prompt=True,
+        )
+        await close_private_challenge_message(
+            event.bot,
+            user_id,
+            int(getattr(recovery, "private_message_id", 0) or 0),
+        )
         return
     await session.rollback()
     reconciliation = await enforce_ban_with_policy_reconciliation_result(

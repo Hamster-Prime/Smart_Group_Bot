@@ -2088,6 +2088,9 @@ def _join_event(*, user_id: int = 900, full_name: str = "新人", username: str 
                 return_value=SimpleNamespace(status="member", can_send_messages=True)
             ),
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=777)),
+            edit_message_text=AsyncMock(
+                return_value=SimpleNamespace(message_id=777)
+            ),
             delete_message=AsyncMock(return_value=True),
             restrict_chat_member=AsyncMock(),
             ban_chat_member=AsyncMock(),
@@ -2393,9 +2396,27 @@ class JoinTriggersVerificationTests(_DbTestCase):
             )
             first_restrict = event.bot.restrict_chat_member.await_args_list[0]
             self.assertFalse(first_restrict.kwargs["permissions"].can_send_messages)
-            # The absorbed challenge's live prompt must not survive the ban.
-            event.bot.delete_message.assert_awaited_once_with(-100, 777)
+            # The absorbed challenge becomes the terminal profile-review notice
+            # instead of producing a second group message.
+            event.bot.edit_message_text.assert_awaited_once()
+            edit_kwargs = event.bot.edit_message_text.await_args.kwargs
+            self.assertEqual(edit_kwargs["chat_id"], -100)
+            self.assertEqual(edit_kwargs["message_id"], 777)
+            self.assertIsNone(edit_kwargs["reply_markup"])
+            self.assertIn("<b>成员资料审核 · 已处理</b>", edit_kwargs["text"])
+            self.assertIn("已在当前群封禁成员", edit_kwargs["text"])
+            self.assertEqual(event.bot.send_message.await_count, 1)
+            event.bot.delete_message.assert_not_awaited()
             self.assertIsNone(await get_join_verification(session, -100, 914))
+            self.assertIsNone(await get_global_ban(session, 914))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 914,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
 
     async def test_banned_rejoin_is_banned_without_verification(self) -> None:
         from bot.handlers import membership

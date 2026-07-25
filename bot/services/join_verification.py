@@ -69,6 +69,7 @@ from bot.services.authz import (
     is_super_admin_user_id,
     set_group_bot_present,
 )
+from bot.services.ban_audit import record_ban_event
 from bot.services.background_health import record_background_failure
 from bot.services.join_screening import is_globally_banned
 from bot.services.recent_messages import (
@@ -82,7 +83,11 @@ from bot.services.request_priority import (
     current_execution_priority,
 )
 from bot.services.resource_health import register_resource_health_provider
-from bot.services.message_templates import card_field, render_progress_notice
+from bot.services.message_templates import (
+    card_field,
+    render_progress_notice,
+    render_summary_notice,
+)
 from bot.utils.telegram import (
     configured_auto_delete_seconds,
     schedule_message_auto_delete_durable,
@@ -802,6 +807,40 @@ async def mark_group_banned(
     return previous
 
 
+async def mark_profile_screening_group_ban(
+    session: AsyncSession,
+    group_id: int,
+    user_id: int,
+    *,
+    reason: str,
+    target_display: str = "",
+    target_username: str = "",
+) -> _GroupBanState:
+    """Persist a profile-screening ban only in the current group.
+
+    Profile metadata is group-rule evidence, so a hit must not create a
+    cross-group ``GlobalBan``.  Keep the local policy and its audit fact in the
+    same transaction so join/message enforcement and admin unban remain
+    recoverable through the existing ``UserWarning`` flow.
+    """
+
+    previous = await mark_group_banned(session, int(group_id), int(user_id))
+    already_banned = bool(previous is not None and previous[1])
+    await record_ban_event(
+        session,
+        group_id=int(group_id),
+        target_user_id=int(user_id),
+        target_display=target_display,
+        target_username=target_username,
+        action="ban",
+        source="profile_screening",
+        outcome="policy_updated" if already_banned else "policy_added",
+        reason=reason,
+        details={"scope": "group"},
+    )
+    return previous
+
+
 async def rollback_group_ban(
     session: AsyncSession,
     group_id: int,
@@ -1194,6 +1233,28 @@ def spoiler_display_name(display_name: str, user_id: int) -> str:
     if not label:
         return html.escape(str(user_id))
     return f"<tg-spoiler>{html.escape(label)}</tg-spoiler>"
+
+
+def build_profile_screening_ban_notice(
+    *,
+    user_id: int,
+    display_name: str,
+    reason: str,
+) -> str:
+    """Render the shared group-local profile-screening outcome notice."""
+
+    shown = spoiler_display_name(display_name, int(user_id))
+    return render_summary_notice(
+        "成员资料审核 · 已处理",
+        [
+            card_field(
+                "处理结果",
+                f"已在当前群封禁成员 <b>{shown}</b>（ID: <code>{int(user_id)}</code>）",
+            ),
+        ],
+        emphasis="如需解封，请管理员使用 <code>/unban</code> 命令。",
+        details=[card_field("原因", html.escape(reason or "资料命中群规"))],
+    )
 
 
 _VERIFICATION_NOTICE_LABELS = {

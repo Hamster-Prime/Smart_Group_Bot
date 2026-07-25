@@ -2,11 +2,12 @@ import asyncio
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 from bot.db.engine import init_db
-from bot.db.models import Group, ModerationRule, UserWarning
+from bot.db.models import BanAuditEvent, Group, ModerationRule, UserWarning
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.services.authz import authorize_group
@@ -23,11 +24,16 @@ from bot.services.join_screening import (
     remove_global_ban,
     screen_member_profile,
 )
+from bot.services.join_verification import (
+    get_join_verification,
+    upsert_join_verification,
+)
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
     bind_update_completion,
     reset_update_completion,
 )
+from bot.utils.timezone import now_shanghai_naive
 
 
 class GlobalBanServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -267,10 +273,60 @@ def _join_event(*, user_id: int = 900, full_name: str = "新人", username: str 
         bot=SimpleNamespace(
             get_chat=AsyncMock(return_value=SimpleNamespace(bio="正经简介")),
             send_message=AsyncMock(),
+            edit_message_text=AsyncMock(
+                return_value=SimpleNamespace(message_id=777)
+            ),
+            delete_message=AsyncMock(return_value=True),
             ban_chat_member=AsyncMock(return_value=True),
             get_chat_member=AsyncMock(return_value=SimpleNamespace(status="kicked")),
         ),
     )
+
+
+class ProfileScreeningNoticeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_required_prompt_missing_does_not_send_new_notice(self) -> None:
+        from bot.handlers import membership
+
+        event = _join_event(user_id=910, full_name="广告用户")
+        await membership._publish_profile_screening_ban_notice(
+            event,
+            membership.Settings(_env_file=None),
+            user_id=910,
+            display_name="广告用户",
+            reason="昵称含广告",
+            require_existing_prompt=True,
+        )
+
+        event.bot.edit_message_text.assert_not_awaited()
+        event.bot.send_message.assert_not_awaited()
+
+    async def test_existing_prompt_edit_failure_does_not_send_second_notice(self) -> None:
+        from unittest.mock import patch
+
+        from bot.handlers import membership
+
+        event = _join_event(user_id=909, full_name="广告用户")
+        event.bot.edit_message_text = AsyncMock(side_effect=RuntimeError("edit failed"))
+        cleanup = AsyncMock(return_value=True)
+        settings = membership.Settings(_env_file=None)
+
+        with patch(
+            "bot.handlers.membership.delete_verification_prompt",
+            new=cleanup,
+        ):
+            await membership._publish_profile_screening_ban_notice(
+                event,
+                settings,
+                user_id=909,
+                display_name="广告用户",
+                reason="昵称含广告",
+                prompt_message_id=777,
+                require_existing_prompt=True,
+            )
+
+        event.bot.edit_message_text.assert_awaited_once()
+        cleanup.assert_awaited_once_with(event.bot, -100, 777)
+        event.bot.send_message.assert_not_awaited()
 
 
 class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -297,7 +353,7 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
         settings.moderation.enabled = True
         return settings
 
-    async def test_violating_join_gets_banned_and_recorded(self) -> None:
+    async def test_violating_join_gets_group_banned_without_global_ban(self) -> None:
         from unittest.mock import patch
 
         from bot.handlers import membership
@@ -319,12 +375,88 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
                 901,
                 revoke_messages=True,
             )
-            event.bot.send_message.assert_awaited_once()
-            self.assertTrue(await is_globally_banned(session, 901))
-            row = await get_global_ban(session, 901)
-            self.assertEqual(row.source, "join_screening")
+            event.bot.send_message.assert_not_awaited()
+            self.assertFalse(await is_globally_banned(session, 901))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 901,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
+            audit = await session.scalar(
+                select(BanAuditEvent).where(
+                    BanAuditEvent.group_id == -100,
+                    BanAuditEvent.target_user_id == 901,
+                    BanAuditEvent.source == "profile_screening",
+                )
+            )
+            self.assertIsNotNone(audit)
+            self.assertIn("昵称含广告", audit.reason)
 
-    async def test_deauthorization_during_join_llm_discards_global_ban(self) -> None:
+    async def test_profile_violation_updates_existing_join_verification_prompt(self) -> None:
+        from unittest.mock import patch
+
+        from bot.handlers import membership
+
+        event = _join_event(user_id=908, full_name="广告用户")
+        edited = SimpleNamespace(message_id=777)
+        event.bot.edit_message_text = AsyncMock(return_value=edited)
+        settings = self._settings()
+        settings.bot.auto_delete_seconds = 42
+        settings.bot.auto_delete_categories = ["moderation"]
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=908,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=10),
+                display_name="广告用户",
+                prompt_message_id=777,
+            )
+            await session.commit()
+            fake_moderation = SimpleNamespace(
+                check_rules=AsyncMock(return_value=(True, "昵称含广告", None))
+            )
+            with (
+                patch("bot.handlers.membership.ModerationService", return_value=fake_moderation),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+                patch(
+                    "bot.handlers.membership.schedule_message_auto_delete_durable",
+                    new=AsyncMock(return_value=True),
+                ) as schedule_mock,
+            ):
+                await membership.on_member_join(
+                    event,
+                    session=session,
+                    settings=settings,
+                )
+
+            event.bot.edit_message_text.assert_awaited_once()
+            edit_kwargs = event.bot.edit_message_text.await_args.kwargs
+            self.assertEqual(edit_kwargs["chat_id"], -100)
+            self.assertEqual(edit_kwargs["message_id"], 777)
+            self.assertEqual(edit_kwargs["parse_mode"], "HTML")
+            self.assertIsNone(edit_kwargs["reply_markup"])
+            self.assertIn("<b>成员资料审核 · 已处理</b>", edit_kwargs["text"])
+            self.assertIn("已在当前群封禁成员", edit_kwargs["text"])
+            self.assertIn("昵称含广告", edit_kwargs["text"])
+            event.bot.send_message.assert_not_awaited()
+            event.bot.delete_message.assert_not_awaited()
+            schedule_mock.assert_awaited_once_with(edited, 42)
+            self.assertFalse(await is_globally_banned(session, 908))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 908,
+                )
+            )
+            self.assertIsNotNone(warning)
+            self.assertTrue(warning.is_banned)
+            self.assertIsNone(await get_join_verification(session, -100, 908))
+
+    async def test_deauthorization_during_join_llm_discards_profile_ban(self) -> None:
         from unittest.mock import patch
 
         from bot.handlers import membership
@@ -359,6 +491,14 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
         event.bot.send_message.assert_not_awaited()
         async with self.session_factory() as session:
             self.assertFalse(await is_globally_banned(session, 907))
+            warning = await session.scalar(
+                select(UserWarning.id).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 907,
+                    UserWarning.is_banned.is_(True),
+                )
+            )
+            self.assertIsNone(warning)
 
     async def test_clean_join_is_not_banned_and_marks_profile_checked(self) -> None:
         from unittest.mock import patch
