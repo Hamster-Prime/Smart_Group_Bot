@@ -148,6 +148,7 @@ def build_bot_runtime_profile_context(
         "music_search": "音乐搜索、歌曲发送、播放链接、封面与歌词",
         "websearch": "联网搜索实时信息",
         "webfetch": "抓取网页正文",
+        "mihomo_doc": "实时查询 mihomo（Clash Meta）官方配置文档",
         "bilibili_search": "B站搜索、视频详情、热门与排行榜",
         "weibo_search": "微博热搜、搜索与链接内容提取",
         "api_model_query": "本群配置的模型 API 查询：实时模型列表与列表内模型测活（不要用联网搜索代替）",
@@ -234,6 +235,11 @@ def build_bot_runtime_profile_context(
         lines.append(
             "movie_info_routing: 查询电影的当前元数据、TMDB/IMDb 评分或上映状态时，"
             "优先调用 movie_info；仅在结果不足时再用通用联网搜索。"
+        )
+    if "mihomo_doc" in normalized_skills:
+        lines.append(
+            "mihomo_doc_routing: 涉及 mihomo/Clash Meta 配置、排错或 YAML 编写审查时，"
+            "必须先查询实时官方文档；search/toc 后继续读取 page/section，不得凭模型记忆补字段。"
         )
 
     lines.append(build_command_guide_context())
