@@ -1540,6 +1540,10 @@ button:disabled {
   gap: 14px 18px;
 }
 
+.group-api-model-query-note {
+  grid-column: 1 / -1;
+}
+
 .group-settings-grid .field.proactive-brief,
 .group-settings-grid .field.mimic-profile,
 .group-settings-grid .field.welcome-message,

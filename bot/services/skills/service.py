@@ -18,6 +18,7 @@ from bot.services.message_templates import render_data_brief
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
+from bot.services.skills.api_model_query import ApiModelQuerySkill
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
@@ -25,7 +26,6 @@ from bot.services.skills.movie_info import MovieInfoSkill
 from bot.services.skills.music_search import MusicSearchSkill
 from bot.services.skills.rule_manage import RuleManageSkill
 from bot.services.skills.send_sticker import SendStickerSkill
-from bot.services.skills.sub2api_query import Sub2ApiQuerySkill
 from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.services.skills.weibo_search import WeiboSearchSkill
@@ -133,7 +133,7 @@ _INTERMEDIATE_TOOL_REPLY_PATTERNS: dict[str, re.Pattern[str]] = {
     "music_search": re.compile(r"^找到\s*\d+\s*首相关歌曲[。！？!?\. ]*$"),
     "bilibili_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|视频|Feed|热搜)[。！？!?\. ]*$"),
     "weibo_search": re.compile(r"^(?:找到|拿到)\s*\d+\s*条.*?(?:结果|微博|Feed|热搜)[。！？!?\. ]*$"),
-    "sub2api_query": re.compile(
+    "api_model_query": re.compile(
         r"^(?:查到\s*\d+\s*个可用模型|模型\s*\S+\s*(?:可用|不可用).*)[。！？!?\. ]*$"
     ),
     "movie_info": re.compile(
@@ -148,7 +148,7 @@ _INFO_FOLLOWUP_SKILLS = frozenset(
         "music_search",
         "bilibili_search",
         "weibo_search",
-        "sub2api_query",
+        "api_model_query",
         "movie_info",
     }
 )
@@ -203,9 +203,9 @@ class SkillService:
             self._register(movie_info_skill)
         if settings is not None:
             self._register(VoteBanSkill(settings))
-        sub2api_skill = Sub2ApiQuerySkill(settings)
-        if sub2api_skill.available:
-            self._register(sub2api_skill)
+        if settings is not None:
+            self._register(ApiModelQuerySkill(settings))
+        self.api_model_query_skill_name = ApiModelQuerySkill.name
         self.tts_skill_name = DoubaoTTSSkill.name
         self.tts_service = DoubaoTTSService(settings) if settings is not None else None
         if self.tts_service and self.tts_service.available:
@@ -214,17 +214,31 @@ class SkillService:
     def _register(self, skill: Skill) -> None:
         self.skills[skill.name] = skill
 
-    def _selected_skills(self, *, allow_tts: bool) -> dict[str, Skill]:
-        if allow_tts:
-            return dict(self.skills)
+    def _selected_skills(
+        self,
+        *,
+        allow_tts: bool,
+        allow_api_model_query: bool,
+    ) -> dict[str, Skill]:
         return {
             name: skill
             for name, skill in self.skills.items()
-            if name != self.tts_skill_name
+            if (allow_tts or name != self.tts_skill_name)
+            and (allow_api_model_query or name != self.api_model_query_skill_name)
         }
 
-    def available_skill_names(self, *, allow_tts: bool = True) -> list[str]:
-        return list(self._selected_skills(allow_tts=allow_tts).keys())
+    def available_skill_names(
+        self,
+        *,
+        allow_tts: bool = True,
+        allow_api_model_query: bool = False,
+    ) -> list[str]:
+        return list(
+            self._selected_skills(
+                allow_tts=allow_tts,
+                allow_api_model_query=allow_api_model_query,
+            ).keys()
+        )
 
     @staticmethod
     def _normalize_user_text(text: str, *, merged_count: int) -> str:
@@ -398,6 +412,7 @@ class SkillService:
         sender_is_tg_admin: bool = False,
         intent_type: str = "casual",
         allow_tts: bool = True,
+        allow_api_model_query: bool = False,
         tts_mode: str = TTS_MODE_OFF,
         merged_count: int = 1,
         merged_context: str = "",
@@ -407,7 +422,10 @@ class SkillService:
         style_profile_context: str = "",
     ) -> dict[str, Any]:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
-        selected_skills = self._selected_skills(allow_tts=allow_tts)
+        selected_skills = self._selected_skills(
+            allow_tts=allow_tts,
+            allow_api_model_query=allow_api_model_query,
+        )
         return {
             "messages": self._build_answer_messages(
                 user_text,
@@ -496,6 +514,16 @@ class SkillService:
             return SkillRunResult(ok=False, skill=name, summary="未知技能", error="unknown_skill")
 
         may_have_side_effect = self._tool_may_have_side_effect(name, arguments)
+        execution_timeout = self.tool_timeout_seconds
+        timeout_provider = getattr(skill, "execution_timeout_seconds", None)
+        if callable(timeout_provider):
+            try:
+                execution_timeout = max(
+                    execution_timeout,
+                    min(610.0, max(0.1, float(timeout_provider(arguments)))),
+                )
+            except (TypeError, ValueError):
+                log.warning("skill returned invalid execution timeout | name=%s", name)
 
         # A timed-out coroutine may ignore cancellation. Give it a private
         # context so a late completion cannot race the next model round by
@@ -538,14 +566,14 @@ class SkillService:
 
         task = asyncio.create_task(_invoke(), name=f"skill:{name}")
         try:
-            done, _ = await asyncio.wait({task}, timeout=self.tool_timeout_seconds)
+            done, _ = await asyncio.wait({task}, timeout=execution_timeout)
             if task not in done:
                 task.cancel()
                 _track_skill_orphan(task)
                 log.warning(
                     "skill timed out | name=%s timeout=%.1fs",
                     name,
-                    self.tool_timeout_seconds,
+                    execution_timeout,
                 )
                 if may_have_side_effect:
                     return self._ambiguous_side_effect_result(name)
@@ -713,10 +741,11 @@ class SkillService:
                 "Do not stop at only reporting the number of matches.\n"
                 "Use the returned tracks to answer the user in Chinese now."
             )
-        if result.skill == "sub2api_query":
+        if result.skill == "api_model_query":
             return (
                 "[TOOL_FOLLOWUP]\n"
-                "You already have Sub2API gateway query results (models list or liveness check).\n"
+                "You already have this group's configured API model query results "
+                "(models list or liveness check).\n"
                 "Do not stop at an intermediate status like only reporting the count or raw summary.\n"
                 "Read the payload fields (models[].id, alive, latency_ms, error_detail) "
                 "and answer the user's actual request in Chinese now.\n"
@@ -1397,6 +1426,7 @@ class SkillService:
         session_factory: Any | None = None,
         intent_type: str = "casual",
         allow_tts: bool = True,
+        allow_api_model_query: bool = False,
         tts_mode: str = TTS_MODE_OFF,
         merged_count: int = 1,
         merged_context: str = "",
@@ -1411,7 +1441,10 @@ class SkillService:
         if contains_prompt_injection(user_text):
             log.warning("skill input may contain prompt injection")
 
-        selected_skills = self._selected_skills(allow_tts=allow_tts)
+        selected_skills = self._selected_skills(
+            allow_tts=allow_tts,
+            allow_api_model_query=allow_api_model_query,
+        )
         messages = self._build_answer_messages(
             user_text,
             history=history,

@@ -45,6 +45,7 @@ from bot.services.authz import (
 from bot.services.callback_auth import is_group_admin_or_higher
 from bot.services.ban_audit import record_ban_event
 from bot.services.call_admin import handle_call_admin, is_call_admin_trigger
+from bot.services.api_model_query import api_model_query_tool_enabled
 from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.vote_ban import (
     VOTE_BAN_ADMIN_RESOLUTION_BAN,
@@ -4250,6 +4251,7 @@ async def _process_pending_reply_batch(
                 log.info("[%s] pending batch skipped | reason=mute_all_replies user=%s", group_id, user_id)
                 return True
             tts_mode = normalize_tts_mode(group_settings)
+            allow_api_model_query = api_model_query_tool_enabled(group_settings)
             style_state = get_style_state(group_settings)
             style_profile_context = build_style_profile_context(
                 str(style_state.get("profile_text") or ""),
@@ -4335,6 +4337,7 @@ async def _process_pending_reply_batch(
                         sender_is_tg_admin=False,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
+                        allow_api_model_query=allow_api_model_query,
                         tts_mode=tts_mode,
                         merged_count=merged_count,
                         merged_context=merged_context,
@@ -4373,6 +4376,7 @@ async def _process_pending_reply_batch(
                         session_factory=session_factory,
                         intent_type=action,
                         allow_tts=is_tts_tool_enabled(tts_mode),
+                        allow_api_model_query=allow_api_model_query,
                         tts_mode=tts_mode,
                         merged_count=merged_count,
                         merged_context=merged_context,
@@ -4440,7 +4444,8 @@ async def _process_pending_reply_batch(
                             llm,
                             settings=settings,
                             skill_names=skill.available_skill_names(
-                                allow_tts=is_tts_tool_enabled(tts_mode)
+                                allow_tts=is_tts_tool_enabled(tts_mode),
+                                allow_api_model_query=allow_api_model_query,
                             ),
                         )
                         raw_reply = await casual.reply(

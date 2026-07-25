@@ -708,6 +708,96 @@ async def fetch_json(
         ) from exc
 
 
+async def request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    json_body: Any | None = None,
+    timeout_sec: float = 15.0,
+    allowed_hosts: Iterable[str] = (),
+    max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
+    max_decoded_bytes: int = _DEFAULT_MAX_DECODED_BYTES,
+) -> tuple[int, Any | None, str, str]:
+    """Make one bounded, DNS-pinned JSON request without forwarding redirects.
+
+    The return value is ``(status, parsed_json, final_url, error_text)``.  A
+    redirect is returned as an error instead of being followed, which keeps
+    caller-supplied credentials confined to the explicitly configured origin.
+    """
+    normalized_method = str(method or "").strip().upper()
+    if normalized_method not in {"GET", "POST"}:
+        raise ValueError("unsupported_http_method")
+
+    request_headers = {
+        "User-Agent": "SmartGroupBot/1.0",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if headers:
+        forbidden_request_headers = {
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "proxy-connection",
+        }
+        request_headers.update(
+            {
+                str(name): str(value)
+                for name, value in headers.items()
+                if str(name).strip()
+                and str(name).strip().lower() not in forbidden_request_headers
+            }
+        )
+    # Keep response decompression within the formats bounded below.
+    request_headers["Accept-Encoding"] = "gzip, deflate"
+    if normalized_method == "POST":
+        request_headers["Content-Type"] = "application/json"
+
+    timeout_value = max(0.1, float(timeout_sec))
+    request_url = (url or "").strip()
+    async with asyncio.timeout(timeout_value):
+        target = await resolve_public_http_url(
+            request_url,
+            allowed_hosts=allowed_hosts,
+            dns_timeout_sec=min(_DNS_TIMEOUT_SEC, timeout_value),
+        )
+        response = await _fetch_text_one_hop(
+            request_url,
+            target=target,
+            params=dict(params or {}) or None,
+            headers=request_headers,
+            timeout_sec=timeout_value,
+            allowed_content_types=(
+                "application/json",
+                "text/json",
+                "text/plain",
+                "text/html",
+                "application/xhtml+xml",
+            ),
+            max_response_bytes=max_response_bytes,
+            max_decoded_bytes=max_decoded_bytes,
+            method=normalized_method,
+            json_body=json_body,
+        )
+
+    if response.status in _HTTP_REDIRECT_STATUSES:
+        return response.status, None, response.url, "redirect_not_allowed"
+    try:
+        payload = json.loads(response.text)
+    except (json.JSONDecodeError, TypeError):
+        error_text = clean_multiline_text((response.text or "").strip(), max_len=300)
+        return (
+            response.status,
+            None,
+            response.url,
+            error_text or "invalid_json_response",
+        )
+    return response.status, payload, response.url, ""
+
+
 def _content_type_allowed(content_type: str, allowed: Iterable[str]) -> bool:
     media_type = (content_type or "").split(";", 1)[0].strip().lower()
     if not media_type:
@@ -786,6 +876,8 @@ async def _fetch_text_one_hop(
     allowed_content_types: Iterable[str],
     max_response_bytes: int,
     max_decoded_bytes: int,
+    method: str = "GET",
+    json_body: Any | None = None,
 ) -> _HopResponse:
     resolver = _PinnedResolver(target)
     connector = aiohttp.TCPConnector(
@@ -806,7 +898,13 @@ async def _fetch_text_one_hop(
         auto_decompress=False,
         trust_env=False,
     ) as session:
-        async with session.get(url, params=params, allow_redirects=False) as response:
+        async with session.request(
+            method,
+            url,
+            params=params,
+            json=json_body,
+            allow_redirects=False,
+        ) as response:
             response_url = str(response.url)
             content_type = str(response.headers.get("content-type") or "").lower()
             location = str(response.headers.get("location") or "").strip()

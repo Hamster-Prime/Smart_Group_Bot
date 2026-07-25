@@ -10,6 +10,7 @@ from bot.db.models import RuntimeConfigRecord, RuntimeConfigSecret
 from bot.services.runtime_config import (
     RuntimeConfigConflictError,
     RuntimeConfigManager,
+    SecretCipher,
     build_legacy_runtime_config,
 )
 
@@ -174,8 +175,23 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             bot_payload = dict(payload["bot"])
             bot_payload["drop_pending_updates"] = True
             payload["bot"] = bot_payload
+            payload["sub2api"] = {
+                "enabled": True,
+                "base_url": "https://retired.example.com",
+                "http_timeout_sec": 15.0,
+                "check_timeout_sec": 45.0,
+            }
             row.payload = payload
             row.revision = 7
+            session.add(
+                RuntimeConfigSecret(
+                    name="sub2api.api_key",
+                    ciphertext=SecretCipher(
+                        self.settings.config_master_key
+                    ).encrypt("retired-global-key"),
+                    updated_by=42,
+                )
+            )
             await session.commit()
 
         reloaded_settings = Settings(
@@ -200,6 +216,10 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertEqual(row.revision, 7)
             self.assertFalse(row.payload["bot"]["drop_pending_updates"])
+            self.assertNotIn("sub2api", row.payload)
+            self.assertIsNone(
+                await session.get(RuntimeConfigSecret, "sub2api.api_key")
+            )
 
     async def test_secret_is_encrypted_masked_and_preserved_on_regular_save(self) -> None:
         payload = self.manager.config.public_payload()
@@ -494,7 +514,10 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             expected_revision=1,
             updated_by=42,
             secret_changes={
-                "sub2api.api_key": {"action": "replace", "value": "gateway-key"}
+                "movie_info.tmdb_read_access_token": {
+                    "action": "replace",
+                    "value": "tmdb-read-token",
+                }
             },
         )
         reloaded_settings = Settings(
@@ -511,7 +534,10 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         await reloaded.initialize()
         self.assertEqual(reloaded.revision, 2)
-        self.assertEqual(reloaded.config.sub2api.api_key, "gateway-key")
+        self.assertEqual(
+            reloaded.config.movie_info.tmdb_read_access_token,
+            "tmdb-read-token",
+        )
 
     async def test_invalid_legacy_provider_does_not_create_config_row(self) -> None:
         async with self.session_factory() as session:

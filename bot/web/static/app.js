@@ -29,7 +29,7 @@
     { id: "bot", label: "Bot 行为", icon: "bot", subtitle: "消息、上下文与主动发言", group: "Bot 能力" },
     { id: "safety", label: "审核验证", icon: "shield-check", subtitle: "内容审核与入群验证", group: "Bot 能力" },
     { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸", group: "Bot 能力" },
-    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息与 Sub2API 接入", group: "Bot 能力" },
+    { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息服务接入", group: "Bot 能力" },
     { id: "groups", label: "群组设置", icon: "users", subtitle: "逐群行为、群规与自动化", group: "群组管理" },
     { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局封禁", group: "群组管理" },
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转", group: "系统" },
@@ -37,6 +37,7 @@
 
   const GROUP_SECTION_NAV = [
     { key: "reply-media", label: "回复与媒体", icon: "message-circle" },
+    { key: "model-api", label: "模型 API", icon: "server" },
     { key: "onboarding", label: "入群欢迎", icon: "user-plus" },
     { key: "permissions", label: "成员权限", icon: "key-round" },
     { key: "safety", label: "安全防护", icon: "shield-check" },
@@ -49,6 +50,11 @@
 
   const GROUP_SECTION_SETTING_KEYS = {
     "reply-media": ["mute_all_replies", "at_reply_mode", "av_enabled", "tts_mode"],
+    "model-api": [
+      "api_model_query_enabled", "api_model_query_base_url",
+      "api_model_query_http_timeout_sec", "api_model_query_check_timeout_sec",
+      "api_model_query_api_key_configured",
+    ],
     onboarding: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
     permissions: ["default_permissions"],
     safety: [
@@ -127,6 +133,10 @@
     "mimic_target_user_id",
     "mimic_target_user_name",
     "mimic_profile_text",
+    "api_model_query_enabled",
+    "api_model_query_base_url",
+    "api_model_query_http_timeout_sec",
+    "api_model_query_check_timeout_sec",
   ]);
 
   const RAID_GUARD_GROUP_INT_FIELDS = [
@@ -201,6 +211,7 @@
     groupPermissionLoads: new Map(),
     groupTelegramAdmins: new Map(),
     groupTemplateButtonDrafts: new Map(),
+    groupApiModelQuerySecretChanges: new Map(),
     groupCardOpen: new Map(),
     groupSectionOpen: new Map(),
     resourceFormDrafts: new Map(),
@@ -308,6 +319,7 @@
   function groupDirty(group) {
     const buttonDraft = state.groupTemplateButtonDrafts.get(String(group.id));
     return Boolean(buttonDraft?.error)
+      || state.groupApiModelQuerySecretChanges.has(String(group.id))
       || !sameValue(group.settings, state.groupBaselines.get(String(group.id)));
   }
 
@@ -1050,16 +1062,6 @@
             ${secretField("movie_info.imdb_aws_session_token", "IMDb AWS Session Token", "临时凭据可留空；空白不会覆盖已保存的密钥")}
           </div>
         </section>
-        <section class="settings-section">
-          ${sectionHead("Sub2API")}
-          <div class="field-grid three">
-            ${toggle("sub2api.enabled", "启用 Sub2API", "允许订阅查询技能访问服务")}
-            ${field("sub2api.http_timeout_sec", "HTTP 超时（秒）", { type: "number", min: 1, max: 300, step: 0.1, required: true })}
-            ${field("sub2api.check_timeout_sec", "检查超时（秒）", { type: "number", min: 1, max: 600, step: 0.1, required: true })}
-            ${field("sub2api.base_url", "Base URL", { type: "url", maxlength: 1000, full: true })}
-            ${secretField("sub2api.api_key", "API Key", "空白不会覆盖已保存的密钥")}
-          </div>
-        </section>
       </div>`;
   }
 
@@ -1151,6 +1153,11 @@
       mimic_profile_text: String(settings.mimic_profile_text || ""),
       mimic_sample_count: Number(settings.mimic_sample_count || 0),
       mimic_distilled_at_count: Number(settings.mimic_distilled_at_count || 0),
+      api_model_query_enabled: Boolean(settings.api_model_query_enabled),
+      api_model_query_base_url: String(settings.api_model_query_base_url || ""),
+      api_model_query_http_timeout_sec: Number(settings.api_model_query_http_timeout_sec ?? 15),
+      api_model_query_check_timeout_sec: Number(settings.api_model_query_check_timeout_sec ?? 45),
+      api_model_query_api_key_configured: Boolean(settings.api_model_query_api_key_configured),
     };
   }
 
@@ -1304,6 +1311,50 @@
       </div>`;
   }
 
+  function groupApiModelQuerySecretChange(groupId) {
+    return state.groupApiModelQuerySecretChanges.get(String(groupId));
+  }
+
+  function groupApiModelQuerySecretConfigured(group) {
+    const change = groupApiModelQuerySecretChange(group.id);
+    if (change?.action === "replace") return Boolean(String(change.value || "").trim());
+    if (change?.action === "clear") return false;
+    return Boolean(group.settings.api_model_query_api_key_configured);
+  }
+
+  function renderGroupApiModelQuerySecretField(group, saving) {
+    const change = groupApiModelQuerySecretChange(group.id);
+    const configured = Boolean(group.settings.api_model_query_api_key_configured);
+    const replacing = change?.action === "replace";
+    const clearing = change?.action === "clear";
+    const status = clearing
+      ? `<span class="badge warning">等待清除</span>`
+      : replacing
+        ? `<span class="badge warning">等待替换</span>`
+        : configured
+          ? `<span class="badge success">已配置</span>`
+          : `<span class="badge">未配置</span>`;
+    const action = clearing || replacing
+      ? `<button class="mini-icon-button" type="button" data-action="group-api-model-query-secret-undo" data-group-id="${attr(group.id)}" aria-label="${clearing ? "撤销清除" : "撤销替换"}" title="${clearing ? "撤销清除" : "撤销替换"}"${saving ? " disabled" : ""}>${icon("undo-2")}</button>`
+      : configured
+        ? `<button class="mini-icon-button danger" type="button" data-action="group-api-model-query-secret-clear" data-group-id="${attr(group.id)}" aria-label="清除 API Key" title="清除 API Key"${saving ? " disabled" : ""}>${icon("trash-2")}</button>`
+        : "";
+    const placeholder = replacing
+      ? "已暂存新密钥；再次输入可替换待保存值"
+      : configured
+        ? "留空保留当前密钥"
+        : "输入 API Key";
+    return `
+      <div class="field full group-api-model-query-secret">
+        <label class="field-label" for="group-${attr(group.id)}-api-model-query-api-key">API Key</label>
+        <div class="secret-control">
+          <input id="group-${attr(group.id)}-api-model-query-api-key" type="password" data-group-api-model-query-secret-input data-group-id="${attr(group.id)}" value="" maxlength="1024" placeholder="${attr(placeholder)}" autocomplete="new-password"${clearing || saving ? " disabled" : ""}>
+          <div class="secret-status">${status}${action}</div>
+        </div>
+        <span class="field-hint">密钥不会回显；留空会保留已保存值，清除需与关闭此功能一并保存。</span>
+      </div>`;
+  }
+
   function renderCallAdminTargets(group, saving) {
     const key = String(group.id);
     const admins = state.groupTelegramAdmins.get(key);
@@ -1423,6 +1474,10 @@
     if (settingKeys.includes("welcome_buttons") && state.groupTemplateButtonDrafts.get(String(group.id))?.error) {
       return true;
     }
+    if (
+      settingKeys.includes("api_model_query_api_key_configured")
+      && state.groupApiModelQuerySecretChanges.has(String(group.id))
+    ) return true;
     return settingKeys.some(key => !sameValue(group.settings[key], baseline[key]));
   }
 
@@ -1548,6 +1603,36 @@
                       <option value="on"${group.settings.tts_mode === "on" ? " selected" : ""}>允许按需语音</option>
                       <option value="always"${group.settings.tts_mode === "always" ? " selected" : ""}>始终发送语音</option>
                     </select>
+                  </div>
+                </div>`,
+            })}
+            ${renderGroupSettingsSection(group, {
+              key: "model-api",
+              title: "模型 API",
+              description: "逐群拉取可用模型并按所选模型发起连接测试",
+              iconName: "server",
+              itemLabel: "5 项",
+              settingKeys: GROUP_SECTION_SETTING_KEYS["model-api"],
+              content: `
+                <div class="group-settings-grid">
+                  <div class="notice info group-api-model-query-note">
+                    ${icon("info")}
+                    <span>兼容 OpenAI Chat Completions API；仅允许公网 HTTPS，Base URL 填写到服务根地址或包含 <code>/v1</code> 均可。</span>
+                  </div>
+                  ${groupToggle(group, "api_model_query_enabled", "启用模型 API", "允许本群查询模型列表并测试指定模型", saving)}
+                  <div class="field full">
+                    <label class="field-label" for="group-${attr(group.id)}-api-model-query-base-url">Base URL</label>
+                    <input id="group-${attr(group.id)}-api-model-query-base-url" type="url" data-group-id="${attr(group.id)}" data-group-key="api_model_query_base_url" data-kind="string" value="${attr(group.settings.api_model_query_base_url)}" maxlength="1000" placeholder="https://api.example.com 或 https://api.example.com/v1"${saving ? " disabled" : ""}>
+                    <span class="field-hint">开启时必填；不能包含账号、查询参数或 URL 片段。</span>
+                  </div>
+                  ${renderGroupApiModelQuerySecretField(group, saving)}
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-api-model-query-http-timeout">单请求超时（秒）</label>
+                    <input id="group-${attr(group.id)}-api-model-query-http-timeout" type="number" min="1" max="300" step="0.1" required data-group-id="${attr(group.id)}" data-group-key="api_model_query_http_timeout_sec" data-kind="number" value="${attr(group.settings.api_model_query_http_timeout_sec)}"${saving ? " disabled" : ""}>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="group-${attr(group.id)}-api-model-query-check-timeout">模型测试总超时（秒）</label>
+                    <input id="group-${attr(group.id)}-api-model-query-check-timeout" type="number" min="1" max="600" step="0.1" required data-group-id="${attr(group.id)}" data-group-key="api_model_query_check_timeout_sec" data-kind="number" value="${attr(group.settings.api_model_query_check_timeout_sec)}"${saving ? " disabled" : ""}>
                   </div>
                 </div>`,
             })}
@@ -2067,7 +2152,7 @@
         <div class="error-state">${icon("circle-x")}<p>${escapeHtml(state.groupsError)}</p></div>`;
     }
     return `
-      ${pageHead("群组设置", "按群管理回复、入群、权限、关键词回复、定时消息、群规和成员名单；所有配置统一保存。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size || state.reloadingGroups ? " disabled" : ""}>${state.reloadingGroups ? `<span class="spinner spinner-small"></span>刷新中` : `${icon("refresh-cw")}刷新群组`}</button>`)}
+      ${pageHead("群组设置", "按群管理回复、模型 API、入群、权限、关键词回复、定时消息、群规和成员名单；所有配置统一保存。", `<button class="secondary-button" type="button" data-action="reload-groups"${state.groupSaving.size || state.reloadingGroups ? " disabled" : ""}>${state.reloadingGroups ? `<span class="spinner spinner-small"></span>刷新中` : `${icon("refresh-cw")}刷新群组`}</button>`)}
       <div class="group-toolbar">
         <div class="search-wrap">${icon("search")}<input id="group-search" class="search-input" type="search" placeholder="搜索群名或群 ID" aria-label="搜索群名或群 ID" autocomplete="off" value="${attr(state.groupSearch)}"></div>
         <span class="badge info">${state.groups.length} 个群组</span>
@@ -2254,6 +2339,7 @@
 
   function discardGroupResourceDrafts(groupId) {
     const target = String(groupId);
+    state.groupApiModelQuerySecretChanges.delete(target);
     for (const key of [...state.resourceFormDrafts.keys()]) {
       if (resourceDraftGroupId(key) === target) state.resourceFormDrafts.delete(key);
     }
@@ -2715,7 +2801,8 @@
     payload.verification.hcaptcha_secret_key = "";
     payload.tts.app_key = "";
     payload.tts.access_key = "";
-    payload.sub2api.api_key = "";
+    // Older settings documents may still contain the retired global Sub2API block.
+    if (payload.sub2api) payload.sub2api.api_key = "";
     payload.movie_info.tmdb_read_access_token = "";
     payload.movie_info.imdb_api_key = "";
     payload.movie_info.imdb_aws_access_key_id = "";
@@ -2816,7 +2903,7 @@
       showToast(`欢迎语按钮格式无效：${templateDraft.error}`, "error", 6500);
       return false;
     }
-    const invalid = [...content.querySelectorAll("[data-group-key], [data-template-buttons], [data-permission-control]")].find(
+    const invalid = [...content.querySelectorAll("[data-group-key], [data-template-buttons], [data-permission-control], [data-group-api-model-query-secret-input]")].find(
       control => String(control.dataset.groupId) === String(groupId) && !control.checkValidity(),
     );
     if (invalid) {
@@ -2827,6 +2914,22 @@
         invalid.scrollIntoView({ block: "center", behavior: "auto" });
       });
       showToast("请修正群组设置中标记的字段", "error", 5000);
+      return false;
+    }
+    const apiModelQuerySecretChange = groupApiModelQuerySecretChange(groupId);
+    if (group.settings.api_model_query_enabled && apiModelQuerySecretChange?.action === "clear") {
+      revealGroupSection(groupId, "model-api");
+      showToast(`${group.title || group.id}：清除模型 API Key 时必须同时关闭模型 API`, "error", 6000);
+      return false;
+    }
+    if (group.settings.api_model_query_enabled && !String(group.settings.api_model_query_base_url || "").trim()) {
+      revealGroupSection(groupId, "model-api");
+      showToast(`${group.title || group.id}：开启模型 API 前请填写 Base URL`, "error", 6000);
+      return false;
+    }
+    if (group.settings.api_model_query_enabled && !groupApiModelQuerySecretConfigured(group)) {
+      revealGroupSection(groupId, "model-api");
+      showToast(`${group.title || group.id}：开启模型 API 前请配置 API Key`, "error", 6000);
       return false;
     }
     const permissionConfig = group.settings.default_permissions;
@@ -2983,6 +3086,7 @@
 
   async function persistGroupChanges(group) {
     const baseline = state.groupBaselines.get(String(group.id)) || {};
+    const apiModelQuerySecretChange = groupApiModelQuerySecretChange(group.id);
     const changedSettings = Object.fromEntries(
       Object.entries(group.settings).filter(
         ([key, value]) => GROUP_EDITABLE_KEYS.has(key) && !sameValue(value, baseline[key]),
@@ -2990,12 +3094,22 @@
     );
     const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.id)}/settings`, {
       method: "PUT",
-      body: JSON.stringify({ revision: group.revision, settings: clone(changedSettings) }),
+      body: JSON.stringify({
+        revision: group.revision,
+        settings: clone(changedSettings),
+        ...(apiModelQuerySecretChange
+          ? { api_model_query_secret_change: clone(apiModelQuerySecretChange) }
+          : {}),
+      }),
     });
     const returnedSettings = result?.settings || result?.group?.settings;
     if (returnedSettings) group.settings = normalizeGroupSettings(returnedSettings);
+    else if (apiModelQuerySecretChange) {
+      group.settings.api_model_query_api_key_configured = apiModelQuerySecretChange.action === "replace";
+    }
     if (result?.group?.revision) group.revision = String(result.group.revision);
     state.groupTemplateButtonDrafts.delete(String(group.id));
+    state.groupApiModelQuerySecretChanges.delete(String(group.id));
     state.groupBaselines.set(String(group.id), clone(group.settings));
     return result?.permission_apply;
   }
@@ -3354,6 +3468,20 @@
       updateChrome();
       return;
     }
+    if (target.matches("[data-group-api-model-query-secret-input]")) {
+      const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
+      if (!group || state.groupSaving.has(String(group.id))) return;
+      const value = target.value.trim();
+      if (value) state.groupApiModelQuerySecretChanges.set(String(group.id), { action: "replace", value });
+      else state.groupApiModelQuerySecretChanges.delete(String(group.id));
+      const badge = target.closest(".secret-control")?.querySelector(".badge");
+      if (badge) {
+        badge.className = `badge ${value ? "warning" : group.settings.api_model_query_api_key_configured ? "success" : ""}`.trim();
+        badge.textContent = value ? "等待替换" : group.settings.api_model_query_api_key_configured ? "已配置" : "未配置";
+      }
+      updateGroupCardState(target, group);
+      return;
+    }
     if (target.matches("[data-prompt-input]")) {
       const key = target.dataset.promptInput;
       state.config.prompts[key] = target.value;
@@ -3566,6 +3694,18 @@
       updateChrome();
       return;
     }
+    if (action === "group-api-model-query-secret-clear") {
+      state.groupApiModelQuerySecretChanges.set(String(button.dataset.groupId), { action: "clear" });
+      renderContent();
+      updateChrome();
+      return;
+    }
+    if (action === "group-api-model-query-secret-undo") {
+      state.groupApiModelQuerySecretChanges.delete(String(button.dataset.groupId));
+      renderContent();
+      updateChrome();
+      return;
+    }
     if (action === "select-prompt") {
       const promptList = content.querySelector(".prompt-list");
       const promptScrollLeft = promptList?.scrollLeft || 0;
@@ -3693,6 +3833,7 @@
           if (groupIndex >= 0) state.groups.splice(groupIndex, 1);
           state.groupBaselines.delete(groupKey);
           state.groupTemplateButtonDrafts.delete(groupKey);
+          state.groupApiModelQuerySecretChanges.delete(groupKey);
           state.groupResources.delete(groupKey);
           state.groupResourceLoads.delete(groupKey);
           state.groupPermissionLoads.delete(groupKey);
@@ -3764,6 +3905,7 @@
         "刷新会丢弃所有未保存的群组设置和群管理表单草稿。",
       )) return;
       state.groupTemplateButtonDrafts.clear();
+      state.groupApiModelQuerySecretChanges.clear();
       clearResourceFormDrafts();
       await reloadGroups();
     }
@@ -4139,6 +4281,7 @@
       "重新加载会丢弃所有未保存的配置、群组设置和群管理表单草稿。",
     )) return;
     state.groupTemplateButtonDrafts.clear();
+    state.groupApiModelQuerySecretChanges.clear();
     clearResourceFormDrafts();
     loadAll();
   });

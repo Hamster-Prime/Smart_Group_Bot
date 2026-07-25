@@ -38,6 +38,25 @@ class Group(Base):
     permanent_memories: Mapped[list[GroupPermanentMemory]] = relationship(back_populates="group")
 
 
+class GroupApiModelQuerySecret(Base):
+    """Encrypted OpenAI-compatible API credential scoped to one group."""
+
+    __tablename__ = "group_api_model_query_secrets"
+
+    group_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("groups.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ciphertext: Mapped[str] = mapped_column(Text, default="")
+    updated_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class GroupContextSummary(Base):
     __tablename__ = "group_context_summaries"
 

@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.config import (
@@ -42,7 +42,6 @@ _STATIC_SECRET_PATHS = (
     "verification.hcaptcha_secret_key",
     "tts.app_key",
     "tts.access_key",
-    "sub2api.api_key",
     "movie_info.tmdb_read_access_token",
     "movie_info.imdb_api_key",
     "movie_info.imdb_aws_access_key_id",
@@ -424,14 +423,6 @@ class MusicSettingsConfig(StrictModel):
     stable_sources: list[str] = Field(default_factory=lambda: ["kuwo", "netease", "joox", "bilibili"])
 
 
-class Sub2APISettingsConfig(StrictModel):
-    enabled: bool = False
-    base_url: str = Field(default="", max_length=1000)
-    api_key: str = Field(default="", max_length=1024)
-    http_timeout_sec: float = Field(default=15.0, ge=1.0, le=300.0)
-    check_timeout_sec: float = Field(default=45.0, ge=1.0, le=600.0)
-
-
 class MovieInfoSettingsConfig(StrictModel):
     enabled: bool = False
     http_timeout_sec: float = Field(default=6.0, ge=1.0, le=6.0)
@@ -547,7 +538,6 @@ class RuntimeConfig(StrictModel):
     verification: VerificationSettingsConfig = Field(default_factory=VerificationSettingsConfig)
     tts: TTSSettingsConfig = Field(default_factory=TTSSettingsConfig)
     music: MusicSettingsConfig = Field(default_factory=MusicSettingsConfig)
-    sub2api: Sub2APISettingsConfig = Field(default_factory=Sub2APISettingsConfig)
     movie_info: MovieInfoSettingsConfig = Field(default_factory=MovieInfoSettingsConfig)
     av: AVSettingsConfig = Field(default_factory=AVSettingsConfig)
     stickers: StickerSettingsConfig = Field(default_factory=StickerSettingsConfig)
@@ -594,7 +584,6 @@ class RuntimeConfig(StrictModel):
             "verification.hcaptcha_secret_key": self.verification.hcaptcha_secret_key,
             "tts.app_key": self.tts.app_key,
             "tts.access_key": self.tts.access_key,
-            "sub2api.api_key": self.sub2api.api_key,
             "movie_info.tmdb_read_access_token": (
                 self.movie_info.tmdb_read_access_token
             ),
@@ -627,7 +616,6 @@ class RuntimeConfig(StrictModel):
         )
         clone.tts.app_key = secrets.get("tts.app_key", "")
         clone.tts.access_key = secrets.get("tts.access_key", "")
-        clone.sub2api.api_key = secrets.get("sub2api.api_key", "")
         clone.movie_info.tmdb_read_access_token = secrets.get(
             "movie_info.tmdb_read_access_token", ""
         ).strip()
@@ -888,11 +876,6 @@ class RuntimeConfig(StrictModel):
         settings.music_api_base_url = self.music.base_url
         settings.music_api_default_source = self.music.default_source
         settings.music_api_stable_sources = ",".join(self.music.stable_sources)
-        settings.sub2api_enabled = self.sub2api.enabled
-        settings.sub2api_base_url = self.sub2api.base_url
-        settings.sub2api_api_key = self.sub2api.api_key
-        settings.sub2api_http_timeout_sec = self.sub2api.http_timeout_sec
-        settings.sub2api_check_timeout_sec = self.sub2api.check_timeout_sec
         movie_info = self.movie_info
         if movie_info.enabled:
             tmdb_ready = bool(movie_info.tmdb_read_access_token)
@@ -990,21 +973,28 @@ ConfigAppliedCallback = Callable[[RuntimeConfig], Awaitable[None] | None]
 def _normalize_deprecated_runtime_payload(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
-    """Persist the retired backlog-deletion switch at its only safe value."""
+    """Normalize retired global settings before strict schema validation."""
 
+    normalized = dict(payload)
+    changed = False
     bot_payload = payload.get("bot")
-    if (
+    if not (
         isinstance(bot_payload, dict)
         and "drop_pending_updates" in bot_payload
         and bot_payload["drop_pending_updates"] is False
     ):
-        return payload, False
+        normalized_bot = dict(bot_payload) if isinstance(bot_payload, dict) else {}
+        normalized_bot["drop_pending_updates"] = False
+        normalized["bot"] = normalized_bot
+        changed = True
 
-    normalized = dict(payload)
-    normalized_bot = dict(bot_payload) if isinstance(bot_payload, dict) else {}
-    normalized_bot["drop_pending_updates"] = False
-    normalized["bot"] = normalized_bot
-    return normalized, True
+    # The former Sub2API credential was global and therefore cannot be safely
+    # migrated to any particular group. All groups intentionally start with
+    # the replacement API model query feature disabled.
+    if "sub2api" in normalized:
+        normalized.pop("sub2api", None)
+        changed = True
+    return (normalized, True) if changed else (payload, False)
 
 
 class RuntimeConfigManager:
@@ -1110,19 +1100,26 @@ class RuntimeConfigManager:
                         _normalize_deprecated_runtime_payload(row.payload or {})
                     )
                     config = RuntimeConfig.model_validate(raw_payload)
+                    retired_secret = await session.execute(
+                        delete(RuntimeConfigSecret).where(
+                            RuntimeConfigSecret.name == "sub2api.api_key"
+                        )
+                    )
+                    retired_secret_deleted = int(retired_secret.rowcount or 0) > 0
                     secrets = await self._load_secret_map(session)
                     config = config.with_secrets(secrets)
                     revision = int(row.revision or 1)
-                    if payload_normalized:
+                    if payload_normalized or retired_secret_deleted:
                         # This is an internal safety migration, not an operator
                         # edit. Preserve the revision so an already-open admin
                         # page does not encounter a needless conflict.
-                        row.payload = raw_payload
-                        row.schema_version = CONFIG_SCHEMA_VERSION
+                        if payload_normalized:
+                            row.payload = raw_payload
+                            row.schema_version = CONFIG_SCHEMA_VERSION
                         await session.commit()
                         log.info(
-                            "Normalized deprecated bot.drop_pending_updates=false "
-                            "without changing runtime config revision"
+                            "Normalized deprecated runtime settings without "
+                            "changing runtime config revision"
                         )
 
             config.apply_to_settings(self.settings)
@@ -1154,7 +1151,8 @@ class RuntimeConfigManager:
     ) -> RuntimeConfig:
         async with self._lock:
             current = self.config
-            candidate = RuntimeConfig.model_validate(payload)
+            normalized_payload, _ = _normalize_deprecated_runtime_payload(payload)
+            candidate = RuntimeConfig.model_validate(normalized_payload)
             allowed_paths = candidate.secret_paths()
             secrets = current.extract_secrets()
 
@@ -1577,13 +1575,6 @@ def build_legacy_runtime_config(
                 for value in settings.music_api_stable_sources.split(",")
                 if value.strip()
             ],
-        ),
-        sub2api=Sub2APISettingsConfig(
-            enabled=settings.sub2api_enabled,
-            base_url=settings.sub2api_base_url,
-            api_key=settings.sub2api_api_key,
-            http_timeout_sec=settings.sub2api_http_timeout_sec,
-            check_timeout_sec=settings.sub2api_check_timeout_sec,
         ),
         movie_info=MovieInfoSettingsConfig(
             enabled=settings.movie_info_enabled,

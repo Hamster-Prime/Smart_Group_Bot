@@ -164,9 +164,11 @@ Mini App 群组页可读取并完整编辑 Telegram 当前 `ChatPermissions` 全
 | `bilibili_search` | B站视频/UP主搜索、热门、排行榜 |
 | `weibo_search` | 微博热搜、内容搜索、Feed 流 |
 | `movie_info` | TMDB / 官方 IMDb 电影搜索、详情、独立评分和上映状态（需配置） |
-| `sub2api_query` | Sub2API 网关查询：模型列表、模型测活（需配置） |
+| `api_model_query` | 当前群独立配置的 OpenAI 兼容 API：实时模型列表、列表内模型测活（按群启用） |
 | `doubao_tts` | 豆包 TTS 语音合成（需配置） |
 | `vote_ban` | 明确请求且回复目标消息时发起民主投票；与命令共用用户额度 |
+
+`api_model_query` 默认对所有群关闭。每个群在设置中心单独填写自己的 Base URL 和 API Key 后启用；API Key 使用 `CONFIG_MASTER_KEY` 加密并与其他群隔离。模型测活会先刷新该群的模型列表，只测试列表中精确存在的模型 ID。配置地址只允许访问 DNS 校验后的公网 HTTPS 目标，鉴权请求不会跟随重定向，上游返回文本也会在进入主模型前按当前群 API Key 脱敏。
 
 `movie_info` 的供应商凭证在设置中心配置，只有至少一个合规可用的供应商才会注册。IMDb 实时接口仅指官方 AWS Data Exchange GraphQL API，需要相应商业订阅与许可；不会抓取 IMDb 网页。TMDB 也必须先取得适用于当前用途的 API 授权，尤其是 AI / chatbot 或商业场景，不应仅凭普通 developer key 默认上线。
 
@@ -289,8 +291,8 @@ uv export --frozen --no-dev --no-emit-project --no-hashes \
 
 - 模型供应商、API 密钥、角色模型、fallback、推理等级和重试参数
 - Bot 回复、流式输出、上下文、主动话题和按消息类别配置的自动删除策略（每个类别可选「定时自动删除」或「内联删除按钮」二选一；定时删除可单独设置秒数，留空继承全局秒数；删除按钮仅群管理员可用）
-- 审核、Cloudflare Turnstile/hCaptcha、TTS、音乐、Sub2API、AV 和贴纸池
-- 日志输出、全部 LLM 提示词，以及每个授权群的完整默认权限/定时时段、消息模板/按钮、功能开关、群规、永久记忆、带用户名的警告/封禁与审核豁免、回复静默名单和说话风格画像
+- 审核、Cloudflare Turnstile/hCaptcha、TTS、音乐、影片信息、AV 和贴纸池
+- 日志输出、全部 LLM 提示词，以及每个授权群的独立模型 API、完整默认权限/定时时段、消息模板/按钮、功能开关、群规、永久记忆、带用户名的警告/封禁与审核豁免、回复静默名单和说话风格画像
 
 配置保存在数据库中并对后续请求热生效。第三方密钥使用 `CONFIG_MASTER_KEY` 加密，API 只返回“已配置”状态，不回传明文。全局配置使用 revision 防止多个页面互相覆盖。
 
@@ -379,7 +381,7 @@ Smart_Group_Bot/
 │   │       ├── bilibili_search.py
 │   │       ├── weibo_search.py
 │   │       ├── movie_info.py
-│   │       ├── sub2api_query.py
+│   │       ├── api_model_query.py
 │   │       └── doubao_tts.py
 │   ├── db/
 │   │   ├── models.py           # ORM 模型

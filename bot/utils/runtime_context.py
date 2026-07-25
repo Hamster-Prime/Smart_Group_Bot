@@ -150,7 +150,7 @@ def build_bot_runtime_profile_context(
         "webfetch": "抓取网页正文",
         "bilibili_search": "B站搜索、视频详情、热门与排行榜",
         "weibo_search": "微博热搜、搜索与链接内容提取",
-        "sub2api_query": "本站模型网关查询：可用模型列表与指定模型测活（问模型能不能用时优先用它，不要联网搜索）",
+        "api_model_query": "本群配置的模型 API 查询：实时模型列表与列表内模型测活（不要用联网搜索代替）",
         "movie_info": "影片实时信息查询：TMDB/IMDb 元数据、独立评分与上映状态",
         "doubao_tts": "文字转语音",
         "vote_ban": "明确请求且回复目标消息时发起民主投票封禁（受用户额度限制）",

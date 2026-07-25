@@ -7,11 +7,20 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from functools import wraps
 from typing import Annotated, Any, Literal
 
 from aiohttp import web
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    ValidationError,
+)
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -32,6 +41,15 @@ from bot.db.models import (
     UserWarning,
 )
 from bot.services.at_reply import is_at_reply_enabled, set_at_reply_enabled
+from bot.services.api_model_query import (
+    clear_group_api_model_query_secret,
+    get_api_model_query_config,
+    group_api_model_query_secret_exists,
+    normalize_api_model_query_api_key,
+    normalize_api_model_query_base_url,
+    replace_group_api_model_query_secret,
+    set_api_model_query_config,
+)
 from bot.services.ban_audit import record_ban_event
 from bot.services.doubao_tts import normalize_tts_mode, set_tts_mode
 from bot.services.proactive import (
@@ -151,6 +169,10 @@ _GROUP_SETTING_FIELDS = {
     "mimic_target_user_id",
     "mimic_target_user_name",
     "mimic_profile_text",
+    "api_model_query_enabled",
+    "api_model_query_base_url",
+    "api_model_query_http_timeout_sec",
+    "api_model_query_check_timeout_sec",
 }
 # Per-group raid-guard numeric overrides: key -> (min, max); null = inherit.
 _RAID_GUARD_GROUP_INT_FIELDS = {
@@ -257,6 +279,21 @@ class _GroupSettingsUpdate(BaseModel):
     mimic_target_user_id: StrictInt | None = Field(default=None, ge=0)
     mimic_target_user_name: str | None = Field(default=None, max_length=80)
     mimic_profile_text: str | None = Field(default=None, max_length=1200)
+    api_model_query_enabled: StrictBool | None = None
+    api_model_query_base_url: str | None = Field(default=None, max_length=1000)
+    api_model_query_http_timeout_sec: StrictFloat | StrictInt | None = Field(
+        default=None, ge=1.0, le=300.0
+    )
+    api_model_query_check_timeout_sec: StrictFloat | StrictInt | None = Field(
+        default=None, ge=1.0, le=600.0
+    )
+
+
+class _GroupApiModelQuerySecretChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["replace", "clear"]
+    value: str = Field(default="", max_length=1024)
 
 
 class _RuleCreate(BaseModel):
@@ -502,6 +539,7 @@ def _setting_int(settings_data: dict[str, Any], key: str) -> int | None:
 def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
     proactive_state = get_cooldown_task_state(settings_data)
     style_state = get_style_state(settings_data)
+    api_model_query = get_api_model_query_config(settings_data)
     try:
         welcome_buttons = normalize_template_buttons(
             settings_data.get("welcome_buttons")
@@ -582,6 +620,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         "mimic_profile_text": str(style_state.get("profile_text") or ""),
         "mimic_sample_count": int(style_state.get("sample_count") or 0),
         "mimic_distilled_at_count": int(style_state.get("distilled_at_count") or 0),
+        "api_model_query_enabled": api_model_query.enabled,
+        "api_model_query_base_url": api_model_query.base_url,
+        "api_model_query_http_timeout_sec": api_model_query.http_timeout_sec,
+        "api_model_query_check_timeout_sec": api_model_query.check_timeout_sec,
+        "api_model_query_api_key_configured": api_model_query.api_key_configured,
     }
 
 
@@ -591,6 +634,11 @@ def _group_revision(settings_data: dict[str, Any]) -> str:
         key: public.get(key)
         for key in sorted(_GROUP_SETTING_FIELDS)
     }
+    # The key itself is never returned, but replacing it must still invalidate
+    # an already-open Mini App revision so concurrent saves cannot race.
+    editable["_api_model_query_secret_version"] = get_api_model_query_config(
+        settings_data
+    ).secret_version
     encoded = json.dumps(
         editable,
         ensure_ascii=False,
@@ -1400,6 +1448,44 @@ def _apply_group_settings(
         task_brief = str(update.proactive_task_brief or "").strip()
         updated = _set_proactive_task_brief(updated, task_brief)
 
+    api_model_query_fields = {
+        "api_model_query_enabled",
+        "api_model_query_base_url",
+        "api_model_query_http_timeout_sec",
+        "api_model_query_check_timeout_sec",
+    }
+    if fields & api_model_query_fields:
+        api_config = get_api_model_query_config(updated)
+        try:
+            if "api_model_query_enabled" in fields:
+                api_config = replace(
+                    api_config, enabled=bool(update.api_model_query_enabled)
+                )
+            if "api_model_query_base_url" in fields:
+                api_config = replace(
+                    api_config,
+                    base_url=normalize_api_model_query_base_url(
+                        update.api_model_query_base_url
+                    ),
+                )
+            if "api_model_query_http_timeout_sec" in fields:
+                api_config = replace(
+                    api_config,
+                    http_timeout_sec=float(update.api_model_query_http_timeout_sec),
+                )
+            if "api_model_query_check_timeout_sec" in fields:
+                api_config = replace(
+                    api_config,
+                    check_timeout_sec=float(update.api_model_query_check_timeout_sec),
+                )
+            updated = set_api_model_query_config(updated, api_config)
+        except (TypeError, ValueError) as exc:
+            raise _APIError(
+                400,
+                "invalid_api_model_query_settings",
+                str(exc) or "模型 API 查询配置无效。",
+            ) from exc
+
     style_fields = {
         "mimic_target_user_id",
         "mimic_target_user_name",
@@ -1507,6 +1593,8 @@ def register_settings_routes(
                     "配置校验失败。",
                     details=_validation_details(exc),
                 )
+            except RuntimeConfigEncryptionError as exc:
+                return _error_response(400, "secret_storage_unavailable", str(exc))
             except Exception:
                 log.exception("Mini App group API request failed")
                 return _error_response(500, "internal_error", "服务器处理请求失败。")
@@ -2114,8 +2202,48 @@ def register_settings_routes(
         await _require_group_access(group_id, int(user.id))
 
         request_body = await _json_object(request)
+        unknown_request = set(request_body) - {
+            "revision",
+            "settings",
+            "api_model_query_secret_change",
+        }
+        if unknown_request:
+            raise _APIError(
+                400,
+                "unknown_group_settings_request",
+                f"包含不允许的群设置请求字段：{', '.join(sorted(unknown_request))}",
+            )
         expected_revision = str(request_body.get("revision") or "").strip()
         body = request_body.get("settings")
+        raw_secret_change = request_body.get("api_model_query_secret_change")
+        secret_change: _GroupApiModelQuerySecretChange | None = None
+        if raw_secret_change is not None:
+            if not isinstance(raw_secret_change, dict):
+                raise _APIError(
+                    400,
+                    "invalid_api_model_query_secret_change",
+                    "模型 API Key 变更格式无效。",
+                )
+            secret_change = _GroupApiModelQuerySecretChange.model_validate(
+                raw_secret_change
+            )
+            if secret_change.action == "replace":
+                try:
+                    normalized_api_key = normalize_api_model_query_api_key(
+                        secret_change.value
+                    )
+                except ValueError as exc:
+                    raise _APIError(
+                        400,
+                        "invalid_api_model_query_secret",
+                        str(exc),
+                    ) from exc
+                if not normalized_api_key:
+                    raise _APIError(
+                        400,
+                        "invalid_api_model_query_secret",
+                        "模型 API Key 不能为空。",
+                    )
         if not expected_revision or not isinstance(body, dict):
             raise _APIError(
                 400,
@@ -2131,7 +2259,7 @@ def register_settings_routes(
                 f"包含不允许修改的群设置：{names}",
             )
         settings_update = _GroupSettingsUpdate.model_validate(body)
-        if not settings_update.model_fields_set:
+        if not settings_update.model_fields_set and secret_change is None:
             raise _APIError(400, "empty_group_settings", "至少需要提供一个群设置。")
 
         permissions_changed = (
@@ -2164,6 +2292,60 @@ def register_settings_routes(
                     settings_update,
                     settings,
                 )
+                api_model_query_fields = {
+                    "api_model_query_enabled",
+                    "api_model_query_base_url",
+                    "api_model_query_http_timeout_sec",
+                    "api_model_query_check_timeout_sec",
+                }
+                api_model_query_change_requested = bool(
+                    settings_update.model_fields_set & api_model_query_fields
+                    or secret_change is not None
+                )
+                if api_model_query_change_requested:
+                    stored_api_config = get_api_model_query_config(stored_settings)
+                    api_key_configured = await group_api_model_query_secret_exists(
+                        session, group_id
+                    )
+                    if secret_change is not None:
+                        if secret_change.action == "replace":
+                            await replace_group_api_model_query_secret(
+                                session,
+                                group_id=group_id,
+                                api_key=secret_change.value,
+                                master_key=settings.config_master_key,
+                                updated_by=int(user.id),
+                            )
+                            api_key_configured = True
+                        else:
+                            await clear_group_api_model_query_secret(
+                                session, group_id=group_id
+                            )
+                            api_key_configured = False
+                        stored_api_config = replace(
+                            stored_api_config,
+                            secret_version=stored_api_config.secret_version + 1,
+                        )
+                    updated_api_config = replace(
+                        get_api_model_query_config(updated_settings),
+                        api_key_configured=api_key_configured,
+                        secret_version=stored_api_config.secret_version,
+                    )
+                    if updated_api_config.enabled and not updated_api_config.base_url:
+                        raise _APIError(
+                            400,
+                            "api_model_query_not_configured",
+                            "开启模型 API 查询前请先填写 Base URL。",
+                        )
+                    if updated_api_config.enabled and not api_key_configured:
+                        raise _APIError(
+                            400,
+                            "api_model_query_key_required",
+                            "开启模型 API 查询前请先配置 API Key。",
+                        )
+                    updated_settings = set_api_model_query_config(
+                        updated_settings, updated_api_config
+                    )
                 current_style_target = int(
                     get_style_state(updated_settings).get("target_user_id") or 0
                 )

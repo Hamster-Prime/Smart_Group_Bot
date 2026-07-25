@@ -19,6 +19,7 @@ from bot.db.models import (
     Admin,
     AuthorizedGroup,
     Group,
+    GroupApiModelQuerySecret,
     GroupMember,
     GroupPermanentMemory,
     KeywordReply,
@@ -27,7 +28,7 @@ from bot.db.models import (
     SpeechStyleSample,
     UserWarning,
 )
-from bot.services.runtime_config import RuntimeConfigManager
+from bot.services.runtime_config import RuntimeConfigManager, SecretCipher
 from bot.services.group_permissions import PERMISSION_FIELDS
 from bot.services.verify_web import VerifyWebServer
 from bot.utils.telegram import configured_auto_delete_seconds
@@ -594,6 +595,259 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task["task_brief"], "new brief")
             self.assertTrue(row.settings["av_enabled"])
             self.assertEqual(row.settings["tts_mode"], "always")
+
+    async def test_group_api_model_query_secrets_are_encrypted_and_isolated(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    AuthorizedGroup(group_id=-110, authorized_by=42),
+                    AuthorizedGroup(group_id=-111, authorized_by=42),
+                    Group(id=-110, title="Model API A", settings={}),
+                    Group(id=-111, title="Model API B", settings={}),
+                ]
+            )
+            await session.commit()
+
+        group_a = await self._group_document(-110)
+        group_b = await self._group_document(-111)
+        first_key = "sk-group-a-first"
+        group_b_key = "sk-group-b-only"
+        saved_a_response = await self.client.put(
+            "/api/v1/groups/-110/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_a["revision"],
+                "settings": {
+                    "api_model_query_enabled": True,
+                    "api_model_query_base_url": "https://api-a.example.com/v1/",
+                    "api_model_query_http_timeout_sec": 12,
+                    "api_model_query_check_timeout_sec": 34,
+                },
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": first_key,
+                },
+            },
+        )
+        self.assertEqual(saved_a_response.status, 200)
+        saved_a = (await saved_a_response.json())["group"]
+        self.assertNotEqual(saved_a["revision"], group_a["revision"])
+
+        saved_b_response = await self.client.put(
+            "/api/v1/groups/-111/settings",
+            headers=self._headers(),
+            json={
+                "revision": group_b["revision"],
+                "settings": {
+                    "api_model_query_enabled": True,
+                    "api_model_query_base_url": "https://api-b.example.com",
+                },
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": group_b_key,
+                },
+            },
+        )
+        self.assertEqual(saved_b_response.status, 200)
+        saved_b = (await saved_b_response.json())["group"]
+
+        groups_response = await self.client.get(
+            "/api/v1/groups",
+            headers=self._headers(),
+        )
+        self.assertEqual(groups_response.status, 200)
+        groups = {
+            int(item["id"]): item
+            for item in (await groups_response.json())["groups"]
+        }
+        public_a = groups[-110]["settings"]
+        public_b = groups[-111]["settings"]
+        self.assertTrue(public_a["api_model_query_api_key_configured"])
+        self.assertTrue(public_b["api_model_query_api_key_configured"])
+        self.assertEqual(
+            public_a["api_model_query_base_url"],
+            "https://api-a.example.com/v1",
+        )
+        self.assertEqual(
+            public_b["api_model_query_base_url"],
+            "https://api-b.example.com",
+        )
+        for public in (public_a, public_b):
+            self.assertNotIn("api_model_query_api_key", public)
+            self.assertNotIn("api_key", public)
+            self.assertNotIn("ciphertext", public)
+        public_payload = json.dumps(groups, ensure_ascii=False)
+        self.assertNotIn(first_key, public_payload)
+        self.assertNotIn(group_b_key, public_payload)
+
+        cipher = SecretCipher(self.settings.config_master_key)
+        async with self.session_factory() as session:
+            stored_group_a = await session.get(Group, -110)
+            stored_group_b = await session.get(Group, -111)
+            secret_a = await session.get(GroupApiModelQuerySecret, -110)
+            secret_b = await session.get(GroupApiModelQuerySecret, -111)
+            config_a = stored_group_a.settings["api_model_query"]
+            config_b = stored_group_b.settings["api_model_query"]
+            self.assertNotIn("api_key", config_a)
+            self.assertNotIn("ciphertext", config_a)
+            self.assertNotIn("api_key", config_b)
+            self.assertNotIn("ciphertext", config_b)
+            self.assertNotEqual(secret_a.ciphertext, first_key)
+            self.assertNotEqual(secret_b.ciphertext, group_b_key)
+            self.assertNotEqual(secret_a.ciphertext, secret_b.ciphertext)
+            self.assertEqual(cipher.decrypt(secret_a.ciphertext), first_key)
+            self.assertEqual(cipher.decrypt(secret_b.ciphertext), group_b_key)
+
+        replacement_key = "sk-group-a-replacement"
+        replacement_response = await self.client.put(
+            "/api/v1/groups/-110/settings",
+            headers=self._headers(),
+            json={
+                "revision": saved_a["revision"],
+                "settings": {},
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": replacement_key,
+                },
+            },
+        )
+        self.assertEqual(replacement_response.status, 200)
+        replaced_a = (await replacement_response.json())["group"]
+        self.assertNotEqual(replaced_a["revision"], saved_a["revision"])
+
+        stale_response = await self.client.put(
+            "/api/v1/groups/-110/settings",
+            headers=self._headers(),
+            json={
+                "revision": saved_a["revision"],
+                "settings": {},
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": "sk-stale-write",
+                },
+            },
+        )
+        self.assertEqual(stale_response.status, 409)
+        self.assertEqual(
+            (await stale_response.json())["error"]["code"],
+            "group_revision_conflict",
+        )
+
+        async with self.session_factory() as session:
+            secret_a = await session.get(GroupApiModelQuerySecret, -110)
+            secret_b = await session.get(GroupApiModelQuerySecret, -111)
+            self.assertEqual(cipher.decrypt(secret_a.ciphertext), replacement_key)
+            self.assertEqual(cipher.decrypt(secret_b.ciphertext), group_b_key)
+
+        refreshed_b = await self._group_document(-111)
+        self.assertEqual(refreshed_b["revision"], saved_b["revision"])
+        self.assertEqual(
+            refreshed_b["settings"]["api_model_query_base_url"],
+            "https://api-b.example.com",
+        )
+
+    async def test_group_api_model_query_enable_and_clear_validation(self) -> None:
+        async with self.session_factory() as session:
+            session.add(AuthorizedGroup(group_id=-112, authorized_by=42))
+            session.add(Group(id=-112, title="Model API Validation", settings={}))
+            await session.commit()
+
+        initial = await self._group_document(-112)
+        missing_url = await self.client.put(
+            "/api/v1/groups/-112/settings",
+            headers=self._headers(),
+            json={
+                "revision": initial["revision"],
+                "settings": {"api_model_query_enabled": True},
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": "sk-rolled-back",
+                },
+            },
+        )
+        self.assertEqual(missing_url.status, 400)
+        self.assertEqual(
+            (await missing_url.json())["error"]["code"],
+            "api_model_query_not_configured",
+        )
+        async with self.session_factory() as session:
+            self.assertIsNone(await session.get(GroupApiModelQuerySecret, -112))
+
+        missing_key = await self.client.put(
+            "/api/v1/groups/-112/settings",
+            headers=self._headers(),
+            json={
+                "revision": initial["revision"],
+                "settings": {
+                    "api_model_query_enabled": True,
+                    "api_model_query_base_url": "https://api.example.com",
+                },
+            },
+        )
+        self.assertEqual(missing_key.status, 400)
+        self.assertEqual(
+            (await missing_key.json())["error"]["code"],
+            "api_model_query_key_required",
+        )
+
+        enabled_response = await self.client.put(
+            "/api/v1/groups/-112/settings",
+            headers=self._headers(),
+            json={
+                "revision": initial["revision"],
+                "settings": {
+                    "api_model_query_enabled": True,
+                    "api_model_query_base_url": "https://api.example.com",
+                },
+                "api_model_query_secret_change": {
+                    "action": "replace",
+                    "value": "sk-enabled",
+                },
+            },
+        )
+        self.assertEqual(enabled_response.status, 200)
+        enabled = (await enabled_response.json())["group"]
+
+        clear_while_enabled = await self.client.put(
+            "/api/v1/groups/-112/settings",
+            headers=self._headers(),
+            json={
+                "revision": enabled["revision"],
+                "settings": {},
+                "api_model_query_secret_change": {"action": "clear"},
+            },
+        )
+        self.assertEqual(clear_while_enabled.status, 400)
+        self.assertEqual(
+            (await clear_while_enabled.json())["error"]["code"],
+            "api_model_query_key_required",
+        )
+        unchanged = await self._group_document(-112)
+        self.assertEqual(unchanged["revision"], enabled["revision"])
+        self.assertTrue(
+            unchanged["settings"]["api_model_query_api_key_configured"]
+        )
+        async with self.session_factory() as session:
+            self.assertIsNotNone(await session.get(GroupApiModelQuerySecret, -112))
+
+        cleared_response = await self.client.put(
+            "/api/v1/groups/-112/settings",
+            headers=self._headers(),
+            json={
+                "revision": enabled["revision"],
+                "settings": {"api_model_query_enabled": False},
+                "api_model_query_secret_change": {"action": "clear"},
+            },
+        )
+        self.assertEqual(cleared_response.status, 200)
+        cleared = (await cleared_response.json())["group"]
+        self.assertFalse(cleared["settings"]["api_model_query_enabled"])
+        self.assertFalse(
+            cleared["settings"]["api_model_query_api_key_configured"]
+        )
+        self.assertNotEqual(cleared["revision"], enabled["revision"])
+        async with self.session_factory() as session:
+            self.assertIsNone(await session.get(GroupApiModelQuerySecret, -112))
 
     async def test_partial_group_update_preserves_proactive_inheritance(self) -> None:
         async with self.session_factory() as session:

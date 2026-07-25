@@ -85,6 +85,7 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         source = _APP_JS.read_text(encoding="utf-8")
         section_keys = (
             "reply-media",
+            "model-api",
             "onboarding",
             "permissions",
             "safety",
@@ -476,6 +477,77 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         ):
             self.assertIn(f'secretField("{path}"', integrations)
             self.assertIn(f'payload.{path} = "";', strip_secrets)
+
+    def test_model_api_settings_are_group_scoped_and_sub2api_ui_is_removed(
+        self,
+    ) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        integrations = source.split("function renderIntegrations", 1)[1].split(
+            "function renderLogging", 1
+        )[0]
+        strip_secrets = source.split("function stripSecrets", 1)[1].split(
+            "function validateConfig", 1
+        )[0]
+
+        self.assertIn('{ key: "model-api", label: "模型 API"', source)
+        self.assertIn('key: "model-api"', source)
+        self.assertIn("兼容 OpenAI Chat Completions API", source)
+        self.assertIn("或包含 <code>/v1</code> 均可", source)
+        self.assertNotIn("Sub2API", integrations)
+        self.assertNotIn("影片信息与 Sub2API 接入", source)
+        self.assertIn('payload.sub2api.api_key = "";', strip_secrets)
+
+    def test_group_model_api_secret_draft_is_private_and_part_of_save_state(
+        self,
+    ) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        group_dirty = source.split("function groupDirty", 1)[1].split(
+            "function anyGroupDirty", 1
+        )[0]
+        group_section_dirty = source.split(
+            "function groupSectionDirty", 1
+        )[1].split("function updateRenderedGroupSectionDirty", 1)[0]
+        persist_group = source.split(
+            "async function persistGroupChanges", 1
+        )[1].split("function applySavedResourceOperation", 1)[0]
+
+        self.assertIn("groupApiModelQuerySecretChanges: new Map()", source)
+        self.assertIn("state.groupApiModelQuerySecretChanges.has", group_dirty)
+        self.assertIn("state.groupApiModelQuerySecretChanges.has", group_section_dirty)
+        self.assertIn("api_model_query_secret_change", persist_group)
+        self.assertIn("state.groupApiModelQuerySecretChanges.delete", persist_group)
+        self.assertIn(
+            'type="password" data-group-api-model-query-secret-input', source
+        )
+        self.assertIn('data-group-id="${attr(group.id)}" value=""', source)
+        self.assertIn("留空会保留已保存值", source)
+        self.assertIn('action: "clear"', source)
+
+    def test_group_model_api_enablement_is_validated_against_effective_secret(
+        self,
+    ) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        validator = source.split(
+            "async function validateGroupForSave", 1
+        )[1].split("function snapshotField", 1)[0]
+
+        self.assertIn("api_model_query_enabled", validator)
+        self.assertIn('apiModelQuerySecretChange?.action === "clear"', validator)
+        self.assertIn("api_model_query_base_url", validator)
+        self.assertIn("groupApiModelQuerySecretConfigured(group)", validator)
+        self.assertGreaterEqual(validator.count('revealGroupSection(groupId, "model-api")'), 3)
+
+    def test_group_model_api_secret_drafts_are_discarded_on_reload(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        reload_groups = source.split(
+            'if (action === "reload-groups")', 1
+        )[1].split("});", 1)[0]
+        reload_all = source.split(
+            'reloadButton.addEventListener("click"', 1
+        )[1].split('window.addEventListener("beforeunload"', 1)[0]
+
+        self.assertIn("state.groupApiModelQuerySecretChanges.clear();", reload_groups)
+        self.assertIn("state.groupApiModelQuerySecretChanges.clear();", reload_all)
 
 
 if __name__ == "__main__":

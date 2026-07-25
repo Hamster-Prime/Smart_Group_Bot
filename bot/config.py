@@ -251,12 +251,6 @@ class Settings(BaseSettings):
     music_api_default_source: str = "kuwo"
     music_api_stable_sources: str = "kuwo,netease,joox,bilibili"
 
-    sub2api_enabled: bool = False
-    sub2api_base_url: str = ""
-    sub2api_api_key: str = ""
-    sub2api_http_timeout_sec: float = 15.0
-    sub2api_check_timeout_sec: float = 45.0
-
     movie_info_enabled: bool = False
     movie_info_http_timeout_sec: float = 6.0
     movie_info_max_results: int = 6

@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from bot.services.skills import platform_common
 from bot.services.skills.platform_common import (
@@ -20,6 +20,7 @@ from bot.services.skills.platform_common import (
     _read_limited_raw_body,
     fetch_bytes,
     fetch_text,
+    request_json,
     resolve_public_http_url,
     run_search_thread,
 )
@@ -241,6 +242,235 @@ class PlatformCommonSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Content-Length", sent_headers)
         self.assertNotIn("Connection", sent_headers)
         self.assertEqual(sent_headers["X-Test"], "allowed")
+
+    async def test_json_request_rejects_method_before_network_access(self) -> None:
+        resolve = AsyncMock()
+        request = AsyncMock()
+        with (
+            patch.object(platform_common, "resolve_public_http_url", new=resolve),
+            patch.object(platform_common, "_fetch_text_one_hop", new=request),
+            self.assertRaisesRegex(ValueError, "unsupported_http_method"),
+        ):
+            await request_json("https://api.example.com/v1/models", method="DELETE")
+
+        resolve.assert_not_awaited()
+        request.assert_not_awaited()
+
+    async def test_json_post_uses_pinned_single_hop_and_bounded_reader(self) -> None:
+        public = _ResolvedTarget("api.example.com", 443, ("93.184.216.34",))
+        request = AsyncMock(
+            return_value=_HopResponse(
+                status=200,
+                text='{"choices": [{"message": {"content": "pong"}}]}',
+                url="https://api.example.com/v1/chat/completions",
+                content_type="application/json",
+            )
+        )
+        resolve = AsyncMock(return_value=public)
+        body = {"model": "model-a", "messages": []}
+        with (
+            patch.object(platform_common, "resolve_public_http_url", new=resolve),
+            patch.object(platform_common, "_fetch_text_one_hop", new=request),
+        ):
+            status, payload, final_url, error = await request_json(
+                "https://api.example.com/v1/chat/completions",
+                method="post",
+                headers={
+                    "Authorization": "Bearer group-secret",
+                    "Host": "127.0.0.1",
+                    "Content-Length": "999",
+                },
+                json_body=body,
+                max_response_bytes=1024,
+                max_decoded_bytes=2048,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "pong")
+        self.assertEqual(final_url, "https://api.example.com/v1/chat/completions")
+        self.assertEqual(error, "")
+        resolve.assert_awaited_once()
+        kwargs = request.await_args.kwargs
+        self.assertEqual(kwargs["target"], public)
+        self.assertEqual(kwargs["method"], "POST")
+        self.assertEqual(kwargs["json_body"], body)
+        self.assertEqual(kwargs["max_response_bytes"], 1024)
+        self.assertEqual(kwargs["max_decoded_bytes"], 2048)
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer group-secret")
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
+        self.assertNotIn("Host", kwargs["headers"])
+        self.assertNotIn("Content-Length", kwargs["headers"])
+
+    async def test_json_post_client_disables_redirects_at_http_layer(self) -> None:
+        class AsyncContext:
+            def __init__(self, value: object) -> None:
+                self.value = value
+
+            async def __aenter__(self) -> object:
+                return self.value
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        class FakeClientSession:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+                self.request_args: tuple[object, ...] | None = None
+                self.request_kwargs: dict[str, object] | None = None
+
+            async def __aenter__(self) -> "FakeClientSession":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            def request(self, *args: object, **kwargs: object) -> AsyncContext:
+                self.request_args = args
+                self.request_kwargs = kwargs
+                response = SimpleNamespace(
+                    status=200,
+                    url="https://api.example.com/v1/chat/completions",
+                    headers={"content-type": "application/json"},
+                    connection=None,
+                    content_length=12,
+                    content=_ChunkStream([b'{"ok": true}']),
+                    charset="utf-8",
+                )
+                return AsyncContext(response)
+
+        public = _ResolvedTarget("api.example.com", 443, ("93.184.216.34",))
+        sessions: list[FakeClientSession] = []
+        connector = object()
+
+        def new_session(**kwargs: object) -> FakeClientSession:
+            session = FakeClientSession(**kwargs)
+            sessions.append(session)
+            return session
+
+        with (
+            patch.object(
+                platform_common,
+                "resolve_public_http_url",
+                new=AsyncMock(return_value=public),
+            ),
+            patch.object(
+                platform_common.aiohttp,
+                "TCPConnector",
+                return_value=connector,
+            ) as tcp,
+            patch.object(platform_common.aiohttp, "ClientSession", side_effect=new_session),
+        ):
+            status, payload, _final_url, error = await request_json(
+                "https://api.example.com/v1/chat/completions",
+                method="POST",
+                headers={"Authorization": "Bearer group-secret"},
+                json_body={"model": "model-a"},
+            )
+
+        self.assertEqual((status, payload, error), (200, {"ok": True}, ""))
+        tcp.assert_called_once_with(
+            resolver=ANY,
+            use_dns_cache=False,
+            force_close=True,
+            limit=1,
+        )
+        self.assertEqual(len(sessions), 1)
+        session = sessions[0]
+        self.assertIs(session.kwargs["connector"], connector)
+        self.assertFalse(session.kwargs["auto_decompress"])
+        self.assertFalse(session.kwargs["trust_env"])
+        self.assertEqual(
+            session.request_args,
+            ("POST", "https://api.example.com/v1/chat/completions"),
+        )
+        self.assertEqual(session.request_kwargs["json"], {"model": "model-a"})
+        self.assertFalse(session.request_kwargs["allow_redirects"])
+        self.assertEqual(
+            session.kwargs["headers"]["Authorization"], "Bearer group-secret"
+        )
+
+    async def test_json_redirect_is_not_followed_or_given_auth_again(self) -> None:
+        public = _ResolvedTarget("api.example.com", 443, ("93.184.216.34",))
+        resolve = AsyncMock(return_value=public)
+        request = AsyncMock(
+            return_value=_HopResponse(
+                status=307,
+                text="",
+                url="https://api.example.com/v1/models",
+                content_type="text/html",
+                location="https://attacker.example/steal",
+            )
+        )
+        with (
+            patch.object(platform_common, "resolve_public_http_url", new=resolve),
+            patch.object(platform_common, "_fetch_text_one_hop", new=request),
+        ):
+            result = await request_json(
+                "https://api.example.com/v1/models",
+                headers={"Authorization": "Bearer group-secret"},
+            )
+
+        self.assertEqual(
+            result,
+            (
+                307,
+                None,
+                "https://api.example.com/v1/models",
+                "redirect_not_allowed",
+            ),
+        )
+        resolve.assert_awaited_once()
+        request.assert_awaited_once()
+
+    async def test_json_request_cleans_non_json_error_body(self) -> None:
+        public = _ResolvedTarget("api.example.com", 443, ("93.184.216.34",))
+        request = AsyncMock(
+            return_value=_HopResponse(
+                status=502,
+                text="  upstream\x00 failed\n\nplease retry  ",
+                url="https://api.example.com/v1/models",
+                content_type="text/plain",
+            )
+        )
+        with (
+            patch.object(
+                platform_common,
+                "resolve_public_http_url",
+                new=AsyncMock(return_value=public),
+            ),
+            patch.object(platform_common, "_fetch_text_one_hop", new=request),
+        ):
+            status, payload, _final_url, error = await request_json(
+                "https://api.example.com/v1/models"
+            )
+
+        self.assertEqual(status, 502)
+        self.assertIsNone(payload)
+        self.assertEqual(error, "upstream failed\n\nplease retry")
+
+    async def test_json_request_bounds_non_json_error_preview(self) -> None:
+        public = _ResolvedTarget("api.example.com", 443, ("93.184.216.34",))
+        request = AsyncMock(
+            return_value=_HopResponse(
+                status=500,
+                text="X" * 1000,
+                url="https://api.example.com/v1/models",
+                content_type="text/plain",
+            )
+        )
+        with (
+            patch.object(
+                platform_common,
+                "resolve_public_http_url",
+                new=AsyncMock(return_value=public),
+            ),
+            patch.object(platform_common, "_fetch_text_one_hop", new=request),
+        ):
+            _status, _payload, _final_url, error = await request_json(
+                "https://api.example.com/v1/models"
+            )
+
+        self.assertEqual(error, ("X" * 300) + " ...")
 
     async def test_host_allowlist_rejects_suffix_confusion_and_credentials(self) -> None:
         with self.assertRaisesRegex(UnsafeUrlError, "host_not_allowed"):
