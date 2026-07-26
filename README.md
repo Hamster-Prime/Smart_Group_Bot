@@ -16,6 +16,16 @@
 
 ---
 
+## 开源与开发者
+
+Smart Group Bot 已完全开源，并采用 [MIT License](LICENSE)。
+
+- 源码仓库：[Hamster-Prime/Smart_Group_Bot](https://github.com/Hamster-Prime/Smart_Group_Bot)
+- 开发者：[@Sanite_Ava](https://t.me/Sanite_Ava)
+- 开发者联系方式：[@Sanite_Ava_Private_ChatBot](https://t.me/Sanite_Ava_Private_ChatBot)
+
+---
+
 ## 架构概览
 
 ```

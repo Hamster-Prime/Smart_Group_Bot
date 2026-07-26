@@ -22,6 +22,7 @@ from bot.config import BotConfig, Settings
 from bot.services.background_health import record_background_failure
 from bot.services.memory import MemoryService
 from bot.utils.prompts import get_prompt, with_persona
+from bot.utils.project_info import build_bot_project_info_context
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, sanitize_history_for_llm
 from bot.utils.telegram import configured_auto_delete_seconds, send_chat_message
@@ -396,6 +397,10 @@ def build_proactive_prompt_payload(
     ]
     if history:
         messages.extend(sanitize_history_for_llm(history, max_items=len(history)))
+    # Re-anchor source-controlled project facts after untrusted history.  The
+    # same block is already present in with_persona(), but this late copy wins
+    # if old history contains conflicting origin or developer claims.
+    messages.append({"role": "system", "content": build_bot_project_info_context()})
     messages.append({"role": "user", "content": normalized_brief})
     return {"messages": messages}
 

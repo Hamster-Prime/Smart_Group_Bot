@@ -49,6 +49,13 @@ from bot.services.message_templates import render_action_notice, render_data_bri
 from bot.services.skills import SkillService
 from bot.services.skills.platform_common import fetch_bytes
 from bot.utils.command_catalog import build_help_text
+from bot.utils.project_info import (
+    PROJECT_DEVELOPER,
+    PROJECT_DEVELOPER_CONTACT,
+    PROJECT_LICENSE,
+    PROJECT_NAME,
+    PROJECT_REPOSITORY_URL,
+)
 from bot.utils.telegram import (
     answer_with_auto_delete,
     configured_auto_delete_seconds,
@@ -67,6 +74,25 @@ _AV_GROUP_ENABLE_KEY = "av_enabled"
 _LEGACY_ACTION_RESPONSE_RE = re.compile(
     r"^\s*<b>(?P<title>[^<>\n]+)</b>(?:\n+)?(?P<body>[\s\S]*?)\s*$"
 )
+
+
+def _build_start_text() -> str:
+    """Render the deterministic public self-introduction for /start."""
+    return (
+        f"<b>{html.escape(PROJECT_NAME)} · 智能群管机器人</b>\n"
+        "欢迎使用。\n\n"
+        "<b>核心功能</b>\n"
+        "永久记忆（管理员自然语言维护）\n"
+        "内容审核\n"
+        "智能闲聊\n\n"
+        "<b>开源信息</b>\n"
+        f"完全开源（{html.escape(PROJECT_LICENSE)}）\n"
+        f"源码仓库：{html.escape(PROJECT_REPOSITORY_URL)}\n"
+        f"开发者：<code>{html.escape(PROJECT_DEVELOPER)}</code>\n"
+        f"联系方式：<code>{html.escape(PROJECT_DEVELOPER_CONTACT)}</code>\n\n"
+        "<b>快速开始</b>\n"
+        "发送 /help 查看完整命令。"
+    )
 
 
 def _render_action_response(text: str) -> str:
@@ -800,16 +826,7 @@ async def cmd_start(message: Message, session: AsyncSession, settings: Settings)
             group_id=parse_private_verify_group_id(payload),
         ):
             return
-    await _answer(message, settings,
-        "<b>智能群管机器人</b>\n"
-        "欢迎使用。\n\n"
-        "<b>核心功能</b>\n"
-        "永久记忆（管理员自然语言维护）\n"
-        "内容审核\n"
-        "智能闲聊\n\n"
-        "<b>快速开始</b>\n"
-        "发送 /help 查看完整命令。"
-    )
+    await _answer(message, settings, _build_start_text())
 
 
 @router.message(Command("help"))

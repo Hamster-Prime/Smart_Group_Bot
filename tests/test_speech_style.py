@@ -281,13 +281,22 @@ class StylePromptInjectionTests(unittest.TestCase):
         blocks = [c for c in contents if c.startswith("[ACTIVE_PERSONA]\n")]
         self.assertEqual(len(blocks), 1)
         self.assertIn("爱用捏", blocks[0])
-        # The clone persona must be the LAST system block (only the user
-        # message follows) so it wins on recency over the default persona.
+        # The clone persona follows the default style, while the immutable
+        # project facts remain the final system anchor.
         active_idx = next(
             i for i, m in enumerate(messages) if m["content"].startswith("[ACTIVE_PERSONA]\n")
         )
-        self.assertTrue(all(m["role"] != "system" for m in messages[active_idx + 1 :]))
+        project_idx = next(
+            i for i, m in enumerate(messages) if m["content"].startswith("[BOT_PROJECT_INFO]\n")
+        )
+        self.assertLess(active_idx, project_idx)
+        self.assertTrue(all(m["role"] != "system" for m in messages[project_idx + 1 :]))
         self.assertEqual(messages[-1]["role"], "user")
+
+    def test_style_block_preserves_project_info_rule(self) -> None:
+        context = build_style_profile_context("不改变项目资料规则。", target_name="老王")
+
+        self.assertIn("[BOT_PROJECT_INFO]", context)
 
     def test_casual_prompt_without_profile_has_no_block(self) -> None:
         from bot.services.casual import CasualService
@@ -314,7 +323,11 @@ class StylePromptInjectionTests(unittest.TestCase):
         active_idx = next(
             i for i, m in enumerate(messages) if m["content"].startswith("[ACTIVE_PERSONA]\n")
         )
-        self.assertTrue(all(m["role"] != "system" for m in messages[active_idx + 1 :]))
+        project_idx = next(
+            i for i, m in enumerate(messages) if m["content"].startswith("[BOT_PROJECT_INFO]\n")
+        )
+        self.assertLess(active_idx, project_idx)
+        self.assertTrue(all(m["role"] != "system" for m in messages[project_idx + 1 :]))
         self.assertEqual(messages[-1]["role"], "user")
 
 

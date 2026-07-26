@@ -44,7 +44,7 @@ class BotIdentityTests(unittest.TestCase):
             combined.index("[TASK_PROMPT]\ndo the task"),
         )
 
-    def test_with_persona_without_identity_keeps_old_shape(self) -> None:
+    def test_with_persona_without_runtime_identity_keeps_project_info(self) -> None:
         from bot.utils.prompts import with_persona
 
         reset_bot_identity()
@@ -52,6 +52,7 @@ class BotIdentityTests(unittest.TestCase):
 
         self.assertNotIn("[BOT_IDENTITY]\nauthoritative: yes", combined)
         self.assertNotIn("bot_username:", combined)
+        self.assertIn("[BOT_PROJECT_INFO]\nauthoritative: yes", combined)
         self.assertIn("[TASK_PROMPT]\ndo the task", combined)
 
     def test_persona_and_decision_prompts_have_no_hardcoded_bot_name(self) -> None:

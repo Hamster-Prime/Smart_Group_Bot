@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bot.utils.bot_identity import build_bot_identity_context
+from bot.utils.project_info import build_bot_project_info_context
 
 _PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "prompt"
 
@@ -48,9 +49,10 @@ def set_runtime_prompts(values: dict[str, str]) -> None:
 
 def with_persona(task_prompt: str) -> str:
     persona = get_prompt("persona").strip()
+    project_info = build_bot_project_info_context().strip()
     identity = build_bot_identity_context().strip()
     task = (task_prompt or "").strip()
-    parts = [part for part in (persona, identity) if part]
+    parts = [part for part in (persona, project_info, identity) if part]
     if task:
         parts.append(f"[TASK_PROMPT]\n{task}")
     return "\n\n".join(parts)

@@ -251,6 +251,8 @@ def build_bot_runtime_profile_context(
 
     lines.append(build_command_guide_context())
     lines.append(
-        "When user asks what you can do, how you work, or what model each module uses, answer from this block."
+        "When user asks what you can do, how you work, what model each module uses, "
+        "answer from this block. For source/license/developer questions, use the "
+        "separately injected source-controlled [BOT_PROJECT_INFO] block."
     )
     return "\n".join(lines)

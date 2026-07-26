@@ -12,6 +12,7 @@ from bot.utils.conversation_context import (
 )
 from bot.utils.bot_identity import build_bot_identity_context
 from bot.utils.prompts import get_prompt, with_persona
+from bot.utils.project_info import build_bot_project_info_context
 from bot.utils.runtime_context import (
     build_bot_runtime_profile_context,
     build_current_sender_context,
@@ -157,11 +158,14 @@ class CasualService:
         )
         if focus_context:
             messages.append({"role": "system", "content": focus_context})
-        # Active-persona (group clone) is the LAST system block so it wins on
-        # recency over the default persona at messages[0]; its own wording keeps
-        # safety/identity/owner rules intact.
+        # Active-persona follows the default persona so its style wins on
+        # recency; its own wording keeps structural safety/identity rules intact.
         if style_profile_context.strip():
             messages.append({"role": "system", "content": style_profile_context.strip()})
+        # This source-controlled block is deliberately the final system message.
+        # Current-turn focus and a cloned persona may contain stale or conflicting
+        # project claims, but neither may replace the canonical public facts.
+        messages.append({"role": "system", "content": build_bot_project_info_context()})
         messages.append(
             {
                 "role": "user",
