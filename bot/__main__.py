@@ -16,7 +16,6 @@ from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
 from bot.middlewares.logging_mw import LoggingMiddleware
 from bot.middlewares.member_roster import MemberRosterMiddleware
-from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
 from bot.services import memory_holder
@@ -348,9 +347,6 @@ async def main() -> None:
     # A member racing the join-verification mute must not get messages through
     # (or consume profile-screening LLM capacity) before the challenge exists.
     dp.message.outer_middleware(PendingVerificationGateMiddleware(session_factory))
-    # Outer so it also covers matched commands (/help), videos, and empty-text
-    # media that the group handler bypasses.
-    dp.message.outer_middleware(ProfileScreenEnforcementMiddleware(session_factory))
     # Roster tracking feeds the profile patrol; outer so every sender is seen.
     dp.message.outer_middleware(MemberRosterMiddleware(session_factory))
     dp.message.middleware(LoggingMiddleware())

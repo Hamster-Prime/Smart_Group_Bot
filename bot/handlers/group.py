@@ -5597,10 +5597,8 @@ async def on_group_message(
             if manual_exempt:
                 log.info("[%s] moderation skipped | reason=manual_exempt user=%s", group_id, user_id)
 
-        # On-message profile re-screening moved to
-        # bot.middlewares.profile_screen (outer middleware), so it also covers
-        # matched commands, videos, and empty-text media that never reach this
-        # handler.
+        # Profile (name/username/bio) screening runs only on join and during
+        # patrol; ordinary messages are moderated on their content alone.
 
         if not auto_exempt_moderation and not manual_exempt:
             verdict = await mod.evaluate(session, group_id, input_text)

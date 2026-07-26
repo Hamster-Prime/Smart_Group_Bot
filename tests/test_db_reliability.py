@@ -21,10 +21,7 @@ from bot.db.sqlite_session import (
     is_database_locked_error,
 )
 from bot.middlewares.global_ban import GlobalBanEnforcementMiddleware
-from bot.middlewares.profile_screen import ProfileScreenEnforcementMiddleware
 from bot.services.join_verification import BanEnforcementResult
-from bot.services.request_priority import ExecutionPriority, execution_priority_scope
-from bot.services.join_screening import profile_screen_signature
 from bot.services.request_priority import ExecutionPriority, execution_priority_scope
 
 
@@ -500,49 +497,6 @@ class OuterMiddlewareSessionLifetimeTests(unittest.IsolatedAsyncioTestCase):
         # demote the transport for all groups.
         retry = await self._run_unconfirmed_ban(retryable=False)
         retry.assert_not_called()
-
-    async def test_profile_cache_session_is_closed_before_downstream_handler(self) -> None:
-        state = SimpleNamespace(active=0)
-        session = object()
-        middleware = ProfileScreenEnforcementMiddleware(
-            lambda: _TrackedContext(state, session)
-        )
-        settings = Settings(_env_file=None)
-        settings.moderation.enabled = True
-        signature = profile_screen_signature(
-            full_name="Alice",
-            username="alice",
-            rules_fingerprint="rules",
-        )
-
-        async def handler(event, data):
-            self.assertEqual(state.active, 0)
-            return "handled"
-
-        with (
-            patch(
-                "bot.middlewares.profile_screen.is_group_authorized",
-                new=AsyncMock(return_value=True),
-            ),
-            patch(
-                "bot.middlewares.profile_screen.moderation_rules_fingerprint",
-                new=AsyncMock(return_value="rules"),
-            ),
-            patch(
-                "bot.middlewares.profile_screen.get_profile_screen_hash",
-                new=AsyncMock(return_value=signature),
-            ),
-            patch(
-                "bot.middlewares.profile_screen.get_global_ban",
-                new=AsyncMock(return_value=None),
-            ),
-        ):
-            result = await middleware(
-                handler,
-                self._event(),
-                {"settings": settings},
-            )
-        self.assertEqual(result, "handled")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,8 @@ Ban semantics (single-group deployment):
 
 Profile screening runs in two places:
 - on join (membership handler);
-- on message, when the user's profile signature changed or was never checked
-  (see ``bot.middlewares.profile_screen``).
+- during the scheduled member patrol (``bot.services.patrol``).
+Ordinary messages are moderated on their content only.
 
 Profile-screening violations create a ban only in the current group. They do
 not write to the cross-group ``GlobalBan`` registry.

@@ -473,8 +473,7 @@ async def _publish_profile_screening_ban_notice(
         log.exception("join screening notice failed | group=%s", event.chat.id)
         return
     # This is a moderation outcome ("审核通知"): honor the group's
-    # auto-delete retention like the on-message ban notice in
-    # profile_screen.py does.
+    # auto-delete retention.
     try:
         await schedule_message_auto_delete_durable(sent, auto_delete_seconds)
     except Exception:
