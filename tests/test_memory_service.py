@@ -921,6 +921,208 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.wait_for(waiter, timeout=0.2))
         await memory.shutdown(timeout_seconds=0.2)
 
+    async def test_proactive_compaction_triggers_before_full_budget(self) -> None:
+        """Threshold compaction: 85% of the budget compacts without waiting for 100%."""
+        memory = MemoryService(
+            BotConfig(max_context_tokens=64000, max_output_tokens=512),
+            _SummaryStubLLM(),
+            session_factory=Mock(),
+        )
+        memory._get_summary = AsyncMock(return_value="")  # type: ignore[method-assign]
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+
+        budget = memory._soft_budget_tokens(memory._llm_input_budget(None))
+        # Chinese content sized between 85% and 100% of the reply budget: the
+        # old ==100% trigger would skip it, threshold compaction must fire.
+        chinese_chars = int(budget * 0.90)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="喵" * chinese_chars,
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:cn",
+                )
+            ],
+        )
+
+        self.assertTrue(await memory.compact_if_needed(group_id))
+        memory._save_summary_and_clear_history.assert_awaited_once()
+
+    async def test_rough_estimate_counts_cjk_near_one_token_per_char(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=256000, max_output_tokens=512),
+            _StubLLM(),
+            session_factory=Mock(),
+        )
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="中文内容" * 300,
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:cjk",
+                )
+            ],
+        )
+        # 1200 CJK chars must estimate near 1200 tokens, not chars/3=400.
+        self.assertGreaterEqual(memory._rough_history_tokens(group_id), 1200)
+
+    async def test_message_count_threshold_compacts_but_keeps_recent_tail(self) -> None:
+        """Hitting the count threshold summarizes old rows instead of dropping them."""
+        memory = MemoryService(
+            BotConfig(max_context_tokens=256000, max_output_tokens=512),
+            _SummaryStubLLM(),
+            session_factory=Mock(),
+        )
+        memory._get_summary = AsyncMock(return_value="")  # type: ignore[method-assign]
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        total_messages = 800
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content=f"message {idx}",
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id=f"12345:{idx}",
+                )
+                for idx in range(total_messages)
+            ],
+        )
+
+        self.assertTrue(await memory.compact_if_needed(group_id))
+        memory._save_summary_and_clear_history.assert_awaited_once()
+        compacted_ids = memory._save_summary_and_clear_history.await_args.kwargs[
+            "message_ids"
+        ]
+        # The compacted snapshot must be the OLDEST prefix: compressing the
+        # newest slice instead would delete from the DB exactly the rows the
+        # bot keeps in RAM.
+        self.assertEqual(len(compacted_ids), total_messages - 50)
+        self.assertEqual(compacted_ids[0], "12345:0")
+        self.assertEqual(compacted_ids[-1], f"12345:{total_messages - 51}")
+        remaining = memory.get_history(group_id)
+        self.assertEqual(len(remaining), 50)
+        self.assertEqual(remaining[-1]["content"], f"message {total_messages - 1}")
+        self.assertEqual(remaining[0]["content"], f"message {total_messages - 50}")
+
+    async def test_compaction_below_thresholds_stays_idle(self) -> None:
+        memory = MemoryService(
+            BotConfig(max_context_tokens=256000, max_output_tokens=512),
+            _SummaryStubLLM(),
+            session_factory=Mock(),
+        )
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="普通的一条消息",
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:small",
+                )
+            ],
+        )
+
+        self.assertFalse(await memory.compact_if_needed(group_id))
+        memory._save_summary_and_clear_history.assert_not_awaited()
+
+    async def test_compaction_stays_idle_at_half_budget(self) -> None:
+        """History far above the 512-token floor but below 85% must not compact."""
+        memory = MemoryService(
+            BotConfig(max_context_tokens=64000, max_output_tokens=512),
+            _SummaryStubLLM(),
+            session_factory=Mock(),
+        )
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+
+        budget = memory._soft_budget_tokens(memory._llm_input_budget(None))
+        chinese_chars = int(budget * 0.50)
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content="喵" * chinese_chars,
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id="12345:half",
+                )
+            ],
+        )
+
+        self.assertFalse(await memory.compact_if_needed(group_id))
+        memory._save_summary_and_clear_history.assert_not_awaited()
+
+    async def test_summary_dominated_group_does_not_churn_compression(self) -> None:
+        """A standing summary plus a small kept tail must not re-compact per message.
+
+        Post-compaction steady state on a small budget: the summary alone keeps
+        the trigger estimate saturated while the retained tail has almost no
+        compressible content. Without the snapshot-content gate this fires one
+        compress LLM call per group message forever.
+        """
+        memory = MemoryService(
+            BotConfig(max_context_tokens=4096, max_output_tokens=512),
+            _SummaryStubLLM(),
+            session_factory=Mock(),
+        )
+        memory._save_summary_and_clear_history = AsyncMock()  # type: ignore[method-assign]
+        memory._format_system_memory_blocks = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        group_id = 12345
+        memory._history_loaded.add(group_id)
+        memory._summary_cache[group_id] = "背景摘要" * 300
+        memory._replace_working_history(
+            group_id,
+            [
+                memory._history_item(
+                    role="user",
+                    content=f"hi {idx}",
+                    created_at=datetime.now(timezone.utc),
+                    sender_id=42,
+                    sender_name="Alice",
+                    message_type="text",
+                    message_id=f"12345:tail-{idx}",
+                )
+                for idx in range(51)
+            ],
+        )
+
+        self.assertFalse(await memory.compact_if_needed(group_id))
+        memory._save_summary_and_clear_history.assert_not_awaited()
+
     async def test_shutdown_fails_receipt_for_blocked_memory_write(self) -> None:
         memory = MemoryService(
             BotConfig(max_context_tokens=4096, max_output_tokens=512),

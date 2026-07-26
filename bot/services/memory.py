@@ -49,11 +49,34 @@ _COMPACTION_MAX_CONCURRENT = 1
 _COMPACTION_DEADLINE_SECONDS = 90.0
 _COMPACTION_BACKOFF_BASE_SECONDS = 30.0
 _COMPACTION_BACKOFF_MAX_SECONDS = 15 * 60.0
-_COMPACTION_ROUGH_TRIGGER_RATIO = 0.70
+_COMPACTION_PROACTIVE_TRIGGER_RATIO = 0.85
+_COMPACTION_MESSAGE_COUNT_TRIGGER = 800
+_COMPACTION_KEEP_RECENT_MESSAGES = 50
+_COMPACTION_MIN_SNAPSHOT_TOKENS = 512
 _TOKENIZER_THREAD_TIMEOUT_SECONDS = 2.0
 _TOKENIZER_THREAD_SLOTS = threading.BoundedSemaphore(2)
 _MEMORY_WRITE_QUEUE_CAPACITY = 2048
 _MEMORY_WRITE_BATCH_SIZE = 64
+
+# CJK-family codepoints tokenize near one token per character, unlike the
+# ~3 chars/token of ASCII prose. The rough prefilter must not underestimate
+# Chinese chat or proactive compaction never fires before the hard budget.
+_CJK_CHAR_RE = re.compile(
+    "["
+    "\u3000-\u30ff"  # CJK punctuation, hiragana, katakana
+    "\u3400-\u4dbf"  # CJK extension A
+    "\u4e00-\u9fff"  # CJK unified ideographs
+    "\uac00-\ud7af"  # Hangul syllables
+    "\uf900-\ufaff"  # CJK compatibility ideographs
+    "\uff00-\uffef"  # full-width forms
+    "]"
+)
+
+
+def _estimate_text_tokens(text: str) -> int:
+    cjk_chars = len(_CJK_CHAR_RE.findall(text))
+    other_chars = len(text) - cjk_chars
+    return cjk_chars + (other_chars + 2) // 3
 
 
 @dataclass(slots=True)
@@ -168,6 +191,7 @@ class MemoryService:
         self._history_loaded: set[int] = set()
         self._history_load_locks: dict[int, asyncio.Lock] = {}
         self._history_char_counts: dict[int, int] = {}
+        self._history_token_estimates: dict[int, int] = {}
         self._history_message_ids: dict[int, set[str]] = {}
         self._summary_cache: dict[int, str] = {}
         self._summary_locks: dict[int, asyncio.Lock] = {}
@@ -731,6 +755,7 @@ class MemoryService:
             buf = []
             self._history[group_id] = buf
             self._history_char_counts[group_id] = 0
+            self._history_token_estimates[group_id] = 0
             self._history_message_ids[group_id] = set()
         return buf
 
@@ -744,6 +769,9 @@ class MemoryService:
         self._history_char_counts[int(group_id)] = sum(
             len(str(item.get("content", ""))) for item in normalized
         )
+        self._history_token_estimates[int(group_id)] = sum(
+            _estimate_text_tokens(str(item.get("content", ""))) for item in normalized
+        )
         self._history_message_ids[int(group_id)] = {
             str(item.get("message_id") or "")
             for item in normalized
@@ -755,18 +783,24 @@ class MemoryService:
         message_id = str(item.get("message_id") or "")
         if message_id:
             self._history_message_ids.setdefault(group_id, set()).add(message_id)
+        content = str(item.get("content", ""))
         self._history_char_counts[group_id] = (
-            self._history_char_counts.get(group_id, 0)
-            + len(str(item.get("content", "")))
+            self._history_char_counts.get(group_id, 0) + len(content)
+        )
+        self._history_token_estimates[group_id] = (
+            self._history_token_estimates.get(group_id, 0)
+            + _estimate_text_tokens(content)
         )
 
     def _rough_history_tokens(self, group_id: int) -> int:
         # A conservative, constant-time prefilter. Exact tokenizer work only
-        # runs once history is genuinely close to the model budget.
+        # runs once history is genuinely close to the model budget. The
+        # per-message token estimates are CJK-aware so Chinese-heavy groups
+        # are not underestimated ~3x and left uncompacted until prompt build.
         history = self._history.get(group_id) or []
-        chars = self._history_char_counts.get(group_id, 0)
-        summary_chars = len(self._summary_cache.get(group_id, ""))
-        return max(0, (chars + summary_chars + 2) // 3 + len(history) * 12)
+        tokens = self._history_token_estimates.get(group_id, 0)
+        summary_tokens = _estimate_text_tokens(self._summary_cache.get(group_id, ""))
+        return max(0, tokens + summary_tokens + len(history) * 12)
 
     def get_history(self, group_id: int) -> list[dict[str, Any]]:
         return list(self._working(group_id))
@@ -1381,6 +1415,29 @@ class MemoryService:
             lines.append(format_history_message_line(item, max_body_chars=300))
         return lines
 
+    def _split_history_for_auto_compaction(
+        self,
+        history: list[dict[str, Any]],
+        *,
+        budget_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Choose the snapshot prefix to compress, keeping a recent raw tail.
+
+        Automatic compaction runs proactively while the group is still idle,
+        so the next reply should keep verbatim access to the latest exchange
+        instead of only a freshly distilled summary. The kept tail is dropped
+        when it alone would dominate the budget: then everything compresses.
+        """
+        if len(history) <= _COMPACTION_KEEP_RECENT_MESSAGES:
+            return history
+        tail = history[-_COMPACTION_KEEP_RECENT_MESSAGES:]
+        tail_tokens = sum(
+            _estimate_text_tokens(str(item.get("content", ""))) for item in tail
+        )
+        if tail_tokens > max(1024, budget_tokens // 4):
+            return history
+        return history[: len(history) - _COMPACTION_KEEP_RECENT_MESSAGES]
+
     async def _compact_group_context_if_needed(
         self,
         group_id: int,
@@ -1401,55 +1458,87 @@ class MemoryService:
                 return self._count_tokens(candidate_messages)
             return self._count_prompt_payload_tokens(prompt_payload_builder(candidate_messages))
 
-        history = list(self._working(group_id))
-        if not history:
-            return False
-
-        # Unit tests and callers may intentionally replace _count_tokens to
-        # force exact compaction. Normal production traffic gets the O(1)
-        # prefilter and avoids rebuilding DB-backed system blocks per message.
-        if (
-            prompt_payload_builder is None
-            and "_count_tokens" not in self.__dict__
-            and self._rough_history_tokens(group_id)
-            < int(budget_tokens * _COMPACTION_ROUGH_TRIGGER_RATIO)
-        ):
-            return False
-
-        system_blocks = await self._format_system_memory_blocks(group_id)
-        candidate = [*system_blocks, *history]
-        candidate_tokens = await _run_bounded_tokenizer_call(
-            lambda: _count_candidate_tokens(candidate),
-            self._rough_history_tokens(group_id),
+        # Compaction fires proactively, before the reply-time budget is
+        # exhausted: at a fraction of the token budget, or once raw history
+        # approaches the hard message cap (which would otherwise discard old
+        # rows unsummarized). The CJK-aware rough estimate is accurate enough
+        # to trigger on directly, so mostly-idle at-reply groups compact in
+        # the background instead of at the next mention's prompt build.
+        trigger_tokens = max(
+            1024, int(budget_tokens * _COMPACTION_PROACTIVE_TRIGGER_RATIO)
         )
-        if candidate_tokens < budget_tokens:
-            return False
 
-        lock = self._summary_locks.setdefault(group_id, asyncio.Lock())
-        if lock.locked():
-            return False
-        async with lock:
-            history = list(self._working(group_id))
+        # Unit tests and callers may intentionally replace _count_tokens or
+        # supply a prompt payload builder to force exact token accounting.
+        # Normal production traffic gets the O(1) estimate and never rebuilds
+        # DB-backed system blocks per message.
+        exact_override = (
+            prompt_payload_builder is not None or "_count_tokens" in self.__dict__
+        )
+
+        async def _should_compact() -> tuple[bool, bool, int]:
+            history = self._working(group_id)
             if not history:
-                return False
-
+                return False, False, 0
+            if len(history) >= _COMPACTION_MESSAGE_COUNT_TRIGGER:
+                return True, True, self._rough_history_tokens(group_id)
+            if not exact_override:
+                rough_tokens = self._rough_history_tokens(group_id)
+                if rough_tokens < trigger_tokens:
+                    return False, False, rough_tokens
+                # The trigger estimate includes the standing summary and the
+                # kept recent tail, neither of which compaction can shrink.
+                # Gate on the compressible snapshot's own content so a
+                # summary-dominated small-budget group settles instead of
+                # paying one compress call per message forever.
+                head = self._split_history_for_auto_compaction(
+                    history,
+                    budget_tokens=budget_tokens,
+                )
+                head_content_tokens = sum(
+                    _estimate_text_tokens(str(item.get("content", "")))
+                    for item in head
+                )
+                if head_content_tokens < _COMPACTION_MIN_SNAPSHOT_TOKENS:
+                    return False, False, rough_tokens
+                return True, False, rough_tokens
             system_blocks = await self._format_system_memory_blocks(group_id)
             candidate = [*system_blocks, *history]
             candidate_tokens = await _run_bounded_tokenizer_call(
                 lambda: _count_candidate_tokens(candidate),
                 self._rough_history_tokens(group_id),
             )
-            if candidate_tokens < budget_tokens:
-                return False
+            return candidate_tokens >= trigger_tokens, False, candidate_tokens
 
+        should_compact, _, _ = await _should_compact()
+        if not should_compact:
+            return False
+
+        lock = self._summary_locks.setdefault(group_id, asyncio.Lock())
+        if lock.locked():
+            return False
+        async with lock:
+            should_compact, count_triggered, candidate_tokens = await _should_compact()
+            if not should_compact:
+                return False
+            history = list(self._working(group_id))
+
+            snapshot = self._split_history_for_auto_compaction(
+                history,
+                budget_tokens=budget_tokens,
+            )
             log.info(
-                "memory context nearing limit: group=%s prompt_tokens=%d/%d -> compact",
+                "memory context threshold reached: group=%s trigger=%s "
+                "prompt_tokens=%d/%d messages=%d compacting=%d -> compact",
                 group_id,
+                "message_count" if count_triggered else "token_budget",
                 candidate_tokens,
-                budget_tokens,
+                trigger_tokens,
+                len(history),
+                len(snapshot),
             )
             try:
-                status = await self._compress_and_publish_locked(group_id, history)
+                status = await self._compress_and_publish_locked(group_id, snapshot)
             except Exception:
                 self._record_compaction_failure(group_id)
                 raise
@@ -1638,26 +1727,29 @@ class MemoryService:
         if not messages:
             return []
 
-        budget_chars = max(2048, budget_tokens * 4)
+        # CJK-aware token estimates: plain characters/4 admits roughly 4x too
+        # much Chinese text, which is exactly what used to blow past model
+        # limits when a mostly-idle at-reply group finally mentioned the bot.
+        budget = max(512, budget_tokens)
         systems = [m for m in messages if m.get("role") == "system"]
         others = [m for m in messages if m.get("role") != "system"]
 
         selected_systems: list[dict[str, Any]] = []
-        used_chars = 0
+        used_tokens = 0
         for msg in systems:
-            content = str(msg.get("content", ""))
-            if selected_systems and used_chars + len(content) > budget_chars:
+            tokens = _estimate_text_tokens(str(msg.get("content", ""))) + 12
+            if selected_systems and used_tokens + tokens > budget:
                 break
             selected_systems.append(dict(msg))
-            used_chars += len(content)
+            used_tokens += tokens
 
         selected_tail: list[dict[str, Any]] = []
         for msg in reversed(others):
-            content = str(msg.get("content", ""))
-            if selected_tail and used_chars + len(content) > budget_chars:
+            tokens = _estimate_text_tokens(str(msg.get("content", ""))) + 12
+            if selected_tail and used_tokens + tokens > budget:
                 break
             selected_tail.append(dict(msg))
-            used_chars += len(content)
+            used_tokens += tokens
         selected_tail.reverse()
         return [*selected_systems, *selected_tail]
 
