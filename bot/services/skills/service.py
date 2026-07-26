@@ -8,13 +8,14 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 from bot.config import Settings
 from bot.services.doubao_tts import DoubaoTTSService, TTS_MODE_OFF, build_tts_preference_context
 from bot.services.llm import LLMService
 from bot.services.message_templates import render_data_brief
+from bot.services.reply_progress import ProgressCallback, ProgressReference, ProgressUpdate
 from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
@@ -67,6 +68,38 @@ _SKILL_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
 _SKILL_ORPHAN_STARTED: dict[asyncio.Task[Any], float] = {}
 _SKILL_ORPHAN_MAX_AGE_SECONDS = 120.0
 _MIHOMO_DOC_TURN_PAYLOAD_BUDGET = 40000
+
+_SKILL_PROGRESS_TEXTS: dict[str, tuple[str, str, str]] = {
+    "websearch": ("正在搜索资料", "已搜索资料", "搜索资料失败"),
+    "webfetch": ("正在读取网页", "已读取网页", "读取网页失败"),
+    "bilibili_search": ("正在查询 B 站内容", "已查询 B 站内容", "查询 B 站内容失败"),
+    "weibo_search": ("正在查询微博内容", "已查询微博内容", "查询微博内容失败"),
+    "movie_info": ("正在查询影视信息", "已查询影视信息", "查询影视信息失败"),
+    "music_search": ("正在查询音乐", "已查询音乐", "查询音乐失败"),
+    "api_model_query": ("正在查询 API 模型", "已查询 API 模型", "查询 API 模型失败"),
+    "doubao_tts": ("正在生成语音", "已生成语音", "生成语音失败"),
+    "send_sticker": ("正在选择贴纸", "已发送贴纸", "发送贴纸失败"),
+    "vote_ban": ("正在发起群投票", "已发起群投票", "发起群投票失败"),
+    "memory_manage": ("正在更新群聊记忆", "已更新群聊记忆", "更新群聊记忆失败"),
+    "rule_manage": ("正在更新群规则", "已更新群规则", "更新群规则失败"),
+}
+_MIHOMO_SEARCH_PROGRESS_TEXTS = (
+    "正在搜索 Mihomo 官方文档",
+    "已搜索 Mihomo 官方文档",
+    "搜索 Mihomo 官方文档失败",
+)
+_MIHOMO_READ_PROGRESS_TEXTS = (
+    "正在读取 Mihomo 官方文档",
+    "已读取 Mihomo 官方文档",
+    "读取 Mihomo 官方文档失败",
+)
+_DEFAULT_SKILL_PROGRESS_TEXTS = (
+    "正在调用辅助能力",
+    "已完成辅助调用",
+    "辅助调用失败",
+)
+_PROGRESS_CALLBACK_TIMEOUT_SECONDS = 0.15
+_TRUSTED_PROGRESS_PATH_HOSTS = frozenset({"wiki.metacubex.one"})
 
 
 def _observe_skill_task(task: asyncio.Task[Any]) -> None:
@@ -509,6 +542,220 @@ class SkillService:
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _skill_progress_texts(
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        if name == "mihomo_doc":
+            action = clean_text(str(arguments.get("action") or ""), max_len=16).lower()
+            if action in {"page", "section"}:
+                return _MIHOMO_READ_PROGRESS_TEXTS
+            return _MIHOMO_SEARCH_PROGRESS_TEXTS
+        if name == "music_search":
+            action = clean_text(str(arguments.get("action") or "search"), max_len=24).lower()
+            if action == "send_audio":
+                return ("正在发送音乐", "已发送音乐", "发送音乐失败")
+        return _SKILL_PROGRESS_TEXTS.get(name, _DEFAULT_SKILL_PROGRESS_TEXTS)
+
+    @staticmethod
+    def _safe_progress_reference_url(
+        value: Any,
+        *,
+        trusted_path: bool = False,
+    ) -> str:
+        url = str(value or "").strip()
+        if not url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
+            return ""
+        try:
+            parsed = urlparse(url)
+            _ = parsed.port
+        except (TypeError, ValueError):
+            return ""
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return ""
+        # References are group-visible. Secrets can live in paths as well as
+        # queries/fragments, so arbitrary web pages expose only their origin.
+        # Trusted public documentation may retain its canonical path.
+        if trusted_path and parsed.hostname.lower() in _TRUSTED_PROGRESS_PATH_HOSTS:
+            return parsed._replace(params="", query="", fragment="").geturl()
+        return parsed._replace(path="", params="", query="", fragment="").geturl()
+
+    @classmethod
+    def _progress_references(cls, result: SkillRunResult) -> tuple[ProgressReference, ...]:
+        if not result.ok or not isinstance(result.payload, dict):
+            return ()
+
+        payload = result.payload
+        candidates: list[tuple[str, Any, bool]] = []
+        if result.skill == "webfetch":
+            candidates.append(
+                (
+                    clean_text(str(payload.get("title") or "网页来源"), max_len=160),
+                    payload.get("final_url") or payload.get("url"),
+                    False,
+                )
+            )
+        elif result.skill == "mihomo_doc":
+            action = clean_text(str(payload.get("action") or ""), max_len=16).lower()
+            if action == "page":
+                candidates.append(
+                    (
+                        clean_text(
+                            str(payload.get("title") or "Mihomo 官方文档"),
+                            max_len=160,
+                        ),
+                        payload.get("source_url"),
+                        True,
+                    )
+                )
+            elif action == "section":
+                pages = payload.get("pages")
+                if isinstance(pages, list):
+                    for page in pages:
+                        if not isinstance(page, dict):
+                            continue
+                        candidates.append(
+                            (
+                                clean_text(
+                                    str(page.get("title") or "Mihomo 官方文档"),
+                                    max_len=160,
+                                ),
+                                page.get("source_url"),
+                                True,
+                            )
+                        )
+
+        references: list[ProgressReference] = []
+        seen_urls: set[str] = set()
+        for title, raw_url, trusted_path in candidates:
+            url = cls._safe_progress_reference_url(
+                raw_url,
+                trusted_path=trusted_path,
+            )
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            references.append(
+                ProgressReference(
+                    title=title or "参考资料",
+                    url=url,
+                    trusted_path=trusted_path,
+                )
+            )
+        return tuple(references)
+
+    @staticmethod
+    async def _report_progress(
+        callback: ProgressCallback | None,
+        *,
+        key: str,
+        state: Literal["running", "completed", "failed"],
+        text: str,
+        references: tuple[ProgressReference, ...] = (),
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            async with asyncio.timeout(_PROGRESS_CALLBACK_TIMEOUT_SECONDS):
+                await callback(
+                    ProgressUpdate(
+                        key=key,
+                        state=state,
+                        text=text,
+                        references=references,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            log.warning(
+                "skill progress callback timed out | key=%s state=%s",
+                key,
+                state,
+            )
+        except Exception:
+            log.warning(
+                "skill progress callback failed | key=%s state=%s",
+                key,
+                state,
+                exc_info=True,
+            )
+
+    @classmethod
+    async def _report_tool_started(
+        cls,
+        callback: ProgressCallback | None,
+        *,
+        key: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        started, _, _ = cls._skill_progress_texts(name, arguments)
+        await cls._report_progress(
+            callback,
+            key=key,
+            state="running",
+            text=started,
+        )
+
+    @classmethod
+    async def _report_tool_finished(
+        cls,
+        callback: ProgressCallback | None,
+        *,
+        key: str,
+        name: str,
+        arguments: dict[str, Any],
+        result: SkillRunResult,
+        delivery_confirmed: bool = False,
+    ) -> None:
+        _, completed, failed = cls._skill_progress_texts(name, arguments)
+        confirmed_ambiguous_delivery = bool(
+            delivery_confirmed and result.error == _AMBIGUOUS_SIDE_EFFECT_ERROR
+        )
+        if result.error == _AMBIGUOUS_SIDE_EFFECT_ERROR and not confirmed_ambiguous_delivery:
+            failed = "操作结果待确认，请先检查群内状态"
+        await cls._report_progress(
+            callback,
+            key=key,
+            state="completed" if result.ok or confirmed_ambiguous_delivery else "failed",
+            text=completed if result.ok or confirmed_ambiguous_delivery else failed,
+            references=cls._progress_references(result),
+        )
+
+    @classmethod
+    async def _report_tool_cancelled(
+        cls,
+        callback: ProgressCallback | None,
+        *,
+        key: str,
+        name: str,
+        arguments: dict[str, Any],
+        delivery_confirmed: bool = False,
+    ) -> None:
+        if delivery_confirmed:
+            _, text, _ = cls._skill_progress_texts(name, arguments)
+            state: Literal["completed", "failed"] = "completed"
+        else:
+            text = (
+                "操作已中止，结果未确认"
+                if cls._tool_may_have_side_effect(name, arguments)
+                else "辅助调用已中止"
+            )
+            state = "failed"
+        await cls._report_progress(
+            callback,
+            key=key,
+            state=state,
+            text=text,
+        )
 
     async def _run_tool(
         self,
@@ -1618,6 +1865,7 @@ class SkillService:
         session_factory: Any | None = None,
         is_direct_request: bool = False,
         delivery_callback: Callable[[], None] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> SkillRunResult:
         context = SkillContext(
             session=session,
@@ -1644,6 +1892,7 @@ class SkillService:
                 if self.settings is not None
                 else 0
             ),
+            progress_callback=progress_callback,
         )
 
         def _confirm_delivery() -> None:
@@ -1652,7 +1901,43 @@ class SkillService:
                 delivery_callback()
 
         context.delivery_callback = _confirm_delivery
-        return await self._run_tool(name=name, arguments=arguments or {}, context=context)
+        tool_arguments = arguments or {}
+        progress_key = f"skill:{name}"
+        await self._report_tool_started(
+            context.progress_callback,
+            key=progress_key,
+            name=name,
+            arguments=tool_arguments,
+        )
+        try:
+            delivery_before = context.delivery_confirmed
+            result = await self._run_tool(
+                name=name,
+                arguments=tool_arguments,
+                context=context,
+            )
+        except asyncio.CancelledError:
+            await self._report_tool_cancelled(
+                context.progress_callback,
+                key=progress_key,
+                name=name,
+                arguments=tool_arguments,
+                delivery_confirmed=(
+                    context.delivery_confirmed and not delivery_before
+                ),
+            )
+            raise
+        await self._report_tool_finished(
+            context.progress_callback,
+            key=progress_key,
+            name=name,
+            arguments=tool_arguments,
+            result=result,
+            delivery_confirmed=(
+                context.delivery_confirmed and not delivery_before
+            ),
+        )
+        return result
 
     async def answer_with_skill(
         self,
@@ -1678,6 +1963,7 @@ class SkillService:
         is_direct_request: bool | None = None,
         style_profile_context: str = "",
         delivery_callback: Callable[[], None] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> SkillAnswerResult:
         user_text = self._normalize_user_text(text, merged_count=merged_count)
         if contains_prompt_injection(user_text):
@@ -1734,6 +2020,7 @@ class SkillService:
                 if self.settings is not None
                 else 0
             ),
+            progress_callback=progress_callback,
         )
 
         def _confirm_delivery() -> None:
@@ -1924,11 +2211,41 @@ class SkillService:
                 elif mihomo_budget_result is not None:
                     result = mihomo_budget_result
                 else:
-                    result = await self._run_tool(
+                    progress_key = f"tool:{step}:{tool_index}:{tool_call['id']}"
+                    await self._report_tool_started(
+                        context.progress_callback,
+                        key=progress_key,
                         name=tool_call["name"],
                         arguments=args,
-                        context=context,
-                        skills=selected_skills,
+                    )
+                    try:
+                        delivery_before = context.delivery_confirmed
+                        result = await self._run_tool(
+                            name=tool_call["name"],
+                            arguments=args,
+                            context=context,
+                            skills=selected_skills,
+                        )
+                    except asyncio.CancelledError:
+                        await self._report_tool_cancelled(
+                            context.progress_callback,
+                            key=progress_key,
+                            name=tool_call["name"],
+                            arguments=args,
+                            delivery_confirmed=(
+                                context.delivery_confirmed and not delivery_before
+                            ),
+                        )
+                        raise
+                    await self._report_tool_finished(
+                        context.progress_callback,
+                        key=progress_key,
+                        name=tool_call["name"],
+                        arguments=args,
+                        result=result,
+                        delivery_confirmed=(
+                            context.delivery_confirmed and not delivery_before
+                        ),
                     )
                 if result.ok and result.summary:
                     last_success_summary = result.summary

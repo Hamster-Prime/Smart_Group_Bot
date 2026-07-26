@@ -10,8 +10,9 @@ import time
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
@@ -31,6 +32,24 @@ if TYPE_CHECKING:
     from bot.services.telegram_cleanup import TelegramCleanupScheduler
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class ReplyMessageOverlay:
+    """A progress message that may become the first final reply message."""
+
+    message: Message
+    status_html: str
+    reply_to_message_id: int | None
+    sent_as_reply: bool
+    outcome: Literal[
+        "pending",
+        "attempting",
+        "attached",
+        "definite_failure",
+        "ambiguous",
+    ] = "pending"
+
 
 _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
 _TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
@@ -235,21 +254,39 @@ def _send_total_deadline_seconds() -> float:
     return _SEND_TOTAL_DEADLINE_SECONDS
 
 
-def sanitize_outgoing_mentions(text: str) -> str:
-    """Prevent outgoing mentions while keeping a monospace @name look."""
+def sanitize_outgoing_mentions(text: str, *, monospace: bool = True) -> str:
+    """Prevent outgoing mentions without rewriting code samples.
+
+    ``monospace=False`` is used for Markdown input that will be rendered later;
+    injecting raw ``<code>`` tags there would make the whole answer look like
+    trusted HTML and can break fenced code blocks.
+    """
     if not text:
         return text
 
-    # Keep surrounding text untouched: only strip tg://user links to visible labels.
-    cleaned = _TG_USER_LINK_HTML_RE.sub(lambda match: (match.group(2) or ""), text)
-    cleaned = _TG_USER_LINK_MD_RE.sub(lambda match: (match.group(1) or ""), cleaned)
+    # Keep surrounding text untouched: only strip tg://user links to visible
+    # labels in prose. Literal link examples inside code must remain copyable.
+    cleaned = _transform_markdown_prose(
+        text,
+        lambda prose: _TG_USER_LINK_MD_RE.sub(
+            lambda match: (match.group(1) or ""),
+            _TG_USER_LINK_HTML_RE.sub(
+                lambda match: (match.group(2) or ""),
+                prose,
+            ),
+        ),
+    )
 
     def _break_mention_token(username: str) -> str:
         return f"@\u200b{username}"
 
     def _replace_mentions(segment: str) -> str:
         return _MENTION_USERNAME_RE.sub(
-            lambda match: f"<code>{_break_mention_token(match.group(1))}</code>",
+            lambda match: (
+                f"<code>{_break_mention_token(match.group(1))}</code>"
+                if monospace
+                else _break_mention_token(match.group(1))
+            ),
             segment,
         )
 
@@ -264,6 +301,10 @@ def sanitize_outgoing_mentions(text: str) -> str:
     # make the whole Telegram entity invalid. Visible text inside an existing
     # HTML entity still gets a zero-width break, without nesting another entity.
     protected: list[tuple[int, int, int, str]] = []
+    protected.extend(
+        (block.start, block.end, 0, cleaned[block.start:block.end])
+        for block in _find_fenced_code_blocks(cleaned)
+    )
     protected.extend(
         (match.start(), match.end(), 0, match.group(0))
         for match in _CODE_SPAN_RE.finditer(cleaned)
@@ -290,7 +331,10 @@ def sanitize_outgoing_mentions(text: str) -> str:
             )
 
         if kind == 0:
-            result_parts.append(_replace_mentions_in_code(token))
+            # Telegram does not activate mentions inside code/pre entities.
+            # Keeping the bytes intact also keeps copied configs and scripts
+            # usable (notably @names in YAML, shell and examples).
+            result_parts.append(token)
         else:
             result_parts.append(token)
             tag_match = re.match(r"<\s*(/?)\s*([A-Za-z-]+)", token)
@@ -332,11 +376,17 @@ def sanitize_outgoing_text(text: str) -> str:
     ]
     if leak_positions:
         cleaned = cleaned[: min(leak_positions)].rstrip()
-    cleaned = _HISTORY_WRAPPER_TAG_RE.sub("", cleaned)
-    cleaned = _LLM_INTERNAL_BLOCK_RE.sub(" ", cleaned)
-    cleaned = _LLM_INTERNAL_TAG_RE.sub(" ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = _transform_markdown_prose(
+        cleaned,
+        lambda prose: _LLM_INTERNAL_TAG_RE.sub(
+            " ",
+            _LLM_INTERNAL_BLOCK_RE.sub(
+                " ",
+                _HISTORY_WRAPPER_TAG_RE.sub("", prose),
+            ),
+        ),
+    )
+    cleaned = _normalize_markdown_whitespace(cleaned)
     return cleaned.strip()
 
 
@@ -869,18 +919,295 @@ async def ensure_admin(message: Message, settings: Settings | None = None) -> bo
     return False
 
 
+_MARKDOWN_FENCE_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]{0,3})(?P<fence>`{3,}|~{3,})(?P<rest>[^\n]*)$"
+)
+_MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
+_MARKDOWN_TOKEN_RE = re.compile(r"\x00tgmd(\d+)\x00")
+
+
+@dataclass(frozen=True, slots=True)
+class _FencedCodeBlock:
+    start: int
+    end: int
+    opening: str
+    content: str
+    closing: str
+    fence: str
+    closed: bool
+
+
+class _FencedMarkdownPart(str):
+    """A split Markdown wrapper whose delivered code content stays exact.
+
+    Markdown requires a line break before a closing fence.  That structural
+    newline must not become part of a long single-line code sample merely
+    because Telegram forced it into multiple messages, so split parts retain
+    the exact content separately from their valid Markdown debug form.
+    """
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        opening: str,
+        content: str,
+    ) -> "_FencedMarkdownPart":
+        instance = super().__new__(cls, value)
+        instance.opening = opening
+        instance.content = content
+        return instance
+
+
+def _utf16_units(text: str) -> int:
+    return len(str(text or "").encode("utf-16-le")) // 2
+
+
+def _line_body(line: str) -> str:
+    if line.endswith("\r\n"):
+        return line[:-2]
+    if line.endswith(("\r", "\n")):
+        return line[:-1]
+    return line
+
+
+def _find_fenced_code_blocks(text: str) -> list[_FencedCodeBlock]:
+    """Locate complete or unfinished line-oriented Markdown code fences."""
+    source = str(text or "")
+    lines = source.splitlines(keepends=True)
+    blocks: list[_FencedCodeBlock] = []
+    offsets: list[int] = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line)
+
+    index = 0
+    while index < len(lines):
+        opening_body = _line_body(lines[index])
+        opening_match = _MARKDOWN_FENCE_LINE_RE.match(opening_body)
+        if not opening_match:
+            index += 1
+            continue
+
+        fence = opening_match.group("fence")
+        content_start = offsets[index] + len(lines[index])
+        closing_index: int | None = None
+        for candidate in range(index + 1, len(lines)):
+            closing_body = _line_body(lines[candidate])
+            closing_match = _MARKDOWN_FENCE_LINE_RE.match(closing_body)
+            if not closing_match:
+                continue
+            closing_fence = closing_match.group("fence")
+            if (
+                closing_fence[0] == fence[0]
+                and len(closing_fence) >= len(fence)
+                and not closing_match.group("rest").strip()
+            ):
+                closing_index = candidate
+                break
+
+        start = offsets[index]
+        if closing_index is None:
+            blocks.append(
+                _FencedCodeBlock(
+                    start=start,
+                    end=len(source),
+                    opening=opening_body,
+                    content=source[content_start:],
+                    closing=f"{opening_match.group('indent')}{fence}",
+                    fence=fence,
+                    closed=False,
+                )
+            )
+            break
+
+        closing_body = _line_body(lines[closing_index])
+        closing_start = offsets[closing_index]
+        closing_end = closing_start + len(closing_body)
+        blocks.append(
+            _FencedCodeBlock(
+                start=start,
+                end=closing_end,
+                opening=opening_body,
+                content=source[content_start:closing_start],
+                closing=closing_body,
+                fence=fence,
+                closed=True,
+            )
+        )
+        index = closing_index + 1
+
+    return blocks
+
+
+def _markdown_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Return non-overlapping fenced and inline Markdown code ranges."""
+
+    source = str(text or "")
+    ranges = [(block.start, block.end) for block in _find_fenced_code_blocks(source)]
+    ranges.extend(
+        (match.start(), match.end())
+        for match in _MARKDOWN_INLINE_CODE_RE.finditer(source)
+    )
+    ranges.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start < merged[-1][1]:
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def _transform_markdown_prose(
+    text: str,
+    transform: Callable[[str], str],
+) -> str:
+    """Apply a sanitizer only outside Markdown code spans and fences."""
+
+    source = str(text or "")
+    ranges = _markdown_code_ranges(source)
+    if not ranges:
+        return transform(source)
+
+    rendered: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        rendered.append(transform(source[cursor:start]))
+        rendered.append(source[start:end])
+        cursor = end
+    rendered.append(transform(source[cursor:]))
+    return "".join(rendered)
+
+
+def _contains_telegram_html_outside_markdown_code(text: str) -> bool:
+    """Detect trusted Telegram HTML without mistaking code examples for it."""
+
+    source = str(text or "")
+    ranges = _markdown_code_ranges(source)
+    range_index = 0
+    for match in _TG_HTML_TAG_RE.finditer(source):
+        while range_index < len(ranges) and ranges[range_index][1] <= match.start():
+            range_index += 1
+        if (
+            range_index >= len(ranges)
+            or not ranges[range_index][0] <= match.start() < ranges[range_index][1]
+        ):
+            return True
+    return False
+
+
+def _normalize_markdown_whitespace(text: str) -> str:
+    """Compact prose whitespace without modifying code contents."""
+    source = str(text or "")
+    protected = [
+        (block.start, block.end)
+        for block in _find_fenced_code_blocks(source)
+    ]
+    protected.extend(
+        (match.start(), match.end())
+        for match in _CODE_SPAN_RE.finditer(source)
+    )
+    protected.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    if not protected:
+        source = re.sub(r"\n{3,}", "\n\n", source)
+        return re.sub(r"[ \t]{2,}", " ", source)
+
+    rendered: list[str] = []
+    cursor = 0
+    for start, end in protected:
+        if start < cursor:
+            continue
+        prose = source[cursor:start]
+        prose = re.sub(r"\n{3,}", "\n\n", prose)
+        prose = re.sub(r"[ \t]{2,}", " ", prose)
+        rendered.append(prose)
+        rendered.append(source[start:end])
+        cursor = end
+    prose = source[cursor:]
+    prose = re.sub(r"\n{3,}", "\n\n", prose)
+    prose = re.sub(r"[ \t]{2,}", " ", prose)
+    rendered.append(prose)
+    return "".join(rendered)
+
+
+def _safe_markdown_link(value: str) -> str:
+    candidate = html.unescape(str(value or "").strip())
+    if re.match(r"(?i)^(?:https?://|tg://|mailto:)", candidate):
+        return candidate
+    return ""
+
+
+def _render_inline_markdown(text: str) -> str:
+    tokens: list[str] = []
+
+    def _stash(rendered: str) -> str:
+        index = len(tokens)
+        tokens.append(rendered)
+        return f"\x00tgmd{index}\x00"
+
+    source = _MARKDOWN_INLINE_CODE_RE.sub(
+        lambda match: _stash(f"<code>{html.escape(match.group(1))}</code>"),
+        text,
+    )
+
+    def _link(match: re.Match[str]) -> str:
+        target = _safe_markdown_link(match.group(2))
+        if not target:
+            return match.group(0)
+        return _stash(
+            f'<a href="{html.escape(target, quote=True)}">'
+            f"{html.escape(match.group(1))}</a>"
+        )
+
+    source = _MARKDOWN_LINK_RE.sub(_link, source)
+    rendered = html.escape(source)
+    rendered = re.sub(r"(?m)^#{1,6}[ \t]+(.+)$", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"__([^_\n]+?)__", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", rendered)
+    rendered = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", rendered)
+    rendered = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", rendered)
+    rendered = re.sub(r"(?m)^&gt;[ \t]?(.*)$", r"<blockquote>\1</blockquote>", rendered)
+    return _MARKDOWN_TOKEN_RE.sub(
+        lambda match: tokens[int(match.group(1))],
+        rendered,
+    )
+
+
+def _render_fenced_code_html(opening: str, content: str) -> str:
+    opening_match = _MARKDOWN_FENCE_LINE_RE.match(opening)
+    info = opening_match.group("rest").strip() if opening_match else ""
+    language = info.split(maxsplit=1)[0] if info else ""
+    language_attr = ""
+    if re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", language):
+        language_attr = f' class="language-{html.escape(language, quote=True)}"'
+    return f"<pre><code{language_attr}>{html.escape(content)}</code></pre>"
+
+
 def md_to_html(text: str) -> str:
-    """Convert common Markdown to Telegram HTML."""
-    text = re.sub(r"```\w*\n(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
-    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
-    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    return text
+    """Render model Markdown as escaped, Telegram-safe HTML."""
+    if isinstance(text, _FencedMarkdownPart):
+        return _render_fenced_code_html(text.opening, text.content)
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = _find_fenced_code_blocks(source)
+    if not blocks:
+        return _render_inline_markdown(source)
+
+    rendered: list[str] = []
+    cursor = 0
+    for block in blocks:
+        rendered.append(_render_inline_markdown(source[cursor:block.start]))
+        rendered.append(_render_fenced_code_html(block.opening, block.content))
+        cursor = block.end
+    rendered.append(_render_inline_markdown(source[cursor:]))
+    return "".join(rendered)
+
+
+def _telegram_html_to_plain(text: str) -> str:
+    """Return a readable fallback for trusted Telegram HTML templates."""
+    return html.unescape(_TG_HTML_TAG_RE.sub("", str(text or ""))).strip()
 
 
 def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
@@ -921,37 +1248,144 @@ def _stream_chunks(text: str, chunk_size: int = 96) -> list[str]:
     return chunks
 
 
+def _take_utf16_chunk(text: str, limit: int, *, spaces: bool = True) -> int:
+    """Return a safe Python index whose prefix fits a UTF-16 unit budget."""
+    if limit <= 0:
+        return 0
+    units = 0
+    hard_end = 0
+    newline_end = 0
+    whitespace_end = 0
+    for index, char in enumerate(text):
+        char_units = 2 if ord(char) > 0xFFFF else 1
+        if units + char_units > limit:
+            break
+        units += char_units
+        hard_end = index + 1
+        if char == "\n":
+            newline_end = hard_end
+        elif spaces and char.isspace():
+            whitespace_end = hard_end
+    if hard_end >= len(text):
+        return hard_end
+    return newline_end or whitespace_end or hard_end
+
+
+def _split_plain_utf16(text: str, limit: int, *, spaces: bool = True) -> list[str]:
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        split_at = _take_utf16_chunk(remaining, limit, spaces=spaces)
+        if split_at <= 0:
+            # A valid Telegram budget always fits at least one Unicode scalar,
+            # but keep this helper total for defensive/unit-test callers.
+            split_at = 1
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    return chunks
+
+
+def _split_fenced_code_block(
+    block: _FencedCodeBlock,
+    limit: int,
+) -> list[str]:
+    opening = block.opening
+    closing = block.closing
+    wrapper_units = _utf16_units(f"{opening}\n\n{closing}")
+    if wrapper_units >= limit:
+        opening = block.fence
+        closing = block.fence
+        wrapper_units = _utf16_units(f"{opening}\n\n{closing}")
+    if wrapper_units >= limit:
+        return _split_plain_utf16(
+            f"{block.opening}\n{block.content}{block.closing}",
+            limit,
+            spaces=False,
+        )
+
+    content_limit = limit - wrapper_units
+    content_parts = _split_plain_utf16(
+        block.content,
+        content_limit,
+        spaces=False,
+    ) or [""]
+    parts: list[str] = []
+    for content in content_parts:
+        separator = "" if content.endswith("\n") else "\n"
+        part = f"{opening}\n{content}{separator}{closing}"
+        # ``wrapper_units`` reserves the optional separator above, so this is
+        # an invariant unless a caller supplied a nonsensically tiny budget.
+        if _utf16_units(part) <= limit:
+            parts.append(
+                _FencedMarkdownPart(
+                    part,
+                    opening=opening,
+                    content=content,
+                )
+            )
+        else:
+            parts.extend(_split_plain_utf16(part, limit, spaces=False))
+    return parts
+
+
+def _plain_fallback_for_part(part: str) -> str:
+    if isinstance(part, _FencedMarkdownPart):
+        return part.content
+    return str(part)
+
+
 def _split_for_telegram(text: str, limit: int) -> list[str]:
-    """Split long text so each part stays under Telegram length limits."""
-    source = (text or "").strip()
-    if not source:
+    """Split Markdown on UTF-16 limits while keeping fenced code valid."""
+    source = str(text or "").strip()
+    if not source or limit <= 0:
         return []
-    if len(source) <= limit:
+    if _utf16_units(source) <= limit:
         return [source]
 
+    blocks = _find_fenced_code_blocks(source)
+    if not blocks:
+        return _split_plain_utf16(source, limit)
+
     parts: list[str] = []
+    pending = ""
+
+    def _flush_pending() -> None:
+        nonlocal pending
+        if pending.strip():
+            parts.append(pending)
+        pending = ""
+
+    def _append_plain(value: str) -> None:
+        nonlocal pending
+        remaining = value
+        while remaining:
+            capacity = limit - _utf16_units(pending)
+            if capacity <= 0:
+                _flush_pending()
+                capacity = limit
+            split_at = _take_utf16_chunk(remaining, capacity)
+            if split_at <= 0:
+                _flush_pending()
+                continue
+            pending += remaining[:split_at]
+            remaining = remaining[split_at:]
+            if remaining:
+                _flush_pending()
+
     cursor = 0
-    while cursor < len(source):
-        end = min(cursor + limit, len(source))
-        if end >= len(source):
-            tail = source[cursor:].strip()
-            if tail:
-                parts.append(tail)
-            break
-
-        split_at = source.rfind("\n", cursor, end)
-        if split_at <= cursor:
-            split_at = source.rfind(" ", cursor, end)
-        if split_at <= cursor:
-            split_at = end
+    for block in blocks:
+        _append_plain(source[cursor:block.start])
+        raw_block = source[block.start:block.end]
+        if _utf16_units(raw_block) <= limit:
+            if pending and _utf16_units(pending + raw_block) > limit:
+                _flush_pending()
+            pending += raw_block
         else:
-            split_at += 1
-
-        part = source[cursor:split_at].strip()
-        if part:
-            parts.append(part)
-        cursor = split_at
-
+            _flush_pending()
+            parts.extend(_split_fenced_code_block(block, limit))
+        cursor = block.end
+    _append_plain(source[cursor:])
+    _flush_pending()
     return parts
 
 
@@ -1141,6 +1575,9 @@ async def send_reply(
     stream_interval: float = 1.0,
     auto_delete_seconds: int = 0,
     on_delivery: Callable[[], None] | None = None,
+    on_ambiguous: Callable[[], None] | None = None,
+    overlay: ReplyMessageOverlay | None = None,
+    overlay_remove_after: float = 2.0,
 ) -> bool:
     """Send reply in normal mode or stream-like incremental edits.
 
@@ -1153,6 +1590,30 @@ async def send_reply(
     mode = (delivery_mode or "reply").strip().lower()
     send_as_reply = mode != "message"
     explicit_reply_target = int(reply_to_message_id or 0) or None
+    overlay_compatible = bool(
+        overlay is not None
+        and overlay.sent_as_reply
+        and send_as_reply
+        and int(getattr(getattr(overlay.message, "chat", None), "id", 0) or 0)
+        == int(getattr(message.chat, "id", 0) or 0)
+        and (
+            explicit_reply_target is None
+            or explicit_reply_target == overlay.reply_to_message_id
+        )
+        and str(overlay.status_html or "").strip()
+    )
+
+    def _mark_overlay_ambiguous() -> None:
+        if overlay is not None:
+            overlay.outcome = "ambiguous"
+        if on_ambiguous is None:
+            return
+        try:
+            on_ambiguous()
+        except Exception:
+            # The Telegram request may already have taken effect. Receipt
+            # bookkeeping must never turn that uncertainty into a resend.
+            log.exception("Telegram ambiguous-delivery callback failed")
 
     async def _safe_send(
         body: str,
@@ -1255,6 +1716,275 @@ async def send_reply(
                 await asyncio.sleep(0.3 * attempt)
         return False
 
+    async def _safe_overlay_edit(
+        sent: Message,
+        body: str,
+        *,
+        parse_mode: str | None,
+        retries: int = 2,
+    ) -> Literal["success", "definite_failure", "ambiguous"]:
+        """Edit one known message without turning ambiguity into a resend."""
+
+        attempt = 0
+        saw_ambiguous_result = False
+        while attempt <= retries:
+            try:
+                await sent.edit_text(body, parse_mode=parse_mode)
+                return "success"
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return "success"
+                return (
+                    "ambiguous" if saw_ambiguous_result else "definite_failure"
+                )
+            except TelegramRetryAfter as exc:
+                wait_s = _bounded_retry_after_seconds(exc)
+                if wait_s is None:
+                    return (
+                        "ambiguous" if saw_ambiguous_result else "definite_failure"
+                    )
+                await asyncio.sleep(wait_s)
+                attempt += 1
+            except Exception:
+                saw_ambiguous_result = True
+                if attempt >= retries:
+                    return "ambiguous"
+                attempt += 1
+                await asyncio.sleep(0.3 * attempt)
+        return "ambiguous" if saw_ambiguous_result else "definite_failure"
+
+    async def _schedule_overlay_removal(
+        sent: Message,
+        *,
+        final_body: str,
+        parse_mode: str | None,
+        plain_fallback: str | None = None,
+        confirm_on_success: bool = False,
+    ) -> bool:
+        delay = max(0.0, float(overlay_remove_after))
+
+        async def _converge_to_body() -> bool:
+            result = await _safe_overlay_edit(
+                sent,
+                final_body,
+                parse_mode=parse_mode,
+                retries=4,
+            )
+            if (
+                result == "definite_failure"
+                and parse_mode is not None
+                and plain_fallback is not None
+            ):
+                result = await _safe_overlay_edit(
+                    sent,
+                    plain_fallback,
+                    parse_mode=None,
+                    retries=2,
+                )
+            if result == "success":
+                if confirm_on_success:
+                    confirm_telegram_delivery(on_delivery)
+                return True
+            log.warning(
+                "Telegram reply overlay did not converge to body | "
+                "chat_id=%s message_id=%s outcome=%s",
+                getattr(getattr(sent, "chat", None), "id", "?"),
+                getattr(sent, "message_id", "?"),
+                result,
+            )
+            return False
+
+        async def _remove() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await _converge_to_body()
+            finally:
+                if auto_delete_seconds == AUTO_DELETE_BUTTON_SENTINEL:
+                    await _schedule_delivered_message_cleanup(
+                        sent,
+                        auto_delete_seconds,
+                    )
+
+        scheduled = _schedule_telegram_background_task(
+            _remove(),
+            name=(
+                "telegram-reply-overlay-remove:"
+                f"{getattr(getattr(sent, 'chat', None), 'id', 0)}:"
+                f"{getattr(sent, 'message_id', 0)}"
+            ),
+        )
+        # Arm the status-strip task before awaiting durable cleanup so caller
+        # cancellation cannot leave an attached overlay without a convergence
+        # task. Button mode is attached only after the text edit completes.
+        if auto_delete_seconds != AUTO_DELETE_BUTTON_SENTINEL:
+            await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
+        if scheduled:
+            return True
+
+        # Capacity pressure must not leave the progress quote permanently
+        # attached. Converge immediately on the same message ID; never resend.
+        converged = await _converge_to_body()
+        if auto_delete_seconds == AUTO_DELETE_BUTTON_SENTINEL:
+            await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
+        return converged
+
+    def _arm_overlay_reconciliation(
+        sent: Message,
+        *,
+        final_body: str,
+        parse_mode: str | None,
+        plain_fallback: str | None,
+    ) -> None:
+        scheduled = _schedule_telegram_background_task(
+            _schedule_overlay_removal(
+                sent,
+                final_body=final_body,
+                parse_mode=parse_mode,
+                plain_fallback=plain_fallback,
+                confirm_on_success=True,
+            ),
+            name=(
+                "telegram-reply-overlay-reconcile:"
+                f"{getattr(getattr(sent, 'chat', None), 'id', 0)}:"
+                f"{getattr(sent, 'message_id', 0)}"
+            ),
+        )
+        if not scheduled:
+            log.error(
+                "Telegram reply overlay reconciliation could not be armed | "
+                "chat_id=%s message_id=%s",
+                getattr(getattr(sent, "chat", None), "id", "?"),
+                getattr(sent, "message_id", "?"),
+            )
+
+    async def _attempt_overlay_edit(
+        sent: Message,
+        body: str,
+        *,
+        parse_mode: str | None,
+        retries: int,
+        reconcile_body: str,
+        reconcile_parse_mode: str | None,
+        reconcile_plain_fallback: str | None,
+    ) -> Literal["success", "definite_failure", "ambiguous"]:
+        try:
+            return await _safe_overlay_edit(
+                sent,
+                body,
+                parse_mode=parse_mode,
+                retries=retries,
+            )
+        except asyncio.CancelledError:
+            _mark_overlay_ambiguous()
+            _arm_overlay_reconciliation(
+                sent,
+                final_body=reconcile_body,
+                parse_mode=reconcile_parse_mode,
+                plain_fallback=reconcile_plain_fallback,
+            )
+            raise
+
+    async def _try_attach_overlay(
+        *,
+        html_body: str,
+        plain_body: str,
+    ) -> Message | None:
+        if overlay is None:
+            return None
+
+        overlay.outcome = "attempting"
+        status_html = str(overlay.status_html or "").strip()
+        combined_html = f"{status_html}\n\n{html_body}"
+        combined_result = await _attempt_overlay_edit(
+            overlay.message,
+            combined_html,
+            parse_mode="HTML",
+            retries=2,
+            reconcile_body=html_body,
+            reconcile_parse_mode="HTML",
+            reconcile_plain_fallback=plain_body,
+        )
+        if combined_result == "success":
+            overlay.outcome = "attached"
+            confirm_telegram_delivery(on_delivery)
+            await _schedule_overlay_removal(
+                overlay.message,
+                final_body=html_body,
+                parse_mode="HTML",
+                plain_fallback=plain_body,
+            )
+            return overlay.message
+        if combined_result == "ambiguous":
+            _mark_overlay_ambiguous()
+            await _schedule_overlay_removal(
+                overlay.message,
+                final_body=html_body,
+                parse_mode="HTML",
+                plain_fallback=plain_body,
+                confirm_on_success=True,
+            )
+            return None
+
+        # A definite entity/edit rejection is safe to recover on the same
+        # message ID. Prefer the canonical formatted body, then plain text.
+        body_result = await _attempt_overlay_edit(
+            overlay.message,
+            html_body,
+            parse_mode="HTML",
+            retries=1,
+            reconcile_body=html_body,
+            reconcile_parse_mode="HTML",
+            reconcile_plain_fallback=plain_body,
+        )
+        if body_result == "success":
+            overlay.outcome = "attached"
+            confirm_telegram_delivery(on_delivery)
+            await _schedule_delivered_message_cleanup(
+                overlay.message,
+                auto_delete_seconds,
+            )
+            return overlay.message
+        if body_result == "ambiguous":
+            _mark_overlay_ambiguous()
+            await _schedule_overlay_removal(
+                overlay.message,
+                final_body=html_body,
+                parse_mode="HTML",
+                plain_fallback=plain_body,
+                confirm_on_success=True,
+            )
+            return None
+
+        plain_result = await _attempt_overlay_edit(
+            overlay.message,
+            plain_body,
+            parse_mode=None,
+            retries=1,
+            reconcile_body=plain_body,
+            reconcile_parse_mode=None,
+            reconcile_plain_fallback=None,
+        )
+        if plain_result == "success":
+            overlay.outcome = "attached"
+            confirm_telegram_delivery(on_delivery)
+            await _schedule_delivered_message_cleanup(
+                overlay.message,
+                auto_delete_seconds,
+            )
+            return overlay.message
+        if plain_result == "ambiguous":
+            _mark_overlay_ambiguous()
+            await _schedule_overlay_removal(
+                overlay.message,
+                final_body=plain_body,
+                parse_mode=None,
+                confirm_on_success=True,
+            )
+        else:
+            overlay.outcome = "definite_failure"
+        return None
+
     async def _finalize_stream_format(sent: Message, segment: str) -> bool:
         """Try to preserve markdown formatting after stream plain-text phase."""
         final_html = md_to_html(segment)
@@ -1267,10 +1997,6 @@ async def send_reply(
 
         html_ok = await _safe_edit(sent, final_html, parse_mode="HTML", retries=2)
         if html_ok:
-            return True
-
-        md_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
-        if md_ok:
             return True
 
         # Keep single-message behavior: final fallback edits same message as plain text.
@@ -1330,22 +2056,32 @@ async def send_reply(
         final_plain_ok = await _safe_edit(sent, segment, parse_mode=None, retries=3)
         if not final_plain_ok:
             # Do not send/delete as fallback to avoid duplicate notifications.
-            markdown_ok = await _safe_edit(sent, segment, parse_mode="Markdown", retries=1)
-            if not markdown_ok:
-                await _schedule_delivered_message_cleanup(
-                    sent,
-                    auto_delete_seconds,
-                )
-                return False
+            await _schedule_delivered_message_cleanup(
+                sent,
+                auto_delete_seconds,
+            )
+            return False
 
         ok = await _finalize_stream_format(sent, segment)
         await _schedule_delivered_message_cleanup(sent, auto_delete_seconds)
         return ok
 
     payload = sanitize_outgoing_text((text or "").strip())
-    payload = sanitize_outgoing_mentions(payload)
+    pre_rendered_html = _contains_telegram_html_outside_markdown_code(payload)
+    payload = sanitize_outgoing_mentions(
+        payload,
+        monospace=pre_rendered_html,
+    )
     if not payload:
         return False
+    # Incrementally editing a half-open fence cannot produce a valid Telegram
+    # code entity. Code answers are finalized in one edit; an adopted progress
+    # overlay already carries the useful intermediate state.
+    effective_stream = bool(
+        stream
+        and not overlay_compatible
+        and not _find_fenced_code_blocks(payload)
+    )
 
     semaphore = _SEND_SEMAPHORES.setdefault(
         message.chat.id,
@@ -1354,24 +2090,45 @@ async def send_reply(
 
     async def _deliver_payload() -> bool:
         async with semaphore:
-            pre_rendered_html = _TG_HTML_TAG_RE.search(payload) is not None
             # Pre-rendered HTML must not be streamed as literal, half-open tags.
             # Send it once as HTML and retain the normal format fallbacks.
-            if not stream or pre_rendered_html:
+            if not effective_stream or pre_rendered_html:
+                split_limit = TG_STREAM_SAFE_LIMIT if effective_stream else TG_MESSAGE_LIMIT
                 parts = (
                     [payload]
                     if pre_rendered_html
                     and _telegram_html_text_units(payload) <= TG_MESSAGE_LIMIT
-                    else _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT)
+                    else _split_for_telegram(payload, limit=split_limit)
                 )
                 ok = True
-                for part in parts:
+                for index, part in enumerate(parts):
                     html_body = part if pre_rendered_html else md_to_html(part)
+                    plain_body = (
+                        _telegram_html_to_plain(part)
+                        if pre_rendered_html
+                        else _plain_fallback_for_part(part)
+                    )
+                    if (
+                        index == 0
+                        and len(parts) == 1
+                        and overlay_compatible
+                        and overlay is not None
+                        and _telegram_html_text_units(
+                            f"{overlay.status_html.strip()}\n\n{html_body}"
+                        )
+                        <= TG_MESSAGE_LIMIT
+                    ):
+                        sent = await _try_attach_overlay(
+                            html_body=html_body,
+                            plain_body=plain_body,
+                        )
+                        if sent is not None:
+                            continue
+                        if overlay.outcome == "ambiguous":
+                            return False
                     sent = await _safe_send(html_body, parse_mode="HTML", retries=3)
                     if not sent:
-                        sent = await _safe_send(part, parse_mode="Markdown", retries=2)
-                    if not sent:
-                        sent = await _safe_send(part, parse_mode=None, retries=2)
+                        sent = await _safe_send(plain_body, parse_mode=None, retries=2)
                     ok = ok and bool(sent)
                 return ok
 
@@ -1448,7 +2205,7 @@ async def send_chat_message(
     on_delivery: Callable[[], None] | None = None,
 ) -> bool:
     payload = sanitize_outgoing_text((text or "").strip())
-    payload = sanitize_outgoing_mentions(payload)
+    payload = sanitize_outgoing_mentions(payload, monospace=False)
     if not payload:
         return False
 
@@ -1522,7 +2279,7 @@ async def send_chat_message(
         async with asyncio.timeout(_send_total_deadline_seconds()):
             async with semaphore:
                 ok = True
-                for part in _split_for_telegram(payload, limit=TG_STREAM_SAFE_LIMIT):
+                for part in _split_for_telegram(payload, limit=TG_MESSAGE_LIMIT):
                     html_body = md_to_html(part)
                     sent = await _safe_send(
                         html_body,
@@ -1532,14 +2289,7 @@ async def send_chat_message(
                     )
                     if not sent:
                         sent = await _safe_send(
-                            part,
-                            parse_mode="Markdown",
-                            reply_id=reply_to_message_id,
-                            retries=2,
-                        )
-                    if not sent:
-                        sent = await _safe_send(
-                            part,
+                            _plain_fallback_for_part(part),
                             parse_mode=None,
                             reply_id=reply_to_message_id,
                             retries=2,

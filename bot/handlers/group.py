@@ -10,7 +10,7 @@ import re
 import time
 import weakref
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import Context
 from dataclasses import dataclass, field
@@ -128,6 +128,7 @@ from bot.services.moderation import ModerationVerdict
 from bot.services.notification_pins import unpin_notification_message
 from bot.services.reply_mode import ReplyModeService
 from bot.services.reply_output import ReplyMessageSpec, parse_reply_output
+from bot.services.reply_progress import ReplyProgressTracker
 from bot.services.proactive import note_group_activity, record_group_activity
 from bot.services.privileged_tasks import submit_privileged_task
 from bot.services.resource_health import register_resource_health_provider
@@ -157,6 +158,7 @@ from bot.utils.telegram import (
     sanitize_outgoing_mentions,
     sanitize_outgoing_text,
     schedule_message_auto_delete_durable,
+    ReplyMessageOverlay,
     send_reply,
     typing_action,
 )
@@ -4000,6 +4002,11 @@ async def _deliver_reply_plans(
     tts_already_sent: bool,
     force_text: bool = False,
     on_delivery: Callable[[], None] | None = None,
+    on_ambiguous: Callable[[], None] | None = None,
+    progress_overlay: ReplyMessageOverlay | None = None,
+    progress_overlay_factory: (
+        Callable[[], Awaitable[ReplyMessageOverlay | None]] | None
+    ) = None,
 ) -> tuple[bool, bool, list[str]]:
     """Deliver every plan, falling back to text per failed voice item."""
 
@@ -4009,13 +4016,29 @@ async def _deliver_reply_plans(
     sent_ok = False
     tts_sent_ok = tts_already_sent
     sent_messages: list[str] = []
+    overlay_claimed = False
+
+    async def _claim_progress_overlay(
+        *,
+        allowed: bool = True,
+    ) -> ReplyMessageOverlay | None:
+        nonlocal overlay_claimed, progress_overlay
+        if not allowed:
+            overlay_claimed = True
+            return None
+        if overlay_claimed:
+            return None
+        overlay_claimed = True
+        if progress_overlay is None and progress_overlay_factory is not None:
+            progress_overlay = await progress_overlay_factory()
+        return progress_overlay
 
     if (
         not force_text
         and is_tts_always_enabled(tts_mode)
         and bool(getattr(tts_service, "available", False))
     ):
-        voice_results: list[tuple[TTSDeliveryResult, list[bool]]] = []
+        visible_delivery_seen = bool(tts_already_sent)
         for plan in delivery_plans:
             plan_receipt = [False]
 
@@ -4065,21 +4088,20 @@ async def _deliver_reply_plans(
                 )
             if delivery.any_sent and not plan_receipt[0]:
                 _confirm_plan_delivery()
-            voice_results.append((delivery, plan_receipt))
-
-        for plan, (delivery, plan_receipt) in zip(delivery_plans, voice_results):
-            def _confirm_plan_delivery(receipt: list[bool] = plan_receipt) -> None:
-                receipt[0] = True
-                confirm_telegram_delivery(on_delivery)
 
             if delivery.complete:
                 sent_messages.append(plan.text)
                 sent_ok = True
                 tts_sent_ok = True
+                visible_delivery_seen = True
                 continue
             if delivery.any_sent:
+                visible_delivery_seen = True
                 remaining_sent = False
                 if delivery.remaining_text:
+                    fallback_overlay = await _claim_progress_overlay(
+                        allowed=False,
+                    )
                     remaining_sent = await send_reply(
                         message,
                         delivery.remaining_text,
@@ -4091,6 +4113,8 @@ async def _deliver_reply_plans(
                             "reply",
                         ),
                         on_delivery=_confirm_plan_delivery,
+                        on_ambiguous=on_ambiguous,
+                        overlay=fallback_overlay,
                     )
                 sent_messages.append(
                     plan.text
@@ -4109,6 +4133,9 @@ async def _deliver_reply_plans(
                 )
                 continue
             log.warning("[%s] always-tts item failed; using text fallback", group_id)
+            fallback_overlay = await _claim_progress_overlay(
+                allowed=not visible_delivery_seen,
+            )
             text_ok = await send_reply(
                 message,
                 plan.text,
@@ -4117,12 +4144,16 @@ async def _deliver_reply_plans(
                 stream=False,
                 auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
                 on_delivery=_confirm_plan_delivery,
+                on_ambiguous=on_ambiguous,
+                overlay=fallback_overlay,
             )
             if text_ok:
                 sent_messages.append(plan.text)
                 sent_ok = True
+                visible_delivery_seen = True
             elif plan_receipt[0]:
                 sent_ok = True
+                visible_delivery_seen = True
         return sent_ok, tts_sent_ok, sent_messages
 
     # A TTS tool may already have delivered the answer.  Security/quota
@@ -4137,6 +4168,9 @@ async def _deliver_reply_plans(
             receipt[0] = True
             confirm_telegram_delivery(on_delivery)
 
+        current_overlay = await _claim_progress_overlay(
+            allowed=not tts_already_sent,
+        )
         text_ok = await send_reply(
             message,
             plan.text,
@@ -4147,6 +4181,8 @@ async def _deliver_reply_plans(
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
             on_delivery=_confirm_plan_delivery,
+            on_ambiguous=on_ambiguous,
+            overlay=current_overlay,
         )
         if text_ok:
             sent_messages.append(plan.text)
@@ -4214,9 +4250,19 @@ async def _resolve_pending_reply_action(
 @dataclass(slots=True)
 class _PendingReplyDeliveryReceipt:
     delivered: bool = False
+    ambiguous: bool = False
 
     def confirm(self) -> None:
         self.delivered = True
+
+    def mark_ambiguous(self) -> None:
+        self.ambiguous = True
+
+    @property
+    def consumed(self) -> bool:
+        """Whether replay could duplicate an externally attempted effect."""
+
+        return self.delivered or self.ambiguous
 
 
 def _log_pending_reply_action(
@@ -4280,12 +4326,19 @@ async def _process_pending_reply_batch(
     memory = memory_holder.get()
     session_factory = memory.session_factory
     delivery_confirmed = bool(delivery_receipt and delivery_receipt.delivered)
+    delivery_ambiguous = bool(delivery_receipt and delivery_receipt.ambiguous)
 
     def _confirm_delivery() -> None:
         nonlocal delivery_confirmed
         delivery_confirmed = True
         if delivery_receipt is not None:
             delivery_receipt.confirm()
+
+    def _mark_delivery_ambiguous() -> None:
+        nonlocal delivery_ambiguous
+        delivery_ambiguous = True
+        if delivery_receipt is not None:
+            delivery_receipt.mark_ambiguous()
 
     llm = LLMService(
         settings.bot.main_model,
@@ -4313,6 +4366,20 @@ async def _process_pending_reply_batch(
         or is_explicit_vote_ban_request(item.input_text)
         for item in items
     )
+    progress: ReplyProgressTracker | None = None
+    progress_overlay: ReplyMessageOverlay | None = None
+    progress_handoff_attempted = False
+
+    async def _handoff_progress_overlay() -> ReplyMessageOverlay | None:
+        nonlocal progress_handoff_attempted, progress_overlay
+        if progress_handoff_attempted:
+            return progress_overlay
+        progress_handoff_attempted = True
+        if progress is not None:
+            progress_overlay = await progress.handoff(
+                "已整理并发送回答"
+            )
+        return progress_overlay
 
     log.info(
         "[%s] pending batch flush started | user=%s messages=%d debounce=%.2fs",
@@ -4403,6 +4470,19 @@ async def _process_pending_reply_batch(
             tts_service = skill.tts_service or DoubaoTTSService(settings)
 
             if action != "skip":
+                progress = ReplyProgressTracker(
+                    latest.message,
+                    enabled=latest_is_direct_request,
+                    reveal_after=3.0,
+                    edit_interval=max(
+                        0.8,
+                        float(settings.bot.stream_edit_interval_sec or 0.0),
+                    ),
+                    # Progress is transient UI, not another permanent group
+                    # message. Keep its retention independent from replies.
+                    auto_delete_seconds=30,
+                )
+                await progress.start()
                 history = await memory.get_history_for_llm(
                     group_id,
                     prompt_payload_builder=lambda candidate_history: skill.build_answer_prompt_payload(
@@ -4465,6 +4545,7 @@ async def _process_pending_reply_batch(
                         is_direct_request=latest_is_direct_request,
                         style_profile_context=style_profile_context,
                         delivery_callback=_confirm_delivery,
+                        progress_callback=progress.report,
                     )
                     skill_handled = bool(skill_result.handled)
                     skill_must_deliver_text = bool(
@@ -4519,6 +4600,7 @@ async def _process_pending_reply_batch(
                         reply_source = "skill"
 
                     if not raw_reply and not skill_handled:
+                        await progress.composing()
                         casual = CasualService(
                             llm,
                             settings=settings,
@@ -4550,6 +4632,9 @@ async def _process_pending_reply_batch(
                             action,
                             raw_reply[:80] if raw_reply else "(empty)",
                         )
+
+                    if raw_reply and reply_source == "skill":
+                        await progress.composing()
 
                     current_task = asyncio.current_task()
                     if current_task is not None and current_task.cancelling():
@@ -4709,6 +4794,18 @@ async def _process_pending_reply_batch(
             )
 
             if action != "skip" and delivery_plans:
+                text_delivery_expected = bool(
+                    not tts_sent_ok
+                    and (
+                        skill_must_deliver_text
+                        or not (
+                            is_tts_always_enabled(tts_mode)
+                            and bool(getattr(tts_service, "available", False))
+                        )
+                    )
+                )
+                if progress is not None and text_delivery_expected:
+                    progress_overlay = await _handoff_progress_overlay()
                 delivered, tts_sent_ok, sent_reply_messages = await _deliver_reply_plans(
                     message=latest.message,
                     delivery_plans=delivery_plans,
@@ -4720,12 +4817,17 @@ async def _process_pending_reply_batch(
                     tts_already_sent=tts_sent_ok,
                     force_text=skill_must_deliver_text,
                     on_delivery=_confirm_delivery,
+                    on_ambiguous=_mark_delivery_ambiguous,
+                    progress_overlay=progress_overlay,
+                    progress_overlay_factory=_handoff_progress_overlay,
                 )
                 sent_ok = sent_ok or delivered
-                if delivered:
+                if delivered and not delivery_ambiguous:
                     _confirm_delivery()
 
             if action == "skip":
+                if progress is not None:
+                    await progress.dismiss()
                 log.info(
                     "[%s] pending batch finished | action=skip mention=%s mention_other=%s reply=%s reply_bot=%s reply_other=%s skill_handled=%s sticker_sent=%s tts_sent=%s elapsed=%dms",
                     group_id,
@@ -4783,12 +4885,45 @@ async def _process_pending_reply_batch(
                 len(reply or ""),
                 int((time.perf_counter() - flow_started) * 1000),
             )
-            return bool(
+            succeeded = bool(
                 sent_ok
                 or sticker_sent_ok
                 or tts_sent_ok
+                or delivery_ambiguous
                 or not latest_is_direct_request
             )
+            if progress is not None:
+                overlay_owns_message = bool(
+                    progress_overlay is not None
+                    and progress_overlay.outcome
+                    in {"attempting", "attached", "ambiguous"}
+                )
+                if not overlay_owns_message:
+                    await progress.dismiss()
+            return succeeded
+        except asyncio.CancelledError:
+            overlay_owns_message = bool(
+                progress_overlay is not None
+                and progress_overlay.outcome
+                in {"attempting", "attached", "ambiguous"}
+            )
+            if overlay_owns_message:
+                pass
+            elif delivery_confirmed:
+                if progress is not None:
+                    await progress.dismiss()
+            elif progress is not None and progress.visible:
+                terminal_delivered = await progress.fail(
+                    "处理已中止；若涉及发送或修改，结果可能已生效，"
+                    "请先检查群内状态，确认未执行后再重试"
+                )
+                if terminal_delivered:
+                    _confirm_delivery()
+                else:
+                    await progress.dismiss()
+            elif progress is not None:
+                await progress.dismiss()
+            raise
         except Exception as exc:
             try:
                 await session.rollback()
@@ -4798,6 +4933,12 @@ async def _process_pending_reply_batch(
                     group_id,
                 )
             if delivery_confirmed:
+                if progress is not None and not (
+                    progress_overlay is not None
+                    and progress_overlay.outcome
+                    in {"attempting", "attached", "ambiguous"}
+                ):
+                    await progress.dismiss()
                 log.error(
                     "[%s] pending batch post-delivery processing failed; "
                     "suppressing duplicate failure reply",
@@ -4805,7 +4946,16 @@ async def _process_pending_reply_batch(
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
                 return True
+            if progress is not None and not (
+                progress_overlay is not None
+                and progress_overlay.outcome
+                in {"attempting", "attached", "ambiguous"}
+            ):
+                await progress.dismiss()
             raise
+        finally:
+            if progress is not None:
+                await progress.close()
 
 
 async def _await_hard_deadline(awaitable: Any, *, timeout_seconds: float) -> Any:
@@ -4861,10 +5011,10 @@ async def _notify_pending_reply_failure(
         # failure is terminal and should not cause Telegram to replay the whole
         # moderation/memory pipeline.
         return True
+    outcome = "超时" if timed_out else "失败"
     text = (
-        "这次请求处理超时了，请稍后再试。"
-        if timed_out
-        else "这次请求处理失败了，请稍后再试。"
+        f"这次请求处理{outcome}了。若请求涉及发送或修改，结果可能已生效；"
+        "请先检查群内状态，确认未执行后再重试。"
     )
     try:
         sent = await _await_hard_deadline(
@@ -4943,7 +5093,7 @@ async def _process_pending_reply_batch_guarded(
     try:
         succeeded = bool(
             await _await_hard_deadline(_run(), timeout_seconds=timeout_seconds)
-        ) or delivery_receipt.delivered
+        ) or delivery_receipt.consumed
         if not succeeded:
             succeeded = await _notify_pending_reply_failure(items, timed_out=False)
         return _PendingReplyOutcome(succeeded=succeeded)
@@ -4954,9 +5104,10 @@ async def _process_pending_reply_batch_guarded(
             len(items),
             timeout_seconds,
         )
-        if delivery_receipt.delivered:
+        if delivery_receipt.consumed:
             log.warning(
-                "pending batch exceeded deadline after confirmed delivery; "
+                "pending batch exceeded deadline after delivery or an ambiguous "
+                "external attempt; "
                 "failure notification suppressed | key=%s messages=%d",
                 key,
                 len(items),
@@ -4984,10 +5135,10 @@ async def _process_pending_reply_batch_guarded(
         raise
     except Exception:
         log.exception("pending batch processing failed | key=%s messages=%d", key, len(items))
-        if delivery_receipt.delivered:
+        if delivery_receipt.consumed:
             log.warning(
-                "pending batch failed after confirmed delivery; failure notification "
-                "suppressed | key=%s messages=%d",
+                "pending batch failed after delivery or an ambiguous external attempt; "
+                "failure notification suppressed | key=%s messages=%d",
                 key,
                 len(items),
             )
@@ -5042,7 +5193,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                     delivery_receipt=active_delivery_receipt,
                 )
                 final_succeeded = bool(
-                    outcome.succeeded or active_delivery_receipt.delivered
+                    outcome.succeeded or active_delivery_receipt.consumed
                 )
                 orphan = outcome.orphan
                 if orphan is not None:
@@ -5062,7 +5213,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                     except Exception:
                         pass
                 final_succeeded = bool(
-                    final_succeeded or active_delivery_receipt.delivered
+                    final_succeeded or active_delivery_receipt.consumed
                 )
                 if outcome.timed_out and not final_succeeded:
                     final_succeeded = await _notify_pending_reply_failure(
@@ -5095,7 +5246,7 @@ async def _pending_reply_worker(key: tuple[int, int]) -> None:
                 active_items,
                 succeeded=bool(
                     active_delivery_receipt
-                    and active_delivery_receipt.delivered
+                    and active_delivery_receipt.consumed
                 ),
             )
             active_items = []

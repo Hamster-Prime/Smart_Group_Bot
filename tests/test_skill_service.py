@@ -509,6 +509,11 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         service = SkillService(_llm_stub(), tool_timeout_seconds=0.1)
         service.skills = {"music_search": DeliveredThenFailedMusicSkill()}
         external_receipt = Mock()
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
         complete = AsyncMock(
             return_value=_resp(
                 tool_calls=[
@@ -527,11 +532,15 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
             result = await service.answer_with_skill(
                 "发首歌",
                 delivery_callback=external_receipt,
+                progress_callback=report,
             )
 
         self.assertTrue(result.delivery_confirmed)
         self.assertEqual(result.text, "")
         external_receipt.assert_called_once_with()
+        self.assertEqual(seen_updates[-1].state, "completed")
+        self.assertIn("已发送音乐", seen_updates[-1].text)
+        self.assertNotIn("待确认", seen_updates[-1].text)
 
     async def test_tts_skill_does_not_return_followup_text(self) -> None:
         service = _PlannedSkillService(
@@ -988,6 +997,388 @@ class SkillServiceFollowupSuppressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("微博相关链接：", result)
         self.assertIn("https://example.com/1", result)
         self.assertIn("https://example.com/2", result)
+
+
+class SkillProgressCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_skill_reports_safe_started_and_completed_updates_with_reference(self) -> None:
+        seen_updates = []
+        states_seen_inside_skill: list[str] = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        class ReadingSkill:
+            name = "webfetch"
+
+            async def run(self, arguments, context):
+                del arguments
+                states_seen_inside_skill.extend(update.state for update in seen_updates)
+                self.assert_context_callback(context)
+                return SkillRunResult(
+                    ok=True,
+                    skill=self.name,
+                    summary="网页抓取成功",
+                    payload={
+                        "title": "安全标题",
+                        "url": "https://original.example/page",
+                        "final_url": "https://final.example/page",
+                        "content": "正文",
+                    },
+                )
+
+            @staticmethod
+            def assert_context_callback(context) -> None:
+                if context.progress_callback is None:
+                    raise AssertionError("progress callback missing from SkillContext")
+
+        service = SkillService(_llm_stub())
+        service.skills = {"webfetch": ReadingSkill()}
+        result = await service.run_skill(
+            "webfetch",
+            {"url": "https://secret.example/private-token"},
+            progress_callback=report,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(states_seen_inside_skill, ["running"])
+        self.assertEqual([update.state for update in seen_updates], ["running", "completed"])
+        self.assertEqual([update.key for update in seen_updates], ["skill:webfetch"] * 2)
+        self.assertEqual(seen_updates[0].text, "正在读取网页")
+        self.assertEqual(seen_updates[1].text, "已读取网页")
+        self.assertNotIn("private-token", "\n".join(update.text for update in seen_updates))
+        self.assertEqual(len(seen_updates[1].references), 1)
+        self.assertEqual(seen_updates[1].references[0].title, "安全标题")
+        self.assertEqual(
+            seen_updates[1].references[0].url,
+            "https://final.example",
+        )
+
+    async def test_progress_callback_failure_does_not_change_skill_result(self) -> None:
+        class SuccessfulSkill:
+            name = "websearch"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                return SkillRunResult(ok=True, skill=self.name, summary="ok")
+
+        async def broken_callback(update) -> None:
+            del update
+            raise RuntimeError("progress transport failed")
+
+        service = SkillService(_llm_stub())
+        service.skills = {"websearch": SuccessfulSkill()}
+
+        result = await service.run_skill(
+            "websearch",
+            {"query": "sensitive query"},
+            progress_callback=broken_callback,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary, "ok")
+
+    async def test_failed_tool_replaces_running_update_without_reference(self) -> None:
+        class FailedReadingSkill:
+            name = "webfetch"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                return SkillRunResult(
+                    ok=False,
+                    skill=self.name,
+                    summary="网页请求失败",
+                    payload={"final_url": "https://example.com/partial"},
+                    error="http_503",
+                )
+
+        service = SkillService(_llm_stub())
+        service.skills = {"webfetch": FailedReadingSkill()}
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        result = await service.run_skill(
+            "webfetch",
+            {"url": "https://example.com"},
+            progress_callback=report,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            [(update.key, update.state, update.text) for update in seen_updates],
+            [
+                ("skill:webfetch", "running", "正在读取网页"),
+                ("skill:webfetch", "failed", "读取网页失败"),
+            ],
+        )
+        self.assertEqual(seen_updates[-1].references, ())
+
+    async def test_answer_progress_uses_tool_call_id_and_omits_skipped_calls(self) -> None:
+        service = _PlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-rule-1",
+                            "function": {
+                                "name": "rule_manage",
+                                "arguments": '{"request_text":"添加规则一"}',
+                            },
+                        },
+                        {
+                            "id": "call-rule-2",
+                            "function": {
+                                "name": "rule_manage",
+                                "arguments": '{"request_text":"添加规则二"}',
+                            },
+                        },
+                    ]
+                ),
+                _resp(content="已添加第一条规则。"),
+            ]
+        )
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        result = await service.answer_with_skill(
+            "添加两次规则",
+            progress_callback=report,
+        )
+
+        self.assertIn("已添加第一条规则", result.text)
+        self.assertEqual(service.tool_runs, ["rule_manage"])
+        self.assertEqual(
+            [(update.key, update.state) for update in seen_updates],
+            [
+                ("tool:1:0:call-rule-1", "running"),
+                ("tool:1:0:call-rule-1", "completed"),
+            ],
+        )
+        self.assertFalse(any("规则一" in update.text for update in seen_updates))
+        self.assertFalse(any("规则二" in update.text for update in seen_updates))
+
+    def test_references_only_include_successfully_read_sources(self) -> None:
+        search_result = SkillRunResult(
+            ok=True,
+            skill="mihomo_doc",
+            summary="找到文档",
+            payload={
+                "action": "search",
+                "source_url": "https://wiki.metacubex.one/search/search_index.json",
+            },
+        )
+        section_result = SkillRunResult(
+            ok=True,
+            skill="mihomo_doc",
+            summary="读取完成",
+            payload={
+                "action": "section",
+                "pages": [
+                    {
+                        "title": "DNS 配置",
+                        "source_url": "https://wiki.metacubex.one/config/dns/",
+                    },
+                    {
+                        "title": "重复页面",
+                        "source_url": "https://wiki.metacubex.one/config/dns/",
+                    },
+                    {
+                        "title": "不安全页面",
+                        "source_url": "javascript:alert(1)",
+                    },
+                ],
+            },
+        )
+        failed_result = SkillRunResult(
+            ok=False,
+            skill="webfetch",
+            summary="部分失败",
+            payload={"final_url": "https://example.com/not-read"},
+            error="failed",
+        )
+
+        self.assertEqual(SkillService._progress_references(search_result), ())
+        self.assertEqual(SkillService._progress_references(failed_result), ())
+        references = SkillService._progress_references(section_result)
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0].title, "DNS 配置")
+        self.assertEqual(references[0].url, "https://wiki.metacubex.one/config/dns/")
+
+    async def test_ambiguous_side_effect_progress_does_not_claim_failure(self) -> None:
+        service = _AmbiguousPlannedSkillService(
+            [
+                _resp(
+                    tool_calls=[
+                        {
+                            "id": "call-sticker",
+                            "function": {"name": "send_sticker", "arguments": "{}"},
+                        }
+                    ]
+                )
+            ]
+        )
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        await service.answer_with_skill("发个贴纸", progress_callback=report)
+
+        self.assertEqual(seen_updates[-1].state, "failed")
+        self.assertIn("结果待确认", seen_updates[-1].text)
+        self.assertNotIn("发送贴纸失败", seen_updates[-1].text)
+
+    async def test_progress_reference_strips_query_fragment_and_credentials(self) -> None:
+        safe_result = SkillRunResult(
+            ok=True,
+            skill="webfetch",
+            summary="读取完成",
+            payload={
+                "title": "文档",
+                "final_url": "https://example.com/docs?token=secret&id=1#private",
+            },
+        )
+        credential_result = SkillRunResult(
+            ok=True,
+            skill="webfetch",
+            summary="读取完成",
+            payload={
+                "title": "私密链接",
+                "final_url": "https://user:password@example.com/docs",
+            },
+        )
+
+        self.assertEqual(
+            SkillService._progress_references(safe_result)[0].url,
+            "https://example.com",
+        )
+        self.assertEqual(SkillService._progress_references(credential_result), ())
+
+    async def test_slow_progress_callback_is_bounded(self) -> None:
+        class SuccessfulSkill:
+            name = "websearch"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                return SkillRunResult(ok=True, skill=self.name, summary="ok")
+
+        async def stuck_callback(update) -> None:
+            del update
+            await asyncio.sleep(60)
+
+        service = SkillService(_llm_stub())
+        service.skills = {"websearch": SuccessfulSkill()}
+        started = asyncio.get_running_loop().time()
+
+        result = await service.run_skill(
+            "websearch",
+            progress_callback=stuck_callback,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.5)
+
+    async def test_cancelled_tool_gets_terminal_progress_update(self) -> None:
+        entered = asyncio.Event()
+
+        class CancellableSkill:
+            name = "websearch"
+
+            async def run(self, arguments, context):
+                del arguments, context
+                entered.set()
+                await asyncio.sleep(60)
+                raise AssertionError("unreachable")
+
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        service = SkillService(_llm_stub())
+        service.skills = {"websearch": CancellableSkill()}
+        task = asyncio.create_task(
+            service.run_skill("websearch", progress_callback=report)
+        )
+        await entered.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual([update.state for update in seen_updates], ["running", "failed"])
+        self.assertIn("已中止", seen_updates[-1].text)
+
+    async def test_cancel_after_confirmed_delivery_reports_completed(self) -> None:
+        entered = asyncio.Event()
+
+        class DeliveredThenCancelledSkill:
+            name = "music_search"
+
+            async def run(self, arguments, context):
+                del arguments
+                context.delivery_callback()
+                entered.set()
+                await asyncio.sleep(60)
+                raise AssertionError("unreachable")
+
+        seen_updates = []
+        external_receipt = Mock()
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        service = SkillService(_llm_stub())
+        service.skills = {"music_search": DeliveredThenCancelledSkill()}
+        task = asyncio.create_task(
+            service.run_skill(
+                "music_search",
+                {"action": "send_audio"},
+                delivery_callback=external_receipt,
+                progress_callback=report,
+            )
+        )
+        await entered.wait()
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        external_receipt.assert_called_once_with()
+        self.assertEqual(
+            [update.state for update in seen_updates],
+            ["running", "completed"],
+        )
+        self.assertEqual(seen_updates[-1].text, "已发送音乐")
+
+    async def test_reused_provider_tool_ids_keep_distinct_history_keys(self) -> None:
+        call = {
+            "id": "reused-id",
+            "function": {
+                "name": "websearch",
+                "arguments": '{"query":"dns"}',
+            },
+        }
+        service = _PlannedSkillService(
+            [
+                _resp(tool_calls=[call]),
+                _resp(tool_calls=[call]),
+                _resp(content="整理完成。"),
+            ]
+        )
+        seen_updates = []
+
+        async def report(update) -> None:
+            seen_updates.append(update)
+
+        result = await service.answer_with_skill("继续搜索", progress_callback=report)
+
+        self.assertEqual(result.text, "整理完成。")
+        running_keys = [update.key for update in seen_updates if update.state == "running"]
+        self.assertEqual(running_keys, ["tool:1:0:reused-id", "tool:2:0:reused-id"])
 
 
 class SkillExecutionBoundaryTests(unittest.IsolatedAsyncioTestCase):

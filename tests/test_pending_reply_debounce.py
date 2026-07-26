@@ -9,6 +9,7 @@ from bot.handlers import group
 from bot.services.doubao_tts import TTSDeliveryResult
 from bot.services.skills.base import SkillAnswerResult
 from bot.services.update_completion import UpdateCompletionReceipt
+from bot.utils.telegram import ReplyMessageOverlay
 
 
 def _settings(delay: float = 5.0) -> SimpleNamespace:
@@ -173,6 +174,17 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
         )
+        fake_progress = SimpleNamespace(
+            visible=False,
+            start=AsyncMock(),
+            report=AsyncMock(),
+            composing=AsyncMock(),
+            handoff=AsyncMock(return_value=None),
+            finish=AsyncMock(),
+            fail=AsyncMock(),
+            dismiss=AsyncMock(),
+            close=AsyncMock(),
+        )
         history_ready = False
 
         async def get_history_for_llm(
@@ -202,6 +214,10 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.handlers.group.memory_holder.get", return_value=memory),
             patch("bot.handlers.group.LLMService", return_value=object()),
             patch("bot.handlers.group.SkillService", return_value=fake_skill),
+            patch(
+                "bot.handlers.group.ReplyProgressTracker",
+                return_value=fake_progress,
+            ) as progress_factory,
             patch("bot.handlers.group._is_user_admin_cached", new=admin_lookup),
             patch("bot.handlers.group._best_effort_commit", new=AsyncMock()),
         ):
@@ -223,6 +239,20 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             fake_skill.answer_with_skill.await_args.kwargs["is_direct_request"]
         )
+        self.assertIs(
+            fake_skill.answer_with_skill.await_args.kwargs["progress_callback"],
+            fake_progress.report,
+        )
+        progress_factory.assert_called_once_with(
+            message,
+            enabled=True,
+            reveal_after=3.0,
+            edit_interval=0.8,
+            auto_delete_seconds=30,
+        )
+        fake_progress.start.assert_awaited_once_with()
+        fake_progress.dismiss.assert_awaited_once_with()
+        fake_progress.close.assert_awaited_once_with()
         self.assertNotIn(
             "is_direct_request",
             fake_skill.build_answer_prompt_payload.call_args.kwargs,
@@ -262,9 +292,10 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run_guarded(
         self,
-        skill_result: SkillAnswerResult,
+        skill_result: SkillAnswerResult | Exception,
         *,
         memory_error: Exception | None = None,
+        progress_handoff: ReplyMessageOverlay | None = None,
     ) -> tuple[
         group._PendingReplyOutcome,
         group._PendingReplyItem,
@@ -286,18 +317,41 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             get_history_for_llm=AsyncMock(return_value=[]),
             add_message=AsyncMock(side_effect=memory_error),
         )
+        answer_with_skill = (
+            AsyncMock(side_effect=skill_result)
+            if isinstance(skill_result, Exception)
+            else AsyncMock(return_value=skill_result)
+        )
         fake_skill = SimpleNamespace(
             tts_service=SimpleNamespace(available=False),
             build_answer_prompt_payload=Mock(return_value={"messages": [], "tools": []}),
-            answer_with_skill=AsyncMock(return_value=skill_result),
+            answer_with_skill=answer_with_skill,
+        )
+        fake_progress = SimpleNamespace(
+            visible=True,
+            start=AsyncMock(),
+            report=AsyncMock(),
+            composing=AsyncMock(),
+            handoff=AsyncMock(return_value=progress_handoff),
+            finish=AsyncMock(return_value=True),
+            fail=AsyncMock(return_value=True),
+            dismiss=AsyncMock(),
+            close=AsyncMock(),
         )
         notify_failure = AsyncMock(return_value=True)
+        send_text_reply = AsyncMock(return_value=True)
         schedule_compaction = Mock()
+        self._last_fake_progress = fake_progress
+        self._last_send_text_reply = send_text_reply
 
         with (
             patch("bot.handlers.group.memory_holder.get", return_value=memory),
             patch("bot.handlers.group.LLMService", return_value=object()),
             patch("bot.handlers.group.SkillService", return_value=fake_skill),
+            patch(
+                "bot.handlers.group.ReplyProgressTracker",
+                return_value=fake_progress,
+            ),
             patch(
                 "bot.handlers.group._is_user_admin_cached",
                 new=AsyncMock(return_value=False),
@@ -310,6 +364,10 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "bot.handlers.group._notify_pending_reply_failure",
                 new=notify_failure,
+            ),
+            patch(
+                "bot.handlers.group.send_reply",
+                new=send_text_reply,
             ),
         ):
             outcome = await group._process_pending_reply_batch_guarded(
@@ -371,6 +429,151 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         memory.add_message.assert_awaited_once()
         notify_failure.assert_not_awaited()
         schedule_compaction.assert_not_called()
+
+    async def test_visible_progress_does_not_suppress_pre_delivery_failure(self) -> None:
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(RuntimeError("provider failed"))
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_awaited_once_with([item], timed_out=False)
+        memory.add_message.assert_not_awaited()
+        schedule_compaction.assert_not_called()
+
+    async def test_text_reply_adopts_progress_message_without_later_dismiss(self) -> None:
+        overlay = ReplyMessageOverlay(
+            message=SimpleNamespace(
+                message_id=77,
+                chat=SimpleNamespace(id=-10001),
+            ),
+            status_html=(
+                "<blockquote>01　已理解问题\n"
+                "02　已整理并发送回答</blockquote>"
+            ),
+            reply_to_message_id=99,
+            sent_as_reply=True,
+            outcome="attached",
+        )
+
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(
+                SkillAnswerResult(handled=True, text="最终正文"),
+                progress_handoff=overlay,
+            )
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+        self._last_fake_progress.handoff.assert_awaited_once_with(
+            "已整理并发送回答"
+        )
+        self.assertIs(
+            self._last_send_text_reply.await_args.kwargs["overlay"],
+            overlay,
+        )
+        self._last_fake_progress.dismiss.assert_not_awaited()
+        self._last_fake_progress.finish.assert_not_awaited()
+        memory.add_message.assert_awaited_once_with(
+            item.group_id,
+            "assistant",
+            "最终正文",
+            message_type="assistant_reply",
+            defer_persistence=True,
+            completions=(),
+        )
+        schedule_compaction.assert_called_once_with(memory, item.group_id)
+
+    async def test_mandatory_text_after_skill_tts_does_not_reorder_progress(
+        self,
+    ) -> None:
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(
+                SkillAnswerResult(
+                    handled=True,
+                    text="必须显示的文字说明",
+                    must_deliver_text=True,
+                    tts_sent=True,
+                    tts_text="已发送的语音",
+                ),
+            )
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+        self._last_fake_progress.handoff.assert_not_awaited()
+        self.assertIsNone(
+            self._last_send_text_reply.await_args.kwargs["overlay"]
+        )
+        self._last_fake_progress.dismiss.assert_awaited_once_with()
+        memory.add_message.assert_awaited_once_with(
+            item.group_id,
+            "assistant",
+            "必须显示的文字说明",
+            message_type="assistant_reply",
+            defer_persistence=True,
+            completions=(),
+        )
+        schedule_compaction.assert_called_once_with(memory, item.group_id)
+
+    async def test_cancellation_keeps_visible_manual_check_warning(self) -> None:
+        message = self._message("@bot 发一首歌")
+        item = _item(
+            message.text,
+            message=message,
+            explicit_mention=True,
+            mentioned=True,
+        )
+        session = _PendingSession()
+        memory = SimpleNamespace(
+            session_factory=lambda: session,
+            get_history=Mock(return_value=[]),
+            get_history_for_llm=AsyncMock(return_value=[]),
+        )
+        fake_skill = SimpleNamespace(
+            tts_service=SimpleNamespace(available=False),
+            build_answer_prompt_payload=Mock(return_value={"messages": [], "tools": []}),
+            answer_with_skill=AsyncMock(side_effect=asyncio.CancelledError()),
+        )
+        fake_progress = SimpleNamespace(
+            visible=True,
+            start=AsyncMock(),
+            report=AsyncMock(),
+            composing=AsyncMock(),
+            handoff=AsyncMock(return_value=None),
+            finish=AsyncMock(return_value=True),
+            fail=AsyncMock(return_value=True),
+            dismiss=AsyncMock(),
+            close=AsyncMock(),
+        )
+        receipt = group._PendingReplyDeliveryReceipt()
+
+        with (
+            patch("bot.handlers.group.memory_holder.get", return_value=memory),
+            patch("bot.handlers.group.LLMService", return_value=object()),
+            patch("bot.handlers.group.SkillService", return_value=fake_skill),
+            patch(
+                "bot.handlers.group.ReplyProgressTracker",
+                return_value=fake_progress,
+            ),
+            patch(
+                "bot.handlers.group._is_user_admin_cached",
+                new=AsyncMock(return_value=False),
+            ),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await group._process_pending_reply_batch(
+                    [item],
+                    _processing_settings(),
+                    delivery_receipt=receipt,
+                )
+
+        self.assertTrue(receipt.delivered)
+        fake_progress.fail.assert_awaited_once()
+        warning = fake_progress.fail.await_args.args[0]
+        self.assertIn("先检查群内状态", warning)
+        self.assertIn("确认未执行后再重试", warning)
+        fake_progress.dismiss.assert_not_awaited()
+        fake_progress.close.assert_awaited_once_with()
 
 
 class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -810,6 +1013,77 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.succeeded)
         notify_failure.assert_not_awaited()
 
+    async def test_ambiguous_external_attempt_consumes_batch_without_failure_notice(
+        self,
+    ) -> None:
+        notify_failure = AsyncMock(return_value=False)
+
+        async def ambiguous_then_failed(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings
+            delivery_receipt.mark_ambiguous()
+            return False
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=ambiguous_then_failed,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify_failure,
+            ),
+        ):
+            outcome = await group._process_pending_reply_batch_guarded(
+                (-10001, 123),
+                [_item("@bot 执行动作", mentioned=True)],
+                _processing_settings(),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+
+    async def test_deadline_after_ambiguous_attempt_consumes_batch(self) -> None:
+        notify_failure = AsyncMock(return_value=False)
+
+        async def ambiguous_then_stuck(
+            items: object,
+            settings: object,
+            *,
+            delivery_receipt: group._PendingReplyDeliveryReceipt,
+        ) -> bool:
+            del items, settings
+            delivery_receipt.mark_ambiguous()
+            await asyncio.Future()
+            return False
+
+        with (
+            patch(
+                "bot.handlers.group._process_pending_reply_batch",
+                new=ambiguous_then_stuck,
+            ),
+            patch(
+                "bot.handlers.group._pending_reply_timeout_seconds",
+                return_value=0.02,
+            ),
+            patch(
+                "bot.handlers.group._notify_pending_reply_failure",
+                new=notify_failure,
+            ),
+        ):
+            outcome = await group._process_pending_reply_batch_guarded(
+                (-10001, 123),
+                [_item("@bot 执行动作", mentioned=True)],
+                _processing_settings(),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+
     async def test_outer_cancellation_tracks_child_until_shutdown_drain(self) -> None:
         started = asyncio.Event()
         first_cancel_seen = asyncio.Event()
@@ -871,19 +1145,24 @@ class PendingReplyWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_notifies_direct_item_even_if_later_item_is_indirect(self) -> None:
         direct_message = SimpleNamespace(message_id=10)
         later_message = SimpleNamespace(message_id=11)
-        send = AsyncMock(return_value=True)
 
-        with patch("bot.handlers.group.send_reply", new=send):
-            await group._notify_pending_reply_failure(
-                [
-                    _item("direct", message=direct_message, mentioned=True),
-                    _item("follow up", message=later_message),
-                ],
-                timed_out=True,
-            )
+        for timed_out, outcome in ((False, "失败"), (True, "超时")):
+            with self.subTest(timed_out=timed_out):
+                send = AsyncMock(return_value=True)
+                with patch("bot.handlers.group.send_reply", new=send):
+                    await group._notify_pending_reply_failure(
+                        [
+                            _item("direct", message=direct_message, mentioned=True),
+                            _item("follow up", message=later_message),
+                        ],
+                        timed_out=timed_out,
+                    )
 
-        self.assertIs(send.await_args.args[0], direct_message)
-        self.assertEqual(send.await_args.kwargs["reply_to_message_id"], 10)
+                self.assertIs(send.await_args.args[0], direct_message)
+                self.assertEqual(send.await_args.kwargs["reply_to_message_id"], 10)
+                self.assertIn(outcome, send.await_args.args[1])
+                self.assertIn("先检查群内状态", send.await_args.args[1])
+                self.assertIn("确认未执行后再重试", send.await_args.args[1])
 
 
 class MemoryCompactionSchedulingTests(unittest.IsolatedAsyncioTestCase):
@@ -924,6 +1203,40 @@ class MemoryCompactionSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_first_text_plan_receives_progress_overlay(self) -> None:
+        overlay = ReplyMessageOverlay(
+            message=SimpleNamespace(
+                message_id=77,
+                chat=SimpleNamespace(id=-10001),
+            ),
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=99,
+            sent_as_reply=True,
+        )
+        send = AsyncMock(return_value=True)
+
+        with patch("bot.handlers.group.send_reply", new=send):
+            delivered, tts_sent, stored = await group._deliver_reply_plans(
+                message=SimpleNamespace(),
+                delivery_plans=[
+                    group._ReplyDeliveryPlan("第一条", "reply", 99),
+                    group._ReplyDeliveryPlan("第二条", "message", None),
+                ],
+                settings=_processing_settings(),
+                tts_mode="off",
+                tts_service=SimpleNamespace(available=False),
+                user_id=123,
+                group_id=-10001,
+                tts_already_sent=False,
+                progress_overlay=overlay,
+            )
+
+        self.assertTrue(delivered)
+        self.assertFalse(tts_sent)
+        self.assertEqual(stored, ["第一条", "第二条"])
+        self.assertIs(send.await_args_list[0].kwargs["overlay"], overlay)
+        self.assertIsNone(send.await_args_list[1].kwargs["overlay"])
+
     async def test_legacy_tts_sender_without_delivery_callback_remains_compatible(
         self,
     ) -> None:
@@ -1017,6 +1330,7 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
         send_text = AsyncMock(return_value=True)
         plan = group._ReplyDeliveryPlan("第一段。第二段。", "reply", 1)
         settings = _processing_settings()
+        overlay_factory = AsyncMock()
 
         with (
             patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
@@ -1032,24 +1346,56 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 user_id=123,
                 group_id=-10001,
                 tts_already_sent=False,
+                progress_overlay_factory=overlay_factory,
             )
 
         self.assertTrue(sent)
         self.assertTrue(tts_sent)
         self.assertEqual(stored, [plan.text])
         self.assertEqual(send_text.await_args.args[1], "第二段。")
+        self.assertIsNone(send_text.await_args.kwargs["overlay"])
+        overlay_factory.assert_not_awaited()
 
     async def test_failed_always_tts_item_falls_back_to_text(self) -> None:
-        tts_service = SimpleNamespace(
-            available=True,
-            send_message_tts=AsyncMock(side_effect=[False, True]),
-        )
-        send_text = AsyncMock(return_value=True)
+        delivery_order: list[str] = []
+
+        class SequencedTTS:
+            available = True
+
+            async def send_message_tts(
+                self,
+                _message: object,
+                text: str,
+                **_kwargs: object,
+            ) -> bool:
+                delivery_order.append(f"voice:{text}")
+                return text == "second"
+
+        async def send_text_fallback(
+            _message: object,
+            text: str,
+            **_kwargs: object,
+        ) -> bool:
+            delivery_order.append(f"text:{text}")
+            return True
+
+        tts_service = SequencedTTS()
+        send_text = AsyncMock(side_effect=send_text_fallback)
         plans = [
             group._ReplyDeliveryPlan("first", "reply", 1),
             group._ReplyDeliveryPlan("second", "message", None),
         ]
         settings = _processing_settings()
+        overlay = ReplyMessageOverlay(
+            message=SimpleNamespace(
+                message_id=77,
+                chat=SimpleNamespace(id=-10001),
+            ),
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=1,
+            sent_as_reply=True,
+        )
+        overlay_factory = AsyncMock(return_value=overlay)
 
         with (
             patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
@@ -1065,6 +1411,7 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 user_id=123,
                 group_id=-10001,
                 tts_already_sent=False,
+                progress_overlay_factory=overlay_factory,
             )
 
         self.assertTrue(sent)
@@ -1072,6 +1419,56 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored, ["first", "second"])
         send_text.assert_awaited_once()
         self.assertEqual(send_text.await_args.args[1], "first")
+        self.assertIs(send_text.await_args.kwargs["overlay"], overlay)
+        overlay_factory.assert_awaited_once_with()
+        self.assertEqual(
+            delivery_order,
+            ["voice:first", "text:first", "voice:second"],
+        )
+
+    async def test_all_failed_tts_reuses_progress_for_first_text_fallback(
+        self,
+    ) -> None:
+        tts_service = SimpleNamespace(
+            available=True,
+            send_message_tts=AsyncMock(return_value=False),
+        )
+        send_text = AsyncMock(return_value=True)
+        overlay = ReplyMessageOverlay(
+            message=SimpleNamespace(
+                message_id=77,
+                chat=SimpleNamespace(id=-10001),
+            ),
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=1,
+            sent_as_reply=True,
+        )
+        overlay_factory = AsyncMock(return_value=overlay)
+
+        with (
+            patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
+            patch("bot.handlers.group.configured_auto_delete_seconds", return_value=0),
+            patch("bot.handlers.group.send_reply", new=send_text),
+        ):
+            sent, tts_sent, stored = await group._deliver_reply_plans(
+                message=SimpleNamespace(),
+                delivery_plans=[
+                    group._ReplyDeliveryPlan("文字降级", "reply", 1),
+                ],
+                settings=_processing_settings(),
+                tts_mode="always",
+                tts_service=tts_service,
+                user_id=123,
+                group_id=-10001,
+                tts_already_sent=False,
+                progress_overlay_factory=overlay_factory,
+            )
+
+        self.assertTrue(sent)
+        self.assertFalse(tts_sent)
+        self.assertEqual(stored, ["文字降级"])
+        self.assertIs(send_text.await_args.kwargs["overlay"], overlay)
+        overlay_factory.assert_awaited_once_with()
 
     async def test_mandatory_text_is_visible_after_earlier_tts(self) -> None:
         tts_service = SimpleNamespace(
@@ -1080,6 +1477,7 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         send_text = AsyncMock(return_value=True)
         settings = _processing_settings()
+        overlay_factory = AsyncMock()
 
         with (
             patch("bot.handlers.group.is_tts_always_enabled", return_value=True),
@@ -1096,6 +1494,7 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 group_id=-10001,
                 tts_already_sent=True,
                 force_text=True,
+                progress_overlay_factory=overlay_factory,
             )
 
         self.assertTrue(sent)
@@ -1103,6 +1502,8 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored, ["quota refusal"])
         tts_service.send_message_tts.assert_not_awaited()
         send_text.assert_awaited_once()
+        self.assertIsNone(send_text.await_args.kwargs["overlay"])
+        overlay_factory.assert_not_awaited()
 
 
 class GroupActivityCASTests(unittest.IsolatedAsyncioTestCase):

@@ -7,90 +7,71 @@ from typing import Any
 
 from bot.utils.security import clean_multiline_text
 
+REPLY_OUTPUT_SCHEMA = "smart-group-bot.reply.v2"
+
 REPLY_OUTPUT_PROTOCOL = (
     "[REPLY_OUTPUT_PROTOCOL]\n"
     "The runtime explicitly supports 0, 1, or many outgoing messages in one turn.\n"
-    "You are allowed to choose the number of outgoing messages yourself.\n"
-    "If one natural message is enough, plain text is fine.\n"
-    "In plain text output, every blank-line-separated block is treated as a separate outgoing message.\n"
-    "Inside one visible message, normal line breaks are allowed.\n"
-    "If you want one visible message, do NOT use blank lines. Use single newlines only.\n"
-    "If you want multiple plain-text messages with the default behavior, separate them with blank lines.\n"
-    "Do NOT use blank lines inside one message just for spacing or to imitate multiple chat bubbles.\n"
-    "If you need per-message control for delivery_mode or reply_to, you MUST output JSON.\n"
-    "If you want different delivery modes or different reply targets for different messages, you MUST use message objects.\n"
-    "messages may be plain strings or message objects.\n"
-    "Use plain strings only when every outgoing message can use the default behavior.\n"
-    "Use message objects when you need per-message control.\n"
-    "Plain-text example for two default-behavior messages:\n"
-    "first message\n"
-    "\n"
-    "second message\n"
+    "For the normal case, output one natural Markdown message directly.\n"
+    "Blank lines, paragraphs, lists, blockquotes, and fenced code blocks all remain inside that one message.\n"
+    "Never use blank lines as message separators.\n"
+    "To send zero or multiple messages, or to control delivery_mode/reply_to, output the strict JSON protocol.\n"
+    f'The protocol JSON MUST contain exactly this schema identifier: "schema":"{REPLY_OUTPUT_SCHEMA}".\n'
+    "The protocol JSON must be the entire answer and must not be wrapped in a Markdown code fence.\n"
+    "A JSON object without the exact schema identifier is ordinary visible content, not a command.\n"
+    "messages may contain plain strings or message objects.\n"
+    "Use message objects only when per-message delivery control is needed.\n"
     "Example with JSON strings:\n"
-    '{"messages":["first message","second message"]}\n'
+    f'{{"schema":"{REPLY_OUTPUT_SCHEMA}","messages":["first message","second message"]}}\n'
     "Example with message objects:\n"
-    '{"messages":[{"text":"first message","delivery_mode":"message"},{"text":"second message","delivery_mode":"reply","reply_to":"latest_input"}]}\n'
+    f'{{"schema":"{REPLY_OUTPUT_SCHEMA}","messages":[{{"text":"first message","delivery_mode":"message"}},{{"text":"second message","delivery_mode":"reply","reply_to":"latest_input"}}]}}\n'
     "Example for explicit silence:\n"
-    '{"should_reply":false,"reason":"not_addressed_to_bot"}\n'
+    f'{{"schema":"{REPLY_OUTPUT_SCHEMA}","should_reply":false,"reason":"not_addressed_to_bot"}}\n'
     "When to keep one message (DEFAULT - most of the time):\n"
-    "- one response is enough, even if it has multiple lines\n"
+    "- one response is enough, even if it has multiple paragraphs or code blocks\n"
     "- you are replying to a single topic\n"
-    "- the response is a paragraph, an explanation, or a complete thought\n"
+    "- the response is an explanation or one complete thought\n"
     "When to split into multiple messages (RARE - only when truly needed):\n"
     "- you need to address two completely different people or topics\n"
-    "- different outgoing messages should use different delivery_mode or different reply_to targets\n"
-    "- there are 2 genuinely independent beats that feel unnatural joined together\n"
-    "Do NOT split just because a response is long or has line breaks.\n"
-    "Do NOT split just to create a 'chat bubble' effect - one message is almost always better.\n"
+    "- different outgoing messages need different delivery modes or reply targets\n"
+    "Do NOT split just because a response is long or has blank lines.\n"
+    "Do NOT split just to create a chat-bubble effect.\n"
     "When to use delivery_mode=message:\n"
     "- user explicitly asks for standalone messages\n"
-    '- user says do not use reply format / direct-send / separate-send\n'
+    "- user says do not use reply format / direct-send / separate-send\n"
     "When to use delivery_mode=reply:\n"
     "- the message clearly answers or continues a specific message thread\n"
     "- you want to address a specific person or anchor message\n"
     "Rules:\n"
-    "1. JSON must be the entire answer when you use it.\n"
+    "1. Protocol JSON must be the entire answer when you use it.\n"
     "2. messages are sent in order.\n"
     "3. Keep each message concise and natural.\n"
     "4. If the bot is not the real target, prefer should_reply=false.\n"
     "5. delivery_mode supports auto / reply / message.\n"
-    '6. If delivery_mode is auto, the system will decide reply vs message with the normal logic.\n'
-    '7. reply_to is optional. Use "auto" if the system should choose the default reply target.\n'
+    "6. If delivery_mode is auto, the system chooses reply vs message with the normal logic.\n"
+    "7. reply_to is optional. Use auto if the system should choose the default target.\n"
     "8. If reply_to is needed, use an alias from [REPLY_TARGET_CANDIDATES].\n"
-    "9. Do not describe the protocol in your visible message. Either send plain text or output the JSON directly.\n"
+    "9. Either send Markdown directly or output the strict JSON object; do not describe the protocol.\n"
 )
 
 REPLY_OUTPUT_AWARENESS = (
     "[REPLY_OUTPUT_AWARENESS]\n"
-    "You do have the ability to choose how many outgoing messages to send in this turn.\n"
-    "Do not assume you are limited to a single message.\n"
-    "Do not assume every outgoing message must use the same delivery mode or the same reply target.\n"
-    "You may choose:\n"
-    "- no message\n"
-    "- one message (this is the default and most common choice)\n"
-    "- multiple messages (only when genuinely needed, e.g. addressing different people)\n"
-    "You may also choose per outgoing message:\n"
-    "- delivery_mode=message\n"
-    "- delivery_mode=reply\n"
-    "- reply_to=auto or a concrete alias from [REPLY_TARGET_CANDIDATES]\n"
-    "Practical decision guide:\n"
-    "1. Default to ONE message. Most turns only need one message, even if the content has multiple sentences or line breaks.\n"
-    "2. If you stay in one message, keep the layout compact: use normal line breaks when needed, but do not leave blank lines.\n"
-    "3. In plain text, a blank line is a message separator. Each blank-line-separated paragraph becomes a separate outgoing message.\n"
-    "4. If you want one visible message, use single newlines only and do not leave blank lines.\n"
-    "5. Do NOT use blank lines to fake spacing, multiple bubbles, or separate beats inside one message.\n"
-    "6. Only split into multiple messages when they address genuinely different people, topics, or need different delivery modes.\n"
-    "7. If the user explicitly asks for direct standalone messages, prefer delivery_mode=message for those items.\n"
-    "8. If different outgoing messages should answer different people or different anchors, use message objects and set reply_to per item.\n"
-    "9. If you need per-message control, do not use plain string arrays. Use message objects.\n"
-    "10. After tool use, these same output rules still apply to your final answer.\n"
+    "You can choose zero, one, or multiple outgoing messages for this turn.\n"
+    "Default to ONE message, even when it contains multiple paragraphs or code blocks.\n"
+    "Use normal Markdown layout inside that message, including blank lines when useful.\n"
+    "Blank lines never create additional outgoing messages.\n"
+    "Only the strict schema-tagged JSON protocol can create multiple outgoing messages.\n"
+    "Only split when messages address genuinely different people/topics or need different delivery modes.\n"
+    "Use message objects for delivery_mode=message/reply or a concrete reply_to alias.\n"
+    "Never wrap protocol JSON in a code fence; fenced JSON is visible Markdown content.\n"
+    "After tool use, these same output rules still apply to the final answer.\n"
 )
 
 _REPLY_JSON_KEYS = {
     "action",
+    "disposition",
     "message",
     "messages",
-    "reason",
     "reply",
     "response_type",
     "should_reply",
@@ -100,12 +81,7 @@ _REPLY_JSON_KEYS = {
 }
 _NO_REPLY_ACTIONS = {"silent", "skip", "no_reply", "noreply", "no-response", "no_response"}
 _VALID_DELIVERY_MODES = {"auto", "reply", "message"}
-_STRUCTURED_PLAIN_TEXT_RE = re.compile(
-    r"(?m)^\s*(?:[-*+]\s+|\d+\.\s+|[（(]?\d+[)）]\s+|#{1,6}\s+|>|```|[一二三四五六七八九十]+[、.])"
-)
-_BLANK_LINE_SPLIT_RE = re.compile(r"\n\s*\n+")
-_PLAIN_TEXT_MULTI_MESSAGE_MAX_PART_CHARS = 90
-_PLAIN_TEXT_MULTI_MESSAGE_MAX_TOTAL_CHARS = 240
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
 
 
 @dataclass(slots=True)
@@ -131,36 +107,28 @@ class ParsedReplyOutput:
         return "\n\n".join(self.messages).strip()
 
 
-def _strip_code_fence(text: str) -> str:
-    payload = (text or "").strip()
-    if payload.startswith("```"):
-        payload = re.sub(r"^```(?:json|javascript|js|text|txt)?", "", payload, flags=re.IGNORECASE).strip()
-        payload = re.sub(r"```$", "", payload).strip()
-    return payload
-
-
 def _extract_json_object(text: str) -> dict[str, Any] | None:
-    payload = _strip_code_fence(text)
-    candidates: list[str] = []
-    if payload.startswith("{") and payload.endswith("}"):
-        candidates.append(payload)
-    else:
-        match = re.search(r"\{[\s\S]*\}", payload)
-        if match:
-            candidates.append(match.group(0))
+    """Load an object only when the complete output is JSON.
 
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return None
+    In particular, do not search a Markdown answer for an embedded object and do
+    not unwrap fenced examples. Both behaviours can turn visible code into a bot
+    control command.
+    """
+
+    payload = (text or "").strip()
+    if not payload.startswith("{") or not payload.endswith("}"):
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _is_reply_json(data: dict[str, Any]) -> bool:
-    return any(key in data for key in _REPLY_JSON_KEYS)
+    return data.get("schema") == REPLY_OUTPUT_SCHEMA and any(
+        key in data for key in _REPLY_JSON_KEYS
+    )
 
 
 def _coerce_bool(value: Any) -> bool | None:
@@ -175,8 +143,13 @@ def _coerce_bool(value: Any) -> bool | None:
     return None
 
 
-def _normalize_message_text(value: Any, *, max_len: int) -> str:
-    text = clean_multiline_text(str(value or ""), max_len=max_len).strip()
+def _normalize_message_text(value: Any, *, max_len: int | None) -> str:
+    """Normalize transport-only characters without reformatting Markdown."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _CONTROL_CHAR_RE.sub(" ", text).strip()
+    if max_len is not None and max_len > 0 and len(text) > max_len:
+        return text[:max_len].rstrip() + " ..."
     return text
 
 
@@ -192,46 +165,12 @@ def _normalize_reply_to(value: Any) -> str:
     return normalized or "auto"
 
 
-def _looks_like_structured_plain_text(text: str) -> bool:
-    payload = (text or "").strip()
-    if not payload:
-        return False
-    return bool(_STRUCTURED_PLAIN_TEXT_RE.search(payload))
-
-
-def _extract_plain_text_message_specs(
-    value: str,
+def _extract_message_specs(
+    value: Any,
     *,
     max_messages: int,
-    max_len: int,
+    max_len: int | None,
 ) -> list[ReplyMessageSpec]:
-    if max_messages <= 1:
-        return []
-
-    normalized = clean_multiline_text(
-        value,
-        max_len=max(max_len, 1) * max(max_messages, 1),
-    ).strip()
-    if not normalized or "\n\n" not in normalized:
-        return []
-
-    parts = [
-        _normalize_message_text(part, max_len=max_len)
-        for part in _BLANK_LINE_SPLIT_RE.split(normalized)
-    ]
-    parts = [part for part in parts if part]
-    if len(parts) <= 1:
-        return []
-
-    if len(parts) > max_messages:
-        head = parts[: max_messages - 1]
-        tail = "\n\n".join(parts[max_messages - 1 :]).strip()
-        parts = head + ([tail] if tail else [])
-
-    return [ReplyMessageSpec(text=part) for part in parts]
-
-
-def _extract_message_specs(value: Any, *, max_messages: int, max_len: int) -> list[ReplyMessageSpec]:
     if isinstance(value, str):
         text = _normalize_message_text(value, max_len=max_len)
         return [ReplyMessageSpec(text=text)] if text else []
@@ -277,7 +216,7 @@ def parse_reply_output(
     raw: str,
     *,
     max_messages: int = 8,
-    max_message_chars: int = 1200,
+    max_message_chars: int | None = None,
 ) -> ParsedReplyOutput:
     text = (raw or "").strip()
     if not text:
@@ -285,13 +224,6 @@ def parse_reply_output(
 
     data = _extract_json_object(text)
     if not data or not _is_reply_json(data):
-        plain_text_specs = _extract_plain_text_message_specs(
-            text,
-            max_messages=max_messages,
-            max_len=max_message_chars,
-        )
-        if plain_text_specs:
-            return ParsedReplyOutput(message_specs=plain_text_specs)
         normalized = _normalize_message_text(text, max_len=max_message_chars)
         return ParsedReplyOutput(
             message_specs=[ReplyMessageSpec(text=normalized)] if normalized else []
@@ -301,9 +233,16 @@ def parse_reply_output(
     silent = _coerce_bool(data.get("silent"))
     skip_reply = _coerce_bool(data.get("skip_reply"))
     action = str(data.get("action") or data.get("response_type") or "").strip().lower()
+    disposition = str(data.get("disposition") or "").strip().lower()
     reason = _normalize_message_text(data.get("reason", ""), max_len=160)
 
-    if should_reply is False or silent is True or skip_reply is True or action in _NO_REPLY_ACTIONS:
+    if (
+        disposition in {"silent", "skip", "no_reply"}
+        or should_reply is False
+        or silent is True
+        or skip_reply is True
+        or action in _NO_REPLY_ACTIONS
+    ):
         return ParsedReplyOutput(
             explicit_no_reply=True,
             reason=reason or action or "model_declined_reply",

@@ -1,3 +1,6 @@
+import asyncio
+import html
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -6,7 +9,13 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 
 from bot.services.message_templates import render_data_brief
 from bot.utils import telegram
-from bot.utils.telegram import answer_with_auto_delete, send_chat_message, send_reply, send_reply_messages
+from bot.utils.telegram import (
+    ReplyMessageOverlay,
+    answer_with_auto_delete,
+    send_chat_message,
+    send_reply,
+    send_reply_messages,
+)
 
 
 class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -182,6 +191,24 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('tg://user?id=42', second_kwargs["text"])
         self.assertIn("@Alice", second_kwargs["text"])
 
+    async def test_scheduled_markdown_keeps_mentions_and_fenced_code_valid(self) -> None:
+        sent = SimpleNamespace(message_id=100, chat=SimpleNamespace(id=-10001))
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+
+        ok = await send_chat_message(
+            bot,
+            -10001,
+            "给 @helper：\n\n```html\n<b>literal</b>\n```",
+        )
+
+        self.assertTrue(ok)
+        body = bot.send_message.await_args.kwargs["text"]
+        self.assertEqual(bot.send_message.await_args.kwargs["parse_mode"], "HTML")
+        self.assertIn("@\u200bhelper", body)
+        self.assertIn('<pre><code class="language-html">', body)
+        self.assertIn("&lt;b&gt;literal&lt;/b&gt;", body)
+        self.assertNotIn("&lt;code&gt;@", body)
+
     async def test_send_reply_cleanup_failure_does_not_retry_delivered_message(self) -> None:
         sent = SimpleNamespace(message_id=77, chat=SimpleNamespace(id=-10001))
         message = SimpleNamespace(
@@ -258,10 +285,10 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "第一段第二段",
                 delivery_mode="message",
                 on_delivery=on_delivery,
-            )
+        )
 
         self.assertFalse(ok)
-        self.assertEqual(message.answer.await_count, 4)
+        self.assertEqual(message.answer.await_count, 3)
         on_delivery.assert_called_once_with()
         cleanup.assert_awaited_once_with(sent, 0)
 
@@ -340,7 +367,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         message.reply.assert_awaited_once_with(rendered, parse_mode="HTML")
         sent.edit_text.assert_not_awaited()
 
-    async def test_pre_rendered_stream_keeps_markdown_fallback(self) -> None:
+    async def test_pre_rendered_stream_uses_plain_text_fallback(self) -> None:
         rendered = render_data_brief(
             "搜索结果",
             items="<b>1.</b> result",
@@ -373,7 +400,9 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(message.reply.await_count, 2)
         self.assertEqual(message.reply.await_args_list[0].kwargs["parse_mode"], "HTML")
-        self.assertEqual(message.reply.await_args_list[1].kwargs["parse_mode"], "Markdown")
+        fallback_call = message.reply.await_args_list[1]
+        self.assertIsNone(fallback_call.kwargs["parse_mode"])
+        self.assertNotIn("<b>", fallback_call.args[0])
 
     async def test_html_entities_are_not_split_by_raw_source_length(self) -> None:
         rendered = render_data_brief(
@@ -451,3 +480,427 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         message.reply.assert_not_awaited()
         message.answer.assert_awaited_once()
+
+
+class TelegramMarkdownOutputTests(unittest.TestCase):
+    def test_sanitizer_preserves_fenced_code_whitespace(self) -> None:
+        source = (
+            "配置如下：\n\n"
+            "```yaml\n"
+            "dns:\n"
+            "  default-nameserver:\n"
+            "    - 223.5.5.5\n"
+            "\n"
+            "  fallback:\n"
+            "    - https://example.com/dns-query\n"
+            "```\n\n"
+            "请检查。"
+        )
+
+        cleaned = telegram.sanitize_outgoing_text(source)
+
+        self.assertIn(
+            "```yaml\n"
+            "dns:\n"
+            "  default-nameserver:\n"
+            "    - 223.5.5.5\n"
+            "\n"
+            "  fallback:\n"
+            "    - https://example.com/dns-query\n"
+            "```",
+            cleaned,
+        )
+
+    def test_markdown_renderer_escapes_raw_html_and_code(self) -> None:
+        rendered = telegram.md_to_html(
+            "**配置** <b>raw</b> & value\n\n"
+            "```yaml\n  item: <unsafe> & value\n\n    nested: true\n```"
+        )
+
+        self.assertIn("<b>配置</b>", rendered)
+        self.assertIn("&lt;b&gt;raw&lt;/b&gt; &amp; value", rendered)
+        self.assertIn('<pre><code class="language-yaml">', rendered)
+        self.assertIn("  item: &lt;unsafe&gt; &amp; value", rendered)
+        self.assertIn("\n\n    nested: true\n", rendered)
+        self.assertIn("</code></pre>", rendered)
+
+    def test_sanitizers_leave_code_literals_unchanged(self) -> None:
+        source = (
+            "示例：\n\n"
+            "~~~~text\n"
+            "@example  <think>literal</think>\n"
+            "  <b>not html</b>\n"
+            "  [literal](tg://user?id=42)\n"
+            "~~~~"
+        )
+
+        cleaned = telegram.sanitize_outgoing_text(source)
+        cleaned = telegram.sanitize_outgoing_mentions(cleaned, monospace=False)
+
+        self.assertEqual(cleaned, source)
+
+    def test_split_uses_utf16_units(self) -> None:
+        parts = telegram._split_for_telegram("😀" * 11, limit=10)
+
+        self.assertEqual("".join(parts), "😀" * 11)
+        self.assertEqual([telegram._utf16_units(part) for part in parts], [10, 10, 2])
+
+    def test_long_fenced_code_is_closed_and_reopened_per_part(self) -> None:
+        code_lines = [f"  key_{index}: value_{index}\n" for index in range(12)]
+        source = "```yaml\n" + "".join(code_lines) + "```"
+
+        parts = telegram._split_for_telegram(source, limit=72)
+
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(telegram._utf16_units(part), 72)
+            self.assertTrue(part.startswith("```yaml\n"))
+            self.assertTrue(part.endswith("```"))
+            rendered = telegram.md_to_html(part)
+            self.assertEqual(rendered.count("<pre>"), 1)
+            self.assertEqual(rendered.count("</pre>"), 1)
+        for line in code_lines:
+            self.assertEqual(sum(line.rstrip("\n") in part for part in parts), 1)
+
+    def test_long_single_line_code_delivery_does_not_insert_newlines(self) -> None:
+        code = ("value<&>@literal" * 20) + "😀"
+        source = f"```text\n{code}\n```"
+
+        parts = telegram._split_for_telegram(source, limit=72)
+        delivered_code: list[str] = []
+        for part in parts:
+            rendered = telegram.md_to_html(part)
+            match = re.fullmatch(
+                r'<pre><code class="language-text">(.*)</code></pre>',
+                rendered,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(match)
+            delivered_code.append(html.unescape(match.group(1)))
+
+        self.assertEqual("".join(delivered_code), code + "\n")
+        self.assertNotIn("\n", "".join(delivered_code)[:-1])
+
+
+class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_overlay_and_final_body_share_one_message_then_strip(
+        self,
+    ) -> None:
+        progress_sent = SimpleNamespace(
+            message_id=89,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(),
+        )
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html=(
+                "<blockquote>01　已理解问题\n"
+                "02　已整理并发送回答</blockquote>"
+            ),
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+        source = (
+            "正文自己的引用：\n> 不应被状态清理误删\n\n"
+            "```html\n<b>@literal</b>\n```"
+        )
+
+        ok = await send_reply(
+            message,
+            source,
+            stream=True,
+            overlay=overlay,
+            overlay_remove_after=0.01,
+        )
+        await asyncio.sleep(0.04)
+
+        self.assertTrue(ok)
+        self.assertEqual(overlay.outcome, "attached")
+        message.reply.assert_not_awaited()
+        message.answer.assert_not_awaited()
+        self.assertGreaterEqual(progress_sent.edit_text.await_count, 2)
+        combined = progress_sent.edit_text.await_args_list[0].args[0]
+        final_body = progress_sent.edit_text.await_args_list[-1].args[0]
+        self.assertTrue(combined.startswith(overlay.status_html + "\n\n"))
+        self.assertEqual(final_body, telegram.md_to_html(source))
+        self.assertIn("<blockquote>不应被状态清理误删</blockquote>", final_body)
+        self.assertIn("&lt;b&gt;@literal&lt;/b&gt;", final_body)
+        self.assertNotIn("已理解问题", final_body)
+
+    async def test_incompatible_overlay_keeps_normal_delivery_path(self) -> None:
+        progress_sent = SimpleNamespace(
+            message_id=88,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(),
+        )
+        final_sent = SimpleNamespace(message_id=90, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(),
+            answer=AsyncMock(return_value=final_sent),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+
+        ok = await send_reply(
+            message,
+            "普通正文",
+            delivery_mode="message",
+            overlay=overlay,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(overlay.outcome, "pending")
+        progress_sent.edit_text.assert_not_awaited()
+        message.answer.assert_awaited_once()
+
+    async def test_overlay_is_skipped_when_it_would_overflow_one_final_message(
+        self,
+    ) -> None:
+        progress_sent = SimpleNamespace(
+            message_id=86,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(),
+        )
+        final_sent = SimpleNamespace(message_id=91, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=final_sent),
+            answer=AsyncMock(),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html="<blockquote>" + ("状态" * 80) + "</blockquote>",
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+        body = "x" * 4000
+
+        ok = await send_reply(message, body, overlay=overlay)
+
+        self.assertTrue(ok)
+        self.assertEqual(overlay.outcome, "pending")
+        progress_sent.edit_text.assert_not_awaited()
+        message.reply.assert_awaited_once()
+        self.assertEqual(message.reply.await_args.args[0], body)
+
+    async def test_ambiguous_overlay_edit_never_sends_duplicate_message(self) -> None:
+        progress_sent = SimpleNamespace(
+            message_id=87,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(side_effect=RuntimeError("network timeout")),
+        )
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+        on_ambiguous = Mock()
+
+        with patch("bot.utils.telegram.asyncio.sleep", new=AsyncMock()):
+            ok = await send_reply(
+                message,
+                "最终正文",
+                overlay=overlay,
+                on_ambiguous=on_ambiguous,
+            )
+        await asyncio.sleep(0.01)
+
+        self.assertFalse(ok)
+        self.assertEqual(overlay.outcome, "ambiguous")
+        on_ambiguous.assert_called_once_with()
+        message.reply.assert_not_awaited()
+        message.answer.assert_not_awaited()
+
+    async def test_ambiguous_overlay_converges_on_same_message_id(self) -> None:
+        attempts = 0
+
+        async def edit_text(body: str, **_kwargs: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise RuntimeError("network result unknown")
+            self.assertEqual(body, telegram.md_to_html("**最终正文**"))
+
+        progress_sent = SimpleNamespace(
+            message_id=85,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(side_effect=edit_text),
+        )
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+        delivered = Mock()
+        ambiguous = Mock()
+
+        ok = await send_reply(
+            message,
+            "**最终正文**",
+            overlay=overlay,
+            overlay_remove_after=0.01,
+            on_delivery=delivered,
+            on_ambiguous=ambiguous,
+        )
+        await asyncio.sleep(0.05)
+
+        self.assertFalse(ok)
+        self.assertEqual(overlay.outcome, "ambiguous")
+        ambiguous.assert_called_once_with()
+        delivered.assert_called_once_with()
+        self.assertEqual(progress_sent.edit_text.await_count, 4)
+        message.reply.assert_not_awaited()
+        message.answer.assert_not_awaited()
+
+    async def test_overlay_deadline_marks_ambiguous_and_reconciles_body(self) -> None:
+        first_call = True
+
+        async def edit_text(body: str, **_kwargs: object) -> None:
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                await asyncio.sleep(0.1)
+            self.assertEqual(body, telegram.md_to_html("最终正文"))
+
+        progress_sent = SimpleNamespace(
+            message_id=84,
+            chat=SimpleNamespace(id=-10001),
+            edit_text=AsyncMock(side_effect=edit_text),
+        )
+        message = SimpleNamespace(
+            message_id=321,
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        overlay = ReplyMessageOverlay(
+            message=progress_sent,
+            status_html="<blockquote>01　已理解问题</blockquote>",
+            reply_to_message_id=321,
+            sent_as_reply=True,
+        )
+        ambiguous = Mock()
+
+        with patch("bot.utils.telegram._send_total_deadline_seconds", return_value=0.01):
+            ok = await send_reply(
+                message,
+                "最终正文",
+                overlay=overlay,
+                overlay_remove_after=0.01,
+                on_ambiguous=ambiguous,
+            )
+        await asyncio.sleep(0.05)
+
+        self.assertFalse(ok)
+        self.assertEqual(overlay.outcome, "ambiguous")
+        ambiguous.assert_called_once_with()
+        self.assertEqual(progress_sent.edit_text.await_count, 2)
+        self.assertEqual(
+            progress_sent.edit_text.await_args_list[-1].args[0],
+            telegram.md_to_html("最终正文"),
+        )
+        message.reply.assert_not_awaited()
+        message.answer.assert_not_awaited()
+
+    async def test_multipart_single_line_code_is_delivered_byte_exact(self) -> None:
+        sent = SimpleNamespace(message_id=90, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=sent),
+            answer=AsyncMock(return_value=sent),
+        )
+        code = "A<&>@literal" * 20
+
+        with patch.object(telegram, "TG_MESSAGE_LIMIT", 72):
+            ok = await send_reply(
+                message,
+                f"```text\n{code}\n```",
+                stream=True,
+            )
+
+        self.assertTrue(ok)
+        delivered_code: list[str] = []
+        for call in message.reply.await_args_list:
+            self.assertEqual(call.kwargs["parse_mode"], "HTML")
+            match = re.fullmatch(
+                r'<pre><code class="language-text">(.*)</code></pre>',
+                call.args[0],
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(match)
+            delivered_code.append(html.unescape(match.group(1)))
+        self.assertGreater(len(delivered_code), 1)
+        self.assertEqual("".join(delivered_code), code + "\n")
+
+    async def test_fenced_html_is_delivered_as_code_not_trusted_html(self) -> None:
+        sent = SimpleNamespace(message_id=91, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=sent),
+            answer=AsyncMock(),
+        )
+        source = "示例：\n\n```html\n<b>hello</b>\n```"
+
+        ok = await send_reply(message, source, stream=True)
+
+        self.assertTrue(ok)
+        message.reply.assert_awaited_once()
+        body = message.reply.await_args.args[0]
+        self.assertEqual(message.reply.await_args.kwargs["parse_mode"], "HTML")
+        self.assertIn('<pre><code class="language-html">', body)
+        self.assertIn("&lt;b&gt;hello&lt;/b&gt;", body)
+        self.assertNotIn("```", body)
+
+    async def test_mention_sanitizing_does_not_disable_fenced_code_rendering(self) -> None:
+        sent = SimpleNamespace(message_id=92, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            reply=AsyncMock(return_value=sent),
+            answer=AsyncMock(),
+        )
+        source = "给 @helper：\n\n```yaml\nname: @literal\n```"
+
+        ok = await send_reply(message, source, stream=False)
+
+        self.assertTrue(ok)
+        body = message.reply.await_args.args[0]
+        self.assertIn("@\u200bhelper", body)
+        self.assertIn("name: @literal", body)
+        self.assertIn("<pre><code", body)
+        self.assertNotIn("&lt;code&gt;", body)

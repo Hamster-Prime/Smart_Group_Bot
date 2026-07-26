@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -12,6 +12,9 @@ except ModuleNotFoundError:
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+ProgressCallback = Callable[[Any], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -42,6 +45,7 @@ class SkillContext:
     auto_delete_reply_seconds: int = 0
     delivery_callback: Callable[[], None] | None = None
     delivery_confirmed: bool = False
+    progress_callback: ProgressCallback | None = None
 
 
 @dataclass(slots=True)
