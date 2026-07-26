@@ -41,12 +41,20 @@ class RuntimePromptBlockTests(unittest.TestCase):
     def test_core_prompts_discourage_blank_line_bubbles(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
             self.assertIn("do not leave blank lines", prompt)
-            self.assertIn('a blank line is the signal for "send as separate messages"', prompt)
+            self.assertIn(
+                'a line containing only `[[SPLIT]]` is the signal for "send as separate messages"',
+                prompt,
+            )
+            self.assertIn("a blank line never splits anything", prompt)
 
     def test_core_prompts_forbid_parenthetical_stage_directions(self) -> None:
         for prompt in (CASUAL_SYSTEM, PERSONA_SYSTEM):
             self.assertIn("Do not write bracketed action descriptions or stage directions", prompt)
             self.assertIn("(swings feet)", prompt)
 
-    def test_skill_prompt_declares_blank_line_split_rule(self) -> None:
-        self.assertIn('a blank line is treated as "send as separate messages."', SKILL_TOOL_SYSTEM)
+    def test_skill_prompt_declares_split_marker_rule(self) -> None:
+        self.assertIn(
+            'a line containing only `[[SPLIT]]` is treated as "send as separate messages"',
+            SKILL_TOOL_SYSTEM,
+        )
+        self.assertIn("a blank line never splits anything", SKILL_TOOL_SYSTEM)

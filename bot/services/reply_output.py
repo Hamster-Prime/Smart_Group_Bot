@@ -8,6 +8,7 @@ from typing import Any
 from bot.utils.security import clean_multiline_text
 
 REPLY_OUTPUT_SCHEMA = "smart-group-bot.reply.v2"
+REPLY_SPLIT_MARKER = "[[SPLIT]]"
 
 REPLY_OUTPUT_PROTOCOL = (
     "[REPLY_OUTPUT_PROTOCOL]\n"
@@ -15,7 +16,14 @@ REPLY_OUTPUT_PROTOCOL = (
     "For the normal case, output one natural Markdown message directly.\n"
     "Blank lines, paragraphs, lists, blockquotes, and fenced code blocks all remain inside that one message.\n"
     "Never use blank lines as message separators.\n"
-    "To send zero or multiple messages, or to control delivery_mode/reply_to, output the strict JSON protocol.\n"
+    f"To split plain text into separate outgoing messages, put {REPLY_SPLIT_MARKER} alone on its own line between them.\n"
+    f"A line containing only {REPLY_SPLIT_MARKER} is removed and never shown to users.\n"
+    f"{REPLY_SPLIT_MARKER} written inline inside a sentence or inside a fenced code block is ordinary visible text.\n"
+    "Plain-text example for two messages:\n"
+    "first message\n"
+    f"{REPLY_SPLIT_MARKER}\n"
+    "second message\n"
+    "To send zero messages, or to control delivery_mode/reply_to per message, output the strict JSON protocol.\n"
     f'The protocol JSON MUST contain exactly this schema identifier: "schema":"{REPLY_OUTPUT_SCHEMA}".\n'
     "The protocol JSON must be the entire answer and must not be wrapped in a Markdown code fence.\n"
     "A JSON object without the exact schema identifier is ordinary visible content, not a command.\n"
@@ -34,6 +42,7 @@ REPLY_OUTPUT_PROTOCOL = (
     "When to split into multiple messages (RARE - only when truly needed):\n"
     "- you need to address two completely different people or topics\n"
     "- different outgoing messages need different delivery modes or reply targets\n"
+    f"- for a plain-text split use {REPLY_SPLIT_MARKER}; for per-message delivery control use JSON\n"
     "Do NOT split just because a response is long or has blank lines.\n"
     "Do NOT split just to create a chat-bubble effect.\n"
     "When to use delivery_mode=message:\n"
@@ -60,7 +69,9 @@ REPLY_OUTPUT_AWARENESS = (
     "Default to ONE message, even when it contains multiple paragraphs or code blocks.\n"
     "Use normal Markdown layout inside that message, including blank lines when useful.\n"
     "Blank lines never create additional outgoing messages.\n"
-    "Only the strict schema-tagged JSON protocol can create multiple outgoing messages.\n"
+    f"In plain text, only a line containing just {REPLY_SPLIT_MARKER} starts a new outgoing message.\n"
+    f"The {REPLY_SPLIT_MARKER} line is stripped before sending, so users never see it.\n"
+    "The strict schema-tagged JSON protocol is for zero messages or per-message delivery control.\n"
     "Only split when messages address genuinely different people/topics or need different delivery modes.\n"
     "Use message objects for delivery_mode=message/reply or a concrete reply_to alias.\n"
     "Never wrap protocol JSON in a code fence; fenced JSON is visible Markdown content.\n"
@@ -82,6 +93,10 @@ _REPLY_JSON_KEYS = {
 _NO_REPLY_ACTIONS = {"silent", "skip", "no_reply", "noreply", "no-response", "no_response"}
 _VALID_DELIVERY_MODES = {"auto", "reply", "message"}
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x1F\x7F]")
+# The marker only counts when it owns the whole line, so inline mentions of it
+# inside prose stay visible content.
+_SPLIT_MARKER_LINE_RE = re.compile(r"^\s*\[\[SPLIT\]\]\s*$", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
 
 
 @dataclass(slots=True)
@@ -143,11 +158,23 @@ def _coerce_bool(value: Any) -> bool | None:
     return None
 
 
-def _normalize_message_text(value: Any, *, max_len: int | None) -> str:
+def _normalize_message_text(
+    value: Any,
+    *,
+    max_len: int | None,
+    drop_split_markers: bool = False,
+) -> str:
     """Normalize transport-only characters without reformatting Markdown."""
 
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = _CONTROL_CHAR_RE.sub(" ", text).strip()
+    text = _CONTROL_CHAR_RE.sub(" ", text)
+    if drop_split_markers:
+        # JSON already carries one text per message, so a marker line here is
+        # stray output rather than a split request.
+        text = "\n".join(
+            line for line in text.split("\n") if not _SPLIT_MARKER_LINE_RE.match(line)
+        )
+    text = text.strip()
     if max_len is not None and max_len > 0 and len(text) > max_len:
         return text[:max_len].rstrip() + " ..."
     return text
@@ -172,7 +199,7 @@ def _extract_message_specs(
     max_len: int | None,
 ) -> list[ReplyMessageSpec]:
     if isinstance(value, str):
-        text = _normalize_message_text(value, max_len=max_len)
+        text = _normalize_message_text(value, max_len=max_len, drop_split_markers=True)
         return [ReplyMessageSpec(text=text)] if text else []
 
     if not isinstance(value, list):
@@ -200,7 +227,7 @@ def _extract_message_specs(
         else:
             text = str(item or "")
 
-        normalized = _normalize_message_text(text, max_len=max_len)
+        normalized = _normalize_message_text(text, max_len=max_len, drop_split_markers=True)
         if normalized:
             out.append(
                 ReplyMessageSpec(
@@ -210,6 +237,44 @@ def _extract_message_specs(
                 )
             )
     return out
+
+
+def _split_plain_text_messages(
+    text: str,
+    *,
+    max_messages: int,
+    max_len: int | None,
+) -> list[str]:
+    """Split plain text on standalone [[SPLIT]] marker lines.
+
+    Markers inside fenced code blocks are left alone so a snippet that shows the
+    marker stays intact. Without any marker this returns a single part, which is
+    the safe default when the model does not ask for a split.
+    """
+
+    parts: list[str] = []
+    buffer: list[str] = []
+    in_fence = False
+    for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _CODE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        elif not in_fence and _SPLIT_MARKER_LINE_RE.match(line):
+            parts.append("\n".join(buffer))
+            buffer = []
+            continue
+        buffer.append(line)
+    parts.append("\n".join(buffer))
+
+    normalized = [_normalize_message_text(part, max_len=max_len) for part in parts]
+    normalized = [part for part in normalized if part]
+    if len(normalized) > max_messages > 0:
+        head = normalized[: max_messages - 1]
+        tail = _normalize_message_text(
+            "\n\n".join(normalized[max_messages - 1 :]),
+            max_len=max_len,
+        )
+        normalized = head + ([tail] if tail else [])
+    return normalized
 
 
 def parse_reply_output(
@@ -224,9 +289,13 @@ def parse_reply_output(
 
     data = _extract_json_object(text)
     if not data or not _is_reply_json(data):
-        normalized = _normalize_message_text(text, max_len=max_message_chars)
+        parts = _split_plain_text_messages(
+            text,
+            max_messages=max_messages,
+            max_len=max_message_chars,
+        )
         return ParsedReplyOutput(
-            message_specs=[ReplyMessageSpec(text=normalized)] if normalized else []
+            message_specs=[ReplyMessageSpec(text=part) for part in parts]
         )
 
     should_reply = _coerce_bool(data.get("should_reply"))

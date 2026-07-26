@@ -76,6 +76,67 @@ class ReplyOutputParserTests(unittest.TestCase):
 
         self.assertEqual(parsed.messages, [raw])
 
+    def test_split_marker_creates_separate_messages(self) -> None:
+        raw = (
+            "glm-5.2 不在这边列表里\n"
+            "[[SPLIT]]\n"
+            "所以上游情况没法从群里这边确认\n"
+            "[[SPLIT]]\n"
+            "你自己有渠道在用的话就看那个渠道的状态 xs"
+        )
+
+        parsed = parse_reply_output(raw)
+
+        self.assertEqual(
+            parsed.messages,
+            [
+                "glm-5.2 不在这边列表里",
+                "所以上游情况没法从群里这边确认",
+                "你自己有渠道在用的话就看那个渠道的状态 xs",
+            ],
+        )
+        self.assertTrue(all(spec.delivery_mode == "auto" for spec in parsed.message_specs))
+        self.assertFalse(parsed.used_json)
+
+    def test_split_marker_keeps_blank_lines_inside_each_message(self) -> None:
+        raw = "第一段\n\n仍是第一条\n[[SPLIT]]\n第二条"
+
+        parsed = parse_reply_output(raw)
+
+        self.assertEqual(parsed.messages, ["第一段\n\n仍是第一条", "第二条"])
+
+    def test_inline_split_marker_stays_visible_text(self) -> None:
+        raw = "你可以用 [[SPLIT]] 来分段哦"
+
+        parsed = parse_reply_output(raw)
+
+        self.assertEqual(parsed.messages, [raw])
+
+    def test_split_marker_inside_code_fence_is_not_a_separator(self) -> None:
+        raw = "示例：\n```text\n[[SPLIT]]\n```\n就是这样"
+
+        parsed = parse_reply_output(raw)
+
+        self.assertEqual(parsed.messages, [raw])
+
+    def test_split_marker_respects_max_messages(self) -> None:
+        raw = "\n[[SPLIT]]\n".join(f"第{index}条" for index in range(1, 6))
+
+        parsed = parse_reply_output(raw, max_messages=3)
+
+        self.assertEqual(len(parsed.messages), 3)
+        self.assertEqual(parsed.messages[0], "第1条")
+        self.assertEqual(parsed.messages[1], "第2条")
+        self.assertEqual(parsed.messages[2], "第3条\n\n第4条\n\n第5条")
+
+    def test_stray_split_marker_in_json_message_is_dropped(self) -> None:
+        parsed = parse_reply_output(
+            '{"schema":"%s","messages":["前半\\n[[SPLIT]]\\n后半"]}' % REPLY_OUTPUT_SCHEMA
+        )
+
+        self.assertEqual(parsed.messages, ["前半\n后半"])
+        self.assertTrue(parsed.used_json)
+
     def test_json_multiple_messages_are_preserved_in_order(self) -> None:
         parsed = parse_reply_output(
             f'{{"schema":"{REPLY_OUTPUT_SCHEMA}","messages":["first reply","second reply"],"should_reply":true}}'
