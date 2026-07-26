@@ -85,6 +85,8 @@ class BotConfig(BaseModel):
     reply_batch_timeout_seconds: float = 45.0
     enable_typing: bool = True
     enable_streaming: bool = True
+    # Bot API 10.1+ rich messages (sendRichMessage with Rich Markdown).
+    enable_rich_messages: bool = True
     stream_chunk_size: int = 36
     stream_edit_interval_sec: float = 1.0
     auto_delete_seconds: int = 0
@@ -211,6 +213,7 @@ class Settings(BaseSettings):
     bot_reply_batch_timeout_seconds: float = 45.0
     bot_enable_typing: bool = True
     bot_enable_streaming: bool = True
+    bot_enable_rich_messages: bool = True
     bot_stream_chunk_size: int = 36
     bot_stream_edit_interval_sec: float = 1.0
     bot_auto_delete_seconds: int = 0
@@ -773,6 +776,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         )
     settings.bot.enable_typing = settings.bot_enable_typing
     settings.bot.enable_streaming = settings.bot_enable_streaming
+    settings.bot.enable_rich_messages = settings.bot_enable_rich_messages
     settings.bot.stream_chunk_size = max(8, settings.bot_stream_chunk_size)
     settings.bot.stream_edit_interval_sec = max(0.3, settings.bot_stream_edit_interval_sec)
     configured_auto_delete_seconds = int(settings.bot_auto_delete_seconds or 0)

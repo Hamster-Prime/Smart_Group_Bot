@@ -34,7 +34,11 @@ from bot.services.skills.webfetch import WebFetchSkill
 from bot.services.skills.websearch import WebSearchSkill
 from bot.services.skills.weibo_search import WeiboSearchSkill
 from bot.services.skills.vote_ban import VoteBanSkill
-from bot.services.reply_output import REPLY_OUTPUT_AWARENESS, REPLY_OUTPUT_PROTOCOL
+from bot.services.reply_output import (
+    REPLY_OUTPUT_AWARENESS,
+    REPLY_OUTPUT_PROTOCOL,
+    REPLY_RICH_FORMATTING,
+)
 from bot.utils.conversation_context import (
     build_current_turn_focus_context,
     format_recent_group_context,
@@ -404,6 +408,7 @@ class SkillService:
         messages.append({"role": "system", "content": build_current_time_context()})
         messages.append({"role": "system", "content": REPLY_OUTPUT_PROTOCOL})
         messages.append({"role": "system", "content": REPLY_OUTPUT_AWARENESS})
+        messages.append({"role": "system", "content": REPLY_RICH_FORMATTING})
         if reply_targets_context.strip():
             messages.append({"role": "system", "content": reply_targets_context.strip()})
         messages.append(

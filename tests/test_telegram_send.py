@@ -524,6 +524,133 @@ class TelegramMarkdownOutputTests(unittest.TestCase):
         self.assertIn("\n\n    nested: true\n", rendered)
         self.assertIn("</code></pre>", rendered)
 
+    async def test_rich_send_uses_send_rich_message_with_markdown(self) -> None:
+        sent = SimpleNamespace(message_id=91, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            message_id=42,
+            bot=SimpleNamespace(send_rich_message=AsyncMock(return_value=sent)),
+        )
+
+        ok = await send_reply(
+            message,
+            "| A | B |\n|---|---|\n| 1 | 2 |",
+            delivery_mode="reply",
+            rich=True,
+            stream=True,
+        )
+
+        self.assertTrue(ok)
+        message.bot.send_rich_message.assert_awaited_once()
+        kwargs = message.bot.send_rich_message.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], -10001)
+        self.assertIn("| A | B |", kwargs["rich_message"].markdown)
+        self.assertTrue(kwargs["rich_message"].skip_entity_detection)
+        self.assertEqual(kwargs["reply_parameters"].message_id, 42)
+
+    async def test_rich_send_failure_falls_back_to_html(self) -> None:
+        sent = SimpleNamespace(message_id=92, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            message_id=43,
+            bot=SimpleNamespace(
+                send_rich_message=AsyncMock(
+                    side_effect=TelegramBadRequest(
+                        method=SimpleNamespace(),
+                        message="Bad Request: method not available",
+                    )
+                )
+            ),
+            reply=AsyncMock(return_value=sent),
+        )
+
+        ok = await send_reply(
+            message,
+            "# 标题\n\n**加粗**",
+            delivery_mode="reply",
+            rich=True,
+        )
+
+        self.assertTrue(ok)
+        message.reply.assert_awaited()
+        body, kwargs = message.reply.await_args.args, message.reply.await_args.kwargs
+        self.assertEqual(body[0], "<b>标题</b>\n\n<b>加粗</b>")
+        self.assertEqual(kwargs["parse_mode"], "HTML")
+
+    async def test_plain_chat_reply_skips_rich_message_path(self) -> None:
+        sent = SimpleNamespace(message_id=93, chat=SimpleNamespace(id=-10001))
+        rich_mock = AsyncMock()
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            message_id=44,
+            bot=SimpleNamespace(send_rich_message=rich_mock),
+            reply=AsyncMock(return_value=sent),
+        )
+
+        ok = await send_reply(
+            message,
+            "好呀好呀，**明天见**~",
+            delivery_mode="reply",
+            rich=True,
+        )
+
+        self.assertTrue(ok)
+        rich_mock.assert_not_awaited()
+        message.reply.assert_awaited()
+
+    def test_normalize_block_layout_adds_breathing_room(self) -> None:
+        source = (
+            "结论如下：\n"
+            "# 对比\n"
+            "| A | B |\n"
+            "|---|---|\n"
+            "| 1 | 2 |\n"
+            "总结一下\n"
+            "- 第一点\n"
+            "- 第二点\n"
+            "结束"
+        )
+
+        result = telegram.normalize_block_layout(source)
+
+        self.assertIn("结论如下：\n\n# 对比\n\n| A | B |", result)
+        self.assertIn("| 1 | 2 |\n\n总结一下\n\n- 第一点\n- 第二点\n\n结束", result)
+        self.assertNotIn("\n\n\n", result)
+
+    def test_normalize_block_layout_leaves_code_untouched(self) -> None:
+        source = "说明\n```yaml\nkey: 1\n# comment\n- item\n```\n结束"
+
+        result = telegram.normalize_block_layout(source)
+
+        self.assertIn("```yaml\nkey: 1\n# comment\n- item\n```", result)
+        self.assertIn("说明\n\n```yaml", result)
+        self.assertIn("```\n\n结束", result)
+
+    def test_markdown_renderer_supports_rich_telegram_formats(self) -> None:
+        rendered = telegram.md_to_html(
+            "__也是加粗__ ~~删除~~ ||剧透|| **加粗** *斜体*\n"
+            "> 第一行\n"
+            "> 第二行\n"
+            "普通行\n"
+            ">! 折叠一\n"
+            ">! 折叠二"
+        )
+
+        self.assertIn("<b>也是加粗</b>", rendered)
+        self.assertIn("<s>删除</s>", rendered)
+        self.assertIn("<tg-spoiler>剧透</tg-spoiler>", rendered)
+        self.assertIn("<b>加粗</b>", rendered)
+        self.assertIn("<i>斜体</i>", rendered)
+        self.assertIn("<blockquote>第一行\n第二行</blockquote>", rendered)
+        self.assertIn("<blockquote expandable>折叠一\n折叠二</blockquote>", rendered)
+        self.assertNotIn("<blockquote>第一行</blockquote>", rendered)
+
+    def test_spoiler_marker_inside_code_stays_literal(self) -> None:
+        rendered = telegram.md_to_html("`a || b` 和 ||隐藏||")
+
+        self.assertIn("<code>a || b</code>", rendered)
+        self.assertIn("<tg-spoiler>隐藏</tg-spoiler>", rendered)
+
     def test_sanitizers_leave_code_literals_unchanged(self) -> None:
         source = (
             "示例：\n\n"
@@ -629,7 +756,10 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         combined = progress_sent.edit_text.await_args_list[0].args[0]
         final_body = progress_sent.edit_text.await_args_list[-1].args[0]
         self.assertTrue(combined.startswith(overlay.status_html + "\n\n"))
-        self.assertEqual(final_body, telegram.md_to_html(source))
+        self.assertEqual(
+            final_body,
+            telegram.md_to_html(telegram.normalize_block_layout(source)),
+        )
         self.assertIn("<blockquote>不应被状态清理误删</blockquote>", final_body)
         self.assertIn("&lt;b&gt;@literal&lt;/b&gt;", final_body)
         self.assertNotIn("已理解问题", final_body)

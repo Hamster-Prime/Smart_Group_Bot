@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal
 from aiogram import Bot
 from aiogram.enums import ChatAction, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
-from aiogram.types import Message
+from aiogram.types import InputRichMessage, Message, ReplyParameters
 
 from bot.config import Settings
 from bot.services.authz import is_super_admin_user_id
@@ -182,6 +182,111 @@ def configure_telegram_cleanup_scheduler(
 
 TG_MESSAGE_LIMIT = 4096
 TG_STREAM_SAFE_LIMIT = 3800
+# Bot API 10.1+ rich messages accept up to 32768 UTF-8 chars of Rich Markdown.
+TG_RICH_MESSAGE_LIMIT = 32000
+# Sentinel parse_mode routing _safe_send through sendRichMessage.
+RICH_MARKDOWN_MODE = "__rich_markdown__"
+
+# Structures only a Rich Message can render. Bold/italic/code/quotes/links
+# render fine through the normal HTML path, so plain chat stays a plain
+# message and sendRichMessage is reserved for genuinely structured replies.
+_RICH_ONLY_PATTERNS = (
+    re.compile(r"(?m)^\s*\|.+\|\s*$\n^\s*\|[\s:|-]+\|\s*$"),  # GFM table
+    re.compile(r"(?m)^#{1,6}[ \t]+\S"),                        # heading
+    re.compile(r"(?m)^\s*(?:-{3,}|\*{3,})\s*$"),               # divider
+    re.compile(r"(?m)^\s*(?:[-*+]|\d+\.)[ \t]+\[[ xX]\]"),     # task list
+    re.compile(r"(?m)^\s*(?:[-*+]|\d+\.)[ \t]+\S(?:.*\n\s*(?:[-*+]|\d+\.)[ \t])"),  # multi-item list
+    re.compile(r"==[^=\n]+=="),                                # marked text
+    re.compile(r"\$\$[\s\S]+?\$\$|(?<!\$)\$[^$\n]+\$(?!\$)"),  # math
+    re.compile(r"(?is)<(?:details|sub|sup|aside|tg-collage|tg-slideshow|tg-map)\b"),
+    re.compile(r"(?m)\[\^[^\]\s]+\]"),                         # footnote
+)
+
+
+_CODE_FENCE_LINE_RE = re.compile(r"^\s*(?:```|~~~)")
+_HEADING_LINE_RE = re.compile(r"^#{1,6}[ \t]+\S")
+_LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)[ \t]+\S")
+_TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
+_QUOTE_LINE_RE = re.compile(r"^\s*&?>")
+_DIVIDER_LINE_RE = re.compile(r"^\s*(?:-{3,}|\*{3,})\s*$")
+
+
+def _block_kind(line: str) -> str:
+    if not line.strip():
+        return "blank"
+    if _HEADING_LINE_RE.match(line):
+        return "heading"
+    if _TABLE_LINE_RE.match(line):
+        return "table"
+    if _DIVIDER_LINE_RE.match(line):
+        return "divider"
+    if _LIST_ITEM_LINE_RE.match(line):
+        return "list"
+    if _QUOTE_LINE_RE.match(line):
+        return "quote"
+    return "text"
+
+
+def normalize_block_layout(text: str) -> str:
+    """Insert breathing room between different Markdown block structures.
+
+    Model output frequently glues a heading straight onto prose, or a table
+    onto the sentence above it, which renders as one cramped wall of text.
+    This inserts a single blank line at block-kind boundaries (outside fenced
+    code) while never touching the interior of a list, table, or quote run.
+    """
+
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = source.split("\n")
+    out: list[str] = []
+    in_fence = False
+    prev_kind = "blank"
+    for line in lines:
+        if _CODE_FENCE_LINE_RE.match(line):
+            if not in_fence and out and prev_kind not in ("blank",):
+                out.append("")
+            in_fence = not in_fence
+            out.append(line)
+            if not in_fence:
+                prev_kind = "fence_end"
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        kind = _block_kind(line)
+        if (
+            out
+            and kind != "blank"
+            and prev_kind not in ("blank",)
+            and (
+                prev_kind == "fence_end"
+                or kind == "heading"
+                or prev_kind == "heading"
+                or (kind != prev_kind and "text" in (kind, prev_kind))
+                or (kind == "divider" or prev_kind == "divider")
+            )
+        ):
+            out.append("")
+        out.append(line)
+        prev_kind = kind
+    normalized = "\n".join(out)
+    return re.sub(r"\n{3,}", "\n\n", normalized)
+
+
+def _needs_rich_markdown(text: str) -> bool:
+    """True when the payload uses structures the HTML path cannot render."""
+
+    source = str(text or "")
+    ranges = _markdown_code_ranges(source)
+
+    def _outside_code(pos: int) -> bool:
+        return not any(start <= pos < end for start, end in ranges)
+
+    for pattern in _RICH_ONLY_PATTERNS:
+        for match in pattern.finditer(source):
+            if _outside_code(match.start()):
+                return True
+    return False
 CHAT_SEND_PARALLEL = 3
 TG_TLS_RECORD_RETRY_DELAY = 0.35
 _TYPING_SEND_TIMEOUT_SECONDS = 3.0
@@ -1146,6 +1251,39 @@ def _safe_markdown_link(value: str) -> str:
     return ""
 
 
+_BLOCKQUOTE_LINE_RE = re.compile(r"^&gt;(!?)[ \t]?(.*)$")
+
+
+def _render_blockquotes(text: str) -> str:
+    """Merge consecutive `>` lines into one blockquote; `>!` marks expandable."""
+
+    out: list[str] = []
+    quote_lines: list[str] = []
+    quote_expandable = False
+
+    def _flush() -> None:
+        nonlocal quote_lines, quote_expandable
+        if quote_lines:
+            attr = " expandable" if quote_expandable else ""
+            out.append(
+                f"<blockquote{attr}>" + "\n".join(quote_lines) + "</blockquote>"
+            )
+            quote_lines = []
+            quote_expandable = False
+
+    for line in text.split("\n"):
+        match = _BLOCKQUOTE_LINE_RE.match(line)
+        if match:
+            if match.group(1):
+                quote_expandable = True
+            quote_lines.append(match.group(2))
+        else:
+            _flush()
+            out.append(line)
+    _flush()
+    return "\n".join(out)
+
+
 def _render_inline_markdown(text: str) -> str:
     tokens: list[str] = []
 
@@ -1174,9 +1312,10 @@ def _render_inline_markdown(text: str) -> str:
     rendered = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", rendered)
     rendered = re.sub(r"__([^_\n]+?)__", r"<b>\1</b>", rendered)
     rendered = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", rendered)
+    rendered = re.sub(r"\|\|([^|\n]+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", rendered)
     rendered = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", rendered)
     rendered = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", rendered)
-    rendered = re.sub(r"(?m)^&gt;[ \t]?(.*)$", r"<blockquote>\1</blockquote>", rendered)
+    rendered = _render_blockquotes(rendered)
     return _MARKDOWN_TOKEN_RE.sub(
         lambda match: tokens[int(match.group(1))],
         rendered,
@@ -1586,6 +1725,7 @@ async def send_reply(
     on_ambiguous: Callable[[], None] | None = None,
     overlay: ReplyMessageOverlay | None = None,
     overlay_remove_after: float = 2.0,
+    rich: bool = False,
 ) -> bool:
     """Send reply in normal mode or stream-like incremental edits.
 
@@ -1640,7 +1780,27 @@ async def send_reply(
         current_reply_id = explicit_reply_target if send_as_reply else None
         while attempt <= retries:
             try:
-                if send_as_reply:
+                if parse_mode == RICH_MARKDOWN_MODE:
+                    reply_params = None
+                    if send_as_reply:
+                        target_id = current_reply_id or (
+                            None
+                            if explicit_reply_target
+                            else int(getattr(message, "message_id", 0) or 0)
+                        )
+                        if target_id:
+                            reply_params = ReplyParameters(message_id=target_id)
+                    # skip_entity_detection: outgoing text must never grow live
+                    # @mentions the sanitizer did not approve.
+                    sent = await message.bot.send_rich_message(
+                        chat_id=message.chat.id,
+                        rich_message=InputRichMessage(
+                            markdown=body,
+                            skip_entity_detection=True,
+                        ),
+                        reply_parameters=reply_params,
+                    )
+                elif send_as_reply:
                     if current_reply_id:
                         sent = await message.bot.send_message(
                             chat_id=message.chat.id,
@@ -2102,6 +2262,10 @@ async def send_reply(
 
     payload = sanitize_outgoing_text((text or "").strip())
     pre_rendered_html = _contains_telegram_html_outside_markdown_code(payload)
+    if not pre_rendered_html:
+        # Trusted HTML templates control their own layout; model Markdown gets
+        # blank lines between block structures so it stops rendering cramped.
+        payload = normalize_block_layout(payload)
     payload = sanitize_outgoing_mentions(
         payload,
         monospace=pre_rendered_html,
@@ -2111,8 +2275,18 @@ async def send_reply(
     # Incrementally editing a half-open fence cannot produce a valid Telegram
     # code entity. Code answers are finalized in one edit; an adopted progress
     # overlay already carries the useful intermediate state.
+    # Rich messages carry final Markdown in one request; incremental plain-text
+    # edits would defeat the point, so rich delivery never streams. Ordinary
+    # chat formatting stays on the normal message path; sendRichMessage is used
+    # only when the payload contains rich-only structures it alone can render.
+    effective_rich = bool(
+        rich
+        and _utf16_units(payload) <= TG_RICH_MESSAGE_LIMIT
+        and _needs_rich_markdown(payload)
+    )
     effective_stream = bool(
         stream
+        and not effective_rich
         and not overlay_compatible
         and not _find_fenced_code_blocks(payload)
     )
@@ -2124,6 +2298,18 @@ async def send_reply(
 
     async def _deliver_payload() -> bool:
         async with semaphore:
+            if effective_rich:
+                sent = await _safe_send(
+                    payload,
+                    parse_mode=RICH_MARKDOWN_MODE,
+                    retries=1,
+                )
+                if sent:
+                    return True
+                log.warning(
+                    "rich message send failed, falling back to HTML | chat_id=%s",
+                    message.chat.id,
+                )
             # Pre-rendered HTML must not be streamed as literal, half-open tags.
             # Send it once as HTML and retain the normal format fallbacks.
             if not effective_stream or pre_rendered_html:

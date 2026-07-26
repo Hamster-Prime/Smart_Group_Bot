@@ -4107,6 +4107,7 @@ async def _deliver_reply_plans(
                         delivery.remaining_text,
                         delivery_mode=plan.delivery_mode,
                         reply_to_message_id=plan.reply_to_message_id,
+                        rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
                         stream=False,
                         auto_delete_seconds=configured_auto_delete_seconds(
                             settings,
@@ -4144,6 +4145,7 @@ async def _deliver_reply_plans(
                 plan.text,
                 delivery_mode=plan.delivery_mode,
                 reply_to_message_id=plan.reply_to_message_id,
+                rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
                 stream=False,
                 auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
                 disable_link_preview=bool(
@@ -4182,6 +4184,7 @@ async def _deliver_reply_plans(
             plan.text,
             delivery_mode=plan.delivery_mode,
             reply_to_message_id=plan.reply_to_message_id,
+            rich=bool(getattr(settings.bot, "enable_rich_messages", False)),
             stream=bool(settings.bot.enable_streaming and len(delivery_plans) == 1),
             stream_chunk_size=settings.bot.stream_chunk_size,
             stream_interval=settings.bot.stream_edit_interval_sec,
