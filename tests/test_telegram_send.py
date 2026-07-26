@@ -482,7 +482,7 @@ class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
         message.answer.assert_awaited_once()
 
 
-class TelegramMarkdownOutputTests(unittest.TestCase):
+class TelegramMarkdownOutputTests(unittest.IsolatedAsyncioTestCase):
     def test_sanitizer_preserves_fenced_code_whitespace(self) -> None:
         source = (
             "配置如下：\n\n"

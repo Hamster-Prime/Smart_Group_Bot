@@ -1906,7 +1906,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiogram", specifier = ">=3.20" },
+    { name = "aiogram", specifier = ">=3.29" },
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "cryptography", specifier = ">=41.0" },

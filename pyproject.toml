@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Telegram group management + AI chat bot"
 requires-python = ">=3.12"
 dependencies = [
-    "aiogram>=3.20",
+    # Bot API 10.1 rich messages (sendRichMessage / InputRichMessage) are
+    # imported at module scope, so anything older fails at startup.
+    "aiogram>=3.29",
     "aiohttp>=3.9",
     "aiosqlite>=0.20",
     "sqlalchemy[asyncio]>=2.0",
