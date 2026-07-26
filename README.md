@@ -161,6 +161,7 @@ Mini App 群组页可读取并完整编辑 Telegram 当前 `ChatPermissions` 全
 | `websearch` | DuckDuckGo 联网搜索 |
 | `webfetch` | 抓取网页正文内容 |
 | `mihomo_doc` | 实时查询 mihomo（Clash Meta）官方 Wiki；配置问答、排错与 YAML 编写/审查均先读取官方原文 |
+| `routeros_doc` | 实时查询 MikroTik RouterOS 官方手册、CLI 参考与更新记录；配置/脚本问答和审查均先读取官方原文 |
 | `music_search` | GD Studio 音乐 API：搜索、点播、歌词、专辑封面 |
 | `bilibili_search` | B站视频/UP主搜索、热门、排行榜 |
 | `weibo_search` | 微博热搜、内容搜索、Feed 流 |

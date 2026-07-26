@@ -149,6 +149,7 @@ def build_bot_runtime_profile_context(
         "websearch": "联网搜索实时信息",
         "webfetch": "抓取网页正文",
         "mihomo_doc": "实时查询 mihomo（Clash Meta）官方配置文档",
+        "routeros_doc": "实时查询 MikroTik RouterOS 官方手册与 CLI 参考",
         "bilibili_search": "B站搜索、视频详情、热门与排行榜",
         "weibo_search": "微博热搜、搜索与链接内容提取",
         "api_model_query": "本群配置的模型 API 查询：实时模型列表与列表内模型测活（不要用联网搜索代替）",
@@ -240,6 +241,12 @@ def build_bot_runtime_profile_context(
         lines.append(
             "mihomo_doc_routing: 涉及 mihomo/Clash Meta 配置、排错或 YAML 编写审查时，"
             "必须先查询实时官方文档；search/toc 后继续读取 page/section，不得凭模型记忆补字段。"
+        )
+    if "routeros_doc" in normalized_skills:
+        lines.append(
+            "routeros_doc_routing: 涉及 MikroTik/RouterOS 配置、CLI、脚本、排错或版本变化时，"
+            "必须先查询实时官方手册；search/toc/changelog 只用于定位，随后读取 page/section，"
+            "精确命令参数用 cli 复核，不得凭模型记忆补参数。"
         )
 
     lines.append(build_command_guide_context())
