@@ -134,6 +134,7 @@ class DoubaoTTSSkill:
                     delivery_mode=delivery_mode,
                     stream=False,
                     auto_delete_seconds=context.auto_delete_reply_seconds,
+                    disable_link_preview=context.disable_link_preview,
                     on_delivery=context.delivery_callback,
                 )
             elif context.bot is not None and int(context.chat_id or 0):
@@ -142,6 +143,7 @@ class DoubaoTTSSkill:
                     int(context.chat_id),
                     delivery.remaining_text,
                     auto_delete_seconds=context.auto_delete_reply_seconds,
+                    disable_link_preview=context.disable_link_preview,
                     on_delivery=context.delivery_callback,
                 )
 

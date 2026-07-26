@@ -79,6 +79,7 @@ class EmbedConfig(EmbedEndpointConfig):
 class BotConfig(BaseModel):
     token: str = ""
     parse_mode: str = "HTML"
+    disable_link_preview: bool = True
     drop_pending_updates: bool = False
     inbound_debounce_seconds: float = 5.0
     reply_batch_timeout_seconds: float = 45.0
@@ -739,6 +740,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
             settings.bot.embed_model = EmbedConfig(**bot_data["embed_model"])
         if "parse_mode" in bot_data:
             settings.bot.parse_mode = bot_data["parse_mode"]
+        if "disable_link_preview" in bot_data:
+            settings.bot.disable_link_preview = bool(
+                bot_data["disable_link_preview"]
+            )
         if "drop_pending_updates" in bot_data:
             settings.bot.drop_pending_updates = bot_data["drop_pending_updates"]
         if "reply_batch_timeout_seconds" in bot_data:

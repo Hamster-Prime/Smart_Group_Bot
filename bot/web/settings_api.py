@@ -149,6 +149,7 @@ _GROUP_SETTING_FIELDS = {
     "join_verification_provider",
     "welcome_message",
     "welcome_buttons",
+    "welcome_disable_link_preview",
     GROUP_PERMISSIONS_SETTINGS_KEY,
     "patrol_enabled",
     "raid_guard_enabled",
@@ -248,6 +249,7 @@ class _GroupSettingsUpdate(BaseModel):
     ) = None
     welcome_message: str | None = Field(default=None, max_length=4000)
     welcome_buttons: list[dict[str, Any]] | None = Field(default=None, max_length=12)
+    welcome_disable_link_preview: StrictBool | None = None
     default_permissions: dict[str, Any] | None = None
     patrol_enabled: StrictBool | None = None
     raid_guard_enabled: StrictBool | None = None
@@ -318,6 +320,7 @@ class _KeywordReplyCreate(BaseModel):
     buttons: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     pin_message: StrictBool = False
     auto_delete: StrictBool = True
+    disable_link_preview: StrictBool = True
     enabled: StrictBool = True
 
 
@@ -329,6 +332,7 @@ class _KeywordReplyUpdate(BaseModel):
     buttons: list[dict[str, Any]] | None = Field(default=None, max_length=12)
     pin_message: StrictBool | None = None
     auto_delete: StrictBool | None = None
+    disable_link_preview: StrictBool | None = None
     enabled: StrictBool | None = None
 
 
@@ -342,6 +346,7 @@ class _ScheduledMessageCreate(BaseModel):
     pin_message: StrictBool = False
     unpin_previous: StrictBool = False
     auto_delete: StrictBool = False
+    disable_link_preview: StrictBool = True
     enabled: StrictBool = True
 
 
@@ -355,6 +360,7 @@ class _ScheduledMessageUpdate(BaseModel):
     pin_message: StrictBool | None = None
     unpin_previous: StrictBool | None = None
     auto_delete: StrictBool | None = None
+    disable_link_preview: StrictBool | None = None
     enabled: StrictBool | None = None
 
 
@@ -580,6 +586,11 @@ def _public_group_settings(settings_data: dict[str, Any]) -> dict[str, Any]:
         ),
         "welcome_message": str(settings_data.get("welcome_message") or ""),
         "welcome_buttons": welcome_buttons,
+        "welcome_disable_link_preview": (
+            True
+            if settings_data.get("welcome_disable_link_preview") is None
+            else _setting_bool(settings_data, "welcome_disable_link_preview")
+        ),
         GROUP_PERMISSIONS_SETTINGS_KEY: default_permissions,
         "patrol_enabled": (
             _setting_bool(settings_data, "patrol_enabled")
@@ -706,6 +717,11 @@ def _keyword_reply_document(row: KeywordReply) -> dict[str, Any]:
         "buttons": buttons,
         "pin_message": bool(row.pin_message),
         "auto_delete": bool(row.auto_delete),
+        "disable_link_preview": (
+            True
+            if getattr(row, "disable_link_preview", None) is None
+            else bool(getattr(row, "disable_link_preview"))
+        ),
         "enabled": bool(row.enabled),
     }
 
@@ -725,6 +741,11 @@ def _scheduled_message_document(row: ScheduledMessage) -> dict[str, Any]:
         "pin_message": bool(row.pin_message),
         "unpin_previous": bool(row.unpin_previous),
         "auto_delete": bool(row.auto_delete),
+        "disable_link_preview": (
+            True
+            if getattr(row, "disable_link_preview", None) is None
+            else bool(getattr(row, "disable_link_preview"))
+        ),
         "enabled": bool(row.enabled),
         "last_run_at": row.last_run_at.isoformat() if row.last_run_at else "",
     }
@@ -1303,6 +1324,7 @@ def _apply_group_settings(
             "join_verification_provider",
             "welcome_message",
             "welcome_buttons",
+            "welcome_disable_link_preview",
             GROUP_PERMISSIONS_SETTINGS_KEY,
             "patrol_enabled",
             "raid_guard_enabled",
@@ -1361,6 +1383,13 @@ def _apply_group_settings(
             updated["welcome_buttons"] = welcome_buttons
         else:
             updated.pop("welcome_buttons", None)
+    if "welcome_disable_link_preview" in fields:
+        if update.welcome_disable_link_preview is None:
+            updated.pop("welcome_disable_link_preview", None)
+        else:
+            updated["welcome_disable_link_preview"] = bool(
+                update.welcome_disable_link_preview
+            )
     if GROUP_PERMISSIONS_SETTINGS_KEY in fields:
         if update.default_permissions is None:
             updated.pop(GROUP_PERMISSIONS_SETTINGS_KEY, None)
@@ -2569,6 +2598,7 @@ def register_settings_routes(
             buttons=_validated_template_buttons(body.buttons),
             pin_message=body.pin_message,
             auto_delete=body.auto_delete,
+            disable_link_preview=body.disable_link_preview,
             enabled=body.enabled,
             created_by=int(user.id),
         )
@@ -2613,6 +2643,8 @@ def register_settings_routes(
                 row.pin_message = bool(body.pin_message)
             if "auto_delete" in body.model_fields_set:
                 row.auto_delete = bool(body.auto_delete)
+            if "disable_link_preview" in body.model_fields_set:
+                row.disable_link_preview = bool(body.disable_link_preview)
             if "enabled" in body.model_fields_set:
                 row.enabled = bool(body.enabled)
             await session.commit()
@@ -2666,6 +2698,7 @@ def register_settings_routes(
             pin_message=body.pin_message,
             unpin_previous=body.unpin_previous,
             auto_delete=body.auto_delete,
+            disable_link_preview=body.disable_link_preview,
             enabled=body.enabled,
             # Anchor at creation so a daily entry created after today's HH:MM
             # starts tomorrow instead of firing immediately.
@@ -2713,6 +2746,8 @@ def register_settings_routes(
                 row.unpin_previous = bool(body.unpin_previous)
             if "auto_delete" in body.model_fields_set:
                 row.auto_delete = bool(body.auto_delete)
+            if "disable_link_preview" in body.model_fields_set:
+                row.disable_link_preview = bool(body.disable_link_preview)
             if "enabled" in body.model_fields_set:
                 was_enabled = bool(row.enabled)
                 row.enabled = bool(body.enabled)

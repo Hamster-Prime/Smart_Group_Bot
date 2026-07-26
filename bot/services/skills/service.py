@@ -1892,6 +1892,17 @@ class SkillService:
                 if self.settings is not None
                 else 0
             ),
+            disable_link_preview=(
+                bool(
+                    getattr(
+                        self.settings.bot,
+                        "disable_link_preview",
+                        True,
+                    )
+                )
+                if self.settings is not None
+                else True
+            ),
             progress_callback=progress_callback,
         )
 
@@ -2019,6 +2030,17 @@ class SkillService:
                 configured_auto_delete_seconds(self.settings, "reply")
                 if self.settings is not None
                 else 0
+            ),
+            disable_link_preview=(
+                bool(
+                    getattr(
+                        self.settings.bot,
+                        "disable_link_preview",
+                        True,
+                    )
+                )
+                if self.settings is not None
+                else True
             ),
             progress_callback=progress_callback,
         )

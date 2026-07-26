@@ -127,6 +127,11 @@ class KeywordReply(Base):
     buttons: Mapped[list] = mapped_column(JSON, default=list)
     pin_message: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_delete: Mapped[bool] = mapped_column(Boolean, default=True)
+    disable_link_preview: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(
@@ -157,6 +162,11 @@ class ScheduledMessage(Base):
     pin_message: Mapped[bool] = mapped_column(Boolean, default=False)
     unpin_previous: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_delete: Mapped[bool] = mapped_column(Boolean, default=False)
+    disable_link_preview: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_message_id: Mapped[int] = mapped_column(BigInteger, default=0)

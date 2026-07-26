@@ -482,6 +482,12 @@ class ScheduledMessageService:
         payload = render_markdown_html(source_text)
         plain_fallback = render_plain_template(source_text)
         keyboard = build_template_keyboard(getattr(entry, "buttons", None))
+        raw_disable_link_preview = getattr(entry, "disable_link_preview", None)
+        disable_link_preview = (
+            True
+            if raw_disable_link_preview is None
+            else bool(raw_disable_link_preview)
+        )
         try:
             sent = await send_template_with_fallback(
                 lambda text, **kwargs: self.bot.send_message(
@@ -492,6 +498,7 @@ class ScheduledMessageService:
                 formatted_text=payload,
                 plain_text=plain_fallback,
                 reply_markup=keyboard,
+                disable_link_preview=disable_link_preview,
             )
         except Exception:
             log.exception(

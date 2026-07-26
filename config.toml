@@ -5,6 +5,7 @@
 
 [bot]
 parse_mode = "HTML"
+disable_link_preview = true
 drop_pending_updates = false
 reply_batch_timeout_seconds = 45
 

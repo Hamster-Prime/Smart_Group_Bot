@@ -43,6 +43,7 @@ class SkillContext:
     embedded_reply_text: str = ""
     suppress_followup_text: bool = False
     auto_delete_reply_seconds: int = 0
+    disable_link_preview: bool = True
     delivery_callback: Callable[[], None] | None = None
     delivery_confirmed: bool = False
     progress_callback: ProgressCallback | None = None

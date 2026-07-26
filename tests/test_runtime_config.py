@@ -52,6 +52,8 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.max_context_tokens, 256000)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
         self.assertEqual(self.settings.bot.reply_batch_timeout_seconds, 45.0)
+        self.assertTrue(self.settings.bot.disable_link_preview)
+        self.assertTrue(self.manager.config.bot.disable_link_preview)
         self.assertTrue(self.settings.raid_guard_pin_message)
         self.assertFalse(self.settings.call_admin_pin_message)
         self.assertTrue(self.settings.vote_ban_pin_message)
@@ -72,6 +74,22 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.revision, 1)
             self.assertEqual(row.payload["models"]["providers"][0]["api_key"], "")
             self.assertEqual(row.payload["movie_info"]["tmdb_read_access_token"], "")
+            self.assertTrue(row.payload["bot"]["disable_link_preview"])
+
+    async def test_link_preview_setting_save_apply_and_persist(self) -> None:
+        payload = self.manager.config.public_payload()
+        payload["bot"]["disable_link_preview"] = False
+
+        await self.manager.save(payload, expected_revision=1, updated_by=42)
+
+        self.assertFalse(self.manager.config.bot.disable_link_preview)
+        self.assertFalse(self.settings.bot.disable_link_preview)
+        self.assertFalse(
+            self.manager.api_document()["config"]["bot"]["disable_link_preview"]
+        )
+        async with self.session_factory() as session:
+            row = await session.get(RuntimeConfigRecord, 1)
+            self.assertFalse(row.payload["bot"]["disable_link_preview"])
 
     async def test_first_start_imports_activity_pin_and_auto_delete_settings(self) -> None:
         legacy = Settings(_env_file=None)
@@ -116,6 +134,26 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             {"call_admin": "button"},
         )
         self.assertFalse(imported.bot.drop_pending_updates)
+
+    async def test_legacy_toml_imports_link_preview_setting(self) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".toml",
+            encoding="utf-8",
+            delete=False,
+        ) as stream:
+            stream.write("[bot]\ndisable_link_preview = false\n")
+            config_path = stream.name
+        try:
+            imported = build_legacy_runtime_config(
+                config_path,
+                settings=Settings(_env_file=None),
+                raw_env={},
+            )
+        finally:
+            os.remove(config_path)
+
+        self.assertFalse(imported.bot.disable_link_preview)
 
     async def test_activity_pin_settings_save_apply_and_stay_strict(self) -> None:
         payload = self.manager.config.public_payload()
@@ -208,6 +246,7 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             payload = dict(row.payload)
             bot_payload = dict(payload["bot"])
             bot_payload["drop_pending_updates"] = True
+            bot_payload.pop("disable_link_preview", None)
             payload["bot"] = bot_payload
             payload["sub2api"] = {
                 "enabled": True,
@@ -246,6 +285,11 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.revision, 7)
         self.assertFalse(reloaded.config.bot.drop_pending_updates)
         self.assertFalse(reloaded_settings.bot.drop_pending_updates)
+        self.assertTrue(reloaded.config.bot.disable_link_preview)
+        self.assertTrue(reloaded_settings.bot.disable_link_preview)
+        self.assertTrue(
+            reloaded.api_document()["config"]["bot"]["disable_link_preview"]
+        )
         async with self.session_factory() as session:
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertEqual(row.revision, 7)

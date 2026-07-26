@@ -455,6 +455,19 @@ async def main() -> None:
 
         async def apply_runtime_update(_config: RuntimeConfig) -> None:
             nonlocal logging_config_snapshot
+            # Keep sends that use aiogram's default properties in sync with
+            # the live Bot behavior setting.  Per-message/template paths pass
+            # their own value explicitly and therefore remain authoritative.
+            bot_default = getattr(bot, "default", None)
+            if bot_default is not None:
+                # Per-message paths use disable_web_page_preview.  Clear the
+                # newer aggregate default so the two Telegram parameters can
+                # never disagree when a per-item switch overrides the global
+                # Bot behavior value.
+                bot_default.link_preview = None
+                bot_default.link_preview_is_disabled = bool(
+                    getattr(settings.bot, "disable_link_preview", True)
+                )
             llm.reconfigure(
                 settings.bot.main_model,
                 settings.bot.decision_model,

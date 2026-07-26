@@ -97,6 +97,10 @@ async def send_keyword_reply(
     source_text = str(rule.reply_text or "")
     rendered_text = render_markdown_html(source_text)
     keyboard = build_template_keyboard(getattr(rule, "buttons", None))
+    raw_disable_link_preview = getattr(rule, "disable_link_preview", None)
+    disable_link_preview = (
+        True if raw_disable_link_preview is None else bool(raw_disable_link_preview)
+    )
     try:
         sent = await answer_with_auto_delete(
             message,
@@ -108,6 +112,7 @@ async def send_keyword_reply(
             plain_text_fallback=render_plain_template(source_text),
             sanitize_mentions=False,
             drop_invalid_reply_markup=True,
+            disable_link_preview=disable_link_preview,
         )
     except Exception:
         log.exception(

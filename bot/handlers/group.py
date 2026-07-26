@@ -4112,6 +4112,9 @@ async def _deliver_reply_plans(
                             settings,
                             "reply",
                         ),
+                        disable_link_preview=bool(
+                            getattr(settings.bot, "disable_link_preview", True)
+                        ),
                         on_delivery=_confirm_plan_delivery,
                         on_ambiguous=on_ambiguous,
                         overlay=fallback_overlay,
@@ -4143,6 +4146,9 @@ async def _deliver_reply_plans(
                 reply_to_message_id=plan.reply_to_message_id,
                 stream=False,
                 auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
+                disable_link_preview=bool(
+                    getattr(settings.bot, "disable_link_preview", True)
+                ),
                 on_delivery=_confirm_plan_delivery,
                 on_ambiguous=on_ambiguous,
                 overlay=fallback_overlay,
@@ -4180,6 +4186,9 @@ async def _deliver_reply_plans(
             stream_chunk_size=settings.bot.stream_chunk_size,
             stream_interval=settings.bot.stream_edit_interval_sec,
             auto_delete_seconds=configured_auto_delete_seconds(settings, "reply"),
+            disable_link_preview=bool(
+                getattr(settings.bot, "disable_link_preview", True)
+            ),
             on_delivery=_confirm_plan_delivery,
             on_ambiguous=on_ambiguous,
             overlay=current_overlay,
@@ -4481,6 +4490,9 @@ async def _process_pending_reply_batch(
                     # Progress is transient UI, not another permanent group
                     # message. Keep its retention independent from replies.
                     auto_delete_seconds=30,
+                    disable_link_preview=bool(
+                        getattr(settings.bot, "disable_link_preview", True)
+                    ),
                 )
                 await progress.start()
                 history = await memory.get_history_for_llm(
@@ -6159,6 +6171,9 @@ async def on_group_message(
                         delivery_mode="reply",
                         reply_to_message_id=int(message.message_id or 0) or None,
                         stream=False,
+                        disable_link_preview=bool(
+                            getattr(settings.bot, "disable_link_preview", True)
+                        ),
                     ),
                     timeout_seconds=8.0,
                 ))

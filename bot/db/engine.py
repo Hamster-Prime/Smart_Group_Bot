@@ -1380,9 +1380,33 @@ async def init_db(
             )
             await _sqlite_ensure_column(
                 conn,
+                "keyword_replies",
+                "disable_link_preview",
+                "disable_link_preview BOOLEAN NOT NULL DEFAULT 1",
+            )
+            await conn.execute(
+                text(
+                    "UPDATE keyword_replies SET disable_link_preview = 1 "
+                    "WHERE disable_link_preview IS NULL"
+                )
+            )
+            await _sqlite_ensure_column(
+                conn,
                 "scheduled_messages",
                 "buttons",
                 "buttons JSON NOT NULL DEFAULT '[]'",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "scheduled_messages",
+                "disable_link_preview",
+                "disable_link_preview BOOLEAN NOT NULL DEFAULT 1",
+            )
+            await conn.execute(
+                text(
+                    "UPDATE scheduled_messages SET disable_link_preview = 1 "
+                    "WHERE disable_link_preview IS NULL"
+                )
             )
             await _sqlite_ensure_column(
                 conn,

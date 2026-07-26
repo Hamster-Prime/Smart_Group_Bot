@@ -145,6 +145,7 @@ class ReplyProgressTracker:
         reveal_after: float = 1.5,
         edit_interval: float = 1.0,
         auto_delete_seconds: int = 0,
+        disable_link_preview: bool = True,
     ) -> None:
         self._message = message
         self._enabled = bool(enabled)
@@ -153,6 +154,7 @@ class ReplyProgressTracker:
         # Preserve the existing negative delete-button sentinel as well as
         # positive timer values; zero alone means no cleanup policy.
         self._auto_delete_seconds = int(auto_delete_seconds or 0)
+        self._disable_link_preview = bool(disable_link_preview)
 
         self._updates: OrderedDict[str, ProgressUpdate] = OrderedDict()
         self._references: OrderedDict[str, ProgressReference] = OrderedDict()
@@ -363,7 +365,7 @@ class ReplyProgressTracker:
                     await sent.edit_text(
                         "<blockquote>⚠️ 01　处理已结束</blockquote>",
                         parse_mode="HTML",
-                        disable_web_page_preview=True,
+                        disable_web_page_preview=self._disable_link_preview,
                     )
             except asyncio.CancelledError:
                 raise
@@ -521,7 +523,7 @@ class ReplyProgressTracker:
         body = self._render()
         options = {
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,
+            "disable_web_page_preview": self._disable_link_preview,
         }
         sent: Message | None = None
         sent_as_reply = False
@@ -559,7 +561,7 @@ class ReplyProgressTracker:
                 await self._sent.edit_text(
                     self._render(),
                     parse_mode="HTML",
-                    disable_web_page_preview=True,
+                    disable_web_page_preview=self._disable_link_preview,
                 )
             self._last_edit_at = asyncio.get_running_loop().time()
             return True

@@ -273,6 +273,7 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
             delivery_mode="reply",
             stream=False,
             auto_delete_seconds=45,
+            disable_link_preview=True,
             on_delivery=delivery_callback,
         )
 
@@ -313,6 +314,7 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
             -10001,
             "第二段。\n第三段。",
             auto_delete_seconds=45,
+            disable_link_preview=True,
             on_delivery=delivery_callback,
         )
 

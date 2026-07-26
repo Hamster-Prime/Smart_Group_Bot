@@ -196,6 +196,7 @@ async def send_template_with_fallback(
     formatted_text: str,
     plain_text: str,
     reply_markup: InlineKeyboardMarkup | None,
+    disable_link_preview: bool = True,
 ) -> Any:
     """Send a template while keeping its body if formatting/buttons fail.
 
@@ -209,6 +210,7 @@ async def send_template_with_fallback(
             formatted_text,
             parse_mode="HTML",
             reply_markup=reply_markup,
+            disable_web_page_preview=bool(disable_link_preview),
         )
     except TelegramBadRequest as exc:
         if _formatted_text_rejected(exc):
@@ -217,11 +219,17 @@ async def send_template_with_fallback(
                     plain_text,
                     parse_mode=None,
                     reply_markup=reply_markup,
+                    disable_web_page_preview=bool(disable_link_preview),
                 )
             except TelegramBadRequest:
                 if reply_markup is None:
                     raise
-                return await send(plain_text, parse_mode=None, reply_markup=None)
+                return await send(
+                    plain_text,
+                    parse_mode=None,
+                    reply_markup=None,
+                    disable_web_page_preview=bool(disable_link_preview),
+                )
         if reply_markup is None:
             raise
         try:
@@ -229,11 +237,17 @@ async def send_template_with_fallback(
                 formatted_text,
                 parse_mode="HTML",
                 reply_markup=None,
+                disable_web_page_preview=bool(disable_link_preview),
             )
         except TelegramBadRequest as retry_exc:
             if not _formatted_text_rejected(retry_exc):
                 raise
-            return await send(plain_text, parse_mode=None, reply_markup=None)
+            return await send(
+                plain_text,
+                parse_mode=None,
+                reply_markup=None,
+                disable_web_page_preview=bool(disable_link_preview),
+            )
 
 
 def _stash(tokens: list[str], rendered: str) -> str:

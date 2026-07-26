@@ -840,6 +840,13 @@ class ProactiveTopicService:
                                 self.settings,
                                 "proactive",
                             ),
+                            disable_link_preview=bool(
+                                getattr(
+                                    self.settings.bot,
+                                    "disable_link_preview",
+                                    True,
+                                )
+                            ),
                             on_delivery=_confirm_delivery,
                         )
                     except asyncio.CancelledError:
@@ -876,6 +883,13 @@ class ProactiveTopicService:
                 reply,
                 auto_delete_seconds=configured_auto_delete_seconds(
                     self.settings, "proactive"
+                ),
+                disable_link_preview=bool(
+                    getattr(
+                        self.settings.bot,
+                        "disable_link_preview",
+                        True,
+                    )
                 ),
                 on_delivery=_confirm_delivery,
             )

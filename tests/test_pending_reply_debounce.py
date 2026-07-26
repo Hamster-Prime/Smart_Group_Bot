@@ -249,6 +249,7 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             reveal_after=3.0,
             edit_interval=0.8,
             auto_delete_seconds=30,
+            disable_link_preview=True,
         )
         fake_progress.start.assert_awaited_once_with()
         fake_progress.dismiss.assert_awaited_once_with()

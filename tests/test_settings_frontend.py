@@ -140,6 +140,59 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         self.assertIn("投票完成、管理员中止或直接封禁、票数不足超时后取消置顶", source)
         self.assertIn("自动或手动结束防护时取消置顶", source)
 
+    def test_link_preview_switches_default_on_and_serialize_as_booleans(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        normalize = source.split("function normalizeGroupSettings", 1)[1].split(
+            "function normalizeDefaultPermissions", 1
+        )[0]
+        apply_document = source.split("function applySettingsDocument", 1)[1].split(
+            "function applyGroupsDocument", 1
+        )[0]
+        entry_fields = source.split("const ENTRY_FORM_FIELDS", 1)[1].split(
+            "function readEntryFormValues", 1
+        )[0]
+        group_section_keys = source.split(
+            "const GROUP_SECTION_SETTING_KEYS", 1
+        )[1].split("const RESOURCE_TYPE_META", 1)[0]
+        group_editable_keys = source.split("const GROUP_EDITABLE_KEYS", 1)[1].split(
+            "]);", 1
+        )[0]
+
+        self.assertIn(
+            'toggle("bot.disable_link_preview", "关闭 AI 回复链接预览"', source
+        )
+        self.assertIn("state.config.bot.disable_link_preview = true;", apply_document)
+        self.assertIn(
+            "welcome_disable_link_preview: settings.welcome_disable_link_preview !== false,",
+            normalize,
+        )
+        self.assertIn(
+            'groupToggle(group, "welcome_disable_link_preview", "关闭欢迎语链接预览"',
+            source,
+        )
+        self.assertIn('"welcome_disable_link_preview"', group_section_keys)
+        self.assertIn('"welcome_disable_link_preview"', group_editable_keys)
+        self.assertEqual(
+            source.count('name="disable_link_preview" type="checkbox"'), 4
+        )
+        self.assertEqual(
+            source.count('name="disable_link_preview" type="checkbox" checked'), 2
+        )
+        self.assertEqual(source.count("item.disable_link_preview !== false"), 2)
+        self.assertEqual(
+            source.count(
+                'disable_link_preview: Boolean(snapshotField(snapshot, "disable_link_preview", true))'
+            ),
+            2,
+        )
+        self.assertEqual(
+            source.count(
+                "disable_link_preview: values.disable_link_preview !== false,"
+            ),
+            2,
+        )
+        self.assertEqual(entry_fields.count('"disable_link_preview"'), 2)
+
     def test_group_disclosure_state_is_captured_before_rerender(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
         render_content = source.split("function renderContent", 1)[1].split(

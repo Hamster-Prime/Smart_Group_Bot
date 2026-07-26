@@ -269,6 +269,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         document = (await created.json())["keyword_reply"]
         self.assertTrue(document["pin_message"])
         self.assertFalse(document["auto_delete"])
+        self.assertTrue(document["disable_link_preview"])
         self.assertIn("\n", document["reply_text"])
         self.assertEqual(document["buttons"][0]["text"], "查看说明")
         self.assertEqual(document["buttons"][0]["style"], "danger")
@@ -280,6 +281,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.created_by, 99)
             self.assertEqual(row.buttons[0]["action"], "url")
             self.assertEqual(row.buttons[0]["style"], "danger")
+            self.assertTrue(row.disable_link_preview)
 
         invalid_regex = await self.client.post(
             "/api/v1/groups/-503/keyword-replies",
@@ -294,11 +296,16 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         updated = await self.client.patch(
             f"/api/v1/groups/-503/keyword-replies/{entry_id}",
             headers=self._headers(user_id=99),
-            json={"enabled": False, "reply_text": "改后的回复"},
+            json={
+                "enabled": False,
+                "reply_text": "改后的回复",
+                "disable_link_preview": False,
+            },
         )
         self.assertEqual(updated.status, 200)
         updated_document = (await updated.json())["keyword_reply"]
         self.assertFalse(updated_document["enabled"])
+        self.assertFalse(updated_document["disable_link_preview"])
         self.assertEqual(updated_document["buttons"][0]["style"], "danger")
 
         other_admin = await self.client.delete(
@@ -350,6 +357,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         document = (await created.json())["scheduled_message"]
         self.assertEqual(document["schedule_time"], "09:05")
         self.assertTrue(document["pin_message"])
+        self.assertTrue(document["disable_link_preview"])
         self.assertIn("\n", document["text"])
         self.assertEqual(document["buttons"][0]["action"], "copy")
         entry_id = document["id"]
@@ -373,12 +381,19 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         updated = await self.client.patch(
             f"/api/v1/groups/-504/scheduled-messages/{entry_id}",
             headers=self._headers(user_id=99),
-            json={"schedule_type": "interval", "interval_minutes": 120},
+            json={
+                "schedule_type": "interval",
+                "interval_minutes": 120,
+                "disable_link_preview": False,
+            },
         )
         self.assertEqual(updated.status, 200)
+        updated_document = (await updated.json())["scheduled_message"]
         self.assertEqual(
-            (await updated.json())["scheduled_message"]["interval_minutes"], 120
+            updated_document["interval_minutes"],
+            120,
         )
+        self.assertFalse(updated_document["disable_link_preview"])
 
         deleted = await self.client.delete(
             f"/api/v1/groups/-504/scheduled-messages/{entry_id}",
@@ -959,6 +974,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         group_document = await self._group_document(-260)
+        self.assertTrue(group_document["settings"]["welcome_disable_link_preview"])
         saved = await self.client.put(
             "/api/v1/groups/-260/settings",
             headers=self._headers(),
@@ -975,6 +991,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
                             "style": "success",
                         }
                     ],
+                    "welcome_disable_link_preview": False,
                 },
             },
         )
@@ -987,6 +1004,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             saved_group["settings"]["welcome_buttons"][0]["style"], "success"
         )
+        self.assertFalse(saved_group["settings"]["welcome_disable_link_preview"])
         async with self.session_factory() as session:
             stored = await session.get(Group, -260)
             self.assertEqual(
@@ -995,6 +1013,7 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 stored.settings["welcome_buttons"][0]["style"], "success"
             )
+            self.assertFalse(stored.settings["welcome_disable_link_preview"])
 
         cleared = await self.client.put(
             "/api/v1/groups/-260/settings",
@@ -1008,10 +1027,12 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
         cleared_group = (await cleared.json())["group"]
         self.assertEqual(cleared_group["settings"]["welcome_message"], "")
         self.assertEqual(cleared_group["settings"]["welcome_buttons"], [])
+        self.assertFalse(cleared_group["settings"]["welcome_disable_link_preview"])
         async with self.session_factory() as session:
             stored = await session.get(Group, -260)
             self.assertNotIn("welcome_message", stored.settings or {})
             self.assertNotIn("welcome_buttons", stored.settings or {})
+            self.assertFalse(stored.settings["welcome_disable_link_preview"])
 
     async def test_group_default_permissions_load_and_schedule_roundtrip(self) -> None:
         async with self.session_factory() as session:

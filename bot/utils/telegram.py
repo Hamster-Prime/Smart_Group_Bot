@@ -651,6 +651,7 @@ async def answer_with_auto_delete(
     text: str,
     *,
     auto_delete_seconds: int = 0,
+    disable_link_preview: bool | None = None,
     retry_tls_record_error: bool = False,
     plain_text_fallback: str | None = None,
     sanitize_mentions: bool = True,
@@ -689,6 +690,12 @@ async def answer_with_auto_delete(
         else html.escape(payload)
     )
     send_kwargs = dict(kwargs)
+    if (
+        disable_link_preview is not None
+        and "disable_web_page_preview" not in send_kwargs
+        and "link_preview_options" not in send_kwargs
+    ):
+        send_kwargs["disable_web_page_preview"] = bool(disable_link_preview)
     try:
         sent = await _answer_with_network_retry(safe_text, send_kwargs)
     except TelegramBadRequest as exc:
@@ -1574,6 +1581,7 @@ async def send_reply(
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
     auto_delete_seconds: int = 0,
+    disable_link_preview: bool | None = None,
     on_delivery: Callable[[], None] | None = None,
     on_ambiguous: Callable[[], None] | None = None,
     overlay: ReplyMessageOverlay | None = None,
@@ -1590,6 +1598,11 @@ async def send_reply(
     mode = (delivery_mode or "reply").strip().lower()
     send_as_reply = mode != "message"
     explicit_reply_target = int(reply_to_message_id or 0) or None
+    link_preview_kwargs = (
+        {"disable_web_page_preview": bool(disable_link_preview)}
+        if disable_link_preview is not None
+        else {}
+    )
     overlay_compatible = bool(
         overlay is not None
         and overlay.sent_as_reply
@@ -1634,13 +1647,26 @@ async def send_reply(
                             text=body,
                             parse_mode=parse_mode,
                             reply_to_message_id=current_reply_id,
+                            **link_preview_kwargs,
                         )
                     elif explicit_reply_target:
-                        sent = await message.answer(body, parse_mode=parse_mode)
+                        sent = await message.answer(
+                            body,
+                            parse_mode=parse_mode,
+                            **link_preview_kwargs,
+                        )
                     else:
-                        sent = await message.reply(body, parse_mode=parse_mode)
+                        sent = await message.reply(
+                            body,
+                            parse_mode=parse_mode,
+                            **link_preview_kwargs,
+                        )
                 else:
-                    sent = await message.answer(body, parse_mode=parse_mode)
+                    sent = await message.answer(
+                        body,
+                        parse_mode=parse_mode,
+                        **link_preview_kwargs,
+                    )
                 confirm_telegram_delivery(on_delivery)
                 if schedule_cleanup:
                     await _schedule_delivered_message_cleanup(
@@ -1695,7 +1721,11 @@ async def send_reply(
         attempt = 0
         while attempt <= retries:
             try:
-                await sent.edit_text(body, parse_mode=parse_mode)
+                await sent.edit_text(
+                    body,
+                    parse_mode=parse_mode,
+                    **link_preview_kwargs,
+                )
                 return True
             except TelegramBadRequest as exc:
                 detail = str(exc).lower()
@@ -1729,7 +1759,11 @@ async def send_reply(
         saw_ambiguous_result = False
         while attempt <= retries:
             try:
-                await sent.edit_text(body, parse_mode=parse_mode)
+                await sent.edit_text(
+                    body,
+                    parse_mode=parse_mode,
+                    **link_preview_kwargs,
+                )
                 return "success"
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
@@ -2167,6 +2201,7 @@ async def send_reply_messages(
     stream_chunk_size: int = 36,
     stream_interval: float = 1.0,
     auto_delete_seconds: int = 0,
+    disable_link_preview: bool | None = None,
 ) -> list[bool]:
     normalized = [str(item or "").strip() for item in texts if str(item or "").strip()]
     if not normalized:
@@ -2188,6 +2223,7 @@ async def send_reply_messages(
             stream_chunk_size=stream_chunk_size,
             stream_interval=stream_interval,
             auto_delete_seconds=auto_delete_seconds,
+            disable_link_preview=disable_link_preview,
         )
         results.append(ok)
     return results
@@ -2202,6 +2238,7 @@ async def send_chat_message(
     fallback_mention_user_id: int = 0,
     fallback_mention_name: str = "",
     auto_delete_seconds: int = 0,
+    disable_link_preview: bool | None = None,
     on_delivery: Callable[[], None] | None = None,
 ) -> bool:
     payload = sanitize_outgoing_text((text or "").strip())
@@ -2213,6 +2250,12 @@ async def send_chat_message(
     if fallback_mention_user_id:
         shown = html.escape((fallback_mention_name or str(fallback_mention_user_id)).strip())
         fallback_prefix_html = f'<a href="tg://user?id={fallback_mention_user_id}">@{shown}</a> '
+
+    link_preview_kwargs = (
+        {"disable_web_page_preview": bool(disable_link_preview)}
+        if disable_link_preview is not None
+        else {}
+    )
 
     async def _safe_send(
         body: str,
@@ -2233,6 +2276,7 @@ async def send_chat_message(
                     text=current_body,
                     parse_mode=current_parse_mode,
                     reply_to_message_id=current_reply_id,
+                    **link_preview_kwargs,
                 )
                 confirm_telegram_delivery(on_delivery)
                 await _schedule_delivered_message_cleanup(

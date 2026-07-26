@@ -13,7 +13,7 @@ from bot.db.engine import (
     _SQLITE_VOTE_BAN_INDEX_SQL,
     init_db,
 )
-from bot.db.models import Base, VoteBanSession
+from bot.db.models import Base, KeywordReply, ScheduledMessage, VoteBanSession
 from bot.utils.timezone import now_shanghai_naive
 
 
@@ -71,6 +71,92 @@ class PerformanceIndexTests(unittest.TestCase):
         for table, index_name in expected.items():
             names = {index["name"] for index in inspector.get_indexes(table)}
             self.assertIn(index_name, names, table)
+
+
+class LinkPreviewMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_keyword_and_scheduled_rows_default_to_disabled_preview(
+        self,
+    ) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            async with session_factory() as session:
+                session.add(
+                    KeywordReply(
+                        group_id=-100,
+                        keyword="legacy-keyword",
+                        reply_text="reply",
+                        disable_link_preview=False,
+                    )
+                )
+                session.add(
+                    ScheduledMessage(
+                        group_id=-100,
+                        text="legacy-scheduled",
+                        disable_link_preview=False,
+                    )
+                )
+                await session.commit()
+            await engine.dispose()
+            engine = None
+
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "ALTER TABLE keyword_replies DROP COLUMN disable_link_preview"
+            )
+            connection.execute(
+                "ALTER TABLE scheduled_messages DROP COLUMN disable_link_preview"
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(f"sqlite+aiosqlite:///{path}")
+            async with session_factory() as session:
+                keyword_info = (
+                    await session.execute(text("PRAGMA table_info(keyword_replies)"))
+                ).all()
+                scheduled_info = (
+                    await session.execute(text("PRAGMA table_info(scheduled_messages)"))
+                ).all()
+                keyword_value = (
+                    await session.execute(
+                        text(
+                            "SELECT disable_link_preview FROM keyword_replies "
+                            "WHERE keyword = 'legacy-keyword'"
+                        )
+                    )
+                ).scalar_one()
+                scheduled_value = (
+                    await session.execute(
+                        text(
+                            "SELECT disable_link_preview FROM scheduled_messages "
+                            "WHERE text = 'legacy-scheduled'"
+                        )
+                    )
+                ).scalar_one()
+
+                keyword_row = next(
+                    row for row in keyword_info if row[1] == "disable_link_preview"
+                )
+                scheduled_row = next(
+                    row for row in scheduled_info if row[1] == "disable_link_preview"
+                )
+                self.assertEqual(keyword_row[3], 1)
+                self.assertEqual(scheduled_row[3], 1)
+                self.assertEqual(str(keyword_row[4]).strip("'\""), "1")
+                self.assertEqual(str(scheduled_row[4]).strip("'\""), "1")
+                self.assertEqual(keyword_value, 1)
+                self.assertEqual(scheduled_value, 1)
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
 
 
 class ForeignKeyMigrationTests(unittest.IsolatedAsyncioTestCase):

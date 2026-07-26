@@ -186,6 +186,7 @@ class BotBehaviorConfig(StrictModel):
     model_config = ConfigDict(extra="forbid")
 
     parse_mode: str = Field(default="HTML", max_length=32)
+    disable_link_preview: bool = True
     # Deprecated compatibility field. Automatic lifecycle operations must
     # never discard Telegram's backlog; keep accepting old payloads while
     # normalizing every read/write to the safe value.
@@ -793,6 +794,7 @@ class RuntimeConfig(StrictModel):
 
         bot = self.bot
         settings.bot.parse_mode = bot.parse_mode
+        settings.bot.disable_link_preview = bot.disable_link_preview
         settings.bot.drop_pending_updates = bot.drop_pending_updates
         settings.bot.inbound_debounce_seconds = bot.inbound_debounce_seconds
         settings.bot.reply_batch_timeout_seconds = bot.reply_batch_timeout_seconds
@@ -1366,6 +1368,10 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
             settings.bot.embed_model = EmbedConfig(**raw_embed)
         if "parse_mode" in bot_data:
             settings.bot.parse_mode = str(bot_data["parse_mode"] or "HTML")
+        if "disable_link_preview" in bot_data:
+            settings.bot.disable_link_preview = bool(
+                bot_data["disable_link_preview"]
+            )
         if "drop_pending_updates" in bot_data:
             settings.bot.drop_pending_updates = bool(bot_data["drop_pending_updates"])
         if "reply_batch_timeout_seconds" in bot_data:
@@ -1478,6 +1484,7 @@ def build_legacy_runtime_config(
         models=model_settings,
         bot=BotBehaviorConfig(
             parse_mode=settings.bot.parse_mode,
+            disable_link_preview=settings.bot.disable_link_preview,
             drop_pending_updates=settings.bot.drop_pending_updates,
             inbound_debounce_seconds=settings.bot_inbound_debounce_seconds,
             reply_batch_timeout_seconds=(

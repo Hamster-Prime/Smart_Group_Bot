@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 WELCOME_SETTINGS_KEY = "welcome_message"
 WELCOME_BUTTONS_SETTINGS_KEY = "welcome_buttons"
+WELCOME_DISABLE_LINK_PREVIEW_SETTINGS_KEY = "welcome_disable_link_preview"
 
 
 def group_welcome_template(group_settings: dict | None) -> str:
@@ -41,6 +42,14 @@ def group_welcome_buttons(group_settings: dict | None) -> list[dict]:
         )
     except ValueError:
         return []
+
+
+def group_welcome_disables_link_preview(group_settings: dict | None) -> bool:
+    if not isinstance(group_settings, dict):
+        return True
+    return bool(
+        group_settings.get(WELCOME_DISABLE_LINK_PREVIEW_SETTINGS_KEY, True)
+    )
 
 
 def render_welcome_text(template: str, *, user_id: int, display_name: str) -> str:
@@ -77,6 +86,7 @@ async def send_group_welcome(
         group_settings = group.settings if group else None
         template = group_welcome_template(group_settings)
         buttons = group_welcome_buttons(group_settings)
+        disable_link_preview = group_welcome_disables_link_preview(group_settings)
         # End the read transaction before the Telegram call so this never
         # holds the SQLite snapshot across network I/O.
         await session.commit()
@@ -107,6 +117,7 @@ async def send_group_welcome(
             formatted_text=text,
             plain_text=plain_text,
             reply_markup=keyboard,
+            disable_link_preview=disable_link_preview,
         )
     except Exception:
         log.warning("welcome send failed | group=%s user=%s", group_id, user_id)
@@ -119,8 +130,10 @@ async def send_group_welcome(
 
 __all__ = [
     "WELCOME_BUTTONS_SETTINGS_KEY",
+    "WELCOME_DISABLE_LINK_PREVIEW_SETTINGS_KEY",
     "WELCOME_SETTINGS_KEY",
     "group_welcome_buttons",
+    "group_welcome_disables_link_preview",
     "group_welcome_template",
     "render_welcome_plain",
     "render_welcome_text",

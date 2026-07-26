@@ -55,7 +55,10 @@
       "api_model_query_http_timeout_sec", "api_model_query_check_timeout_sec",
       "api_model_query_api_key_configured",
     ],
-    onboarding: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
+    onboarding: [
+      "join_verification_enabled", "join_verification_provider", "welcome_message",
+      "welcome_disable_link_preview", "welcome_buttons",
+    ],
     permissions: ["default_permissions"],
     safety: [
       "patrol_enabled", "raid_guard_enabled", "raid_guard_pin_message", "raid_guard_join_threshold",
@@ -112,6 +115,7 @@
     "join_verification_enabled",
     "join_verification_provider",
     "welcome_message",
+    "welcome_disable_link_preview",
     "welcome_buttons",
     "default_permissions",
     "patrol_enabled",
@@ -876,6 +880,7 @@
             ${field("bot.inbound_debounce_seconds", "入站合并窗口（秒）", { type: "number", min: 0, max: 60, step: 0.1, required: true })}
             ${field("bot.reply_batch_timeout_seconds", "单次回复总时限（秒）", { type: "number", min: 5, max: 120, step: 1, required: true, hint: "覆盖决策、工具、生成和投递的总预算" })}
             ${field("bot.auto_delete_seconds", "自动删除（秒）", { type: "number", min: 0, max: 604800, step: 1, required: true, hint: "0 表示不自动删除；作为各类别的默认秒数" })}
+            ${toggle("bot.disable_link_preview", "关闭 AI 回复链接预览", "全局控制 AI 自动回复等 Bot 生成内容的网页预览")}
             ${toggle("bot.enable_typing", "显示输入状态", "生成回复时发送 typing 状态")}
             ${toggle("bot.enable_streaming", "流式编辑消息", "生成期间持续更新 Telegram 消息")}
             ${field("bot.stream_chunk_size", "流式首段字符数", { type: "number", min: 8, max: 4096, step: 1, required: true })}
@@ -1135,6 +1140,7 @@
         ? settings.join_verification_provider
         : null,
       welcome_message: String(settings.welcome_message || ""),
+      welcome_disable_link_preview: settings.welcome_disable_link_preview !== false,
       welcome_buttons: normalizeTemplateButtons(settings.welcome_buttons),
       default_permissions: normalizeDefaultPermissions(settings.default_permissions),
       patrol_enabled: settings.patrol_enabled == null ? null : Boolean(settings.patrol_enabled),
@@ -1651,8 +1657,11 @@
               title: "入群与欢迎",
               description: "新成员验证、欢迎语与内联按钮",
               iconName: "users",
-              itemLabel: "4 项",
-              settingKeys: ["join_verification_enabled", "join_verification_provider", "welcome_message", "welcome_buttons"],
+              itemLabel: "5 项",
+              settingKeys: [
+                "join_verification_enabled", "join_verification_provider", "welcome_message",
+                "welcome_disable_link_preview", "welcome_buttons",
+              ],
               content: `
                 <div class="group-settings-grid">
                   <div class="field">
@@ -1678,6 +1687,7 @@
                     <textarea id="group-${attr(group.id)}-welcome" data-group-id="${attr(group.id)}" data-group-key="welcome_message" data-kind="string" maxlength="4000" placeholder="留空不发送欢迎语；支持换行和 Markdown；{name} 为名称，{mention} 为可点击提及"${saving ? " disabled" : ""}>${escapeHtml(group.settings.welcome_message)}</textarea>
                     <span class="field-hint">开启入群验证时在验证通过后发送；支持 **粗体**、*斜体*、[文字](链接) 等 Markdown</span>
                   </div>
+                  ${groupToggle(group, "welcome_disable_link_preview", "关闭欢迎语链接预览", "开启后不生成网页链接预览卡片", saving)}
                   <div class="field welcome-buttons">
                     <label class="field-label" for="group-${attr(group.id)}-welcome-buttons">欢迎语内联按钮</label>
                     <textarea id="group-${attr(group.id)}-welcome-buttons" data-template-buttons data-group-id="${attr(group.id)}" data-group-key="welcome_buttons" maxlength="30000" placeholder="每行：按钮名 | 操作 | 内容 | 行号 | 颜色（可选）&#10;官网 | url | https://example.com | 1 | primary&#10;复制群规 | copy | 群规文本 | 1 | success&#10;管理员删除 | dismiss | | 2 | danger"${saving ? " disabled" : ""}>${escapeHtml(groupTemplateButtonsText(group))}</textarea>
@@ -1973,6 +1983,7 @@
         <textarea name="buttons_text" maxlength="30000" rows="2" aria-label="内联按钮" placeholder="按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；内容中 | 写成 \\|">${escapeHtml(templateButtonsToText(item.buttons))}</textarea>
         <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
         <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
+        <label class="compact-check"><input name="disable_link_preview" type="checkbox"${item.disable_link_preview !== false ? " checked" : ""}><span>关闭链接预览</span></label>
         <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled !== false ? " checked" : ""}><span>启用</span></label>
         <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="keyword-replies" data-resource-id="${attr(item.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
       </form>`;
@@ -1997,6 +2008,7 @@
         <label class="compact-check"><input name="pin_message" type="checkbox"${item.pin_message ? " checked" : ""}><span>置顶</span></label>
         <label class="compact-check"><input name="unpin_previous" type="checkbox"${item.unpin_previous ? " checked" : ""}><span>取消上次置顶</span></label>
         <label class="compact-check"><input name="auto_delete" type="checkbox"${item.auto_delete ? " checked" : ""}><span>自动删除</span></label>
+        <label class="compact-check"><input name="disable_link_preview" type="checkbox"${item.disable_link_preview !== false ? " checked" : ""}><span>关闭链接预览</span></label>
         <label class="compact-check"><input name="enabled" type="checkbox"${item.enabled !== false ? " checked" : ""}><span>启用</span></label>
         <button class="mini-icon-button danger" type="button" data-action="delete-group-resource" data-group-id="${attr(group.id)}" data-resource-type="scheduled-messages" data-resource-id="${attr(item.id)}" aria-label="${pendingCreate ? "移除待新增项" : "标记删除"}" title="${pendingCreate ? "移除待新增项" : "标记删除"}">${icon("trash-2")}</button>
       </form>`;
@@ -2089,6 +2101,7 @@
           <textarea name="buttons_text" maxlength="30000" rows="2" placeholder="可选内联按钮：按钮名 | url/copy/share/dismiss | 内容 | 行号 | primary/success/danger（可选）；| 写成 \\|" aria-label="内联按钮"></textarea>
           <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
           <label class="compact-check"><input name="auto_delete" type="checkbox" checked><span>自动删除</span></label>
+          <label class="compact-check"><input name="disable_link_preview" type="checkbox" checked><span>关闭链接预览</span></label>
           <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
         </form>
         <p class="field-hint">命中后跳过 AI；内容支持 Markdown。${templateButtonStyleLegend()}</p>
@@ -2105,6 +2118,7 @@
           <input name="interval_minutes" type="number" min="5" max="10080" step="1" value="60" aria-label="间隔分钟" title="固定间隔的分钟数" required>
           <label class="compact-check"><input name="pin_message" type="checkbox"><span>置顶</span></label>
           <label class="compact-check"><input name="auto_delete" type="checkbox"><span>自动删除</span></label>
+          <label class="compact-check"><input name="disable_link_preview" type="checkbox" checked><span>关闭链接预览</span></label>
           <button class="secondary-button resource-stage-button" type="submit">${icon("plus")}加入待保存列表</button>
         </form>
         <p class="field-hint">每天定时按 Asia/Shanghai 时间触发；固定间隔最短 5 分钟。</p>
@@ -2587,6 +2601,9 @@
     if (state.config?.bot && (typeof state.config.bot.auto_delete_category_seconds !== "object" || state.config.bot.auto_delete_category_seconds == null)) {
       state.config.bot.auto_delete_category_seconds = {};
     }
+    if (state.config?.bot && state.config.bot.disable_link_preview == null) {
+      state.config.bot.disable_link_preview = true;
+    }
     if (state.config?.verification) {
       state.config.verification.provider ||= "turnstile";
       state.config.verification.hcaptcha_site_key ||= "";
@@ -3014,6 +3031,7 @@
         buttons: parseTemplateButtonsText(snapshotField(snapshot, "buttons_text")),
         pin_message: Boolean(snapshotField(snapshot, "pin_message", false)),
         auto_delete: Boolean(snapshotField(snapshot, "auto_delete", true)),
+        disable_link_preview: Boolean(snapshotField(snapshot, "disable_link_preview", true)),
       };
       if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
       if (!values.keyword) throw new Error("关键词不能为空");
@@ -3033,6 +3051,7 @@
         pin_message: Boolean(snapshotField(snapshot, "pin_message", false)),
         unpin_previous: Boolean(snapshotField(snapshot, "unpin_previous", false)),
         auto_delete: Boolean(snapshotField(snapshot, "auto_delete", false)),
+        disable_link_preview: Boolean(snapshotField(snapshot, "disable_link_preview", true)),
       };
       if (includeEnabled) values.enabled = Boolean(snapshotField(snapshot, "enabled", true));
       if (!values.text) throw new Error("定时消息内容不能为空");
@@ -3951,12 +3970,12 @@
   const ENTRY_FORM_FIELDS = {
     "keyword-replies": {
       strings: ["keyword", "match_type", "reply_text"],
-      booleans: ["pin_message", "auto_delete", "enabled"],
+      booleans: ["pin_message", "auto_delete", "disable_link_preview", "enabled"],
       numbers: [],
     },
     "scheduled-messages": {
       strings: ["text", "schedule_type", "schedule_time"],
-      booleans: ["pin_message", "unpin_previous", "auto_delete", "enabled"],
+      booleans: ["pin_message", "unpin_previous", "auto_delete", "disable_link_preview", "enabled"],
       numbers: ["interval_minutes"],
     },
   };
@@ -4006,6 +4025,7 @@
       buttons: clone(values.buttons || []),
       pin_message: Boolean(values.pin_message),
       auto_delete: values.auto_delete !== false,
+      disable_link_preview: values.disable_link_preview !== false,
       enabled: values.enabled !== false,
     };
     if (type === "scheduled-messages") return {
@@ -4018,6 +4038,7 @@
       pin_message: Boolean(values.pin_message),
       unpin_previous: Boolean(values.unpin_previous),
       auto_delete: Boolean(values.auto_delete),
+      disable_link_preview: values.disable_link_preview !== false,
       enabled: values.enabled !== false,
     };
     if (type === "rules") return {
