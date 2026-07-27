@@ -95,6 +95,10 @@ class ChatRoleConfig(StrictModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, allow_inf_nan=False)
     max_tokens: int = Field(default=2048, ge=1, le=2_000_000)
     timeout_sec: float = Field(default=12.0, ge=1.0, le=600.0, allow_inf_nan=False)
+    # 单次调用（含同模型重试与整条回退链）的总时限；0 = 使用内置默认。
+    total_deadline_sec: float = Field(
+        default=0.0, ge=0.0, le=3600.0, allow_inf_nan=False
+    )
     reasoning_effort: Literal["", "none", "minimal", "low", "medium", "high"] = ""
 
     @field_validator("provider", mode="before")
@@ -118,6 +122,10 @@ class EmbedRoleConfig(StrictModel):
     model: str = Field(default="text-embedding-004", min_length=1, max_length=255)
     fallbacks: list[ModelFallbackConfig] = Field(default_factory=list)
     timeout_sec: float = Field(default=10.0, ge=1.0, le=600.0, allow_inf_nan=False)
+    # 单次调用（含同模型重试与整条回退链）的总时限；0 = 使用内置默认。
+    total_deadline_sec: float = Field(
+        default=0.0, ge=0.0, le=3600.0, allow_inf_nan=False
+    )
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -735,6 +743,7 @@ class RuntimeConfig(StrictModel):
             temperature=main.temperature,
             max_tokens=main.max_tokens,
             timeout_sec=main.timeout_sec,
+            total_deadline_sec=main.total_deadline_sec,
             fallback_spec=self._fallback_spec(main.fallbacks),
             reasoning_effort=main.reasoning_effort,
             **common_retry,
@@ -746,6 +755,7 @@ class RuntimeConfig(StrictModel):
             temperature=models.vision.temperature,
             max_tokens=models.vision.max_tokens,
             timeout_sec=models.vision.timeout_sec,
+            total_deadline_sec=models.vision.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.vision.fallbacks),
             reasoning_effort=models.vision.reasoning_effort,
             **common_retry,
@@ -757,6 +767,7 @@ class RuntimeConfig(StrictModel):
             temperature=models.decision.temperature,
             max_tokens=models.decision.max_tokens,
             timeout_sec=models.decision.timeout_sec,
+            total_deadline_sec=models.decision.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.decision.fallbacks),
             reasoning_effort=models.decision.reasoning_effort,
             **common_retry,
@@ -768,6 +779,7 @@ class RuntimeConfig(StrictModel):
             temperature=models.moderation.temperature,
             max_tokens=models.moderation.max_tokens,
             timeout_sec=models.moderation.timeout_sec,
+            total_deadline_sec=models.moderation.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.moderation.fallbacks),
             reasoning_effort=models.moderation.reasoning_effort,
             **common_retry,
@@ -779,6 +791,7 @@ class RuntimeConfig(StrictModel):
             temperature=models.compress.temperature,
             max_tokens=models.compress.max_tokens,
             timeout_sec=models.compress.timeout_sec,
+            total_deadline_sec=models.compress.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.compress.fallbacks),
             reasoning_effort=models.compress.reasoning_effort,
             **common_retry,
@@ -788,6 +801,7 @@ class RuntimeConfig(StrictModel):
             provider_name=embed_provider,
             model_name=models.embed.model,
             timeout_sec=models.embed.timeout_sec,
+            total_deadline_sec=models.embed.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.embed.fallbacks),
             **common_retry,
         )
@@ -1431,6 +1445,7 @@ def build_legacy_runtime_config(
             temperature=settings.bot.main_model.temperature,
             max_tokens=max(1, settings.max_output_tokens),
             timeout_sec=settings.main_timeout_sec,
+            total_deadline_sec=max(0.0, settings.main_total_deadline_sec),
             reasoning_effort=settings.main_reasoning_effort,
         ),
         vision=ChatRoleConfig(
@@ -1440,6 +1455,7 @@ def build_legacy_runtime_config(
             temperature=settings.bot.vision_model.temperature,
             max_tokens=settings.bot.vision_model.max_tokens,
             timeout_sec=settings.vision_timeout_sec,
+            total_deadline_sec=max(0.0, settings.vision_total_deadline_sec),
             reasoning_effort=settings.vision_reasoning_effort,
         ),
         decision=ChatRoleConfig(
@@ -1449,6 +1465,7 @@ def build_legacy_runtime_config(
             temperature=settings.bot.decision_model.temperature,
             max_tokens=settings.bot.decision_model.max_tokens,
             timeout_sec=settings.decision_timeout_sec,
+            total_deadline_sec=max(0.0, settings.decision_total_deadline_sec),
             reasoning_effort=settings.decision_reasoning_effort,
         ),
         moderation=ChatRoleConfig(
@@ -1458,6 +1475,7 @@ def build_legacy_runtime_config(
             temperature=settings.bot.moderation_model.temperature,
             max_tokens=settings.bot.moderation_model.max_tokens,
             timeout_sec=settings.moderation_timeout_sec,
+            total_deadline_sec=max(0.0, settings.moderation_total_deadline_sec),
             reasoning_effort=settings.moderation_reasoning_effort,
         ),
         compress=ChatRoleConfig(
@@ -1467,6 +1485,7 @@ def build_legacy_runtime_config(
             temperature=settings.bot.compress_model.temperature,
             max_tokens=settings.bot.compress_model.max_tokens,
             timeout_sec=settings.compress_timeout_sec,
+            total_deadline_sec=max(0.0, settings.compress_total_deadline_sec),
             reasoning_effort=settings.compress_reasoning_effort,
         ),
         embed=EmbedRoleConfig(
@@ -1474,6 +1493,7 @@ def build_legacy_runtime_config(
             model=settings.embed_model.strip() or "text-embedding-004",
             fallbacks=_legacy_fallbacks(settings.embed_fallbacks),
             timeout_sec=settings.embed_timeout_sec,
+            total_deadline_sec=max(0.0, settings.embed_total_deadline_sec),
         ),
         retry_attempts=settings.llm_retry_attempts,
         retry_backoff_sec=settings.llm_retry_backoff_sec,

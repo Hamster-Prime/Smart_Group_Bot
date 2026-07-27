@@ -81,6 +81,28 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         for style in ("primary", "success", "danger"):
             self.assertIn(f".template-button-style-swatch.{style}", styles)
 
+    def test_role_cards_expose_total_deadline_with_builtin_defaults(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'field(`models.${roleName}.total_deadline_sec`, "总时限（秒）"',
+            source,
+        )
+        self.assertIn("0 使用内置默认（${meta.deadlineDefault} 秒）", source)
+        # Per-role hints must mirror _LLM_STAGE_DEADLINES in bot/services/llm.py.
+        for role, deadline in (
+            ("main", 120),
+            ("vision", 90),
+            ("decision", 35),
+            ("moderation", 35),
+            ("compress", 90),
+            ("embed", 60),
+        ):
+            self.assertRegex(
+                source,
+                rf"{role}: \{{[^}}]*deadlineDefault: {deadline}[^}}]*\}}",
+            )
+
     def test_group_settings_are_split_into_collapsible_categories(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
         section_keys = (

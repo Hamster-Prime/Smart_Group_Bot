@@ -52,6 +52,9 @@ class ChatEndpointConfig(BaseModel):
     retry_attempts: int = 2
     retry_backoff_sec: float = 0.8
     retry_timeout_multiplier: float = 1.35
+    # Total wall-clock budget across all attempts and fallbacks for one call.
+    # 0 = use the built-in per-stage default.
+    total_deadline_sec: float = 0.0
     # "" = do not send the param; none/minimal/low/medium/high are forwarded.
     reasoning_effort: str = ""
 
@@ -70,6 +73,9 @@ class EmbedEndpointConfig(BaseModel):
     retry_attempts: int = 2
     retry_backoff_sec: float = 0.8
     retry_timeout_multiplier: float = 1.25
+    # Total wall-clock budget across all attempts and fallbacks for one call.
+    # 0 = use the built-in per-stage default.
+    total_deadline_sec: float = 0.0
 
 
 class EmbedConfig(EmbedEndpointConfig):
@@ -173,36 +179,43 @@ class Settings(BaseSettings):
     main_model: str = "gemini-2.0-flash"
     main_fallbacks: str = ""
     main_timeout_sec: float = 12.0
+    # Total budget across all attempts and fallbacks; 0 = built-in default.
+    main_total_deadline_sec: float = 0.0
     main_reasoning_effort: str = "low"
 
     vision_provider_name: str = ""
     vision_model: str = ""
     vision_fallbacks: str = ""
     vision_timeout_sec: float = 15.0
+    vision_total_deadline_sec: float = 0.0
     vision_reasoning_effort: str = "none"
 
     decision_provider_name: str = ""
     decision_model: str = ""
     decision_fallbacks: str = ""
     decision_timeout_sec: float = 6.0
+    decision_total_deadline_sec: float = 0.0
     decision_reasoning_effort: str = "none"
 
     moderation_provider_name: str = ""
     moderation_model: str = ""
     moderation_fallbacks: str = ""
     moderation_timeout_sec: float = 8.0
+    moderation_total_deadline_sec: float = 0.0
     moderation_reasoning_effort: str = "none"
 
     compress_provider_name: str = ""
     compress_model: str = ""
     compress_fallbacks: str = ""
     compress_timeout_sec: float = 12.0
+    compress_total_deadline_sec: float = 0.0
     compress_reasoning_effort: str = "none"
 
     embed_provider_name: str = ""
     embed_model: str = "text-embedding-004"
     embed_fallbacks: str = ""
     embed_timeout_sec: float = 10.0
+    embed_total_deadline_sec: float = 0.0
     llm_retry_attempts: int = 2
     llm_retry_backoff_sec: float = 0.8
     llm_retry_timeout_multiplier: float = 1.35
@@ -611,6 +624,7 @@ def _build_chat_config(
     retry_timeout_multiplier: float,
     fallback_spec: str,
     reasoning_effort: str = "",
+    total_deadline_sec: float = 0.0,
 ) -> ModelConfig:
     if not provider_name:
         raise ValueError("provider name is required")
@@ -633,6 +647,7 @@ def _build_chat_config(
         retry_attempts=retry_attempts,
         retry_backoff_sec=retry_backoff_sec,
         retry_timeout_multiplier=retry_timeout_multiplier,
+        total_deadline_sec=max(0.0, total_deadline_sec),
         reasoning_effort=effort,
         fallbacks=[],
     )
@@ -658,6 +673,7 @@ def _build_chat_config(
                 retry_attempts=retry_attempts,
                 retry_backoff_sec=retry_backoff_sec,
                 retry_timeout_multiplier=retry_timeout_multiplier,
+                total_deadline_sec=max(0.0, total_deadline_sec),
                 reasoning_effort=effort,
             )
         )
@@ -674,6 +690,7 @@ def _build_embed_config(
     retry_backoff_sec: float,
     retry_timeout_multiplier: float,
     fallback_spec: str,
+    total_deadline_sec: float = 0.0,
 ) -> EmbedConfig:
     if not provider_name:
         raise ValueError("provider name is required")
@@ -691,6 +708,7 @@ def _build_embed_config(
         retry_attempts=retry_attempts,
         retry_backoff_sec=retry_backoff_sec,
         retry_timeout_multiplier=retry_timeout_multiplier,
+        total_deadline_sec=max(0.0, total_deadline_sec),
         fallbacks=[],
     )
 
@@ -711,6 +729,7 @@ def _build_embed_config(
                 retry_attempts=retry_attempts,
                 retry_backoff_sec=retry_backoff_sec,
                 retry_timeout_multiplier=retry_timeout_multiplier,
+                total_deadline_sec=max(0.0, total_deadline_sec),
             )
         )
     return cfg
@@ -893,6 +912,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.main_total_deadline_sec)),
         fallback_spec=settings.main_fallbacks,
         reasoning_effort=settings.main_reasoning_effort,
     )
@@ -906,6 +926,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.vision_total_deadline_sec)),
         fallback_spec=settings.vision_fallbacks,
         reasoning_effort=settings.vision_reasoning_effort,
     )
@@ -919,6 +940,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.decision_total_deadline_sec)),
         fallback_spec=settings.decision_fallbacks,
         reasoning_effort=settings.decision_reasoning_effort,
     )
@@ -932,6 +954,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.moderation_total_deadline_sec)),
         fallback_spec=settings.moderation_fallbacks,
         reasoning_effort=settings.moderation_reasoning_effort,
     )
@@ -945,6 +968,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.compress_total_deadline_sec)),
         fallback_spec=settings.compress_fallbacks,
         reasoning_effort=settings.compress_reasoning_effort,
     )
@@ -956,6 +980,7 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_attempts=max(1, int(settings.llm_retry_attempts)),
         retry_backoff_sec=max(0.0, float(settings.llm_retry_backoff_sec)),
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
+        total_deadline_sec=max(0.0, float(settings.embed_total_deadline_sec)),
         fallback_spec=settings.embed_fallbacks,
     )
 

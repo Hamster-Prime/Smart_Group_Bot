@@ -86,12 +86,12 @@
   };
 
   const ROLE_META = {
-    main: { label: "主模型", icon: "message-square", parent: "", embed: false },
-    vision: { label: "视觉模型", icon: "scan-eye", parent: "继承主模型", embed: false },
-    decision: { label: "决策模型", icon: "route", parent: "继承主模型", embed: false },
-    moderation: { label: "审核模型", icon: "shield-alert", parent: "继承决策模型", embed: false },
-    compress: { label: "压缩模型", icon: "minimize-2", parent: "继承主模型", embed: false },
-    embed: { label: "向量模型", icon: "binary", parent: "继承主模型", embed: true },
+    main: { label: "主模型", icon: "message-square", parent: "", embed: false, deadlineDefault: 120 },
+    vision: { label: "视觉模型", icon: "scan-eye", parent: "继承主模型", embed: false, deadlineDefault: 90 },
+    decision: { label: "决策模型", icon: "route", parent: "继承主模型", embed: false, deadlineDefault: 35 },
+    moderation: { label: "审核模型", icon: "shield-alert", parent: "继承决策模型", embed: false, deadlineDefault: 35 },
+    compress: { label: "压缩模型", icon: "minimize-2", parent: "继承主模型", embed: false, deadlineDefault: 90 },
+    embed: { label: "向量模型", icon: "binary", parent: "继承主模型", embed: true, deadlineDefault: 60 },
   };
 
   const PROMPT_META = {
@@ -793,6 +793,7 @@
               <input id="role-model-${roleName}" type="text" value="${attr(role.model)}" data-path="models.${roleName}.model" data-kind="string" maxlength="255"${roleName === "main" || meta.embed ? " required" : ""} placeholder="${allowInherit && !meta.embed ? "留空继承上级模型" : "模型标识"}" autocomplete="off">
             </div>
             ${field(`models.${roleName}.timeout_sec`, "超时（秒）", { type: "number", min: 1, max: 600, step: 0.1, required: true })}
+            ${field(`models.${roleName}.total_deadline_sec`, "总时限（秒）", { type: "number", min: 0, max: 3600, step: 0.1, required: true, hint: `含重试与回退链的整体预算，0 使用内置默认（${meta.deadlineDefault} 秒）` })}
             ${meta.embed ? "" : field(`models.${roleName}.temperature`, "Temperature", { type: "number", min: 0, max: 2, step: 0.05, required: true })}
             ${meta.embed ? "" : field(`models.${roleName}.max_tokens`, "最大输出 Token", { type: "number", min: 1, max: 2000000, step: 1, required: true })}
             ${meta.embed ? "" : field(`models.${roleName}.reasoning_effort`, "推理强度", {

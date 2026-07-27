@@ -582,6 +582,7 @@ class LLMService:
                 retry_attempts=cfg.retry_attempts,
                 retry_backoff_sec=cfg.retry_backoff_sec,
                 retry_timeout_multiplier=cfg.retry_timeout_multiplier,
+                total_deadline_sec=getattr(cfg, "total_deadline_sec", 0.0),
                 reasoning_effort=getattr(cfg, "reasoning_effort", ""),
             ),
             *cfg.fallbacks,
@@ -601,6 +602,7 @@ class LLMService:
                 retry_attempts=cfg.retry_attempts,
                 retry_backoff_sec=cfg.retry_backoff_sec,
                 retry_timeout_multiplier=cfg.retry_timeout_multiplier,
+                total_deadline_sec=getattr(cfg, "total_deadline_sec", 0.0),
             ),
             *cfg.fallbacks,
         ]
@@ -1598,7 +1600,15 @@ class LLMService:
         )
 
     @staticmethod
-    def _stage_deadline_seconds(label: str) -> float:
+    def _stage_deadline_seconds(
+        label: str,
+        cfg: ChatEndpointConfig | EmbedEndpointConfig | None = None,
+    ) -> float:
+        # A per-role total_deadline_sec (settings/Mini App) overrides the
+        # built-in stage default; 0/unset keeps the default.
+        override = float(getattr(cfg, "total_deadline_sec", 0.0) or 0.0)
+        if override > 0:
+            return override
         return _LLM_STAGE_DEADLINES.get(label, 120.0)
 
     @staticmethod
@@ -2212,7 +2222,11 @@ class LLMService:
     ) -> str:
         total = len(candidates)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._stage_deadline_seconds(label)
+        deadline_sec = self._stage_deadline_seconds(
+            label,
+            candidates[0] if candidates else None,
+        )
+        deadline = loop.time() + deadline_sec
         for idx, cfg in enumerate(candidates, start=1):
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -2230,7 +2244,7 @@ class LLMService:
                 log.error(
                     "LLM total deadline exceeded | stage=%s deadline=%.1fs",
                     self._label_cn(label),
-                    self._stage_deadline_seconds(label),
+                    deadline_sec,
                 )
                 return ""
             if resp is not None:
@@ -2257,7 +2271,11 @@ class LLMService:
         candidates = self._chat_candidates(cfg or self.main)
         total = len(candidates)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._stage_deadline_seconds(label)
+        deadline_sec = self._stage_deadline_seconds(
+            label,
+            candidates[0] if candidates else None,
+        )
+        deadline = loop.time() + deadline_sec
         for idx, candidate in enumerate(candidates, start=1):
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -2276,7 +2294,7 @@ class LLMService:
                 log.error(
                     "LLM tool total deadline exceeded | stage=%s deadline=%.1fs",
                     self._label_cn(label),
-                    self._stage_deadline_seconds(label),
+                    deadline_sec,
                 )
                 return None
             if resp is not None:
@@ -2382,7 +2400,10 @@ class LLMService:
         candidates = self._embed_candidates(self.embed_config)
         total = len(candidates)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._stage_deadline_seconds("embed")
+        deadline = loop.time() + self._stage_deadline_seconds(
+            "embed",
+            candidates[0] if candidates else None,
+        )
         for idx, cfg in enumerate(candidates, start=1):
             if self._circuit_is_open(cfg, stage="embed"):
                 log.warning(

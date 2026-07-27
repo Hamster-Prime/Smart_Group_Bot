@@ -155,6 +155,65 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(imported.bot.disable_link_preview)
 
+    async def test_role_total_deadline_save_apply_and_persist(self) -> None:
+        self.assertEqual(self.manager.config.models.moderation.total_deadline_sec, 0.0)
+        self.assertEqual(self.settings.bot.moderation_model.total_deadline_sec, 0.0)
+
+        payload = self.manager.config.public_payload()
+        payload["models"]["moderation"]["total_deadline_sec"] = 90.0
+        payload["models"]["embed"]["total_deadline_sec"] = 40.0
+
+        await self.manager.save(payload, expected_revision=1, updated_by=42)
+
+        self.assertEqual(self.manager.config.models.moderation.total_deadline_sec, 90.0)
+        self.assertEqual(self.settings.bot.moderation_model.total_deadline_sec, 90.0)
+        self.assertEqual(self.settings.bot.embed_model.total_deadline_sec, 40.0)
+        # 未覆盖的角色维持 0（使用内置默认）。
+        self.assertEqual(self.settings.bot.main_model.total_deadline_sec, 0.0)
+        async with self.session_factory() as session:
+            row = await session.get(RuntimeConfigRecord, 1)
+            self.assertEqual(
+                row.payload["models"]["moderation"]["total_deadline_sec"], 90.0
+            )
+
+    async def test_role_total_deadline_rejects_out_of_range_values(self) -> None:
+        from pydantic import ValidationError
+
+        for bad in (-1.0, 3601.0):
+            payload = self.manager.config.public_payload()
+            payload["models"]["moderation"]["total_deadline_sec"] = bad
+            with self.assertRaises(ValidationError):
+                await self.manager.save(payload, expected_revision=1, updated_by=42)
+
+    async def test_stored_document_without_total_deadline_loads_as_zero(self) -> None:
+        # 升级兼容：数据库里已有的旧文档没有 total_deadline_sec 字段，
+        # 加载后必须回落到 0（即内置默认），不能校验失败。
+        payload = self.manager.config.public_payload()
+        for role in ("main", "vision", "decision", "moderation", "compress", "embed"):
+            payload["models"][role].pop("total_deadline_sec", None)
+
+        from bot.services.runtime_config import RuntimeConfig
+
+        loaded = RuntimeConfig.model_validate(payload)
+        self.assertEqual(loaded.models.moderation.total_deadline_sec, 0.0)
+        self.assertEqual(loaded.models.embed.total_deadline_sec, 0.0)
+
+    async def test_legacy_env_total_deadline_is_imported(self) -> None:
+        legacy = Settings(
+            _env_file=None,
+            moderation_total_deadline_sec=55.0,
+            embed_total_deadline_sec=45.0,
+        )
+        imported = build_legacy_runtime_config(
+            "/tmp/nonexistent-smart-group-bot.toml",
+            settings=legacy,
+            raw_env={},
+        )
+
+        self.assertEqual(imported.models.moderation.total_deadline_sec, 55.0)
+        self.assertEqual(imported.models.embed.total_deadline_sec, 45.0)
+        self.assertEqual(imported.models.main.total_deadline_sec, 0.0)
+
     async def test_activity_pin_settings_save_apply_and_stay_strict(self) -> None:
         payload = self.manager.config.public_payload()
         payload["raid_guard"]["pin_message"] = False
