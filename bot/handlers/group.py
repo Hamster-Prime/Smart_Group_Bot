@@ -112,7 +112,6 @@ from bot.services.join_verification import (
 )
 from bot.services.join_screening import (
     is_globally_banned,
-    is_join_screening_exempt,
     moderation_rules_fingerprint,
 )
 from bot.services.bot_screening import (
@@ -431,9 +430,6 @@ async def _claim_current_moderation_verdict(
         await session.rollback()
         return False
     if not await is_group_authorized(session, int(group_id)):
-        await session.rollback()
-        return False
-    if await is_join_screening_exempt(session, int(user_id)):
         await session.rollback()
         return False
     if await session.scalar(

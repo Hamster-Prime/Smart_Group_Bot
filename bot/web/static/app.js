@@ -31,7 +31,7 @@
     { id: "media", label: "媒体能力", icon: "audio-waveform", subtitle: "语音、音乐、AV 与贴纸", group: "Bot 能力" },
     { id: "integrations", label: "外部服务", icon: "plug", subtitle: "影片信息服务接入", group: "Bot 能力" },
     { id: "groups", label: "群组设置", icon: "users", subtitle: "逐群行为、群规与自动化", group: "群组管理" },
-    { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局封禁", group: "群组管理" },
+    { id: "access", label: "权限封禁", icon: "shield-ban", subtitle: "群授权、管理员与全局名单", group: "群组管理" },
     { id: "logging", label: "日志", icon: "scroll-text", subtitle: "运行日志与文件轮转", group: "系统" },
   ];
 
@@ -231,6 +231,10 @@
     access: null,
     accessLoadToken: null,
     accessAdminGroup: null,
+    accessSearches: {
+      "global-bans": "",
+      "global-exemptions": "",
+    },
     promptKey: "decision",
     listPages: new Map(),
     groupSearch: "",
@@ -2214,33 +2218,103 @@
       </div>`;
   }
 
-  function renderAccess() {
-    const access = state.access;
-    if (!access) return `
-      ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。")}
-      <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
-    if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
-    if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
-    const removeLabel = type => ({
+  function accessRemoveLabel(type) {
+    return ({
       "authorized-groups": "取消授权",
       admins: "移除管理员",
       "global-bans": "立即解封",
+      "global-exemptions": "取消豁免",
     })[type] || "移除";
-    const rows = (items, type, label, idKey = "user_id", emptyText) => paginatedRows(items, `access:${type}`, item => {
+  }
+
+  function accessRows(items, type, label, idKey = "user_id", emptyText) {
+    return paginatedRows(items, `access:${type}`, item => {
       const resourceId = type === "admins"
         ? `${item.group_id}:${item.user_id}`
         : item[idKey];
       return `
       <div class="resource-row"><span>${escapeHtml(label(item))}</span>
-      <button class="text-button danger immediate-action" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}">${removeLabel(type)}</button></div>`;
+      <button class="text-button danger immediate-action" type="button" data-action="delete-access" data-access-type="${type}" data-access-id="${attr(resourceId)}">${accessRemoveLabel(type)}</button></div>`;
     }, emptyText);
+  }
+
+  function filteredGlobalAccessItems(type) {
+    const property = type === "global-bans" ? "global_bans" : "global_exemptions";
+    const items = state.access?.[property] || [];
+    const query = String(state.accessSearches[type] || "").trim().toLowerCase();
+    if (!query) return items;
+    return items.filter(item => {
+      const searchable = type === "global-bans"
+        ? `${item.user_id} ${item.reason || ""} ${item.source || ""}`
+        : String(item.user_id);
+      return searchable.toLowerCase().includes(query);
+    });
+  }
+
+  function globalAccessRows(type) {
+    const query = String(state.accessSearches[type] || "").trim();
+    const items = filteredGlobalAccessItems(type);
+    if (type === "global-bans") {
+      return accessRows(
+        items,
+        type,
+        item => `${item.user_id} · ${item.reason || "手动封禁"}`,
+        "user_id",
+        query ? "未找到匹配的全局封禁记录" : "暂无全局封禁记录",
+      );
+    }
+    return accessRows(
+      items,
+      type,
+      item => item.created_by
+        ? `${item.user_id} · 操作人 ${item.created_by}`
+        : `${item.user_id}`,
+      "user_id",
+      query ? "未找到匹配的全局豁免记录" : "暂无全局豁免记录",
+    );
+  }
+
+  function globalAccessSearch(type, placeholder, ariaLabel) {
+    const total = type === "global-bans"
+      ? (state.access?.global_bans || []).length
+      : (state.access?.global_exemptions || []).length;
+    const matched = filteredGlobalAccessItems(type).length;
+    return `
+      <div class="access-list-toolbar">
+        <div class="search-wrap">${icon("search")}<input class="search-input" type="search" data-access-search="${type}" placeholder="${attr(placeholder)}" aria-label="${attr(ariaLabel)}" autocomplete="off" value="${attr(state.accessSearches[type] || "")}"></div>
+        <span class="badge info" data-access-search-count="${type}">${matched === total ? `${total} 条` : `${matched} / ${total} 条`}</span>
+      </div>
+      <div data-access-list="${type}">${globalAccessRows(type)}</div>`;
+  }
+
+  function refreshGlobalAccessList(type) {
+    const list = content.querySelector(`[data-access-list="${CSS.escape(type)}"]`);
+    if (list) list.innerHTML = globalAccessRows(type);
+    const count = content.querySelector(`[data-access-search-count="${CSS.escape(type)}"]`);
+    if (count) {
+      const total = type === "global-bans"
+        ? (state.access?.global_bans || []).length
+        : (state.access?.global_exemptions || []).length;
+      const matched = filteredGlobalAccessItems(type).length;
+      count.textContent = matched === total ? `${total} 条` : `${matched} / ${total} 条`;
+    }
+    refreshIcons();
+  }
+
+  function renderAccess() {
+    const access = state.access;
+    if (!access) return `
+      ${pageHead("权限与封禁", "管理授权群、群管理员和全局名单。")}
+      <button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}加载数据</button>`;
+    if (access.loading) return `<div class="loading-state"><span class="spinner"></span><p>正在加载权限数据</p></div>`;
+    if (access.error) return `${pageHead("权限与封禁", "管理授权群、群管理员和全局名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}重试</button>`)}<div class="notice danger">${icon("circle-x")}<span>${escapeHtml(access.error)}</span></div>`;
     const authGroups = access.authorized_groups || [];
     const adminGroupId = authGroups.some(group => String(group.group_id) === String(state.accessAdminGroup))
       ? String(state.accessAdminGroup)
       : String(authGroups[0]?.group_id ?? "");
     const groupAdmins = access.admins.filter(admin => String(admin.group_id) === adminGroupId);
     return `
-      ${pageHead("权限与封禁", "管理授权群、群管理员和全局封禁名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
+      ${pageHead("权限与封禁", "管理授权群、群管理员和全局名单。", `<button class="secondary-button" type="button" data-action="load-access">${icon("refresh-cw")}刷新</button>`)}
       <div class="resource-grid access-grid">
         <section class="settings-section">
          ${sectionHead("授权群组")}
@@ -2249,7 +2323,7 @@
             <input name="title" maxlength="255" placeholder="群名称（可选）" aria-label="群名称（可选）">
             <button class="secondary-button" type="submit">${icon("shield-check")}立即授权</button>
           </form>
-          ${rows(access.authorized_groups, "authorized-groups", item => `${item.title || "未命名群组"} · ${item.group_id}`, "group_id")}
+          ${accessRows(access.authorized_groups, "authorized-groups", item => `${item.title || "未命名群组"} · ${item.group_id}`, "group_id")}
         </section>
         <section class="settings-section">
          ${sectionHead("群管理员", "先选择群组，下方仅显示并管理该群的管理员。")}
@@ -2258,7 +2332,7 @@
             <input name="user_id" type="number" step="1" placeholder="用户 ID" aria-label="管理员用户 ID" required>
             <button class="secondary-button" type="submit">${icon("user-check")}立即添加</button>
           </form>
-          ${rows(groupAdmins, "admins", item => item.display_name ? `${item.display_name} · ${item.user_id}` : `${item.user_id}`, "user_id", "该群暂无管理员")}
+          ${accessRows(groupAdmins, "admins", item => item.display_name ? `${item.display_name} · ${item.user_id}` : `${item.user_id}`, "user_id", "该群暂无管理员")}
         </section>
         <section class="settings-section">
          ${sectionHead("全局封禁")}
@@ -2267,7 +2341,11 @@
             <input name="reason" maxlength="1000" placeholder="封禁原因" aria-label="封禁原因">
             <button class="secondary-button danger-outline" type="submit">${icon("ban")}立即封禁</button>
           </form>
-          ${rows(access.global_bans, "global-bans", item => `${item.user_id} · ${item.reason || "手动封禁"}`)}
+          ${globalAccessSearch("global-bans", "搜索用户 ID 或封禁原因", "搜索全局封禁")}
+        </section>
+        <section class="settings-section">
+         ${sectionHead("全局资料筛查豁免", "解封后自动加入；取消后，该用户的昵称、用户名和简介将恢复筛查。")}
+          ${globalAccessSearch("global-exemptions", "搜索用户 ID", "搜索全局资料筛查豁免")}
         </section>
       </div>`;
   }
@@ -2819,33 +2897,37 @@
     try {
       const groupsResult = await apiFetch("/api/v1/authorized-groups");
       const authorizedGroups = groupsResult.authorized_groups || [];
-      const loadGlobalBans = async () => {
+      const loadGlobalRegistry = async (endpoint, responseKey) => {
         const all = [];
         let offset = 0;
-        for (let page = 0; page < 100; page += 1) {
-          const result = await apiFetch(`/api/v1/global-bans?limit=500&offset=${offset}`);
-          all.push(...(result.global_bans || []));
+        while (true) {
+          if (state.accessLoadToken !== requestToken) return all;
+          const result = await apiFetch(`/api/v1/${endpoint}?limit=500&offset=${offset}`);
+          if (state.accessLoadToken !== requestToken) return all;
+          all.push(...(result[responseKey] || []));
           if (result.next_offset == null || Number(result.next_offset) <= offset) break;
           offset = Number(result.next_offset);
         }
         return all;
       };
-      const [adminResults, bansResult] = await Promise.all([
+      const [adminResults, bansResult, exemptionsResult] = await Promise.all([
         Promise.all(authorizedGroups.map(async group => {
           const result = await apiFetch(`/api/v1/groups/${encodeURIComponent(group.group_id)}/admins`);
           return (result.admins || []).map(admin => ({ ...admin, group_id: group.group_id }));
         })),
-        loadGlobalBans(),
+        loadGlobalRegistry("global-bans", "global_bans"),
+        loadGlobalRegistry("global-exemptions", "global_exemptions"),
       ]);
       if (state.accessLoadToken !== requestToken) return;
       state.access = {
         authorized_groups: authorizedGroups,
         admins: adminResults.flat(),
         global_bans: bansResult,
+        global_exemptions: exemptionsResult,
       };
     } catch (error) {
       if (state.accessLoadToken !== requestToken) return;
-      state.access = { error: error.message || "权限数据加载失败", authorized_groups: [], admins: [], global_bans: [] };
+      state.access = { error: error.message || "权限数据加载失败", authorized_groups: [], admins: [], global_bans: [], global_exemptions: [] };
     }
     if (state.accessLoadToken === requestToken) renderContent();
   }
@@ -3563,6 +3645,13 @@
     if (target.id === "group-search") {
       state.groupSearch = target.value;
       applyGroupSearchFilter();
+      return;
+    }
+    if (target.matches("[data-access-search]")) {
+      const type = target.dataset.accessSearch;
+      state.accessSearches[type] = target.value;
+      state.listPages.set(`access:${type}`, 1);
+      refreshGlobalAccessList(type);
     }
   });
 
@@ -3871,9 +3960,11 @@
       }
       const accessDeleteMessage = type === "global-bans"
         ? "立即解除该用户的全局封禁？"
-        : type === "admins"
-          ? "立即移除该群管理员？"
-          : "立即取消该群组授权？";
+        : type === "global-exemptions"
+          ? "立即取消该用户的全局资料筛查豁免？"
+          : type === "admins"
+            ? "立即移除该群管理员？"
+            : "立即取消该群组授权？";
       if (!await askConfirmation("确认即时操作", `${accessDeleteMessage} 此操作不会等待“保存全部”。`)) return;
       button.disabled = true;
       beginImmediateMutation();

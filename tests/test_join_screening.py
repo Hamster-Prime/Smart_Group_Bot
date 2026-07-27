@@ -4,10 +4,19 @@ import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, patch
 
 from bot.db.engine import init_db
-from bot.db.models import BanAuditEvent, Group, ModerationRule, UserWarning
+from bot.db.models import (
+    BanAuditEvent,
+    GlobalBan,
+    Group,
+    GroupMember,
+    JoinScreeningExemption,
+    ModerationRule,
+    UserProfileScreen,
+    UserWarning,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bot.services.authz import authorize_group
@@ -19,15 +28,19 @@ from bot.services.join_screening import (
     is_globally_banned,
     is_join_screening_exempt,
     list_global_bans,
+    list_join_screening_exemptions,
     mark_profile_screened,
     profile_signature,
     remove_global_ban,
+    remove_join_screening_exemption,
     screen_member_profile,
+    screen_member_profile_verbose,
 )
 from bot.services.join_verification import (
     get_join_verification,
     upsert_join_verification,
 )
+from bot.services.moderation import ModerationVerdict
 from bot.services.update_completion import (
     UpdateCompletionReceipt,
     bind_update_completion,
@@ -103,6 +116,292 @@ class GlobalBanServiceTests(unittest.IsolatedAsyncioTestCase):
 
             rows = await list_global_bans(session)
             self.assertEqual({row.user_id for row in rows}, {1, 2})
+
+    async def test_list_global_bans_searches_user_reason_and_source(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(
+                        user_id=123456,
+                        reason="ordinary",
+                        source="manual",
+                    ),
+                    GlobalBan(
+                        user_id=700001,
+                        reason="Affiliate SPAM",
+                        source="manual",
+                    ),
+                    GlobalBan(
+                        user_id=700002,
+                        reason="other",
+                        source="profile_screening",
+                    ),
+                ]
+            )
+            await session.commit()
+
+            by_user = await list_global_bans(session, query="345")
+            by_reason = await list_global_bans(session, query="affiliate spam")
+            by_source = await list_global_bans(session, query="PROFILE_SCREENING")
+
+            self.assertEqual([row.user_id for row in by_user], [123456])
+            self.assertEqual([row.user_id for row in by_reason], [700001])
+            self.assertEqual([row.user_id for row in by_source], [700002])
+
+    async def test_list_global_bans_search_escapes_like_wildcards(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(user_id=810001, reason="100% spam", source="manual"),
+                    GlobalBan(user_id=810002, reason="plain spam", source="manual"),
+                ]
+            )
+            await session.commit()
+
+            rows = await list_global_bans(session, query="%")
+
+            self.assertEqual([row.user_id for row in rows], [810001])
+
+    async def test_list_global_bans_filters_before_pagination(self) -> None:
+        created_at = now_shanghai_naive()
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(
+                        user_id=820001,
+                        reason="target",
+                        source="manual",
+                        created_at=created_at,
+                    ),
+                    GlobalBan(
+                        user_id=820002,
+                        reason="target",
+                        source="manual",
+                        created_at=created_at + timedelta(seconds=1),
+                    ),
+                    GlobalBan(
+                        user_id=820003,
+                        reason="target",
+                        source="manual",
+                        created_at=created_at + timedelta(seconds=2),
+                    ),
+                    GlobalBan(
+                        user_id=999999,
+                        reason="unrelated",
+                        source="manual",
+                        created_at=created_at + timedelta(seconds=3),
+                    ),
+                ]
+            )
+            await session.commit()
+
+            rows = await list_global_bans(
+                session,
+                query="target",
+                limit=1,
+                offset=1,
+            )
+
+            self.assertEqual([row.user_id for row in rows], [820002])
+
+    async def test_list_join_screening_exemptions_searches_before_pagination(
+        self,
+    ) -> None:
+        created_at = now_shanghai_naive()
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    JoinScreeningExemption(
+                        user_id=910001,
+                        created_by=1,
+                        created_at=created_at,
+                    ),
+                    JoinScreeningExemption(
+                        user_id=910002,
+                        created_by=1,
+                        created_at=created_at + timedelta(seconds=1),
+                    ),
+                    JoinScreeningExemption(
+                        user_id=420003,
+                        created_by=1,
+                        created_at=created_at + timedelta(seconds=2),
+                    ),
+                ]
+            )
+            await session.commit()
+
+            rows = await list_join_screening_exemptions(
+                session,
+                query="9100",
+                limit=1,
+                offset=1,
+            )
+
+            self.assertEqual([row.user_id for row in rows], [910001])
+
+    async def test_global_registry_pagination_has_stable_tie_breakers(self) -> None:
+        created_at = now_shanghai_naive()
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(
+                        user_id=user_id,
+                        reason="same timestamp",
+                        source="manual",
+                        created_at=created_at,
+                    )
+                    for user_id in (940001, 940002, 940003)
+                ]
+                + [
+                    JoinScreeningExemption(
+                        user_id=user_id,
+                        created_by=1,
+                        created_at=created_at,
+                    )
+                    for user_id in (950001, 950002, 950003)
+                ]
+            )
+            await session.commit()
+
+            bans = await list_global_bans(session, limit=2, offset=1)
+            exemptions = await list_join_screening_exemptions(
+                session,
+                limit=2,
+                offset=1,
+            )
+
+            self.assertEqual([row.user_id for row in bans], [940002, 940001])
+            self.assertEqual(
+                [row.user_id for row in exemptions],
+                [950002, 950001],
+            )
+
+    async def test_remove_join_screening_exemption_is_idempotent(self) -> None:
+        async with self.session_factory() as session:
+            session.add(JoinScreeningExemption(user_id=920001, created_by=1))
+            await session.commit()
+
+            removed = await remove_join_screening_exemption(session, 920001)
+            removed_again = await remove_join_screening_exemption(session, 920001)
+            await session.commit()
+
+            self.assertTrue(removed)
+            self.assertFalse(removed_again)
+            self.assertFalse(await is_join_screening_exempt(session, 920001))
+
+    async def test_remove_join_screening_exemption_keeps_global_ban(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(user_id=930001, reason="keep", source="manual"),
+                    JoinScreeningExemption(user_id=930001, created_by=1),
+                ]
+            )
+            await session.commit()
+
+            removed = await remove_join_screening_exemption(session, 930001)
+            await session.commit()
+
+            self.assertTrue(removed)
+            self.assertTrue(await is_globally_banned(session, 930001))
+            self.assertFalse(await is_join_screening_exempt(session, 930001))
+
+    async def test_remove_join_screening_exemption_invalidates_profile_caches(
+        self,
+    ) -> None:
+        user_id = 960001
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    JoinScreeningExemption(user_id=user_id, created_by=1),
+                    GroupMember(
+                        group_id=-100,
+                        user_id=user_id,
+                        patrol_hash="cached-one",
+                    ),
+                    GroupMember(
+                        group_id=-101,
+                        user_id=user_id,
+                        patrol_hash="cached-two",
+                    ),
+                    UserProfileScreen(
+                        group_id=-100,
+                        user_id=user_id,
+                        profile_hash="cached-one",
+                    ),
+                    UserProfileScreen(
+                        group_id=-101,
+                        user_id=user_id,
+                        profile_hash="cached-two",
+                    ),
+                ]
+            )
+            await session.commit()
+
+            removed = await remove_join_screening_exemption(session, user_id)
+            await session.commit()
+
+            members = list(
+                (
+                    await session.execute(
+                        select(GroupMember).where(GroupMember.user_id == user_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            screens = list(
+                (
+                    await session.execute(
+                        select(UserProfileScreen).where(
+                            UserProfileScreen.user_id == user_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            self.assertTrue(removed)
+            self.assertEqual([member.patrol_hash for member in members], ["", ""])
+            self.assertEqual(screens, [])
+
+    async def test_profile_exemption_does_not_suppress_message_moderation(
+        self,
+    ) -> None:
+        from bot.handlers import group as group_handlers
+
+        user_id = 970001
+        async with self.session_factory() as session:
+            await authorize_group(session, -100, 1)
+            await remove_global_ban(session, user_id, operator_id=1)
+            await session.commit()
+
+            verdict = ModerationVerdict(
+                violated=True,
+                reason="message violation",
+                rule=None,
+                conclusive=True,
+            )
+            with (
+                patch(
+                    "bot.handlers.group.acquire_group_settings_write_intent",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "bot.handlers.group.manual_unban_generation_is_active",
+                    return_value=False,
+                ),
+            ):
+                claimed = await group_handlers._claim_current_moderation_verdict(
+                    session,
+                    group_id=-100,
+                    user_id=user_id,
+                    verdict=verdict,
+                )
+
+            self.assertTrue(await is_join_screening_exempt(session, user_id))
+            self.assertTrue(claimed)
 
     async def test_concurrent_add_global_ban_is_idempotent(self) -> None:
         # Use plain AsyncSession instances here so the database upsert itself,
@@ -244,6 +543,17 @@ class JoinProfileScreeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(violated)
             self.assertEqual(reason, "")
             moderation.check_rules.assert_not_awaited()
+
+            violated, reason, conclusive = await screen_member_profile_verbose(
+                session,
+                moderation,
+                group_id=-100,
+                user_id=556,
+                profile_text="whatever",
+            )
+            self.assertFalse(violated)
+            self.assertEqual(reason, "")
+            self.assertFalse(conclusive)
 
     async def test_screen_member_profile_skips_empty_profile(self) -> None:
         async with self.session_factory() as session:
@@ -499,6 +809,105 @@ class MembershipHandlerTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertIsNone(warning)
+
+    async def test_cancelling_inflight_exemption_restarts_profile_screening(
+        self,
+    ) -> None:
+        from bot.handlers import membership
+        from bot.services.join_screening import _ProfileScreeningExemptionSkip
+
+        user_id = 911
+        event = _join_event(user_id=user_id, full_name="广告用户")
+        async with self.session_factory() as session:
+            await remove_global_ban(session, user_id, operator_id=1)
+            await session.commit()
+
+            calls = 0
+
+            async def skip_then_cancel(
+                current_session,
+                _moderation,
+                **_kwargs,
+            ):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    removed = await remove_join_screening_exemption(
+                        current_session,
+                        user_id,
+                    )
+                    self.assertTrue(removed)
+                    await current_session.commit()
+                    return _ProfileScreeningExemptionSkip((False, "", False))
+                return True, "昵称含广告", True
+
+            with (
+                patch(
+                    "bot.handlers.membership.screen_member_profile_verbose",
+                    side_effect=skip_then_cancel,
+                ),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+            ):
+                await membership.on_member_join(
+                    event,
+                    session=session,
+                    settings=self._settings(),
+                )
+
+            self.assertEqual(calls, 2)
+            event.bot.ban_chat_member.assert_awaited_once_with(
+                -100,
+                user_id,
+                revoke_messages=True,
+            )
+            self.assertFalse(await is_join_screening_exempt(session, user_id))
+
+    async def test_repeated_inflight_exemption_changes_defer_join_handling(
+        self,
+    ) -> None:
+        from bot.handlers import membership
+        from bot.services.join_screening import _ProfileScreeningExemptionSkip
+
+        user_id = 912
+        event = _join_event(user_id=user_id, full_name="状态反复用户")
+        async with self.session_factory() as session:
+            await remove_global_ban(session, user_id, operator_id=1)
+            await session.commit()
+
+            calls = 0
+
+            async def repeatedly_changed(
+                current_session,
+                _moderation,
+                **_kwargs,
+            ):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    await remove_join_screening_exemption(current_session, user_id)
+                    await current_session.commit()
+                return _ProfileScreeningExemptionSkip((False, "", False))
+
+            with (
+                patch(
+                    "bot.handlers.membership.screen_member_profile_verbose",
+                    side_effect=repeatedly_changed,
+                ),
+                patch("bot.handlers.membership._build_llm", return_value=object()),
+                patch(
+                    "bot.handlers.membership.request_current_update_retry"
+                ) as retry_mock,
+            ):
+                await membership.on_member_join(
+                    event,
+                    session=session,
+                    settings=self._settings(),
+                )
+
+            self.assertEqual(calls, 2)
+            retry_mock.assert_called_once_with()
+            event.bot.ban_chat_member.assert_not_awaited()
+            event.bot.send_message.assert_not_awaited()
 
     async def test_clean_join_is_not_banned_and_marks_profile_checked(self) -> None:
         from unittest.mock import patch

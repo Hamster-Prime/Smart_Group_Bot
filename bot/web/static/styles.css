@@ -1709,6 +1709,24 @@ button:disabled {
   border-top: 1px solid var(--border);
 }
 
+.access-list-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 12px 0 4px;
+}
+
+.access-list-toolbar .search-wrap {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.access-list-toolbar .badge {
+  flex: 0 0 auto;
+}
+
 .resource-grid section {
   min-width: 0;
 }
@@ -2790,6 +2808,15 @@ button:disabled {
 
   .search-wrap {
     width: 100%;
+  }
+
+  .access-list-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .access-list-toolbar .badge {
+    align-self: flex-start;
   }
 
   .toast-region {

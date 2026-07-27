@@ -56,8 +56,14 @@ from bot.services.proactive import (
     get_cooldown_task_state,
     set_cooldown_task_enabled,
 )
-from bot.services.join_screening import add_global_ban, list_global_bans, remove_global_ban
-from bot.services.join_screening import is_globally_banned
+from bot.services.join_screening import (
+    add_global_ban,
+    is_globally_banned,
+    list_global_bans,
+    list_join_screening_exemptions,
+    remove_global_ban,
+    remove_join_screening_exemption,
+)
 from bot.services.join_verification import (
     activate_manual_unban_recoveries,
     activate_manual_unban_recovery,
@@ -1932,15 +1938,25 @@ def register_settings_routes(
         unmark_privileged_operator(user_id, group_id=group_id)
         return _success_response({"deleted": row is not None})
 
-    @authenticated
-    async def list_global_bans_api(request: web.Request, _user: Any) -> web.Response:
+    def _global_registry_query(request: web.Request) -> tuple[int, int, str]:
         try:
             limit = min(500, max(1, int(request.query.get("limit", "100"))))
             offset = max(0, int(request.query.get("offset", "0")))
         except (TypeError, ValueError) as exc:
             raise _APIError(400, "invalid_pagination", "分页参数无效。") from exc
+        query = clean_text(str(request.query.get("query", "")), max_len=200)
+        return limit, offset, query
+
+    @authenticated
+    async def list_global_bans_api(request: web.Request, _user: Any) -> web.Response:
+        limit, offset, query = _global_registry_query(request)
         async with session_factory() as session:
-            rows = await list_global_bans(session, limit=limit, offset=offset)
+            rows = await list_global_bans(
+                session,
+                limit=limit,
+                offset=offset,
+                query=query,
+            )
         return _success_response({"global_bans": [
             {
                 "user_id": int(row.user_id),
@@ -1951,6 +1967,42 @@ def register_settings_routes(
             }
             for row in rows
         ], "next_offset": offset + len(rows) if len(rows) == limit else None})
+
+    @authenticated
+    async def list_global_exemptions_api(
+        request: web.Request,
+        _user: Any,
+    ) -> web.Response:
+        limit, offset, query = _global_registry_query(request)
+        async with session_factory() as session:
+            rows = await list_join_screening_exemptions(
+                session,
+                limit=limit,
+                offset=offset,
+                query=query,
+            )
+        return _success_response({
+            "global_exemptions": [
+                {
+                    "user_id": int(row.user_id),
+                    "created_by": int(row.created_by or 0),
+                    "created_at": row.created_at.isoformat() if row.created_at else "",
+                }
+                for row in rows
+            ],
+            "next_offset": offset + len(rows) if len(rows) == limit else None,
+        })
+
+    @authenticated
+    async def delete_global_exemption_api(
+        request: web.Request,
+        _user: Any,
+    ) -> web.Response:
+        target_id = _path_int(request, "user_id")
+        async with session_factory() as session:
+            removed = await remove_join_screening_exemption(session, target_id)
+            await session.commit()
+        return _success_response({"deleted": bool(removed)})
 
     @authenticated
     async def create_global_ban_api(request: web.Request, user: Any) -> web.Response:
@@ -3399,6 +3451,11 @@ def register_settings_routes(
     app.router.add_get("/api/v1/global-bans", list_global_bans_api)
     app.router.add_post("/api/v1/global-bans", create_global_ban_api)
     app.router.add_delete("/api/v1/global-bans/{user_id}", delete_global_ban_api)
+    app.router.add_get("/api/v1/global-exemptions", list_global_exemptions_api)
+    app.router.add_delete(
+        "/api/v1/global-exemptions/{user_id}",
+        delete_global_exemption_api,
+    )
     app.router.add_get("/api/v1/groups", get_groups)
     app.router.add_get(
         "/api/v1/groups/{id}/default-permissions",

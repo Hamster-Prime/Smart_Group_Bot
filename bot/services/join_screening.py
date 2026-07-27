@@ -21,15 +21,34 @@ from __future__ import annotations
 import hashlib
 import logging
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import GlobalBan, JoinScreeningExemption, ModerationRule, UserProfileScreen
+from bot.db.models import (
+    GlobalBan,
+    GroupMember,
+    JoinScreeningExemption,
+    ModerationRule,
+    UserProfileScreen,
+)
 from bot.services.ban_audit import record_ban_event
 
 log = logging.getLogger(__name__)
+
+
+class _ProfileScreeningExemptionSkip(tuple):
+    """Tuple-compatible marker for a profile check skipped by policy."""
+
+    __slots__ = ()
+    skipped_by_exemption = True
+
+
+def _substring_pattern(value: str) -> str:
+    """Build a literal SQL LIKE substring pattern using ``/`` as the escape."""
+    escaped = value.replace("/", "//").replace("%", "/%").replace("_", "/_")
+    return f"%{escaped}%"
 
 
 async def is_globally_banned(session: AsyncSession, user_id: int) -> bool:
@@ -188,15 +207,77 @@ async def is_join_screening_exempt(session: AsyncSession, user_id: int) -> bool:
     return row is not None
 
 
+async def remove_join_screening_exemption(
+    session: AsyncSession,
+    user_id: int,
+) -> bool:
+    """Remove the exemption and invalidate cached profile-screen passes."""
+    await session.flush()
+    row = await session.get(JoinScreeningExemption, user_id)
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.flush()
+    await session.execute(
+        update(GroupMember)
+        .where(GroupMember.user_id == user_id)
+        .values(patrol_hash="")
+    )
+    await session.execute(
+        delete(UserProfileScreen).where(UserProfileScreen.user_id == user_id)
+    )
+    return True
+
+
 async def list_global_bans(
     session: AsyncSession,
     *,
     limit: int = 50,
     offset: int = 0,
+    query: str = "",
 ) -> list[GlobalBan]:
+    stmt = select(GlobalBan)
+    normalized_query = str(query or "").strip()
+    if normalized_query:
+        pattern = _substring_pattern(normalized_query)
+        stmt = stmt.where(
+            or_(
+                cast(GlobalBan.user_id, String).ilike(pattern, escape="/"),
+                GlobalBan.reason.ilike(pattern, escape="/"),
+                GlobalBan.source.ilike(pattern, escape="/"),
+            )
+        )
     stmt = (
-        select(GlobalBan)
-        .order_by(GlobalBan.created_at.desc())
+        stmt.order_by(GlobalBan.created_at.desc(), GlobalBan.user_id.desc())
+        .offset(max(0, int(offset)))
+        .limit(max(1, int(limit)))
+    )
+    with session.no_autoflush:
+        result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_join_screening_exemptions(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    query: str = "",
+) -> list[JoinScreeningExemption]:
+    stmt = select(JoinScreeningExemption)
+    normalized_query = str(query or "").strip()
+    if normalized_query:
+        stmt = stmt.where(
+            cast(JoinScreeningExemption.user_id, String).ilike(
+                _substring_pattern(normalized_query),
+                escape="/",
+            )
+        )
+    stmt = (
+        stmt.order_by(
+            JoinScreeningExemption.created_at.desc(),
+            JoinScreeningExemption.user_id.desc(),
+        )
         .offset(max(0, int(offset)))
         .limit(max(1, int(limit)))
     )
@@ -343,9 +424,9 @@ async def screen_member_profile_verbose(
 ) -> tuple[bool, str, bool]:
     """Screen a member's profile against the group's moderation rules.
 
-    Returns (violated, reason, conclusive). conclusive=False means the
-    verdict fell back to "not violated" because the moderation model output
-    could not be parsed — callers must not cache that as a passed screening.
+    Returns (violated, reason, conclusive). conclusive=False means there is no
+    cacheable pass verdict, either because policy skipped the check or because
+    the moderation model output could not be parsed.
     Users unbanned via /unban are permanently exempt from profile screening
     (their messages still get moderated).
     """
@@ -355,7 +436,9 @@ async def screen_member_profile_verbose(
 
     if await is_join_screening_exempt(session, user_id):
         log.info("profile screening skipped | reason=unban_exempt user=%s group=%s", user_id, group_id)
-        return False, "", True
+        # An exemption is a policy skip, not a passed profile verdict.  Keep it
+        # non-cacheable so cancelling the exemption takes effect immediately.
+        return _ProfileScreeningExemptionSkip((False, "", False))
 
     payload = f"[成员资料审核]\n{text}"
     evaluate = getattr(moderation, "evaluate", None)

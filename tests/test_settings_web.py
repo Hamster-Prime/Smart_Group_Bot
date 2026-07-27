@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlencode
@@ -18,14 +19,17 @@ from bot.db.engine import init_db
 from bot.db.models import (
     Admin,
     AuthorizedGroup,
+    GlobalBan,
     Group,
     GroupApiModelQuerySecret,
     GroupMember,
     GroupPermanentMemory,
+    JoinScreeningExemption,
     KeywordReply,
     ModerationRule,
     ScheduledMessage,
     SpeechStyleSample,
+    UserProfileScreen,
     UserWarning,
 )
 from bot.services.runtime_config import RuntimeConfigManager, SecretCipher
@@ -168,6 +172,251 @@ class SettingsWebTests(unittest.IsolatedAsyncioTestCase):
             headers=self._headers(user_id=99),
         )
         self.assertEqual(ordinary_user.status, 403)
+
+    async def test_global_ban_search_filters_before_pagination(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(
+                        user_id=900001,
+                        reason="unrelated newest row",
+                        source="manual",
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 12, 4),
+                    ),
+                    GlobalBan(
+                        user_id=900002,
+                        reason="reason needle match",
+                        source="manual",
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 12, 3),
+                    ),
+                    GlobalBan(
+                        user_id=900003,
+                        reason="another unrelated row",
+                        source="manual",
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 12, 2),
+                    ),
+                    GlobalBan(
+                        user_id=900004,
+                        reason="ordinary reason",
+                        source="needle_source",
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 12, 1),
+                    ),
+                    GlobalBan(
+                        user_id=7123401,
+                        reason="ordinary reason",
+                        source="manual",
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 12, 0),
+                    ),
+                ]
+            )
+            await session.commit()
+
+        first = await self.client.get(
+            "/api/v1/global-bans",
+            params={"query": "needle", "limit": "1", "offset": "0"},
+            headers=self._headers(),
+        )
+        self.assertEqual(first.status, 200)
+        first_document = await first.json()
+        self.assertEqual(
+            [item["user_id"] for item in first_document["global_bans"]],
+            [900002],
+        )
+        self.assertEqual(first_document["next_offset"], 1)
+
+        second = await self.client.get(
+            "/api/v1/global-bans",
+            params={"query": "needle", "limit": "1", "offset": "1"},
+            headers=self._headers(),
+        )
+        self.assertEqual(second.status, 200)
+        self.assertEqual(
+            [item["user_id"] for item in (await second.json())["global_bans"]],
+            [900004],
+        )
+
+        matched_by_id = await self.client.get(
+            "/api/v1/global-bans",
+            params={"query": "1234"},
+            headers=self._headers(),
+        )
+        self.assertEqual(matched_by_id.status, 200)
+        self.assertEqual(
+            [
+                item["user_id"]
+                for item in (await matched_by_id.json())["global_bans"]
+            ],
+            [7123401],
+        )
+
+    async def test_global_exemption_search_filters_before_pagination(self) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    JoinScreeningExemption(
+                        user_id=800001,
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 13, 3),
+                    ),
+                    JoinScreeningExemption(
+                        user_id=7312301,
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 13, 2),
+                    ),
+                    JoinScreeningExemption(
+                        user_id=800002,
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 13, 1),
+                    ),
+                    JoinScreeningExemption(
+                        user_id=7312302,
+                        created_by=42,
+                        created_at=datetime(2026, 7, 27, 13, 0),
+                    ),
+                ]
+            )
+            await session.commit()
+
+        first = await self.client.get(
+            "/api/v1/global-exemptions",
+            params={"query": "123", "limit": "1", "offset": "0"},
+            headers=self._headers(),
+        )
+        self.assertEqual(first.status, 200)
+        first_document = await first.json()
+        self.assertEqual(
+            [item["user_id"] for item in first_document["global_exemptions"]],
+            [7312301],
+        )
+        self.assertEqual(first_document["next_offset"], 1)
+
+        second = await self.client.get(
+            "/api/v1/global-exemptions",
+            params={"query": "123", "limit": "1", "offset": "1"},
+            headers=self._headers(),
+        )
+        self.assertEqual(second.status, 200)
+        self.assertEqual(
+            [
+                item["user_id"]
+                for item in (await second.json())["global_exemptions"]
+            ],
+            [7312302],
+        )
+
+        missing = await self.client.get(
+            "/api/v1/global-exemptions",
+            params={"query": "does-not-exist"},
+            headers=self._headers(),
+        )
+        self.assertEqual(missing.status, 200)
+        missing_document = await missing.json()
+        self.assertEqual(missing_document["global_exemptions"], [])
+        self.assertIsNone(missing_document["next_offset"])
+
+    async def test_global_exemption_delete_is_idempotent_and_only_removes_exemption(
+        self,
+    ) -> None:
+        target_id = 7555001
+        untouched_id = 7555002
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    GlobalBan(
+                        user_id=target_id,
+                        reason="independent policy row",
+                        source="manual",
+                        created_by=42,
+                    ),
+                    JoinScreeningExemption(user_id=target_id, created_by=42),
+                    JoinScreeningExemption(user_id=untouched_id, created_by=42),
+                    GroupMember(
+                        group_id=-100,
+                        user_id=target_id,
+                        patrol_hash="cached-profile",
+                    ),
+                    UserProfileScreen(
+                        group_id=-100,
+                        user_id=target_id,
+                        profile_hash="cached-profile",
+                    ),
+                ]
+            )
+            await session.commit()
+
+        first = await self.client.delete(
+            f"/api/v1/global-exemptions/{target_id}",
+            headers=self._headers(),
+        )
+        self.assertEqual(first.status, 200)
+        self.assertTrue((await first.json())["deleted"])
+
+        second = await self.client.delete(
+            f"/api/v1/global-exemptions/{target_id}",
+            headers=self._headers(),
+        )
+        self.assertEqual(second.status, 200)
+        self.assertFalse((await second.json())["deleted"])
+
+        async with self.session_factory() as session:
+            self.assertIsNone(await session.get(JoinScreeningExemption, target_id))
+            self.assertIsNotNone(await session.get(JoinScreeningExemption, untouched_id))
+            self.assertIsNotNone(await session.get(GlobalBan, target_id))
+            self.assertEqual(
+                await session.scalar(
+                    select(GroupMember.patrol_hash).where(
+                        GroupMember.user_id == target_id
+                    )
+                ),
+                "",
+            )
+            self.assertIsNone(
+                await session.get(UserProfileScreen, (-100, target_id))
+            )
+
+    async def test_global_policy_endpoints_require_owner_and_validate_pagination(
+        self,
+    ) -> None:
+        async with self.session_factory() as session:
+            session.add_all(
+                [
+                    AuthorizedGroup(group_id=-403, authorized_by=42),
+                    Group(id=-403, title="Scoped Admin Group", settings={}),
+                ]
+            )
+            await session.flush()
+            session.add(Admin(group_id=-403, user_id=99, role="admin"))
+            await session.commit()
+
+        for path in ("/api/v1/global-bans", "/api/v1/global-exemptions"):
+            denied = await self.client.get(
+                path,
+                headers=self._headers(user_id=99),
+            )
+            self.assertEqual(denied.status, 403, path)
+
+            for invalid_query in ({"limit": "many"}, {"offset": "later"}):
+                invalid = await self.client.get(
+                    path,
+                    params=invalid_query,
+                    headers=self._headers(),
+                )
+                self.assertEqual(invalid.status, 400, (path, invalid_query))
+                self.assertEqual(
+                    (await invalid.json())["error"]["code"],
+                    "invalid_pagination",
+                )
+
+        denied_delete = await self.client.delete(
+            "/api/v1/global-exemptions/7312301",
+            headers=self._headers(user_id=99),
+        )
+        self.assertEqual(denied_delete.status, 403)
 
     async def test_group_admin_is_scoped_to_own_authorized_group(self) -> None:
         async with self.session_factory() as session:

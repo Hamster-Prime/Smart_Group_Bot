@@ -51,6 +51,50 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         self.assertEqual(script_version.group(1), style_version.group(1))
         self.assertIn("unified-save-layout", script_version.group(1))
 
+    def test_global_policy_lists_support_independent_search(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+        styles = _STYLES_CSS.read_text(encoding="utf-8")
+        input_handler = source.split(
+            'content.addEventListener("input"', 1
+        )[1].split('content.addEventListener("change"', 1)[0]
+        filter_helper = source.split(
+            "function filteredGlobalAccessItems", 1
+        )[1].split("function globalAccessRows", 1)[0]
+        load_access = source.split("async function loadAccess", 1)[1].split(
+            "function stripSecrets", 1
+        )[0]
+
+        self.assertIn('"global-bans": ""', source)
+        self.assertIn('"global-exemptions": ""', source)
+        self.assertIn(
+            'globalAccessSearch("global-bans", "搜索用户 ID 或封禁原因"',
+            source,
+        )
+        self.assertIn(
+            'globalAccessSearch("global-exemptions", "搜索用户 ID"',
+            source,
+        )
+        self.assertIn('${item.user_id} ${item.reason || ""} ${item.source || ""}', filter_helper)
+        self.assertIn("String(item.user_id)", filter_helper)
+        self.assertIn('target.matches("[data-access-search]")', input_handler)
+        self.assertIn('state.listPages.set(`access:${type}`, 1)', input_handler)
+        self.assertIn("refreshGlobalAccessList(type)", input_handler)
+        self.assertIn('loadGlobalRegistry("global-bans", "global_bans")', load_access)
+        self.assertIn(
+            'loadGlobalRegistry("global-exemptions", "global_exemptions")',
+            load_access,
+        )
+        self.assertIn("while (true)", load_access)
+        self.assertNotIn("page < 100", load_access)
+        self.assertIn(
+            "if (state.accessLoadToken !== requestToken) return all;",
+            load_access,
+        )
+        self.assertIn('"global-exemptions": "取消豁免"', source)
+        self.assertIn("未找到匹配的全局封禁记录", source)
+        self.assertIn("未找到匹配的全局豁免记录", source)
+        self.assertIn(".access-list-toolbar", styles)
+
     def test_template_button_text_roundtrips_optional_style_as_fifth_column(
         self,
     ) -> None:

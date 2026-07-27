@@ -2409,76 +2409,112 @@ async def _process_member_join(
         return
 
     moderation = ModerationService(settings.moderation, _build_llm(settings))
-    violated, reason, conclusive = await screen_member_profile_verbose(
-        session,
-        moderation,
-        group_id=group_id,
-        user_id=user_id,
-        profile_text=profile_text,
-    )
-    log.info(
-        "join screening done | group=%s user=%s violated=%s conclusive=%s reason=%s",
-        group_id,
-        user_id,
-        violated,
-        conclusive,
-        reason or "-",
-    )
-    # The profile LLM may take many seconds. End its read transaction and
-    # re-authorize in a fresh one before any cache/global-ban/Telegram action.
-    await session.rollback()
-    if not await is_group_authorized(session, group_id):
+    exemption_rescreened = False
+    while True:
+        screening_result = await screen_member_profile_verbose(
+            session,
+            moderation,
+            group_id=group_id,
+            user_id=user_id,
+            profile_text=profile_text,
+        )
+        violated, reason, conclusive = screening_result
+        skipped_by_exemption = bool(
+            getattr(screening_result, "skipped_by_exemption", False)
+        )
         log.info(
-            "join screening verdict discarded | reason=group_deauthorized "
-            "group=%s user=%s",
+            "join screening done | group=%s user=%s violated=%s "
+            "conclusive=%s reason=%s",
             group_id,
             user_id,
+            violated,
+            conclusive,
+            reason or "-",
         )
-        return
-    await session.commit()
-    if require_current_membership and not await _join_member_still_present(
-        event,
-        user_id,
-        stage="profile_verdict",
-    ):
-        return
-    # A manual /unban performed while profile moderation was in flight is the
-    # newer operator intent.  Re-read both the exemption and recovery row before
-    # applying the old verdict or starting a new challenge.
-    # Obtain SQLite's process-wide writer gate before the final exemption read.
-    # Whichever of this stale screening verdict and a concurrent /unban commits
-    # last becomes authoritative; an older verdict can no longer delete an
-    # exemption that was created while its LLM request was in flight.
-    await acquire_group_settings_write_intent(session, group_id)
-    if not await is_group_authorized(session, group_id):
+        # The profile LLM may take many seconds. End its read transaction and
+        # re-authorize in a fresh one before any cache/global-ban/Telegram action.
         await session.rollback()
-        return
-    if (
-        manual_unban_generation_is_active(group_id, user_id)
-        or await is_join_screening_exempt(session, user_id)
-    ):
+        if not await is_group_authorized(session, group_id):
+            log.info(
+                "join screening verdict discarded | reason=group_deauthorized "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+            )
+            return
         await session.commit()
-        log.info(
-            "join screening verdict discarded | reason=manual_unban_exemption "
-            "group=%s user=%s",
-            group_id,
+        if require_current_membership and not await _join_member_still_present(
+            event,
             user_id,
-        )
-        return
-    current_verification = await get_join_verification(session, group_id, user_id)
-    if current_verification is not None and str(current_verification.status or "") in {
-        VERIFICATION_STATUS_RELEASING,
-        VERIFICATION_STATUS_UNBANNING,
-    }:
-        await session.commit()
-        log.info(
-            "join screening verdict discarded | reason=permission_recovery_%s "
-            "group=%s user=%s",
-            current_verification.status,
-            group_id,
-            user_id,
-        )
-        return
+            stage="profile_verdict",
+        ):
+            return
+        # A manual /unban performed while profile moderation was in flight is the
+        # newer operator intent.  Re-read both the exemption and recovery row before
+        # applying the old verdict or starting a new challenge.
+        # Obtain SQLite's process-wide writer gate before the final exemption read.
+        # Whichever of this stale screening verdict and a concurrent /unban commits
+        # last becomes authoritative; an older verdict can no longer delete an
+        # exemption that was created while its LLM request was in flight.
+        await acquire_group_settings_write_intent(session, group_id)
+        if not await is_group_authorized(session, group_id):
+            await session.rollback()
+            return
+        if (
+            manual_unban_generation_is_active(group_id, user_id)
+            or await is_join_screening_exempt(session, user_id)
+        ):
+            await session.commit()
+            log.info(
+                "join screening verdict discarded | reason=manual_unban_exemption "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+            )
+            return
+        current_verification = await get_join_verification(session, group_id, user_id)
+        if current_verification is not None and str(current_verification.status or "") in {
+            VERIFICATION_STATUS_RELEASING,
+            VERIFICATION_STATUS_UNBANNING,
+        }:
+            await session.commit()
+            log.info(
+                "join screening verdict discarded | reason=permission_recovery_%s "
+                "group=%s user=%s",
+                current_verification.status,
+                group_id,
+                user_id,
+            )
+            return
+        if skipped_by_exemption:
+            if exemption_rescreened:
+                # A second exemption flip happened during the retry.  Do not
+                # admit an unchecked member; let the durable update retry (or
+                # the next patrol) resolve the now-stable policy state.
+                await session.rollback()
+                request_current_update_retry()
+                log.info(
+                    "join screening deferred | reason=exemption_changed_twice "
+                    "group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return
+            # The exemption existed when screening started but was cancelled
+            # before the final policy claim.  Release the writer transaction and
+            # run the real profile check once so cancellation is immediately
+            # effective instead of admitting an unchecked member.
+            exemption_rescreened = True
+            await session.rollback()
+            log.info(
+                "join screening restarted | reason=exemption_cancelled "
+                "group=%s user=%s",
+                group_id,
+                user_id,
+            )
+            continue
+        break
+
     if not violated:
         # Record the checked signature so on-message re-screening skips this
         # user until their visible profile or the enabled rules change. The
