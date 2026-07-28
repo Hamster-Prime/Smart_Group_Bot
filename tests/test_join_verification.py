@@ -1972,6 +1972,13 @@ class JoinVerificationSchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
                     41, -100, 51, 'join', 'hcaptcha', '', '待验证用户', 777,
                     '2099-01-01 00:00:00'
                 );
+                INSERT INTO join_verifications (
+                    id, group_id, user_id, kind, provider, reason,
+                    display_name, prompt_message_id, deadline_at
+                ) VALUES (
+                    42, -100, 53, 'moderation', 'turnstile', '旧质询',
+                    '旧质询用户', 778, '2099-01-01 00:00:00'
+                );
                 """
             )
             connection.commit()
@@ -2002,6 +2009,14 @@ class JoinVerificationSchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(preserved.provider, "hcaptcha")
                 self.assertEqual(preserved.status, "pending")
                 self.assertIsNone(preserved.lease_until)
+                legacy_moderation = await get_join_verification(session, -100, 53)
+                self.assertIsNotNone(legacy_moderation)
+                self.assertFalse(legacy_moderation.ban_on_timeout)
+                self.assertEqual(
+                    legacy_moderation.status,
+                    VERIFICATION_STATUS_UNBANNING,
+                )
+                self.assertLess(legacy_moderation.lease_until, now_shanghai_naive())
                 await delete_join_verification(session, -100, 51)
                 await upsert_join_verification(
                     session,
@@ -2011,7 +2026,81 @@ class JoinVerificationSchemaMigrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await session.commit()
                 replacement = await get_join_verification(session, -100, 52)
-                self.assertGreater(replacement.id, 41)
+                self.assertGreater(replacement.id, 42)
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(f"{db_path}{suffix}")
+                except OSError:
+                    pass
+
+    async def test_existing_ban_authorization_survives_autoincrement_rebuild(
+        self,
+    ) -> None:
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE join_verifications (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    group_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    kind VARCHAR(32) NOT NULL DEFAULT 'join',
+                    provider VARCHAR(32) NOT NULL DEFAULT 'turnstile',
+                    reason TEXT NOT NULL DEFAULT '',
+                    ban_on_timeout BOOLEAN NOT NULL DEFAULT 0,
+                    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                    lease_until DATETIME,
+                    display_name VARCHAR(255) NOT NULL,
+                    prompt_message_id BIGINT NOT NULL,
+                    private_message_id BIGINT NOT NULL DEFAULT 0,
+                    deadline_at DATETIME NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE UNIQUE INDEX ix_join_verification_group_user
+                    ON join_verifications (group_id, user_id);
+                CREATE INDEX ix_join_verifications_user_id
+                    ON join_verifications (user_id);
+                INSERT INTO join_verifications (
+                    id, group_id, user_id, kind, reason, ban_on_timeout,
+                    status, display_name, prompt_message_id,
+                    private_message_id, deadline_at
+                ) VALUES
+                    (51, -100, 61, 'moderation', '旧删消息质询', 0,
+                     'pending', '安全释放用户', 801, 901, '2099-01-01 00:00:00'),
+                    (52, -100, 62, 'moderation', 'ban 规则质询', 1,
+                     'pending', '保留质询用户', 802, 902, '2099-01-01 00:00:00');
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        engine = None
+        try:
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{db_path}"
+            )
+            async with engine.connect() as conn:
+                result = await conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'join_verifications'"
+                )
+                self.assertIn("AUTOINCREMENT", str(result.scalar_one()).upper())
+
+            async with session_factory() as session:
+                safe = await get_join_verification(session, -100, 61)
+                authorized = await get_join_verification(session, -100, 62)
+                self.assertFalse(safe.ban_on_timeout)
+                self.assertEqual(safe.status, VERIFICATION_STATUS_UNBANNING)
+                self.assertEqual(safe.private_message_id, 901)
+                self.assertTrue(authorized.ban_on_timeout)
+                self.assertEqual(authorized.status, "pending")
+                self.assertEqual(authorized.private_message_id, 902)
         finally:
             if engine is not None:
                 await engine.dispose()
@@ -2498,6 +2587,31 @@ class JoinTriggersVerificationTests(_DbTestCase):
 
 
 class ModerationChallengeTests(_DbTestCase):
+    async def test_begin_refuses_non_ban_rule(self) -> None:
+        settings = _settings(join_verification_enabled=False)
+        bot = SimpleNamespace(
+            restrict_chat_member=AsyncMock(),
+            send_message=AsyncMock(),
+        )
+
+        async with self.session_factory() as session:
+            started = await begin_moderation_challenge(
+                bot=bot,
+                session=session,
+                settings=settings,
+                group_id=-100,
+                user_id=917,
+                display_name="普通用户",
+                bot_username="my_bot",
+                reason="删消息规则",
+                rule_action="delete",
+            )
+            self.assertFalse(started)
+            self.assertIsNone(await get_join_verification(session, -100, 917))
+
+        bot.restrict_chat_member.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
     async def test_begin_mutes_prompts_and_persists_moderation_record(self) -> None:
         settings = _settings(join_verification_enabled=False)
         settings.moderation.challenge_timeout_seconds = 120
@@ -2517,6 +2631,7 @@ class ModerationChallengeTests(_DbTestCase):
                 display_name="可疑用户",
                 bot_username="my_bot",
                 reason="疑似发布广告",
+                rule_action="ban",
             )
             after = now_shanghai_naive()
 
@@ -2525,6 +2640,7 @@ class ModerationChallengeTests(_DbTestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row.kind, VERIFICATION_KIND_MODERATION)
             self.assertEqual(row.reason, "疑似发布广告")
+            self.assertTrue(row.ban_on_timeout)
             self.assertEqual(row.display_name, "可疑用户")
             self.assertEqual(row.prompt_message_id, 818)
             self.assertGreaterEqual(
@@ -2544,7 +2660,7 @@ class ModerationChallengeTests(_DbTestCase):
         bot.send_message.assert_awaited_once()
         prompt_call = bot.send_message.await_args
         self.assertEqual(prompt_call.args[0], -100)
-        self.assertIn("低置信度", prompt_call.args[1])
+        self.assertIn("消息审查验证", prompt_call.args[1])
         self.assertIn("疑似发布广告", prompt_call.args[1])
         self.assertEqual(prompt_call.kwargs["parse_mode"], "HTML")
         keyboard = prompt_call.kwargs["reply_markup"]
@@ -2597,6 +2713,7 @@ class ModerationChallengeTests(_DbTestCase):
                 display_name="竞态用户",
                 bot_username="my_bot",
                 reason="竞态测试",
+                rule_action="ban",
             )
 
         self.assertTrue(started)
@@ -2650,6 +2767,7 @@ class ModerationChallengeTests(_DbTestCase):
                 display_name="提示竞态用户",
                 bot_username="my_bot",
                 reason="提示竞态测试",
+                rule_action="ban",
             )
 
         self.assertTrue(started)
@@ -2681,6 +2799,7 @@ class ModerationChallengeTests(_DbTestCase):
                     display_name="取消用户",
                     bot_username="my_bot",
                     reason="测试取消",
+                    rule_action="ban",
                 )
 
         self.assertEqual(bot.restrict_chat_member.await_count, 2)
@@ -2699,6 +2818,7 @@ class ModerationChallengeTests(_DbTestCase):
                 reason="疑似广告",
                 display_name="可疑用户",
                 prompt_message_id=819,
+                ban_on_timeout=True,
             )
             await session.commit()
             record = await get_join_verification(session, -100, 919)
@@ -2741,6 +2861,58 @@ class ModerationChallengeTests(_DbTestCase):
             self.assertIsNotNone(retry.lease_until)
             self.assertIsNotNone(warning)
             self.assertTrue(warning.is_banned)
+
+    async def test_expired_rejoin_releases_non_ban_moderation_challenge(self) -> None:
+        settings = _settings()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=920,
+                deadline_at=(
+                    now_shanghai_naive()
+                    - CHALLENGE_SUBMIT_GRACE
+                    - timedelta(seconds=1)
+                ),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="旧版删消息质询",
+                ban_on_timeout=False,
+            )
+            await session.commit()
+            record = await get_join_verification(session, -100, 920)
+
+            event = SimpleNamespace(
+                chat=SimpleNamespace(id=-100),
+                bot=SimpleNamespace(
+                    ban_chat_member=AsyncMock(),
+                    unban_chat_member=AsyncMock(return_value=True),
+                    restrict_chat_member=AsyncMock(return_value=True),
+                ),
+            )
+            await membership._enforce_pending_moderation_challenge(
+                event,
+                session,
+                settings,
+                record,
+                display_name="旧版用户",
+            )
+
+        event.bot.ban_chat_member.assert_not_awaited()
+        event.bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            920,
+            only_if_banned=True,
+        )
+        event.bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 920))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 920,
+                )
+            )
+            self.assertIsNone(warning)
 
     async def test_cancelled_expired_rejoin_keeps_enforcing_lease(self) -> None:
         async with self.session_factory() as session:
@@ -2855,6 +3027,7 @@ class VerificationCallbackTests(_DbTestCase):
         message_id: int,
         kind: str = VERIFICATION_KIND_JOIN,
         reason: str = "",
+        ban_on_timeout: bool = False,
     ):
         deadline = now_shanghai_naive() + timedelta(minutes=5)
         async with self.session_factory() as session:
@@ -2865,6 +3038,7 @@ class VerificationCallbackTests(_DbTestCase):
                 deadline_at=deadline,
                 kind=kind,
                 reason=reason,
+                ban_on_timeout=ban_on_timeout,
                 display_name=f"用户{user_id}",
                 prompt_message_id=message_id,
             )
@@ -3389,12 +3563,57 @@ class VerificationCallbackTests(_DbTestCase):
             self.assertTrue(warning.is_banned)
         callback.bot.edit_message_text.assert_not_awaited()
 
+    async def test_admin_reject_non_ban_moderation_releases_safely(self) -> None:
+        await self._add_record(
+            user_id=959,
+            message_id=859,
+            kind=VERIFICATION_KIND_MODERATION,
+            reason="旧版删消息质询",
+            ban_on_timeout=False,
+        )
+        callback = _verification_callback(
+            action=VERIFICATION_CALLBACK_REJECT,
+            target_user_id=959,
+            operator_id=12,
+            message_id=859,
+        )
+
+        with patch(
+            "bot.handlers.membership.is_group_admin_or_higher",
+            new=AsyncMock(return_value=True),
+        ):
+            async with self.session_factory() as session:
+                await membership.on_verification_callback(
+                    callback,
+                    session=session,
+                    settings=_settings(),
+                )
+
+        callback.bot.ban_chat_member.assert_not_awaited()
+        callback.bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            959,
+            only_if_banned=True,
+        )
+        callback.bot.restrict_chat_member.assert_awaited_once()
+        self.assertIn("未授权封禁", callback.answer.await_args.args[0])
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 959))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 959,
+                )
+            )
+            self.assertIsNone(warning)
+
     async def test_admin_reject_moderation_only_bans_current_group(self) -> None:
         await self._add_record(
             user_id=950,
             message_id=850,
             kind=VERIFICATION_KIND_MODERATION,
             reason="疑似广告",
+            ban_on_timeout=True,
         )
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3437,6 +3656,7 @@ class VerificationCallbackTests(_DbTestCase):
             message_id=853,
             kind=VERIFICATION_KIND_MODERATION,
             reason="疑似广告",
+            ban_on_timeout=True,
         )
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3499,6 +3719,7 @@ class VerificationCallbackTests(_DbTestCase):
             message_id=854,
             kind=VERIFICATION_KIND_MODERATION,
             reason="疑似广告",
+            ban_on_timeout=True,
         )
         async with self.session_factory() as session:
             await add_global_ban(session, 954, reason="测试", source="manual")
@@ -3558,6 +3779,7 @@ class VerificationCallbackTests(_DbTestCase):
             message_id=852,
             kind=VERIFICATION_KIND_MODERATION,
             reason="疑似广告",
+            ban_on_timeout=True,
         )
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3604,6 +3826,7 @@ class VerificationCallbackTests(_DbTestCase):
             message_id=851,
             kind=VERIFICATION_KIND_MODERATION,
             reason="疑似广告",
+            ban_on_timeout=True,
         )
         callback = _verification_callback(
             action=VERIFICATION_CALLBACK_REJECT,
@@ -3685,6 +3908,7 @@ class PrivateStartTests(_DbTestCase):
                 deadline_at=now_shanghai_naive() + timedelta(minutes=5),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似广告 <链接>",
+                ban_on_timeout=True,
             )
             await session.commit()
 
@@ -3703,6 +3927,33 @@ class PrivateStartTests(_DbTestCase):
             self.assertIn("疑似广告 &lt;链接&gt;", text)
             self.assertIn("超时将被封禁", text)
             self.assertNotIn("超时将被移出群聊", text)
+
+    async def test_non_ban_moderation_private_start_queues_safe_release(self) -> None:
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=925,
+                deadline_at=now_shanghai_naive() + timedelta(minutes=5),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="旧版删消息质询",
+                ban_on_timeout=False,
+            )
+            await session.commit()
+
+            message = self._private_message(925)
+            handled = await maybe_send_private_verification(
+                message,
+                session,
+                _settings(join_verification_enabled=False),
+            )
+
+            self.assertFalse(handled)
+            message.answer.assert_not_awaited()
+            record = await get_join_verification(session, -100, 925)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.status, VERIFICATION_STATUS_UNBANNING)
+            self.assertLessEqual(record.lease_until, now_shanghai_naive())
 
     async def test_group_scoped_start_selects_exact_pending_record(self) -> None:
         async with self.session_factory() as session:
@@ -4148,6 +4399,7 @@ class SweeperTests(_DbTestCase):
                 user_id=941,
                 deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
+                ban_on_timeout=True,
             )
             await session.commit()
             record = await get_join_verification(session, -100, 941)
@@ -4329,6 +4581,7 @@ class SweeperTests(_DbTestCase):
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似诈骗链接",
                 prompt_message_id=778,
+                ban_on_timeout=True,
             )
             await upsert_join_verification(
                 session, group_id=-100, user_id=931, deadline_at=now + timedelta(minutes=5)
@@ -4362,7 +4615,7 @@ class SweeperTests(_DbTestCase):
             for item in bot.edit_message_text.await_args_list
         }
         self.assertIn("移出群聊", finalized[777])
-        self.assertIn("已封禁", finalized[778])
+        self.assertIn("已在当前群封禁", finalized[778])
 
         async with self.session_factory() as session:
             self.assertIsNone(await get_join_verification(session, -100, 930))
@@ -4436,6 +4689,7 @@ class SweeperTests(_DbTestCase):
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似诈骗链接",
                 prompt_message_id=779,
+                ban_on_timeout=True,
             )
             await session.commit()
 
@@ -4567,6 +4821,7 @@ class SweeperTests(_DbTestCase):
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="疑似违规",
                 prompt_message_id=792,
+                ban_on_timeout=True,
             )
             await session.commit()
 
@@ -4604,6 +4859,7 @@ class SweeperTests(_DbTestCase):
                 deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="待质询",
+                ban_on_timeout=True,
             )
             await session.commit()
 
@@ -4629,6 +4885,53 @@ class SweeperTests(_DbTestCase):
             self.assertIsNotNone(record)
             self.assertGreater(record.deadline_at, now)
             self.assertIsNone(await get_global_ban(session, 933))
+
+    async def test_non_ban_moderation_release_ignores_provider_outage(self) -> None:
+        now = now_shanghai_naive()
+        async with self.session_factory() as session:
+            await upsert_join_verification(
+                session,
+                group_id=-100,
+                user_id=954,
+                deadline_at=now - CHALLENGE_SUBMIT_GRACE - timedelta(seconds=1),
+                kind=VERIFICATION_KIND_MODERATION,
+                reason="旧版来源不明质询",
+                ban_on_timeout=False,
+            )
+            await session.commit()
+
+        bot = SimpleNamespace(
+            ban_chat_member=AsyncMock(),
+            unban_chat_member=AsyncMock(return_value=True),
+            restrict_chat_member=AsyncMock(return_value=True),
+        )
+        settings = _settings(
+            join_verification_turnstile_site_key="same-key",
+            join_verification_turnstile_secret_key="same-key",
+        )
+        sweeper = JoinVerificationSweeper(
+            bot=bot,
+            session_factory=self.session_factory,
+            settings=settings,
+        )
+
+        self.assertEqual(await sweeper.sweep_once(), 1)
+        bot.ban_chat_member.assert_not_awaited()
+        bot.unban_chat_member.assert_awaited_once_with(
+            -100,
+            954,
+            only_if_banned=True,
+        )
+        bot.restrict_chat_member.assert_awaited_once()
+        async with self.session_factory() as session:
+            self.assertIsNone(await get_join_verification(session, -100, 954))
+            warning = await session.scalar(
+                select(UserWarning).where(
+                    UserWarning.group_id == -100,
+                    UserWarning.user_id == 954,
+                )
+            )
+            self.assertIsNone(warning)
 
     async def test_sweep_only_pauses_records_for_unavailable_provider(self) -> None:
         now = now_shanghai_naive()
@@ -4814,6 +5117,7 @@ class MemberLeaveCleanupTests(_DbTestCase):
                 kind=VERIFICATION_KIND_MODERATION,
                 reason="待完成质询",
                 prompt_message_id=889,
+                ban_on_timeout=True,
             )
             await session.commit()
 

@@ -363,7 +363,7 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         message._test_record_pass.assert_not_awaited()
         message.delete.assert_not_awaited()
 
-    async def test_violation_deletes_resets_counter_and_counts_warning(self) -> None:
+    async def test_delete_rule_deletes_without_ban_escalation(self) -> None:
         rule = SimpleNamespace(id=5, action="delete", rule_type="llm", pattern="禁止广告")
         verdict = ModerationVerdict(
             violated=True, reason="广告", rule=rule, conclusive=True, confidence=0.95
@@ -372,7 +372,6 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
             is_user_exempt=AsyncMock(return_value=False),
             evaluate=AsyncMock(return_value=verdict),
             is_high_confidence=lambda _verdict: True,
-            add_warning=AsyncMock(return_value=(1, False)),
             record_violation=AsyncMock(return_value=SimpleNamespace(id=501)),
         )
         answer = AsyncMock()
@@ -384,13 +383,11 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         message._test_reset.assert_awaited_once()
         message._test_record_pass.assert_not_awaited()
         message.bot.ban_chat_member.assert_not_awaited()
-        moderation.add_warning.assert_awaited_once()
-        self.assertEqual(moderation.record_violation.await_args.args[4], "ban_warning")
+        self.assertEqual(moderation.record_violation.await_args.args[4], "delete")
         answer.assert_awaited_once()
-        keyboard = answer.await_args.kwargs["reply_markup"]
-        self.assertEqual(keyboard.inline_keyboard[0][1].callback_data, "mact:undo:501")
+        self.assertIsNone(answer.await_args.kwargs["reply_markup"])
 
-    async def test_repeat_violations_escalate_to_ban(self) -> None:
+    async def test_delete_rule_never_uses_counted_ban_path(self) -> None:
         rule = SimpleNamespace(id=5, action="delete", rule_type="llm", pattern="禁止广告")
         verdict = ModerationVerdict(
             violated=True, reason="广告", rule=rule, conclusive=True, confidence=0.95
@@ -407,12 +404,34 @@ class BotSenderModerationHandlerTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.handlers.group.answer_with_auto_delete", new=answer):
             message = await self._run(moderation_service=moderation)
 
-        message.bot.ban_chat_member.assert_awaited_once_with(
-            GROUP_ID,
-            BOT_ID,
-            revoke_messages=True,
+        message.delete.assert_awaited_once()
+        message.bot.ban_chat_member.assert_not_awaited()
+        moderation.add_warning.assert_not_awaited()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "delete")
+
+    async def test_warn_rule_never_deletes_or_uses_counted_ban_path(self) -> None:
+        rule = SimpleNamespace(id=8, action="warn", rule_type="llm", pattern="禁止刷屏")
+        verdict = ModerationVerdict(
+            violated=True, reason="刷屏", rule=rule, conclusive=True, confidence=0.95
         )
-        self.assertEqual(moderation.record_violation.await_args.args[4], "ban_applied")
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: True,
+            add_warning=AsyncMock(return_value=(3, True)),
+            record_violation=AsyncMock(return_value=SimpleNamespace(id=504)),
+        )
+        answer = AsyncMock()
+
+        with patch("bot.handlers.group.answer_with_auto_delete", new=answer):
+            message = await self._run(moderation_service=moderation)
+
+        message.delete.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
+        moderation.add_warning.assert_not_awaited()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "warn")
+        keyboard = answer.await_args.kwargs["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][1].callback_data, "mact:undo:504")
 
     async def test_high_confidence_ban_rule_bans_bot(self) -> None:
         rule = SimpleNamespace(id=6, action="ban", rule_type="llm", pattern="禁止广告")

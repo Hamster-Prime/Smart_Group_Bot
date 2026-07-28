@@ -880,7 +880,8 @@ async def _enforce_pending_moderation_challenge(
 ) -> None:
     """Keep an unresolved message/patrol/raid challenge intact across leave/rejoin.
 
-    Moderation challenges ban on expiry; patrol and raid challenges kick
+    Only moderation challenges explicitly issued from a ban rule may ban on
+    expiry; patrol, raid, and legacy/non-punitive moderation challenges release
     without banning, matching the sweeper's consequences for each kind.
     """
     now = now_shanghai_naive()
@@ -917,6 +918,61 @@ async def _enforce_pending_moderation_challenge(
         return
 
     is_patrol = record.kind in (VERIFICATION_KIND_PATROL, VERIFICATION_KIND_RAID)
+    safe_release_moderation = bool(
+        record.kind == VERIFICATION_KIND_MODERATION
+        and not bool(getattr(record, "ban_on_timeout", False))
+    )
+    if safe_release_moderation:
+        lease_until = await _lease_terminal_verification(
+            session,
+            now=now,
+            record=record,
+            expired=expired,
+            target_status=VERIFICATION_STATUS_UNBANNING,
+        )
+        if lease_until is None:
+            return
+
+        async def preserve_existing_ban() -> bool:
+            await session.rollback()
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=int(record.group_id),
+                user_id=int(record.user_id),
+            )
+            await session.commit()
+            return blocked
+
+        async def no_challenge_restriction() -> bool:
+            return False
+
+        reconciliation = await reconcile_moderation_ban_after_lost_lease_result(
+            event.bot,
+            int(record.group_id),
+            int(record.user_id),
+            preserve_existing_ban,
+            restriction_required=no_challenge_restriction,
+        )
+        if not reconciliation.ok:
+            await _defer_terminal_verification(
+                session,
+                verification_id=int(record.id),
+                lease_until=lease_until,
+                status=VERIFICATION_STATUS_UNBANNING,
+            )
+            return
+        if await _complete_terminal_verification(
+            session,
+            verification_id=int(record.id),
+            lease_until=lease_until,
+            status=VERIFICATION_STATUS_UNBANNING,
+        ):
+            await close_private_challenge_message(
+                event.bot,
+                int(record.user_id),
+                int(snapshot.get("private_message_id") or 0),
+            )
+        return
     if expired:
         lease_until = await _lease_terminal_verification(
             session,
@@ -1097,6 +1153,7 @@ async def _enforce_pending_moderation_challenge(
             reason=record.reason,
             display_name=display_name or record.display_name,
             prompt_message_id=0,
+            ban_on_timeout=bool(getattr(record, "ban_on_timeout", False)),
         )
         if recovery is not None:
             await session.commit()
@@ -1138,6 +1195,7 @@ def _verification_snapshot(record: JoinVerification) -> dict[str, object]:
         "kind": str(record.kind),
         "provider": str(record.provider),
         "reason": str(record.reason or ""),
+        "ban_on_timeout": bool(getattr(record, "ban_on_timeout", False)),
         "display_name": str(record.display_name or ""),
         "prompt_message_id": int(record.prompt_message_id or 0),
         "private_message_id": int(getattr(record, "private_message_id", 0) or 0),
@@ -1547,6 +1605,11 @@ async def _handle_verification_admin_callback(
     ):
         await _ack_security_callback(callback, "不能封禁最高管理员", show_alert=True)
         return
+    safe_moderation_reject = bool(
+        action == VERIFICATION_CALLBACK_REJECT
+        and record.kind == VERIFICATION_KIND_MODERATION
+        and not bool(getattr(record, "ban_on_timeout", False))
+    )
     if action == VERIFICATION_CALLBACK_APPROVE:
         locally_banned = bool(
             await session.scalar(
@@ -1568,11 +1631,12 @@ async def _handle_verification_admin_callback(
             return
 
     snapshot = _verification_snapshot(record)
-    terminal_status = (
-        VERIFICATION_STATUS_RELEASING
-        if action == VERIFICATION_CALLBACK_APPROVE
-        else VERIFICATION_STATUS_ENFORCING
-    )
+    if safe_moderation_reject:
+        terminal_status = VERIFICATION_STATUS_UNBANNING
+    elif action == VERIFICATION_CALLBACK_APPROVE:
+        terminal_status = VERIFICATION_STATUS_RELEASING
+    else:
+        terminal_status = VERIFICATION_STATUS_ENFORCING
     lease_until = await _lease_terminal_verification(
         session,
         now=now_shanghai_naive(),
@@ -1604,6 +1668,82 @@ async def _handle_verification_admin_callback(
             "验证状态已被更高优先级的权限操作更新",
             show_alert=True,
         )
+        return
+    if safe_moderation_reject:
+        log.warning(
+            "refused moderation admin ban without ban-rule authorization | "
+            "group=%s user=%s",
+            group_id,
+            target_user_id,
+        )
+
+        async def preserve_existing_ban() -> bool:
+            await session.rollback()
+            blocked = await verification_release_blocked_by_ban(
+                session,
+                group_id=group_id,
+                user_id=target_user_id,
+            )
+            await session.commit()
+            return blocked
+
+        async def no_challenge_restriction() -> bool:
+            return False
+
+        reconciliation = await reconcile_moderation_ban_after_lost_lease_result(
+            callback.bot,
+            group_id,
+            target_user_id,
+            preserve_existing_ban,
+            restriction_required=no_challenge_restriction,
+        )
+        if not reconciliation.ok:
+            deferred = await _defer_terminal_verification(
+                session,
+                verification_id=int(record.id),
+                lease_until=lease_until,
+                status=VERIFICATION_STATUS_UNBANNING,
+            )
+            await _ack_security_callback(
+                callback,
+                "该质询不具备封禁授权，后台将继续重试安全放行"
+                if deferred
+                else "该质询不具备封禁授权，恢复状态已由后台接管",
+                show_alert=True,
+            )
+            return
+        if not await _complete_terminal_verification(
+            session,
+            verification_id=int(record.id),
+            lease_until=lease_until,
+            status=VERIFICATION_STATUS_UNBANNING,
+        ):
+            await _ack_security_callback(
+                callback,
+                "权限已按最新策略校准，验证状态由后台继续确认",
+                show_alert=True,
+            )
+            return
+        current_state = (
+            "已保留现有封禁"
+            if reconciliation.final_banned is True
+            else "发言权限已恢复"
+        )
+        released_text = build_verification_progress_text(
+            kind=VERIFICATION_KIND_MODERATION,
+            status="已取消",
+            completed="已阻止未授权封禁",
+            current=current_state,
+            action=f"<b>{shown}</b> 的旧消息审查质询不具备封禁授权。",
+            details="仅来源群规动作明确为 ban 的质询才允许封禁。",
+        )
+        await _edit_verification_prompt(callback, settings, text=released_text)
+        await close_private_challenge_message(
+            callback.bot,
+            target_user_id,
+            int(snapshot.get("private_message_id") or 0),
+        )
+        await _ack_security_callback(callback, "已阻止未授权封禁并安全处理")
         return
     if action == VERIFICATION_CALLBACK_APPROVE:
         restored = await restore_member_permissions(callback.bot, group_id, target_user_id)
@@ -1674,9 +1814,9 @@ async def _handle_verification_admin_callback(
             )
         return
 
-    # An admin rejection is a ban decision for every prompt kind: unlike the
-    # timeout path (temporary ban + unban so the member can rejoin), rejecting
-    # marks the durable group-local ban and applies a permanent Telegram ban.
+    # An admin rejection is a ban decision for join/patrol/raid prompts and for
+    # moderation prompts explicitly issued by a ban rule. Legacy or otherwise
+    # unauthorized moderation prompts are released by the guard above.
     ban_state = await mark_group_banned(session, group_id, target_user_id)
     await session.commit()
 

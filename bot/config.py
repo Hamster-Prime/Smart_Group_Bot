@@ -143,10 +143,10 @@ class BotConfig(BaseModel):
 class ModerationConfig(BaseModel):
     enabled: bool = True
     warn_threshold: int = 3
-    # 违规判定置信度 >= 该值时直接按规则动作处理；低于该值时删除消息并
-    # 要求真人质询（质询依赖所选验证服务和公网地址配置）。
+    # 违规判定置信度 >= 该值时直接按规则动作处理；低于该值时 warn/delete
+    # 仍按原动作处理，只有 ban 规则要求真人质询。
     high_confidence_threshold: float = Field(default=0.9, allow_inf_nan=False)
-    # 低置信度质询限时（秒），超时自动封禁。
+    # 低置信度 ban 规则质询限时（秒），超时自动封禁。
     challenge_timeout_seconds: int = 600
     # 其他 bot（如 guest 模式广告机）发送的消息也进入内容审核；
     # 连续 bot_screening_message_count 条干净后加入白名单不再审核。

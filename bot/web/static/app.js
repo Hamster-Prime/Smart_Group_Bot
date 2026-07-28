@@ -922,15 +922,15 @@
   function renderSafety() {
     const provider = state.config.verification.provider || "turnstile";
     return `
-      ${pageHead("审核与验证", "管理违规判定、低置信度质询和新成员验证。")}
+      ${pageHead("审核与验证", "管理违规判定、ban 规则低置信度质询和新成员验证。")}
       <div class="section-stack">
         <section class="settings-section">
           ${sectionHead("内容审核")}
           <div class="field-grid three">
             ${toggle("moderation.enabled", "启用内容审核", "对群消息执行审核规则")}
-            ${field("moderation.warn_threshold", "警告阈值", { type: "number", min: 1, max: 100, step: 1, required: true })}
-            ${field("moderation.high_confidence_threshold", "高置信度阈值", { type: "number", min: 0, max: 1, step: 0.01, required: true })}
-            ${field("moderation.challenge_timeout_seconds", "质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
+            ${field("moderation.warn_threshold", "ban 规则累计阈值", { type: "number", min: 1, max: 100, step: 1, required: true, hint: "仅 action=ban 的规则会累计并在达标后封禁" })}
+            ${field("moderation.high_confidence_threshold", "高置信度阈值", { type: "number", min: 0, max: 1, step: 0.01, required: true, hint: "低于阈值时，warn/delete 保持原动作；只有 ban 规则进入真人质询" })}
+            ${field("moderation.challenge_timeout_seconds", "ban 质询超时（秒）", { type: "number", min: 60, max: 86400, step: 1, required: true })}
             ${toggle("moderation.bot_screening_enabled", "审核其他 bot 消息", "guest 模式等 bot 消息先审核，累计干净消息达标后加入白名单")}
             ${field("moderation.bot_screening_message_count", "bot 白名单所需干净消息数", { type: "number", min: 1, max: 100, step: 1, required: true })}
           </div>

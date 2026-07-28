@@ -18,9 +18,9 @@ Join flow (per-group policy):
   they may rejoin and retry later while the Bot API revokes their old view.
 
 Moderation-challenge flow (kind="moderation"):
-- A message judged violating with LOW confidence is deleted, the sender is
-  fully muted, and the same private-chat deep link + Mini App challenge is
-  issued (begin_moderation_challenge).
+- A message judged violating with LOW confidence under a ``ban`` rule is
+  deleted, the sender is fully muted, and the same private-chat deep link +
+  Mini App challenge is issued (begin_moderation_challenge).
 - Passing restores permissions; missing the deadline bans the user in the
   current group until a group administrator lifts that ban.
 
@@ -1578,6 +1578,7 @@ async def prepare_join_verification(
     display_name: str = "",
     prompt_message_id: int = 0,
     provider: str = "turnstile",
+    ban_on_timeout: bool = False,
     lease_until: datetime | None = None,
 ) -> PreparedVerification | None:
     """Persist a short preparation lease before muting or posting a prompt.
@@ -1597,6 +1598,7 @@ async def prepare_join_verification(
         "kind": kind,
         "provider": selected_provider,
         "reason": (reason or "")[:500],
+        "ban_on_timeout": bool(ban_on_timeout),
         "display_name": (display_name or "")[:255],
         "prompt_message_id": int(prompt_message_id or 0),
         "deadline_at": deadline_at,
@@ -1889,6 +1891,7 @@ async def upsert_join_verification(
     display_name: str = "",
     prompt_message_id: int = 0,
     provider: str = "turnstile",
+    ban_on_timeout: bool = False,
 ) -> None:
     """Create or replace the pending verification for (group, user).
 
@@ -1903,6 +1906,7 @@ async def upsert_join_verification(
         "kind": kind,
         "provider": selected_provider,
         "reason": (reason or "")[:500],
+        "ban_on_timeout": bool(ban_on_timeout),
         "display_name": (display_name or "")[:255],
         "prompt_message_id": prompt_message_id,
         "deadline_at": deadline_at,
@@ -2686,7 +2690,11 @@ async def extend_pending_verification_deadlines(
     provider: str | None = None,
     group_id: int | None = None,
 ) -> int:
-    """Give affected pending users a fresh window while a provider is unavailable."""
+    """Give solvable pending challenges a fresh window during provider outages.
+
+    Moderation rows without explicit ban authorization are excluded because
+    they must be released, not kept muted until the provider recovers.
+    """
     current = now or now_shanghai_naive()
     stmt = (
         select(JoinVerification)
@@ -2697,6 +2705,10 @@ async def extend_pending_verification_deadlines(
         .where(
             JoinVerification.status == VERIFICATION_STATUS_PENDING,
             AuthorizedGroup.bot_present.is_(True),
+            or_(
+                JoinVerification.kind != VERIFICATION_KIND_MODERATION,
+                JoinVerification.ban_on_timeout.is_(True),
+            ),
         )
     )
     if group_id is not None:
@@ -4190,6 +4202,7 @@ async def begin_moderation_challenge(
     display_name: str,
     bot_username: str,
     reason: str,
+    rule_action: str,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
     """Mute a sender, issue a provider challenge, and persist its deadline.
@@ -4198,6 +4211,15 @@ async def begin_moderation_challenge(
     A prompt failure restores permissions so callers can safely fall back to
     the rule's normal high-confidence action without stranding the member.
     """
+    if str(rule_action or "").strip().lower() != "ban":
+        log.error(
+            "refused non-ban moderation challenge | group=%s user=%s action=%s",
+            group_id,
+            user_id,
+            rule_action,
+        )
+        return False
+
     key = (group_id, user_id)
     lock = _MODERATION_CHALLENGE_LOCKS.get(key)
     if lock is None:
@@ -4214,6 +4236,7 @@ async def begin_moderation_challenge(
             display_name=display_name,
             bot_username=bot_username,
             reason=reason,
+            rule_action=rule_action,
             session_factory=session_factory,
         )
 
@@ -4228,8 +4251,11 @@ async def _begin_moderation_challenge_locked(
     display_name: str,
     bot_username: str,
     reason: str,
+    rule_action: str,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> bool:
+    if str(rule_action or "").strip().lower() != "ban":
+        return False
     if not moderation_challenge_ready(settings):
         return False
 
@@ -4310,6 +4336,7 @@ async def _begin_moderation_challenge_locked(
         reason=(reason or "疑似命中群规")[:500],
         display_name=display_name,
         provider=verification_provider(settings),
+        ban_on_timeout=True,
     )
     if prepared is None:
         await session.rollback()
@@ -4616,6 +4643,37 @@ async def maybe_send_private_verification(
     )
     if record is None:
         return False
+    if (
+        record.kind == VERIFICATION_KIND_MODERATION
+        and not bool(getattr(record, "ban_on_timeout", False))
+    ):
+        # A moderation row without an explicit ban-rule snapshot must never
+        # receive a challenge that promises a ban on failure. Queue it for the
+        # sweeper's compensating unban/permission restore instead.
+        release_at = now_shanghai_naive() - timedelta(seconds=1)
+        queued = await session.execute(
+            update(JoinVerification)
+            .where(
+                JoinVerification.id == int(record.id),
+                JoinVerification.status == VERIFICATION_STATUS_PENDING,
+                JoinVerification.ban_on_timeout.is_not(True),
+            )
+            .values(
+                status=VERIFICATION_STATUS_UNBANNING,
+                lease_until=release_at,
+            )
+        )
+        if int(queued.rowcount or 0):
+            await session.commit()
+            log.warning(
+                "private moderation challenge refused without ban authorization | "
+                "group=%s user=%s",
+                record.group_id,
+                record.user_id,
+            )
+        else:
+            await session.rollback()
+        return False
     if verification_deadline_passed(record.deadline_at):
         # The sweeper will kick shortly; a fresh button would be useless.
         return False
@@ -4819,10 +4877,15 @@ class JoinVerificationSweeper:
                     getattr(record, "status", VERIFICATION_STATUS_PENDING)
                     or VERIFICATION_STATUS_PENDING
                 )
+                safe_release_moderation = bool(
+                    record.kind == VERIFICATION_KIND_MODERATION
+                    and not bool(getattr(record, "ban_on_timeout", False))
+                )
                 record_provider = normalize_verification_provider(record.provider)
                 if (
                     authorized
                     and record_status == VERIFICATION_STATUS_PENDING
+                    and not safe_release_moderation
                     and (
                         record_provider in unavailable_providers
                         or self.settings is not None
@@ -4839,6 +4902,7 @@ class JoinVerificationSweeper:
                 target_status = (
                     VERIFICATION_STATUS_UNBANNING
                     if record_status == VERIFICATION_STATUS_UNBANNING
+                    or safe_release_moderation
                     else (
                         VERIFICATION_STATUS_RELEASING
                         if record_status == VERIFICATION_STATUS_RELEASING
@@ -4863,6 +4927,13 @@ class JoinVerificationSweeper:
                     unauthorized_enforcing_claimed.append(record)
                     continue
                 if target_status == VERIFICATION_STATUS_UNBANNING:
+                    if safe_release_moderation:
+                        log.warning(
+                            "moderation challenge converted to safe release | "
+                            "reason=ban_not_authorized group=%s user=%s",
+                            record.group_id,
+                            record.user_id,
+                        )
                     unbanning_claimed.append(record)
                     continue
                 if target_status == VERIFICATION_STATUS_RELEASING:
@@ -4998,6 +5069,33 @@ class JoinVerificationSweeper:
                 )
                 return
             if record.kind == VERIFICATION_KIND_MODERATION:
+                if not bool(getattr(record, "ban_on_timeout", False)):
+                    # Defense in depth: classification above should have sent
+                    # this row through unbanning. If a future routing change
+                    # regresses, convert the exact lease before any Telegram
+                    # ban call instead of trusting kind="moderation" alone.
+                    lease_until = getattr(record, "lease_until", None)
+                    if lease_until is None:
+                        return
+                    async with self.session_factory() as release_session:
+                        converted = await release_session.execute(
+                            update(JoinVerification)
+                            .where(
+                                JoinVerification.id == int(record.id),
+                                JoinVerification.status
+                                == VERIFICATION_STATUS_ENFORCING,
+                                JoinVerification.lease_until == lease_until,
+                                JoinVerification.ban_on_timeout.is_not(True),
+                            )
+                            .values(status=VERIFICATION_STATUS_UNBANNING)
+                        )
+                        if int(converted.rowcount or 0) != 1:
+                            await release_session.rollback()
+                            return
+                        await release_session.commit()
+                    record.status = VERIFICATION_STATUS_UNBANNING
+                    await self._recover_unbanning(record)
+                    return
                 enforcement = await ban_member_result(
                     self.bot,
                     record.group_id,

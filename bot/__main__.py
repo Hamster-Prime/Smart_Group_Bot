@@ -549,7 +549,7 @@ async def main() -> None:
         elif settings.moderation.enabled or settings.join_verification_enabled:
             log.warning(
                 "真人验证密钥或公网验证地址不完整；入群验证不会签发，"
-                "低置信度审核也将回退到原群规动作。"
+                "低置信度 ban 群规也将回退到原群规动作。"
             )
         log.info("Bot starting...")
 

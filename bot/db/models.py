@@ -587,7 +587,8 @@ class JoinVerification(Base):
 
     kind="join": issued on member join; missing the deadline kicks (the user
     may rejoin and retry). kind="moderation": issued when a message is judged
-    violating with low confidence; missing the deadline bans permanently.
+    violating with low confidence under a ban rule; ``ban_on_timeout`` records
+    whether missing the deadline may permanently ban the member.
     kind="patrol": issued when the profile patrol flags a member; missing the
     deadline kicks without banning (the user may rejoin). kind="raid": issued
     by the raid guard's retroactive sweep after a join-flood lockdown; same
@@ -611,6 +612,13 @@ class JoinVerification(Base):
         String(32), default="turnstile", server_default="turnstile"
     )
     reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # Only meaningful for kind="moderation".  Default safely against accidental
+    # escalation: legacy/unspecified rows release instead of banning on timeout.
+    ban_on_timeout: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="0",
+    )
     status: Mapped[str] = mapped_column(
         String(16),
         default="pending",

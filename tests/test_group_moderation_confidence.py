@@ -156,11 +156,17 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             )
         return message
 
-    async def test_low_confidence_deletes_and_issues_challenge(self) -> None:
+    async def test_low_confidence_ban_rule_deletes_and_issues_challenge(self) -> None:
+        rule = SimpleNamespace(
+            id=15,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
         verdict = ModerationVerdict(
             violated=True,
             reason="语义存在歧义",
-            rule=None,
+            rule=rule,
             conclusive=True,
             confidence=0.7,
         )
@@ -184,6 +190,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         begin.assert_awaited_once()
         self.assertEqual(begin.await_args.kwargs["user_id"], 42)
         self.assertEqual(begin.await_args.kwargs["reason"], "语义存在歧义")
+        self.assertEqual(begin.await_args.kwargs["rule_action"], "ban")
         moderation.record_violation.assert_awaited_once()
         self.assertEqual(moderation.record_violation.await_args.args[4], "challenge")
         self.assertEqual(
@@ -191,11 +198,17 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             777,
         )
 
-    async def test_failed_challenge_releases_source_key_for_warn_fallback(self) -> None:
+    async def test_failed_challenge_releases_source_key_for_ban_fallback(self) -> None:
+        rule = SimpleNamespace(
+            id=16,
+            action="ban",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
         verdict = ModerationVerdict(
             violated=True,
             reason="语义存在歧义",
-            rule=None,
+            rule=rule,
             conclusive=True,
             confidence=0.7,
         )
@@ -205,6 +218,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
             is_user_exempt=AsyncMock(return_value=False),
             evaluate=AsyncMock(return_value=verdict),
             is_high_confidence=lambda _verdict: False,
+            add_warning=AsyncMock(return_value=(2, False)),
             record_violation=AsyncMock(side_effect=[provisional, final]),
         )
         begin = AsyncMock(return_value=False)
@@ -228,9 +242,105 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [call.args[4] for call in moderation.record_violation.await_args_list],
-            ["challenge", "warn"],
+            ["challenge", "ban_warning"],
         )
         message._test_session.delete.assert_awaited_once_with(provisional)
+        answer.assert_awaited_once()
+
+    async def test_low_confidence_delete_rule_never_starts_challenge_or_ban(self) -> None:
+        rule = SimpleNamespace(
+            id=17,
+            action="delete",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="疑似广告",
+            rule=rule,
+            conclusive=True,
+            confidence=0.7,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=327, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        answer = AsyncMock()
+
+        message = await self._run(
+            moderation,
+            ready=patch(
+                "bot.handlers.group.moderation_challenge_ready",
+                return_value=True,
+            ),
+            begin=patch(
+                "bot.handlers.group.begin_moderation_challenge",
+                new=begin,
+            ),
+            answer=patch(
+                "bot.handlers.group.answer_with_auto_delete",
+                new=answer,
+            ),
+        )
+
+        begin.assert_not_awaited()
+        message.delete.assert_awaited_once()
+        message.bot.ban_chat_member.assert_not_awaited()
+        message.chat.ban.assert_not_awaited()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "delete")
+        answer.assert_awaited_once()
+
+    async def test_low_confidence_warn_rule_never_starts_challenge_or_ban(self) -> None:
+        rule = SimpleNamespace(
+            id=18,
+            action="warn",
+            rule_type="llm",
+            pattern="禁止刷屏",
+        )
+        verdict = ModerationVerdict(
+            violated=True,
+            reason="疑似刷屏",
+            rule=rule,
+            conclusive=True,
+            confidence=0.7,
+        )
+        moderation = SimpleNamespace(
+            is_user_exempt=AsyncMock(return_value=False),
+            evaluate=AsyncMock(return_value=verdict),
+            is_high_confidence=lambda _verdict: False,
+            record_violation=AsyncMock(
+                return_value=SimpleNamespace(id=328, notice_sent_at=None)
+            ),
+        )
+        begin = AsyncMock(return_value=True)
+        answer = AsyncMock()
+
+        message = await self._run(
+            moderation,
+            ready=patch(
+                "bot.handlers.group.moderation_challenge_ready",
+                return_value=True,
+            ),
+            begin=patch(
+                "bot.handlers.group.begin_moderation_challenge",
+                new=begin,
+            ),
+            answer=patch(
+                "bot.handlers.group.answer_with_auto_delete",
+                new=answer,
+            ),
+        )
+
+        begin.assert_not_awaited()
+        message.delete.assert_not_awaited()
+        message.bot.ban_chat_member.assert_not_awaited()
+        message.chat.ban.assert_not_awaited()
+        self.assertEqual(moderation.record_violation.await_args.args[4], "warn")
         answer.assert_awaited_once()
 
     async def test_deauthorization_during_verdict_suppresses_terminal_action(self) -> None:
@@ -677,10 +787,16 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("封禁结果未确认", answer.await_args.args[1])
 
     async def test_invalid_confidence_never_falls_back_to_direct_action(self) -> None:
+        rule = SimpleNamespace(
+            id=19,
+            action="delete",
+            rule_type="llm",
+            pattern="禁止广告",
+        )
         verdict = ModerationVerdict(
             violated=True,
             reason="格式不完整",
-            rule=None,
+            rule=rule,
             conclusive=False,
             confidence=0.0,
         )
@@ -694,7 +810,7 @@ class GroupModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
 
         message = await self._run(
             moderation,
-            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=False),
+            ready=patch("bot.handlers.group.moderation_challenge_ready", return_value=True),
             begin=patch("bot.handlers.group.begin_moderation_challenge", new=begin),
         )
 

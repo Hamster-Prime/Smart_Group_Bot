@@ -836,6 +836,8 @@ async def _screen_bot_sender_message(
 
     rule = verdict.rule
     rule_action = str(rule.action if rule else "delete").strip().lower()
+    if rule_action not in {"warn", "delete", "ban"}:
+        rule_action = "delete"
     ban_now = rule_action == "ban" and moderation.is_high_confidence(verdict)
 
     await reset_bot_screening(session, group_id, bot_id)
@@ -1065,20 +1067,78 @@ async def _screen_bot_sender_message(
         )
         return
 
-    # Non-immediate violations go through the counted warning path, so a
-    # flooding ad bot is auto-banned after warn_threshold hits instead of
-    # producing an unbounded delete/notice loop.
+    if rule_action in {"warn", "delete"}:
+        async with _moderation_user_lock(group_id, bot_id):
+            if not await _claim_current_moderation_verdict(
+                session,
+                group_id=group_id,
+                user_id=bot_id,
+                verdict=verdict,
+            ):
+                return
+            violation = await moderation.record_violation(
+                session,
+                group_id,
+                bot_id,
+                input_text,
+                rule_action,
+                rule,
+                source_message_id=_source_message_id(message),
+            )
+            await session.flush()
+            await session.commit()
+            if rule_action == "delete":
+                try:
+                    await message.delete()
+                except Exception:
+                    log.warning(
+                        "[%s] bot moderation delete failed | bot=%s",
+                        group_id,
+                        bot_id,
+                    )
+            notice = _build_moderation_notice(
+                warn_target=warn_target,
+                reason=verdict.reason,
+                rule=rule,
+                hit_action=rule_action,
+            )
+            await _send_moderation_notice_once_locked(
+                session=session,
+                violation=violation,
+                message=message,
+                notice=notice,
+                auto_delete_seconds=configured_auto_delete_seconds(
+                    settings,
+                    "moderation",
+                ),
+                reply_markup=(
+                    _build_moderation_action_keyboard(int(violation.id))
+                    if rule_action == "warn"
+                    else None
+                ),
+            )
+        log.info(
+            "[%s]【结束】bot审核拦截 | bot=%s | 动作=%s | 封禁=否 | 总耗时=%dms",
+            group_id,
+            bot_id,
+            rule_action,
+            int((time.perf_counter() - flow_started) * 1000),
+        )
+        return
+
+    # A low-confidence ban-rule hit cannot use a human challenge, so retain
+    # the counted warning path. Only an explicit ban rule may reach this path.
     warn_threshold = max(1, int(settings.moderation.warn_threshold))
     counted_outcome = await _apply_counted_moderation_ban(
-            moderation=moderation,
-            session=session,
-            message=message,
-            group_id=group_id,
-            user_id=bot_id,
-            input_text=input_text,
-            rule=rule,
-            message_deleted=False,
-            verdict=verdict,
+        moderation=moderation,
+        session=session,
+        message=message,
+        group_id=group_id,
+        user_id=bot_id,
+        input_text=input_text,
+        rule=rule,
+        message_deleted=False,
+        verdict=verdict,
         )
     if counted_outcome is None:
         return
@@ -5618,81 +5678,7 @@ async def on_group_message(
 
                 message_deleted = False
                 high_confidence = mod.is_high_confidence(verdict)
-                if not high_confidence and not sender_identity.is_chat:
-                    if moderation_challenge_ready(settings):
-                        async with _moderation_user_lock(group_id, user_id):
-                            if not await _claim_current_moderation_verdict(
-                                session,
-                                group_id=group_id,
-                                user_id=user_id,
-                                verdict=verdict,
-                            ):
-                                return
-                            challenge_violation = await mod.record_violation(
-                                session,
-                                group_id,
-                                user_id,
-                                input_text,
-                                "challenge",
-                                rule,
-                                source_message_id=_source_message_id(message),
-                            )
-                            await session.flush()
-                            await session.commit()
-                            try:
-                                await message.delete()
-                                message_deleted = True
-                            except Exception:
-                                log.warning(
-                                    "[%s] low-confidence message delete failed | user=%s",
-                                    group_id,
-                                    user_id,
-                                )
-                            await _refresh_violation_notice_state(
-                                session,
-                                challenge_violation,
-                            )
-                            challenged = (
-                                getattr(challenge_violation, "notice_sent_at", None)
-                                is not None
-                            )
-                            if not challenged:
-                                challenged = await begin_moderation_challenge(
-                                    bot=message.bot,
-                                    session=session,
-                                    settings=settings,
-                                    group_id=group_id,
-                                    user_id=user_id,
-                                    display_name=display_name,
-                                    bot_username=getattr(bot_me, "username", "") or "",
-                                    reason=reason,
-                                    session_factory=session_factory,
-                                )
-                                if challenged:
-                                    challenge_violation.notice_sent_at = (
-                                        now_shanghai_naive()
-                                    )
-                                    await session.commit()
-                                else:
-                                    # The challenge was not created, so this
-                                    # provisional event must not monopolize the
-                                    # source-message idempotency key.  The
-                                    # deterministic fallback below will create
-                                    # the real warn/delete/ban event instead.
-                                    delete_row = getattr(session, "delete", None)
-                                    if callable(delete_row):
-                                        await delete_row(challenge_violation)
-                                        await session.commit()
-                        if challenged:
-                            log.info(
-                                "[%s]【结束】审核质询 | user=%s | confidence=%.2f | 已删=%s | 总耗时=%dms",
-                                group_id,
-                                user_id,
-                                verdict.confidence,
-                                message_deleted,
-                                int((time.perf_counter() - flow_started) * 1000),
-                            )
-                            return
+                if not high_confidence:
                     if not verdict.conclusive:
                         log.warning(
                             "[%s] inconclusive moderation confidence; no direct action | user=%s",
@@ -5700,32 +5686,106 @@ async def on_group_message(
                             user_id,
                         )
                         return
-                    log.warning(
-                        "[%s] low-confidence challenge unavailable; falling back to rule action | "
-                        "user=%s confidence=%.2f action=%s",
-                        group_id,
-                        user_id,
-                        verdict.confidence,
-                        action,
-                    )
-
-                if not high_confidence and sender_identity.is_chat:
-                    if not verdict.conclusive:
+                    if action == "ban" and not sender_identity.is_chat:
+                        if moderation_challenge_ready(settings):
+                            async with _moderation_user_lock(group_id, user_id):
+                                if not await _claim_current_moderation_verdict(
+                                    session,
+                                    group_id=group_id,
+                                    user_id=user_id,
+                                    verdict=verdict,
+                                ):
+                                    return
+                                challenge_violation = await mod.record_violation(
+                                    session,
+                                    group_id,
+                                    user_id,
+                                    input_text,
+                                    "challenge",
+                                    rule,
+                                    source_message_id=_source_message_id(message),
+                                )
+                                await session.flush()
+                                await session.commit()
+                                try:
+                                    await message.delete()
+                                    message_deleted = True
+                                except Exception:
+                                    log.warning(
+                                        "[%s] low-confidence message delete failed | user=%s",
+                                        group_id,
+                                        user_id,
+                                    )
+                                await _refresh_violation_notice_state(
+                                    session,
+                                    challenge_violation,
+                                )
+                                challenged = (
+                                    getattr(challenge_violation, "notice_sent_at", None)
+                                    is not None
+                                )
+                                if not challenged:
+                                    challenged = await begin_moderation_challenge(
+                                        bot=message.bot,
+                                        session=session,
+                                        settings=settings,
+                                        group_id=group_id,
+                                        user_id=user_id,
+                                        display_name=display_name,
+                                        bot_username=getattr(bot_me, "username", "") or "",
+                                        reason=reason,
+                                        rule_action=action,
+                                        session_factory=session_factory,
+                                    )
+                                    if challenged:
+                                        challenge_violation.notice_sent_at = (
+                                            now_shanghai_naive()
+                                        )
+                                        await session.commit()
+                                    else:
+                                        # The challenge was not created, so this
+                                        # provisional event must not monopolize the
+                                        # source-message idempotency key.  The
+                                        # deterministic fallback below will create
+                                        # the real ban event instead.
+                                        delete_row = getattr(session, "delete", None)
+                                        if callable(delete_row):
+                                            await delete_row(challenge_violation)
+                                            await session.commit()
+                            if challenged:
+                                log.info(
+                                    "[%s]【结束】审核质询 | user=%s | confidence=%.2f | 已删=%s | 总耗时=%dms",
+                                    group_id,
+                                    user_id,
+                                    verdict.confidence,
+                                    message_deleted,
+                                    int((time.perf_counter() - flow_started) * 1000),
+                                )
+                                return
                         log.warning(
-                            "[%s] inconclusive sender-chat moderation; no direct action | "
-                            "sender_chat=%s",
+                            "[%s] low-confidence ban challenge unavailable; "
+                            "falling back to ban rule action | user=%s confidence=%.2f",
                             group_id,
                             user_id,
+                            verdict.confidence,
                         )
-                        return
-                    log.warning(
-                        "[%s] sender-chat cannot complete a challenge; applying rule action | "
-                        "sender_chat=%s confidence=%.2f action=%s",
-                        group_id,
-                        user_id,
-                        verdict.confidence,
-                        action,
-                    )
+                    elif action == "ban":
+                        log.warning(
+                            "[%s] sender-chat cannot complete a ban challenge; "
+                            "applying ban rule action | sender_chat=%s confidence=%.2f",
+                            group_id,
+                            user_id,
+                            verdict.confidence,
+                        )
+                    else:
+                        log.info(
+                            "[%s] low-confidence non-ban rule uses configured action | "
+                            "user=%s confidence=%.2f action=%s",
+                            group_id,
+                            user_id,
+                            verdict.confidence,
+                            action,
+                        )
 
                 if action == "ban" and sender_identity.is_chat:
                     # Channel identities are chat IDs, not users. Passing one
@@ -5921,16 +5981,16 @@ async def on_group_message(
 
                 warn_threshold = max(1, settings.moderation.warn_threshold)
                 counted_outcome = await _apply_counted_moderation_ban(
-                        moderation=mod,
-                        session=session,
-                        message=message,
-                        group_id=group_id,
-                        user_id=user_id,
-                        input_text=input_text,
-                        rule=rule,
-                        message_deleted=message_deleted,
-                        verdict=verdict,
-                    )
+                    moderation=mod,
+                    session=session,
+                    message=message,
+                    group_id=group_id,
+                    user_id=user_id,
+                    input_text=input_text,
+                    rule=rule,
+                    message_deleted=message_deleted,
+                    verdict=verdict,
+                )
                 if counted_outcome is None:
                     return
                 (

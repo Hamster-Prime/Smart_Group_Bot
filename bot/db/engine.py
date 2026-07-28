@@ -811,35 +811,62 @@ async def _sqlite_migrate_join_verification_autoincrement(conn) -> bool:
     status_expr = "status" if "status" in columns else "'pending'"
     lease_expr = "lease_until" if "lease_until" in columns else "NULL"
 
+    table_columns = [
+        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT",
+        "group_id BIGINT NOT NULL",
+        "user_id BIGINT NOT NULL",
+        "kind VARCHAR(32) NOT NULL DEFAULT 'join'",
+        "provider VARCHAR(32) NOT NULL DEFAULT 'turnstile'",
+        "reason TEXT NOT NULL DEFAULT ''",
+    ]
+    insert_columns = ["id", "group_id", "user_id", "kind", "provider", "reason"]
+    select_columns = ["id", "group_id", "user_id", "kind", "provider", "reason"]
+    if "ban_on_timeout" in columns:
+        table_columns.append("ban_on_timeout BOOLEAN NOT NULL DEFAULT 0")
+        insert_columns.append("ban_on_timeout")
+        select_columns.append("COALESCE(ban_on_timeout, 0)")
+    table_columns.extend(
+        [
+            "status VARCHAR(16) NOT NULL DEFAULT 'pending'",
+            "lease_until DATETIME",
+            "display_name VARCHAR(255) NOT NULL",
+            "prompt_message_id BIGINT NOT NULL",
+        ]
+    )
+    insert_columns.extend(
+        ["status", "lease_until", "display_name", "prompt_message_id"]
+    )
+    select_columns.extend(
+        [status_expr, lease_expr, "display_name", "prompt_message_id"]
+    )
+    if "private_message_id" in columns:
+        table_columns.append("private_message_id BIGINT NOT NULL DEFAULT 0")
+        insert_columns.append("private_message_id")
+        select_columns.append("private_message_id")
+    table_columns.extend(
+        [
+            "deadline_at DATETIME NOT NULL",
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        ]
+    )
+    insert_columns.extend(["deadline_at", "created_at"])
+    select_columns.extend(["deadline_at", "created_at"])
+
     await conn.execute(
         text("DROP TABLE IF EXISTS join_verifications_autoincrement")
     )
     await conn.execute(
         text(
             "CREATE TABLE join_verifications_autoincrement ("
-            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
-            "group_id BIGINT NOT NULL, "
-            "user_id BIGINT NOT NULL, "
-            "kind VARCHAR(32) NOT NULL DEFAULT 'join', "
-            "provider VARCHAR(32) NOT NULL DEFAULT 'turnstile', "
-            "reason TEXT NOT NULL DEFAULT '', "
-            "status VARCHAR(16) NOT NULL DEFAULT 'pending', "
-            "lease_until DATETIME, "
-            "display_name VARCHAR(255) NOT NULL, "
-            "prompt_message_id BIGINT NOT NULL, "
-            "deadline_at DATETIME NOT NULL, "
-            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
-            ")"
+            + ", ".join(table_columns)
+            + ")"
         )
     )
     await conn.execute(
         text(
             "INSERT INTO join_verifications_autoincrement "
-            "(id, group_id, user_id, kind, provider, reason, status, lease_until, "
-            "display_name, prompt_message_id, deadline_at, created_at) "
-            "SELECT id, group_id, user_id, kind, provider, reason, "
-            f"{status_expr}, {lease_expr}, display_name, prompt_message_id, "
-            "deadline_at, created_at FROM join_verifications"
+            f"({', '.join(insert_columns)}) "
+            f"SELECT {', '.join(select_columns)} FROM join_verifications"
         )
     )
     await conn.execute(text("DROP TABLE join_verifications"))
@@ -1282,9 +1309,35 @@ async def init_db(
             await _sqlite_ensure_column(
                 conn,
                 "join_verifications",
+                "ban_on_timeout",
+                "ban_on_timeout BOOLEAN NOT NULL DEFAULT 0",
+            )
+            await _sqlite_ensure_column(
+                conn,
+                "join_verifications",
                 "private_message_id",
                 "private_message_id BIGINT NOT NULL DEFAULT 0",
             )
+            # Older moderation challenges did not preserve the originating
+            # rule action, so they cannot be distinguished safely. Run this
+            # cleanup on every startup: SQLite may have committed ADD COLUMN
+            # before a crash prevented the first cleanup pass from completing.
+            legacy_release = await conn.execute(
+                text(
+                    "UPDATE join_verifications "
+                    "SET ban_on_timeout = 0, status = 'unbanning', "
+                    "lease_until = datetime('now', '-1 second') "
+                    "WHERE kind = 'moderation' "
+                    "AND COALESCE(ban_on_timeout, 0) = 0 "
+                    "AND status IN ('preparing', 'pending', 'enforcing', 'releasing')"
+                )
+            )
+            if int(legacy_release.rowcount or 0):
+                log.warning(
+                    "Migrated: queued %s moderation challenges without ban "
+                    "authorization for safe release",
+                    int(legacy_release.rowcount or 0),
+                )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_join_verifications_status_lease "
