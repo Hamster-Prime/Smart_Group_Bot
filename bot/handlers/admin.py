@@ -103,6 +103,7 @@ from bot.services.group_settings import acquire_group_settings_write_intent
 from bot.services.message_templates import (
     render_action_notice,
     render_data_brief,
+    render_expandable_blockquote,
     render_progress_notice,
 )
 from bot.services.skills import SkillService
@@ -262,6 +263,28 @@ def _render_task_result(
         action=None if structured_body else body,
     )
     return f"{notice}\n\n{body}" if structured_body else notice
+
+
+def _render_ban_result(
+    title: str,
+    *,
+    errors: list[str] | tuple[str, ...] = (),
+) -> str:
+    """Render concise ban/unban outcomes with optional collapsed errors."""
+
+    parts = [f"<b>{html.escape(str(title))}</b>"]
+    error_lines = [
+        html.escape(str(error).strip())
+        for error in errors
+        if str(error).strip()
+    ]
+    if error_lines:
+        parts.append(
+            render_expandable_blockquote(
+                ["<b>错误详情</b>", *error_lines]
+            )
+        )
+    return "\n\n".join(parts)
 
 
 async def _answer(
@@ -1179,10 +1202,18 @@ async def _publish_privileged_result(
     *,
     status: _TaskResultStatus,
     default_title: str = "后台任务",
+    compact: bool = False,
 ) -> None:
+    rendered = (
+        str(text or "").strip()
+        if compact
+        else _render_task_result(text, status=status, default_title=default_title)
+    )
+    if not rendered:
+        rendered = f"<b>{html.escape(default_title)}</b>"
     await _publish_privileged_text(
         message,
-        _render_task_result(text, status=status, default_title=default_title),
+        rendered,
     )
 
 
@@ -1306,11 +1337,25 @@ async def _ensure_ban_command_admin(
     settings: Settings,
 ) -> bool:
     if not is_group(message):
-        await _answer(message, settings, "该命令仅可在群内使用。")
+        await _answer(
+            message,
+            settings,
+            _render_ban_result(
+                "封禁管理未执行",
+                errors=["该命令仅可在群内使用。"],
+            ),
+        )
         return False
     user = message.from_user
     if user is None:
-        await _answer(message, settings, "无法识别操作者。")
+        await _answer(
+            message,
+            settings,
+            _render_ban_result(
+                "封禁管理未执行",
+                errors=["无法识别操作者。"],
+            ),
+        )
         return False
     try:
         with privileged_request_scope():
@@ -1332,7 +1377,14 @@ async def _ensure_ban_command_admin(
         )
     if telegram_admin:
         return True
-    await _answer(message, settings, "仅本群管理员可使用该命令。")
+    await _answer(
+        message,
+        settings,
+        _render_ban_result(
+            "封禁管理未执行",
+            errors=["仅本群管理员可使用该命令。"],
+        ),
+    )
     return False
 
 
@@ -1452,7 +1504,10 @@ async def _perform_group_ban_locked(
     )
     rejection = await _ban_target_rejection(message, settings, target_id)
     if rejection:
-        return rejection
+        return _render_ban_result(
+            "本群封禁未完成",
+            errors=[rejection],
+        )
 
     prompts: set[tuple[int, int]] = set()
     private_prompts: set[tuple[int, int]] = set()
@@ -1474,7 +1529,10 @@ async def _perform_group_ban_locked(
     )
     if recovery is None:
         await session.rollback()
-        return "无法建立封禁恢复工单，本次未调用 Telegram；请立即重试。"
+        return _render_ban_result(
+            "本群封禁未完成",
+            errors=["无法建立封禁恢复工单，本次未调用 Telegram；请立即重试。"],
+        )
     # Do not hold a SQLite read snapshot across the Telegram API call. The
     # post-enforcement transaction must observe challenges/warnings written by
     # other moderation entry points while the request was in flight.
@@ -1508,9 +1566,12 @@ async def _perform_group_ban_locked(
                 group_id,
                 target_id,
             )
-        return (
-            "Telegram 群内封禁结果未确认，已保留崩溃恢复工单；"
-            "请检查 bot 的封禁用户权限后重试。"
+        return _render_ban_result(
+            "本群封禁未完成",
+            errors=[
+                "Telegram 群内封禁结果未确认，已保留崩溃恢复工单；"
+                "请检查 bot 的封禁用户权限后重试。"
+            ],
         )
 
     target_user = getattr(getattr(message, "reply_to_message", None), "from_user", None)
@@ -1597,9 +1658,12 @@ async def _perform_group_ban_locked(
     await delete_verification_prompts(message.bot, prompts)
     await close_private_challenge_messages(message.bot, private_prompts)
     if not persisted:
-        return (
-            "封禁执行期间权限策略已被更新或数据库写入失败；"
-            "已按最新持久化策略重新校准 Telegram 状态。"
+        return _render_ban_result(
+            "本群封禁未完成",
+            errors=[
+                "封禁执行期间权限策略已被更新或数据库写入失败；"
+                "已按最新持久化策略重新校准 Telegram 状态。"
+            ],
         )
 
     await _delete_ban_target_message(
@@ -1608,15 +1672,7 @@ async def _perform_group_ban_locked(
         message_id=replied_message_id,
     )
 
-    lines = [
-        "<b>本群封禁完成</b>",
-        f"<b>用户ID</b>: <code>{target_id}</code>",
-        f"<b>群ID</b>: <code>{group_id}</code>",
-    ]
-    if reason:
-        lines.append(f"<b>原因</b>: {html.escape(reason)}")
-    lines.append("此操作不会影响其他群组，也不会加入全局封禁名单。")
-    return "\n".join(lines)
+    return _render_ban_result("本群封禁完成")
 
 
 async def _perform_group_unban(
@@ -1653,9 +1709,12 @@ async def _perform_group_unban_locked(
         getattr(message.from_user, "full_name", "") or ""
     )
     if await is_globally_banned(session, target_id):
-        return (
-            "该用户仍在全局封禁名单中，不能只解除本群封禁；"
-            "请由最高管理员重新发送 /unban 并选择「全局解封」。"
+        return _render_ban_result(
+            "本群解封未完成",
+            errors=[
+                "该用户仍在全局封禁名单中，不能只解除本群封禁；"
+                "请由最高管理员重新发送 /unban 并选择「全局解封」。"
+            ],
         )
     row = await session.scalar(
         select(UserWarning).where(
@@ -1672,7 +1731,6 @@ async def _perform_group_unban_locked(
         if row is not None
         else None
     )
-    cleared_count = warning_snapshot[1] if warning_snapshot is not None else 0
     prompts: set[tuple[int, int]] = set()
     private_prompts: set[tuple[int, int]] = set()
     verification = await get_join_verification(session, group_id, target_id)
@@ -1700,7 +1758,10 @@ async def _perform_group_unban_locked(
             raise RuntimeError("Telegram returned false")
     except Exception as exc:
         log.info("group unban failed | group=%s user=%s error=%s", group_id, target_id, exc)
-        return "Telegram 群内解封失败，请检查 bot 的封禁用户权限后重试。"
+        return _render_ban_result(
+            "本群解封未完成",
+            errors=["Telegram 群内解封失败，请检查 bot 的封禁用户权限后重试。"],
+        )
 
     # A global ban added while Telegram was in flight wins. Re-enforce it
     # immediately instead of leaving Telegram and the policy registry split.
@@ -1714,7 +1775,10 @@ async def _perform_group_unban_locked(
                 group_id,
                 target_id,
             )
-        return "解封期间该用户被加入全局封禁名单，已保留封禁状态。"
+        return _render_ban_result(
+            "本群解封未完成",
+            errors=["解封期间该用户被加入全局封禁名单，已保留封禁状态。"],
+        )
 
     claimed = False
     if warning_snapshot is None:
@@ -1755,9 +1819,15 @@ async def _perform_group_unban_locked(
                     group_id,
                     target_id,
                 )
-            return "解封期间封禁状态已被其他管理操作更新，已保留最新封禁状态。"
+            return _render_ban_result(
+                "本群解封未完成",
+                errors=["解封期间封禁状态已被其他管理操作更新，已保留最新封禁状态。"],
+            )
         await session.rollback()
-        return "群内解封已执行，但警告记录同时被其他操作更新，因此保留了最新记录。"
+        return _render_ban_result(
+            "本群解封未完成",
+            errors=["群内解封已执行，但警告记录同时被其他操作更新，因此保留了最新记录。"],
+        )
 
     current_verification = await get_join_verification(session, group_id, target_id)
     if (
@@ -1783,7 +1853,10 @@ async def _perform_group_unban_locked(
                 group_id,
                 target_id,
             )
-        return "Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请稍后重试。"
+        return _render_ban_result(
+            "本群解封未完成",
+            errors=["Telegram 已解封，但数据库更新失败；已尝试恢复封禁，请稍后重试。"],
+        )
 
     await delete_verification_prompts(message.bot, prompts)
     await close_private_challenge_messages(message.bot, private_prompts)
@@ -1837,20 +1910,12 @@ async def _perform_group_unban_locked(
                 group_id,
                 target_id,
             )
-    lines = [
-        "<b>本群解封完成</b>",
-        f"<b>用户ID</b>: <code>{target_id}</code>",
-        f"<b>群ID</b>: <code>{group_id}</code>",
-        (
-            f"<b>违规次数</b>: 已清零（原 {cleared_count} 次）"
-            if cleared_count
-            else "<b>违规次数</b>: 原本无记录"
-        ),
-        "此操作不会修改其他群组或全局封禁名单。",
-    ]
-    if not restored:
-        lines.append("⚠️ 已解除封禁，但 Telegram 未确认权限恢复；用户重新入群后将按群默认权限生效。")
-    return "\n".join(lines)
+    errors = (
+        ["已解除封禁，但 Telegram 未确认权限恢复；用户重新入群后将按群默认权限生效。"]
+        if not restored
+        else []
+    )
+    return _render_ban_result("本群解封完成", errors=errors)
 
 
 async def _perform_global_ban(
@@ -1914,7 +1979,7 @@ async def _perform_global_ban_locked(
         default_reason = (
             "管理员标记为垃圾用户" if source == "spam_command" else "手动封禁"
         )
-        created = await add_global_ban(
+        await add_global_ban(
             session,
             target_id,
             reason=reason or default_reason,
@@ -2000,28 +2065,19 @@ async def _perform_global_ban_locked(
             group_id=source_group_id,
             message_id=replied_message_id,
         )
-    banned_groups = sum(outcome.succeeded for outcome in outcomes)
-    status = "已加入全局封禁名单" if created else "已在全局封禁名单（信息已更新）"
-    lines = [
-        "<b>全局封禁完成</b>",
-        f"<b>用户ID</b>: <code>{target_id}</code>",
-        f"<b>状态</b>: {status}",
-        f"<b>群内封禁</b>: {banned_groups}/{len(group_ids)} 个授权群成功",
-        "该用户此后发言或重新入群时都会被全局封禁策略拦截。",
-    ]
-    if reason:
-        lines.insert(3, f"<b>原因</b>: {html.escape(reason)}")
+    errors: list[str] = []
     deferred_groups = max(0, len(journal_group_ids) - len(group_ids))
     if deferred_groups:
-        lines.append(
-            f"<b>离线群延后</b>: {deferred_groups} 个；"
-            "Bot 重回群后由持久工单补偿。"
+        errors.append(
+            f"{deferred_groups} 个离线群尚未处理，Bot 重回群后将由持久工单继续补偿。"
         )
     failure_summary = _failure_summary(outcomes)
     if failure_summary:
-        lines.append(f"<b>未完成分类</b>: {html.escape(failure_summary)}")
-        lines.append("失败群会继续受全局策略拦截，可安全地重新提交同一命令补偿。")
-    return "\n".join(lines)
+        errors.append(
+            f"群内封禁未完成：{failure_summary}。"
+            "失败群仍受全局策略拦截，可重新提交同一命令补偿。"
+        )
+    return _render_ban_result("全局封禁完成", errors=errors)
 
 
 async def _perform_global_unban(
@@ -2060,7 +2116,7 @@ async def _perform_global_unban_locked(
             target_id,
             group_ids=journal_group_ids,
         )
-        removed = await remove_global_ban(
+        await remove_global_ban(
             session,
             target_id,
             operator_id=operator_id,
@@ -2076,15 +2132,13 @@ async def _perform_global_unban_locked(
             for item in recoveries
             if item.private_message_id > 0
         )
-        cleared_total = 0
         for group_id in journal_group_ids:
-            cleared_count, _ = await _clear_user_warning(
+            await _clear_user_warning(
                 session,
                 group_id,
                 target_id,
                 preserve_ban=False,
             )
-            cleared_total += cleared_count
         await session.commit()
     activate_manual_unban_recoveries(recoveries)
     await _publish_privileged_progress(
@@ -2143,30 +2197,24 @@ async def _perform_global_unban_locked(
     unbanned_groups = sum(outcome.succeeded for outcome in outcomes)
     restored_groups = len(restored_group_ids)
 
-    lines = [
-        "<b>全局解封完成</b>",
-        f"<b>用户ID</b>: <code>{target_id}</code>",
-        f"<b>状态</b>: {'已移出全局封禁名单' if removed else '原本不在全局封禁名单'}",
-        f"<b>群内解封</b>: {unbanned_groups}/{len(group_ids)} 个授权群成功",
-        f"<b>发言权限恢复</b>: {restored_groups} 个群成功",
-        (
-            f"<b>违规次数</b>: 已清零（累计 {cleared_total} 次）"
-            if cleared_total
-            else "<b>违规次数</b>: 原本无记录"
-        ),
-        "<b>资料审查</b>: 已加入资料审查豁免（消息内容仍会正常审核）",
-    ]
+    errors: list[str] = []
+    unrestored_groups = max(0, unbanned_groups - restored_groups)
+    if unrestored_groups:
+        errors.append(
+            f"{unrestored_groups} 个群未确认发言权限恢复，恢复工单将继续重试。"
+        )
     deferred_groups = max(0, len(journal_group_ids) - len(group_ids))
     if deferred_groups:
-        lines.append(
-            f"<b>离线群延后</b>: {deferred_groups} 个；"
-            "Bot 重回群后由持久工单继续解封。"
+        errors.append(
+            f"{deferred_groups} 个离线群尚未处理，Bot 重回群后将由持久工单继续解封。"
         )
     failure_summary = _failure_summary(outcomes)
     if failure_summary:
-        lines.append(f"<b>未完成分类</b>: {html.escape(failure_summary)}")
-        lines.append("未完成群保留恢复工单；可安全地重新提交同一全局解封。")
-    return "\n".join(lines)
+        errors.append(
+            f"群内解封未完成：{failure_summary}。"
+            "未完成群保留恢复工单，可重新提交同一全局解封。"
+        )
+    return _render_ban_result("全局解封完成", errors=errors)
 
 
 def _scope_keyboard(
@@ -2294,6 +2342,7 @@ async def _run_result_job(
     progress_message: Message,
     operation: Callable[[], Awaitable[str]],
     task_title: str = "后台任务",
+    compact: bool = False,
 ) -> None:
     try:
         result_text = await operation()
@@ -2301,11 +2350,20 @@ async def _run_result_job(
         raise
     except Exception:
         log.exception("privileged administration job failed")
+        failure_text = (
+            _render_ban_result(
+                f"{task_title}未完成",
+                errors=["后台任务发生异常，幂等状态已保留，请稍后重试。"],
+            )
+            if compact
+            else "<b>操作未完成</b>\n后台任务发生异常，幂等状态已保留，请稍后重试。"
+        )
         await _publish_privileged_result(
             progress_message,
-            "<b>操作未完成</b>\n后台任务发生异常，幂等状态已保留，请稍后重试。",
+            failure_text,
             status="failed",
             default_title=task_title,
+            compact=compact,
         )
         raise
     await _publish_privileged_result(
@@ -2313,6 +2371,7 @@ async def _run_result_job(
         result_text,
         status="completed",
         default_title=task_title,
+        compact=compact,
     )
 
 
@@ -2334,7 +2393,14 @@ async def cmd_ban(
         await _answer(message, settings, _BAN_USAGE)
         return
     if is_super_admin_user_id(target_id, settings):
-        await _answer(message, settings, "不能封禁最高管理员。")
+        await _answer(
+            message,
+            settings,
+            _render_ban_result(
+                "本群封禁未执行",
+                errors=["不能封禁最高管理员。"],
+            ),
+        )
         return
     operator = message.from_user
     if operator and is_super_admin_user_id(int(operator.id), settings):
@@ -2370,7 +2436,10 @@ async def cmd_ban(
                 group_id=int(message.chat.id),
                 user_id=operator_id,
             ):
-                return "<b>本群封禁已取消</b>\n操作者权限或群授权已发生变化。"
+                return _render_ban_result(
+                    "本群封禁已取消",
+                    errors=["操作者权限或群授权已发生变化。"],
+                )
             async with session_factory() as work_session:
                 return await _perform_group_ban(
                     message,
@@ -2387,6 +2456,7 @@ async def cmd_ban(
                 progress_message=progress,
                 operation=operation,
                 task_title="本群封禁",
+                compact=True,
             ),
             lane="critical",
             priority=0,
@@ -2395,14 +2465,19 @@ async def cmd_ban(
         if not submission.accepted:
             await _publish_privileged_result(
                 progress,
-                "<b>本群封禁未入队</b>\n权限任务队列正忙，请立即重试。",
+                _render_ban_result(
+                    "本群封禁未入队",
+                    errors=["权限任务队列正忙，请立即重试。"],
+                ),
                 status="rejected",
+                compact=True,
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
-                "<b>本群封禁正在执行</b>\n相同目标已有任务，未重复提交。",
+                _render_ban_result("本群封禁正在执行"),
                 status="duplicate",
+                compact=True,
             )
         return
     text = await _perform_group_ban(
@@ -2437,7 +2512,14 @@ async def cmd_spam(
         return
     rejection = await _ban_target_rejection(message, settings, target_id)
     if rejection:
-        await _answer(message, settings, rejection)
+        await _answer(
+            message,
+            settings,
+            _render_ban_result(
+                "垃圾用户封禁未执行",
+                errors=[rejection],
+            ),
+        )
         return
 
     operator = message.from_user
@@ -2457,7 +2539,14 @@ async def cmd_spam(
                 autoflush=False,
             )
     if effective_factory is None:
-        await _answer(message, settings, "数据库会话未就绪，请稍后重试。")
+        await _answer(
+            message,
+            settings,
+            _render_ban_result(
+                "垃圾用户封禁未执行",
+                errors=["数据库会话未就绪，请稍后重试。"],
+            ),
+        )
         return
 
     await session.commit()
@@ -2481,10 +2570,16 @@ async def cmd_spam(
             group_id=group_id,
             user_id=operator_id,
         ):
-            return "<b>垃圾用户封禁已取消</b>\n操作者权限或群授权已发生变化。"
+            return _render_ban_result(
+                "垃圾用户封禁已取消",
+                errors=["操作者权限或群授权已发生变化。"],
+            )
         latest_rejection = await _ban_target_rejection(message, settings, target_id)
         if latest_rejection:
-            return f"<b>垃圾用户封禁已取消</b>\n{latest_rejection}"
+            return _render_ban_result(
+                "垃圾用户封禁已取消",
+                errors=[latest_rejection],
+            )
         return await _perform_global_ban(
             progress,
             effective_factory,
@@ -2504,6 +2599,7 @@ async def cmd_spam(
                 progress_message=progress,
                 operation=operation,
                 task_title="垃圾用户全局封禁",
+                compact=True,
             ),
             lane="critical_bulk",
             priority=10,
@@ -2512,14 +2608,19 @@ async def cmd_spam(
         if not submission.accepted:
             await _publish_privileged_result(
                 progress,
-                "<b>垃圾用户封禁未入队</b>\n权限任务队列正忙，请立即重试。",
+                _render_ban_result(
+                    "垃圾用户封禁未入队",
+                    errors=["权限任务队列正忙，请立即重试。"],
+                ),
                 status="rejected",
+                compact=True,
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
-                "<b>垃圾用户封禁正在执行</b>\n相同目标已有全局封禁任务，未重复提交。",
+                _render_ban_result("垃圾用户封禁正在执行"),
                 status="duplicate",
+                compact=True,
             )
         return
 
@@ -2529,6 +2630,7 @@ async def cmd_spam(
         result_text,
         status="completed",
         default_title="垃圾用户全局封禁",
+        compact=True,
     )
 
 
@@ -2582,7 +2684,10 @@ async def cmd_unban(
                 group_id=int(message.chat.id),
                 user_id=operator_id,
             ):
-                return "<b>本群解封已取消</b>\n操作者权限或群授权已发生变化。"
+                return _render_ban_result(
+                    "本群解封已取消",
+                    errors=["操作者权限或群授权已发生变化。"],
+                )
             async with session_factory() as work_session:
                 return await _perform_group_unban(
                     message,
@@ -2597,6 +2702,7 @@ async def cmd_unban(
                 progress_message=progress,
                 operation=operation,
                 task_title="本群解封",
+                compact=True,
             ),
             lane="critical",
             priority=0,
@@ -2605,14 +2711,19 @@ async def cmd_unban(
         if not submission.accepted:
             await _publish_privileged_result(
                 progress,
-                "<b>本群解封未入队</b>\n权限任务队列正忙，请立即重试。",
+                _render_ban_result(
+                    "本群解封未入队",
+                    errors=["权限任务队列正忙，请立即重试。"],
+                ),
                 status="rejected",
+                compact=True,
             )
         elif not submission.created:
             await _publish_privileged_result(
                 progress,
-                "<b>本群解封正在执行</b>\n相同目标已有任务，未重复提交。",
+                _render_ban_result("本群解封正在执行"),
                 status="duplicate",
+                compact=True,
             )
         return
     text = await _perform_group_unban(
@@ -2719,9 +2830,15 @@ async def on_ban_scope_choice(
         async def operation() -> str:
             await ack_gate.wait()
             if not is_super_admin_user_id(int(operator.id), settings):
-                return "<b>权限任务已取消</b>\n执行前复验发现最高管理员身份已发生变化。"
+                return _render_ban_result(
+                    "权限任务已取消",
+                    errors=["执行前复验发现最高管理员身份已发生变化。"],
+                )
             if action == "ban" and is_super_admin_user_id(target_id, settings):
-                return "<b>权限任务已取消</b>\n目标用户已成为最高管理员。"
+                return _render_ban_result(
+                    "权限任务已取消",
+                    errors=["目标用户已成为最高管理员。"],
+                )
             if scope == "l" and not await _queued_operator_can_manage_members(
                 bot=callback.bot,
                 session_factory=session_factory,
@@ -2729,7 +2846,10 @@ async def on_ban_scope_choice(
                 group_id=int(chat.id),
                 user_id=int(operator.id),
             ):
-                return "<b>权限任务已取消</b>\n群授权或操作者权限已发生变化。"
+                return _render_ban_result(
+                    "权限任务已取消",
+                    errors=["群授权或操作者权限已发生变化。"],
+                )
             if action == "ban" and scope == "l":
                 async with session_factory() as work_session:
                     return await _perform_group_ban(
@@ -2774,6 +2894,7 @@ async def on_ban_scope_choice(
                     progress_message=message,
                     operation=operation,
                     task_title=task_title,
+                    compact=True,
                 )
             except BaseException:
                 async with _BAN_SCOPE_LOCK:
@@ -2892,6 +3013,7 @@ async def on_ban_scope_choice(
         result_text,
         status="completed",
         default_title=task_title,
+        compact=True,
     )
 
 

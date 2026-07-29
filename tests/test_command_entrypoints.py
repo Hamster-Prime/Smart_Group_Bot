@@ -607,9 +607,10 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(commit=AsyncMock())
         session_factory = object()
 
-        async def run_inline(*, progress_message, operation, task_title):
+        async def run_inline(*, progress_message, operation, task_title, compact):
             self.assertIs(progress_message, progress)
             self.assertEqual(task_title, "垃圾用户全局封禁")
+            self.assertTrue(compact)
             return await operation()
 
         submission = SimpleNamespace(accepted=True, created=True)
@@ -678,6 +679,47 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             target_message_id=321,
         )
 
+    async def test_group_ban_queue_rejection_uses_collapsed_error(self) -> None:
+        progress = SimpleNamespace(
+            edit_text=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            text="/ban 456",
+            reply_to_message=None,
+            bot=SimpleNamespace(),
+            answer=AsyncMock(return_value=progress),
+        )
+        session = SimpleNamespace(commit=AsyncMock())
+
+        with (
+            patch(
+                "bot.handlers.admin.ensure_group_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin._ensure_ban_command_admin",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "bot.handlers.admin.submit_privileged_task",
+                return_value=SimpleNamespace(accepted=False, created=False),
+            ),
+        ):
+            await admin.cmd_ban(
+                message,
+                session=session,
+                settings=_settings(),
+                session_factory=object(),
+            )
+
+        text = progress.edit_text.await_args.args[0]
+        self.assertIn("<b>本群封禁未入队</b>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertNotIn("处理结果已返回", text)
+
     async def test_group_ban_failure_keeps_pending_verification(self) -> None:
         verification = SimpleNamespace(prompt_message_id=321)
         recovery = SimpleNamespace(verification_id=91, lease_until=object())
@@ -719,6 +761,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("崩溃恢复工单", text)
+        self.assertIn("<blockquote expandable>", text)
         ban.assert_awaited_once_with(message.bot, -10001, 456)
         complete.assert_not_awaited()
         delete_prompts.assert_not_awaited()
@@ -744,6 +787,7 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn("避免误封", text)
+        self.assertIn("<blockquote expandable>", text)
         message.bot.ban_chat_member.assert_not_awaited()
 
     async def test_group_ban_success_cleans_verification_prompt_after_commit(self) -> None:
@@ -787,7 +831,9 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
                 reason="test",
             )
 
-        self.assertIn("本群封禁完成", text)
+        self.assertEqual(text, "<b>本群封禁完成</b>")
+        self.assertNotIn("此操作不会", text)
+        self.assertNotIn("<blockquote", text)
         ban.assert_awaited_once_with(message.bot, -10001, 456)
         complete.assert_awaited_once_with(
             session,
@@ -801,6 +847,117 @@ class CommandEntrypointTests(unittest.IsolatedAsyncioTestCase):
             chat_id=-10001,
             message_id=445,
         )
+
+    async def test_group_unban_only_shows_permission_error_as_collapsed_detail(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            reply_to_message=None,
+            bot=SimpleNamespace(),
+        )
+        session = SimpleNamespace(
+            scalar=AsyncMock(side_effect=[None, None]),
+            commit=AsyncMock(),
+            rollback=AsyncMock(),
+        )
+
+        with (
+            patch(
+                "bot.handlers.admin.is_globally_banned",
+                new=AsyncMock(side_effect=[False, False]),
+            ),
+            patch(
+                "bot.handlers.admin.get_join_verification",
+                new=AsyncMock(side_effect=[None, None]),
+            ),
+            patch(
+                "bot.handlers.admin.lease_join_verification_for_unban",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("bot.handlers.admin.unban_member", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()),
+            patch("bot.handlers.admin.close_private_challenge_messages", new=AsyncMock()),
+            patch(
+                "bot.handlers.admin.restore_member_permissions",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("bot.handlers.admin.record_ban_event", new=AsyncMock()),
+        ):
+            text = await admin._perform_group_unban_locked(
+                message,
+                session,
+                target_id=456,
+            )
+
+        self.assertIn("<b>本群解封完成</b>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertIn("未确认权限恢复", text)
+        self.assertNotIn("此操作不会修改其他群组", text)
+
+    async def test_group_unban_success_only_shows_title(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+            reply_to_message=None,
+            bot=SimpleNamespace(),
+        )
+        session = SimpleNamespace(
+            scalar=AsyncMock(side_effect=[None, None]),
+            commit=AsyncMock(),
+            rollback=AsyncMock(),
+        )
+
+        with (
+            patch(
+                "bot.handlers.admin.is_globally_banned",
+                new=AsyncMock(side_effect=[False, False]),
+            ),
+            patch(
+                "bot.handlers.admin.get_join_verification",
+                new=AsyncMock(side_effect=[None, None]),
+            ),
+            patch(
+                "bot.handlers.admin.lease_join_verification_for_unban",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("bot.handlers.admin.unban_member", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()),
+            patch("bot.handlers.admin.close_private_challenge_messages", new=AsyncMock()),
+            patch(
+                "bot.handlers.admin.restore_member_permissions",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("bot.handlers.admin.record_ban_event", new=AsyncMock()),
+        ):
+            text = await admin._perform_group_unban_locked(
+                message,
+                session,
+                target_id=456,
+            )
+
+        self.assertEqual(text, "<b>本群解封完成</b>")
+        self.assertNotIn("<blockquote", text)
+        self.assertNotIn("此操作不会", text)
+
+    async def test_group_unban_global_ban_conflict_is_collapsed(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001, type="supergroup"),
+            from_user=SimpleNamespace(id=123, full_name="Admin"),
+        )
+
+        with patch(
+            "bot.handlers.admin.is_globally_banned",
+            new=AsyncMock(return_value=True),
+        ):
+            text = await admin._perform_group_unban_locked(
+                message,
+                SimpleNamespace(),
+                target_id=456,
+            )
+
+        self.assertIn("<b>本群解封未完成</b>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertIn("仍在全局封禁名单", text)
 
     async def test_lm_list_reply_is_persistent(self) -> None:
         message = SimpleNamespace(

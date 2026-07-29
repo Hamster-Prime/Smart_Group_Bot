@@ -305,6 +305,36 @@ class PrivilegedTaskRunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
+    def test_ban_result_only_adds_collapsed_details_for_errors(self) -> None:
+        success = admin._render_ban_result("本群解封完成")
+        failed = admin._render_ban_result(
+            "本群解封未完成",
+            errors=["Telegram <拒绝>"],
+        )
+
+        self.assertEqual(success, "<b>本群解封完成</b>")
+        self.assertNotIn("<blockquote", success)
+        self.assertIn("<blockquote expandable>", failed)
+        self.assertIn("Telegram &lt;拒绝&gt;", failed)
+
+    async def test_compact_privileged_result_omits_generic_task_status(self) -> None:
+        message = SimpleNamespace(
+            edit_text=AsyncMock(),
+            answer=AsyncMock(),
+        )
+
+        await admin._publish_privileged_result(
+            message,
+            "<b>本群封禁完成</b>",
+            status="completed",
+            default_title="本群封禁",
+            compact=True,
+        )
+
+        text = message.edit_text.await_args.args[0]
+        self.assertEqual(text, "<b>本群封禁完成</b>")
+        self.assertNotIn("处理结果已返回", text)
+
     def test_task_result_status_does_not_depend_on_body_words(self) -> None:
         completed = admin._render_task_result(
             "<b>规则添加成功</b>\n<b>规则内容</b>: 禁止伪造支付失败截图",
@@ -396,7 +426,8 @@ class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(calls, [-101, -102, -103])
-        self.assertIn("3/3", text)
+        self.assertEqual(text, "<b>全局封禁完成</b>")
+        self.assertNotIn("<blockquote", text)
 
     async def test_global_unban_completes_successful_recovery_journals(self) -> None:
         recoveries = tuple(
@@ -456,7 +487,60 @@ class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(unbanned, [-101, -102])
         self.assertEqual(completed, [1, 2])
-        self.assertIn("2/2", text)
+        self.assertEqual(text, "<b>全局解封完成</b>")
+        self.assertNotIn("<blockquote", text)
+
+    async def test_global_unban_collapses_permission_restore_errors(self) -> None:
+        recoveries = (
+            UnbanRecovery(
+                verification_id=1,
+                group_id=-101,
+                user_id=77,
+                lease_until=datetime(2026, 1, 1),
+            ),
+        )
+        message = SimpleNamespace(
+            bot=SimpleNamespace(),
+            edit_text=AsyncMock(),
+            answer=AsyncMock(),
+        )
+        with (
+            patch(
+                "bot.handlers.admin._authorized_group_ids",
+                new=AsyncMock(return_value=[-101]),
+            ),
+            patch(
+                "bot.handlers.admin.lease_join_verifications_for_user_unban",
+                new=AsyncMock(return_value=recoveries),
+            ),
+            patch("bot.handlers.admin.remove_global_ban", new=AsyncMock(return_value=True)),
+            patch("bot.handlers.admin._clear_user_warning", new=AsyncMock(return_value=(0, False))),
+            patch("bot.handlers.admin.delete_verification_prompts", new=AsyncMock()),
+            patch("bot.handlers.admin.unban_member", new=AsyncMock(return_value=True)),
+            patch(
+                "bot.handlers.admin.restore_member_permissions",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.admin.verification_release_blocked_by_ban",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "bot.handlers.admin.complete_leased_join_verification",
+                new=AsyncMock(),
+            ),
+        ):
+            text = await admin._perform_global_unban(
+                message,
+                _FakeSessionFactory(),
+                target_id=77,
+                operator_id=1,
+            )
+
+        self.assertIn("<b>全局解封完成</b>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertIn("未确认发言权限恢复", text)
+        self.assertNotIn("<b>发言权限恢复</b>", text)
 
     async def test_global_ban_reconciles_when_unban_policy_wins_race(self) -> None:
         message = SimpleNamespace(
@@ -505,7 +589,9 @@ class PrivilegedAdminTests(unittest.IsolatedAsyncioTestCase):
 
         unban.assert_awaited_once()
         restore.assert_awaited_once()
-        self.assertIn("0/1", text)
+        self.assertIn("<b>全局封禁完成</b>", text)
+        self.assertIn("<blockquote expandable>", text)
+        self.assertIn("结果未确认 1", text)
 
     async def test_global_ban_deletes_target_only_when_origin_group_succeeds(
         self,
