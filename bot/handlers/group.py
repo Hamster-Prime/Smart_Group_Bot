@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from contextvars import Context
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import F, Router
@@ -594,6 +594,10 @@ def _message_archive_metadata(
     if telegram_raw_text is None:
         telegram_raw_text = raw_text
 
+    edited_at = getattr(message, "edit_date", None)
+    if isinstance(edited_at, int):
+        edited_at = datetime.fromtimestamp(edited_at, tz=timezone.utc)
+
     if sender_identity.is_chat:
         sender_kind = (
             "anonymous_admin"
@@ -661,7 +665,7 @@ def _message_archive_metadata(
         "author_signature": str(getattr(message, "author_signature", "") or ""),
         "raw_text": str(telegram_raw_text),
         "derived_text": derived_text,
-        "edited_at": getattr(message, "edit_date", None),
+        "edited_at": edited_at,
         "is_reply": reply is not None,
         "reply_to_message_id": (
             int(getattr(reply, "message_id", 0) or 0) or None

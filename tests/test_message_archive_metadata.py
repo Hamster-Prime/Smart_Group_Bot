@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -133,7 +134,7 @@ class MessageArchiveMetadataTests(unittest.IsolatedAsyncioTestCase):
             "编辑后的内容",
             sender=_user(9, "Carol", username="carol"),
         )
-        message.edit_date = None
+        message.edit_date = 1785369600
         archive = AsyncMock()
         memory = SimpleNamespace(archive_message=archive)
 
@@ -161,6 +162,10 @@ class MessageArchiveMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["message_id"], "61")
         self.assertEqual(kwargs["telegram_message_id"], 61)
         self.assertEqual(kwargs["sender_id"], 9)
+        self.assertEqual(
+            kwargs["edited_at"],
+            datetime(2026, 7, 30, tzinfo=timezone.utc),
+        )
         self.assertFalse(kwargs["extra_metadata"]["sender_is_tg_admin"])
         self.assertTrue(kwargs["defer_persistence"])
 
