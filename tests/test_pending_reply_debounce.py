@@ -538,7 +538,6 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-10001),
             ),
             status_html=(
-                "<b>消息回复 · 已完成</b>\n\n"
                 "<blockquote><s>已理解问题</s>\n"
                 "<b>当前</b>　已整理并发送回答</blockquote>"
             ),
@@ -1292,7 +1291,6 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-10001),
             ),
             status_html=(
-                "<b>消息回复 · 已完成</b>\n\n"
                 "<blockquote><s>已理解问题</s>\n"
                 "<b>当前</b>　已整理并发送回答</blockquote>"
             ),
@@ -1478,7 +1476,6 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-10001),
             ),
             status_html=(
-                "<b>消息回复 · 已完成</b>\n\n"
                 "<blockquote><s>已理解问题</s>\n"
                 "<b>当前</b>　已整理并发送回答</blockquote>"
             ),
@@ -1530,7 +1527,6 @@ class ReplyDeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-10001),
             ),
             status_html=(
-                "<b>消息回复 · 已完成</b>\n\n"
                 "<blockquote><s>已理解问题</s>\n"
                 "<b>当前</b>　已整理并发送回答</blockquote>"
             ),

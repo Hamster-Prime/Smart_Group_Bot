@@ -66,7 +66,6 @@ _TELEGRAM_RENDER_BUDGET = 3900
 _STATUS_RENDER_BUDGET = 2800
 _REFERENCE_URL_LIMIT = 512
 _HANDOFF_RENDER_BUDGET = 1200
-_PROGRESS_TITLE = "消息回复"
 
 
 def _compact_text(value: object, *, limit: int) -> str:
@@ -364,10 +363,7 @@ class ReplyProgressTracker:
             try:
                 async with asyncio.timeout(_TELEGRAM_IO_TIMEOUT_SECONDS):
                     await sent.edit_text(
-                        (
-                            f"<b>{_PROGRESS_TITLE} · 未完成</b>\n\n"
-                            f"<blockquote>{card_field('当前', '⚠️ 处理已结束')}</blockquote>"
-                        ),
+                        f"<blockquote>{card_field('当前', '⚠️ 处理已结束')}</blockquote>",
                         parse_mode="HTML",
                         disable_web_page_preview=self._disable_link_preview,
                     )
@@ -735,13 +731,6 @@ class ReplyProgressTracker:
             if current_item.state == "failed":
                 current_text = f"⚠️ {current_text}"
 
-            if self._terminal == "completed":
-                title_status = "已完成"
-            elif self._terminal == "failed":
-                title_status = "未完成"
-            else:
-                title_status = "处理中"
-
             next_step = ""
             if self._terminal is None:
                 next_step = (
@@ -763,10 +752,7 @@ class ReplyProgressTracker:
                 status_lines.append(card_field("当前", current_text))
                 if next_step:
                     status_lines.append(card_field("下一步", next_step))
-                return (
-                    f"<b>{_PROGRESS_TITLE} · {title_status}</b>\n\n"
-                    f"<blockquote>{'\n'.join(status_lines)}</blockquote>"
-                )
+                return f"<blockquote>{'\n'.join(status_lines)}</blockquote>"
 
             shown_lines = list(history_lines)
             omitted_updates = 0

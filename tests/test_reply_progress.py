@@ -56,10 +56,10 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("正在处理</b>", body)
         self.assertEqual(
             body,
-            "<b>消息回复 · 处理中</b>\n\n"
             "<blockquote><b>当前</b>　正在理解问题\n"
             "<b>下一步</b>　整理并发送回答</blockquote>",
         )
+        self.assertNotIn("消息回复", body)
         self.assertNotIn("01　", body)
         self.assertNotIn("02　", body)
         self.assertNotIn("03　", body)
@@ -87,7 +87,7 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
 
         body = sent.edit_text.await_args.args[0]
         self.assertEqual(body.count("搜索官方资料"), 1)
-        self.assertIn("<b>消息回复 · 处理中</b>", body)
+        self.assertNotIn("消息回复", body)
         self.assertIn("<s>已理解问题</s>", body)
         self.assertIn("<s>已搜索官方资料</s>", body)
         self.assertIn("<b>当前</b>　正在读取 DNS 文档", body)
@@ -233,7 +233,7 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         await tracker.fail("读取资料失败")
 
         body = sent.edit_text.await_args.args[0]
-        self.assertIn("<b>消息回复 · 未完成</b>", body)
+        self.assertNotIn("消息回复", body)
         self.assertIn("<b>当前</b>　⚠️ 读取资料失败", body)
         self.assertNotIn("01　", body)
         self.assertNotIn("02　", body)
@@ -322,7 +322,7 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
 
         sent.edit_text.assert_awaited_once()
         body = sent.edit_text.await_args.args[0]
-        self.assertIn("<b>消息回复 · 未完成</b>", body)
+        self.assertNotIn("消息回复", body)
         self.assertIn("<b>当前</b>　⚠️ 处理已结束", body)
         self.assertNotIn("01　", body)
         self.assertNotIn("02　", body)
@@ -390,10 +390,10 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("正在处理", overlay.status_html)
         self.assertEqual(
             overlay.status_html,
-            "<b>消息回复 · 已完成</b>\n\n"
             "<blockquote><s>已理解问题</s>\n"
             "<b>当前</b>　已整理并发送回答</blockquote>",
         )
+        self.assertNotIn("消息回复", overlay.status_html)
         self.assertNotIn("01　", overlay.status_html)
         self.assertNotIn("02　", overlay.status_html)
         self.assertNotIn("03　", overlay.status_html)

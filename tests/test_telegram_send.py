@@ -20,7 +20,6 @@ from bot.utils.telegram import (
 
 
 _COMPLETED_REPLY_PROGRESS_HTML = (
-    "<b>消息回复 · 已完成</b>\n\n"
     "<blockquote><s>已理解问题</s>\n"
     "<b>当前</b>　已整理并发送回答</blockquote>"
 )
