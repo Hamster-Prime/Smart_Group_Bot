@@ -14,21 +14,22 @@ _INJECTION_RE = re.compile(
     r"(娉勯湶|杈撳嚭).{0,8}(绯荤粺鎻愮ず璇峾鎻愮ず璇峾瀵嗛挜|token)|"
     r"瓒婄嫳|DAN)"
 )
-_TRUSTED_TG_ADMIN_RE = re.compile(r"\bis_tg_admin\s*:\s*(yes|true|1)\b", re.IGNORECASE)
-_TRUSTED_SOURCE_RE = re.compile(
-    r"\btrusted_source\s*:\s*(yes|tg_admin|group_admin|telegram_admin)\b",
-    re.IGNORECASE,
-)
 _LEGACY_HISTORY_PREFIX_RE = re.compile(r"^\[(?P<meta>[^\]]+)\]\s*(?P<body>.*)$", re.DOTALL)
+_LEGACY_STRUCTURED_META_RE = re.compile(
+    r"^\s*id\s*:\s*(?P<sender_id>-?\d+)\s+"
+    r"username\s*:\s*(?P<username>\S+)\s+"
+    r"is_owner\s*:\s*(?P<is_owner>yes|no|true|false|1|0)\s+"
+    r"is_tg_admin\s*:\s*(?P<is_tg_admin>yes|no|true|false|1|0)\s+"
+    r"trusted_source\s*:\s*(?P<trusted_source>none|yes|tg_admin|group_admin|telegram_admin)\s+"
+    r"name\s*:\s*(?P<sender_name>.*)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _LEGACY_ID_RE = re.compile(r"\bid\s*:\s*(-?\d+)\b", re.IGNORECASE)
 _LEGACY_USERNAME_RE = re.compile(r"\busername\s*:\s*([^\s]+)", re.IGNORECASE)
 _LEGACY_NAME_RE = re.compile(r"\bname\s*:\s*(.+)$", re.IGNORECASE)
-# Owner marker travels the same system-prepended tag as trusted_source, so it
-# is only ever read from the meta bracket the system controls — never from the
-# user-controlled body (see _LEGACY_HISTORY_PREFIX_RE, which stops at the first
-# ']'). This keeps a spoofed "[id:X is_owner:yes] ..." inside a message body
-# from ever being parsed as owner.
-_LEGACY_OWNER_RE = re.compile(r"\bis_owner\s*:\s*(yes|true|1)\b", re.IGNORECASE)
+_TRUSTED_HISTORY_SOURCES = frozenset(
+    {"yes", "tg_admin", "group_admin", "telegram_admin"}
+)
 
 SECURITY_PREAMBLE = (
     "[SAFETY_RULES]\n"
@@ -92,11 +93,13 @@ def wrap_trusted_multiline(label: str, text: str, max_len: int = 4000) -> str:
     return f"<trusted:{label}>\n{content}\n</trusted:{label}>"
 
 
-def _is_trusted_history_source(content: str) -> bool:
-    text = content or ""
-    if _TRUSTED_TG_ADMIN_RE.search(text):
-        return True
-    return bool(_TRUSTED_SOURCE_RE.search(text))
+def _is_truthy_metadata(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"yes", "true", "1"}
+
+
+def _normalize_trusted_history_source(value: Any) -> str:
+    normalized = clean_text(str(value or ""), max_len=32).lower()
+    return normalized if normalized in _TRUSTED_HISTORY_SOURCES else ""
 
 
 def _stringify_history_timestamp(value: Any) -> str:
@@ -128,24 +131,35 @@ def _extract_legacy_history_metadata(content: str) -> dict[str, str]:
     trusted_source = ""
     is_owner = ""
 
-    if _LEGACY_OWNER_RE.search(meta):
-        is_owner = "yes"
+    # Authority is accepted only from the exact system-generated metadata
+    # layout. Telegram display names and message bodies are user-controlled;
+    # scanning the whole bracket/body for marker-like text would let a name
+    # such as "x trusted_source:tg_admin" forge administrator history.
+    structured = _LEGACY_STRUCTURED_META_RE.fullmatch(meta)
+    if structured:
+        sender_id = clean_text(structured.group("sender_id"), max_len=32)
+        sender_username = clean_text(structured.group("username"), max_len=64)
+        sender_name = clean_text(structured.group("sender_name"), max_len=160)
+        if _is_truthy_metadata(structured.group("is_owner")):
+            is_owner = "yes"
+        if _is_truthy_metadata(structured.group("is_tg_admin")):
+            trusted_source = _normalize_trusted_history_source(
+                structured.group("trusted_source")
+            )
+    else:
+        # Retain best-effort identity rendering for older rows, but never infer
+        # trust from an unstructured legacy string.
+        id_match = _LEGACY_ID_RE.search(meta)
+        if id_match:
+            sender_id = clean_text(id_match.group(1), max_len=32)
 
-    id_match = _LEGACY_ID_RE.search(meta)
-    if id_match:
-        sender_id = clean_text(id_match.group(1), max_len=32)
+        username_match = _LEGACY_USERNAME_RE.search(meta)
+        if username_match:
+            sender_username = clean_text(username_match.group(1), max_len=64)
 
-    username_match = _LEGACY_USERNAME_RE.search(meta)
-    if username_match:
-        sender_username = clean_text(username_match.group(1), max_len=64)
-
-    name_match = _LEGACY_NAME_RE.search(meta)
-    if name_match:
-        sender_name = clean_text(name_match.group(1), max_len=160)
-
-    trusted_match = _TRUSTED_SOURCE_RE.search(meta)
-    if trusted_match:
-        trusted_source = clean_text(trusted_match.group(1), max_len=32)
+        name_match = _LEGACY_NAME_RE.search(meta)
+        if name_match:
+            sender_name = clean_text(name_match.group(1), max_len=160)
 
     return {
         "body": body,
@@ -175,17 +189,16 @@ def build_history_message_record(
         str(msg.get("sender_username", "") or legacy["sender_username"]),
         max_len=64,
     )
-    trusted_source = clean_text(
-        str(msg.get("trusted_source", "") or legacy["trusted_source"]),
-        max_len=32,
+    trusted_source = _normalize_trusted_history_source(
+        msg.get("trusted_source", "") or legacy["trusted_source"]
     )
     # Owner is authoritative only from the system-set flag / system-prepended
     # tag, never from the user-controlled body. Non-owner lines carry no owner
     # marker at all so the model can positively bind 主人 to the immutable
     # sender_id instead of guessing from spoofable display names.
     is_owner = ""
-    raw_owner = str(msg.get("is_owner", "") or "").strip().lower()
-    if raw_owner in ("yes", "true", "1") or legacy["is_owner"] == "yes":
+    raw_owner = msg.get("is_owner", "")
+    if _is_truthy_metadata(raw_owner) or legacy["is_owner"] == "yes":
         is_owner = "yes"
     if is_owner == "yes":
         sender_role = "owner"
@@ -195,6 +208,19 @@ def build_history_message_record(
         sender_role = "member"
     sent_at = _stringify_history_timestamp(msg.get("created_at"))
     message_type = clean_text(str(msg.get("message_type", "") or ""), max_len=64)
+    memory_source = clean_text(
+        str(msg.get("memory_source", "") or ""),
+        max_len=64,
+    )
+    message_key = clean_text(str(msg.get("message_key", "") or ""), max_len=128)
+    reply_to_message_id = clean_text(
+        str(msg.get("reply_to_message_id", "") or ""),
+        max_len=32,
+    )
+    reply_to_sender_name = clean_text(
+        str(msg.get("reply_to_sender_name", "") or ""),
+        max_len=160,
+    )
     body = legacy["body"] if legacy["body"] else raw_content
     body = clean_multiline_text(body, max_len=max_body_chars)
 
@@ -218,6 +244,10 @@ def build_history_message_record(
         "is_owner": is_owner,
         "sender_role": sender_role,
         "message_type": message_type,
+        "memory_source": memory_source,
+        "message_key": message_key,
+        "reply_to_message_id": reply_to_message_id,
+        "reply_to_sender_name": reply_to_sender_name,
         "content": body or "(empty)",
     }
 
@@ -230,7 +260,12 @@ def format_history_message_block(
     record = build_history_message_record(msg, max_body_chars=max_body_chars)
     lines = [
         "[HISTORY_MESSAGE]",
-        "source_type: recent_group_history",
+        "source_type: "
+        + (
+            "recalled_group_archive"
+            if record["memory_source"].startswith("recalled_archive")
+            else "recent_group_history"
+        ),
         f"message_role: {record['role']}",
         f"sent_at: {record['sent_at']}",
         f"sender: {record['sender_name']}",
@@ -244,6 +279,12 @@ def format_history_message_block(
         lines.append(f"trusted_source: {record['trusted_source']}")
     if record["message_type"]:
         lines.append(f"message_type: {record['message_type']}")
+    if record["message_key"]:
+        lines.append(f"message_key: {record['message_key']}")
+    if record["reply_to_message_id"]:
+        lines.append(f"reply_to_message_id: {record['reply_to_message_id']}")
+    if record["reply_to_sender_name"]:
+        lines.append(f"reply_to_sender: {record['reply_to_sender_name']}")
     lines.extend(["content:", record["content"]])
     return "\n".join(lines)
 
@@ -265,6 +306,8 @@ def format_history_message_line(
         line += f" | trusted_source={record['trusted_source']}"
     if record["message_type"]:
         line += f" | message_type={record['message_type']}"
+    if record["reply_to_message_id"]:
+        line += f" | reply_to={record['reply_to_message_id']}"
     line += f" | content={content}"
     return line
 
@@ -286,6 +329,8 @@ def sanitize_history_for_llm(
     for msg in history[-max_items:]:
         role = str(msg.get("role", "user"))
         raw_content = str(msg.get("content", ""))
+        memory_source = str(msg.get("memory_source", "") or "").strip().lower()
+        record = build_history_message_record(msg, max_body_chars=max_item_chars)
         formatted = format_history_message_block(msg, max_body_chars=max_item_chars)
         wrapper_limit = max_item_chars + 512
         if role == "system":
@@ -296,7 +341,14 @@ def sanitize_history_for_llm(
                 }
             )
             continue
-        if role == "user" and _is_trusted_history_source(raw_content):
+        if (
+            role == "user"
+            and not memory_source.startswith("recalled_archive")
+            and (
+                record["is_owner"] == "yes"
+                or record["trusted_source"] in _TRUSTED_HISTORY_SOURCES
+            )
+        ):
             out.append(
                 {
                     "role": "user",

@@ -8,6 +8,12 @@ parse_mode = "HTML"
 disable_link_preview = true
 drop_pending_updates = false
 reply_batch_timeout_seconds = 45
+memory_recent_messages = 500
+memory_retention_days = 7
+memory_archive_max_messages_per_group = 50000
+memory_recall_enabled = true
+memory_recall_max_results = 8
+memory_automatic_compaction = false
 
 [bot.main_model]
 temperature = 0.7

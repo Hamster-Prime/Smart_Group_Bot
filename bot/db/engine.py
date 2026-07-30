@@ -44,6 +44,27 @@ _SQLITE_VOTE_BAN_INDEX_SQL = (
     "WHERE status IN ('active', 'enforcing')"
 )
 
+_SQLITE_ARCHIVE_FTS_TABLE = "group_message_archive_fts"
+_SQLITE_ARCHIVE_FTS_TRIGGER_NAMES = (
+    "trg_group_message_archive_fts_insert",
+    "trg_group_message_archive_fts_delete",
+    "trg_group_message_archive_fts_update",
+)
+_SQLITE_ARCHIVE_EMBEDDING_TRIGGER_NAMES = (
+    "trg_group_message_archive_embedding_insert",
+    "trg_group_message_archive_embedding_update",
+)
+
+
+def _sqlite_archive_fts_scope_sql(prefix: str) -> str:
+    """Return a stable, tokenizer-safe scope token for one archive row."""
+
+    return (
+        f"CASE WHEN {prefix}.group_id < 0 "
+        f"THEN 'group_n_' || CAST(-{prefix}.group_id AS TEXT) "
+        f"ELSE 'group_p_' || CAST({prefix}.group_id AS TEXT) END"
+    )
+
 
 def _restrict_sqlite_file_permissions(path: Path) -> None:
     """Keep the database and WAL sidecars private on POSIX filesystems."""
@@ -710,6 +731,400 @@ async def _sqlite_migrate_message_vector_timestamps(conn) -> bool:
     return changed
 
 
+async def _sqlite_ensure_message_vector_unique_key(conn) -> bool:
+    """Make deferred memory inserts idempotent on upgraded SQLite databases."""
+
+    if not await _sqlite_table_exists(conn, "message_vectors"):
+        return False
+    columns = await _sqlite_table_columns(conn, "message_vectors")
+    if not {"group_id", "message_id"}.issubset(columns):
+        return False
+    if await _sqlite_has_unique_index(conn, "message_vectors", ("message_id",)):
+        return False
+
+    prefix = "CAST(group_id AS TEXT) || ':'"
+    vector_update = ""
+    if "vector_id" in columns:
+        vector_update = (
+            "vector_id = CASE WHEN vector_id IS NULL OR vector_id = '' "
+            f"OR vector_id = message_id THEN {prefix} || message_id "
+            "ELSE vector_id END, "
+        )
+    normalized = await conn.execute(
+        text(
+            "UPDATE message_vectors SET "
+            f"{vector_update}message_id = {prefix} || message_id "
+            "WHERE group_id IS NOT NULL AND message_id IS NOT NULL "
+            "AND substr(message_id, 1, length(CAST(group_id AS TEXT)) + 1) "
+            f"<> {prefix}"
+        )
+    )
+    deduplicated = await conn.execute(
+        text(
+            "DELETE FROM message_vectors WHERE rowid NOT IN ("
+            "SELECT MAX(rowid) FROM message_vectors GROUP BY message_id"
+            ")"
+        )
+    )
+    # Older releases created this name as a non-unique performance index.
+    # SQLite cannot replace it in place, so recreate it with the invariant the
+    # ORM and ON CONFLICT path require.
+    await conn.execute(text("DROP INDEX IF EXISTS ix_message_vectors_message_id"))
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX ix_message_vectors_message_id "
+            "ON message_vectors (message_id)"
+        )
+    )
+    log.info(
+        "Migrated: message_vectors idempotency key enforced "
+        "(scoped=%d deduplicated=%d)",
+        max(0, int(normalized.rowcount or 0)),
+        max(0, int(deduplicated.rowcount or 0)),
+    )
+    return True
+
+
+async def _sqlite_backfill_group_message_archive(conn) -> int:
+    """Copy legacy working-memory rows into the lossless archive once.
+
+    The archive's group-scoped message key makes this safe to run on every
+    startup.  Existing archive rows are never updated: they may already contain
+    richer Telegram data than the old ``message_vectors`` row can provide.
+    """
+    if not await _sqlite_table_exists(conn, "message_vectors"):
+        return 0
+    if not await _sqlite_table_exists(conn, "group_message_archive"):
+        return 0
+
+    columns = await _sqlite_table_columns(conn, "message_vectors")
+    if not {"group_id", "message_id"}.issubset(columns):
+        return 0
+
+    role_expr = "COALESCE(role, 'user')" if "role" in columns else "'user'"
+    sender_id_expr = "sender_id" if "sender_id" in columns else "NULL"
+    sender_name_expr = (
+        "COALESCE(sender_name, '')" if "sender_name" in columns else "''"
+    )
+    message_type_expr = (
+        "COALESCE(message_type, 'text')"
+        if "message_type" in columns
+        else "'text'"
+    )
+    content_expr = "COALESCE(content, '')" if "content" in columns else "''"
+    sent_at_expr = (
+        "COALESCE(created_at, CURRENT_TIMESTAMP)"
+        if "created_at" in columns
+        else "CURRENT_TIMESTAMP"
+    )
+    access_count_expr = (
+        "COALESCE(access_count, 0)" if "access_count" in columns else "0"
+    )
+    last_accessed_expr = "last_accessed" if "last_accessed" in columns else "NULL"
+    raw_message_id = "CAST(message_id AS TEXT)"
+    numeric_message_id = (
+        f"CASE WHEN instr({raw_message_id}, ':') > 0 "
+        f"THEN substr({raw_message_id}, instr({raw_message_id}, ':') + 1) "
+        f"ELSE {raw_message_id} END"
+    )
+    telegram_message_id_expr = (
+        f"CASE WHEN ({numeric_message_id}) <> '' "
+        f"AND ({numeric_message_id}) NOT GLOB '*[^0-9]*' "
+        f"THEN CAST(({numeric_message_id}) AS INTEGER) ELSE NULL END"
+    )
+
+    result = await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO group_message_archive ("
+            "group_id, message_key, telegram_message_id, role, direction, "
+            "sender_kind, sender_id, sender_username, sender_first_name, "
+            "sender_last_name, sender_display_name, sender_is_bot, "
+            "sender_is_premium, sender_language_code, sender_chat_id, "
+            "sender_chat_type, sender_chat_title, author_signature, "
+            "message_type, content, raw_text, derived_text, sent_at, edited_at, "
+            "ingested_at, is_reply, reply_to_message_id, reply_to_sender_id, "
+            "reply_to_sender_name, reply_to_content, message_thread_id, "
+            "media_group_id, media_metadata, forward_metadata, entities, "
+            "extra_metadata, access_count, last_accessed"
+            ") SELECT "
+            f"group_id, {raw_message_id}, {telegram_message_id_expr}, "
+            f"{role_expr}, "
+            f"CASE WHEN {role_expr} = 'assistant' THEN 'outbound' "
+            "ELSE 'inbound' END, "
+            f"CASE WHEN {role_expr} = 'assistant' THEN 'bot' "
+            f"WHEN {sender_id_expr} IS NOT NULL THEN 'user' ELSE 'unknown' END, "
+            f"{sender_id_expr}, '', '', '', {sender_name_expr}, "
+            f"CASE WHEN {role_expr} = 'assistant' THEN 1 "
+            f"WHEN {sender_id_expr} IS NOT NULL THEN 0 ELSE NULL END, "
+            "NULL, '', NULL, '', '', '', "
+            f"{message_type_expr}, {content_expr}, {content_expr}, "
+            f"{content_expr}, {sent_at_expr}, NULL, {sent_at_expr}, "
+            "0, NULL, NULL, '', '', NULL, '', '{}', '{}', '[]', '{}', "
+            f"{access_count_expr}, {last_accessed_expr} "
+            "FROM message_vectors "
+            "WHERE group_id IS NOT NULL AND message_id IS NOT NULL "
+            f"AND {raw_message_id} <> ''"
+        )
+    )
+    inserted = max(0, int(result.rowcount or 0))
+    if inserted:
+        log.info(
+            "Migrated: archived %s existing message_vectors row(s)",
+            inserted,
+        )
+    return inserted
+
+
+async def _sqlite_ensure_group_message_archive_fts(conn) -> bool:
+    """Create and maintain the SQLite FTS5/BM25 archive projection.
+
+    This is an ordinary (content-owning) FTS table instead of an external-
+    content table.  The duplicated searchable text makes trigger behavior
+    explicit and lets DELETE/UPDATE remain compatible with all supported
+    SQLite versions.  ``rowid`` is always the source archive id; the archive
+    table remains the source of truth.
+    """
+
+    if not await _sqlite_table_exists(conn, "group_message_archive"):
+        return False
+
+    expected_columns = (
+        "group_scope",
+        "message_key",
+        "content",
+        "raw_text",
+        "derived_text",
+        "sender_display_name",
+        "sender_username",
+        "reply_to_content",
+    )
+    exists = await _sqlite_table_exists(conn, _SQLITE_ARCHIVE_FTS_TABLE)
+    existing_trigger_names = set(
+        (
+            await conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name IN ("
+                    "'trg_group_message_archive_fts_insert', "
+                    "'trg_group_message_archive_fts_delete', "
+                    "'trg_group_message_archive_fts_update'"
+                    ")"
+                )
+            )
+        ).scalars()
+    )
+    projection_may_be_stale = bool(
+        exists
+        and existing_trigger_names != set(_SQLITE_ARCHIVE_FTS_TRIGGER_NAMES)
+    )
+    rebuild = False
+    if exists:
+        actual_columns = tuple(
+            row[1]
+            for row in (
+                await conn.execute(
+                    text(f"PRAGMA table_info({_SQLITE_ARCHIVE_FTS_TABLE})")
+                )
+            ).all()
+        )
+        schema_sql = str(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='table' AND name=:name"
+                    ),
+                    {"name": _SQLITE_ARCHIVE_FTS_TABLE},
+                )
+            ).scalar_one_or_none()
+            or ""
+        ).lower()
+        if actual_columns != expected_columns or "trigram" not in schema_sql:
+            rebuild = True
+
+    if rebuild:
+        for trigger_name in _SQLITE_ARCHIVE_FTS_TRIGGER_NAMES:
+            await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+        await conn.execute(text(f"DROP TABLE {_SQLITE_ARCHIVE_FTS_TABLE}"))
+        exists = False
+
+    if not exists:
+        try:
+            await conn.execute(
+                text(
+                    f"CREATE VIRTUAL TABLE {_SQLITE_ARCHIVE_FTS_TABLE} "
+                    "USING fts5("
+                    "group_scope, "
+                    "message_key UNINDEXED, "
+                    "content, raw_text, derived_text, "
+                    "sender_display_name, sender_username, reply_to_content, "
+                    "tokenize='trigram case_sensitive 0'"
+                    ")"
+                )
+            )
+        except Exception as exc:
+            # Some downstream Python/SQLite builds omit FTS5 entirely.  Keep
+            # startup usable there; MemoryService will use its bounded LIKE
+            # compatibility path and health logs will make the downgrade clear.
+            detail = str(exc).lower()
+            if (
+                "no such module: fts5" not in detail
+                and "no such tokenizer: trigram" not in detail
+            ):
+                raise
+            log.warning(
+                "SQLite FTS5 trigram unavailable; archive recall uses LIKE fallback"
+            )
+            return False
+
+    new_scope = _sqlite_archive_fts_scope_sql("new")
+    insert_values = (
+        f"{new_scope}, new.message_key, "
+        "COALESCE(new.content, ''), COALESCE(new.raw_text, ''), "
+        "COALESCE(new.derived_text, ''), "
+        "COALESCE(new.sender_display_name, ''), "
+        "COALESCE(new.sender_username, ''), "
+        "COALESCE(new.reply_to_content, '')"
+    )
+    trigger_sql = {
+        "trg_group_message_archive_fts_insert": (
+            "AFTER INSERT ON group_message_archive BEGIN "
+            f"INSERT INTO {_SQLITE_ARCHIVE_FTS_TABLE} "
+            "(rowid, group_scope, message_key, content, raw_text, derived_text, "
+            "sender_display_name, sender_username, reply_to_content) "
+            f"VALUES (new.id, {insert_values}); END"
+        ),
+        "trg_group_message_archive_fts_delete": (
+            "AFTER DELETE ON group_message_archive BEGIN "
+            f"DELETE FROM {_SQLITE_ARCHIVE_FTS_TABLE} WHERE rowid = old.id; END"
+        ),
+        "trg_group_message_archive_fts_update": (
+            "AFTER UPDATE OF group_id, message_key, content, raw_text, "
+            "derived_text, sender_display_name, sender_username, reply_to_content "
+            "ON group_message_archive BEGIN "
+            f"DELETE FROM {_SQLITE_ARCHIVE_FTS_TABLE} WHERE rowid = old.id; "
+            f"INSERT INTO {_SQLITE_ARCHIVE_FTS_TABLE} "
+            "(rowid, group_scope, message_key, content, raw_text, derived_text, "
+            "sender_display_name, sender_username, reply_to_content) "
+            f"VALUES (new.id, {insert_values}); END"
+        ),
+    }
+    for trigger_name, body in trigger_sql.items():
+        await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+        await conn.execute(text(f"CREATE TRIGGER {trigger_name} {body}"))
+
+    archive_count = int(
+        (
+            await conn.execute(text("SELECT COUNT(*) FROM group_message_archive"))
+        ).scalar_one()
+        or 0
+    )
+    fts_count = int(
+        (
+            await conn.execute(
+                text(f"SELECT COUNT(*) FROM {_SQLITE_ARCHIVE_FTS_TABLE}")
+            )
+        ).scalar_one()
+        or 0
+    )
+    if (
+        not exists
+        or rebuild
+        or projection_may_be_stale
+        or archive_count != fts_count
+    ):
+        await conn.execute(text(f"DELETE FROM {_SQLITE_ARCHIVE_FTS_TABLE}"))
+        archive_scope = _sqlite_archive_fts_scope_sql("archive")
+        await conn.execute(
+            text(
+                f"INSERT INTO {_SQLITE_ARCHIVE_FTS_TABLE} "
+                "(rowid, group_scope, message_key, content, raw_text, derived_text, "
+                "sender_display_name, sender_username, reply_to_content) "
+                f"SELECT archive.id, {archive_scope}, archive.message_key, "
+                "COALESCE(archive.content, ''), COALESCE(archive.raw_text, ''), "
+                "COALESCE(archive.derived_text, ''), "
+                "COALESCE(archive.sender_display_name, ''), "
+                "COALESCE(archive.sender_username, ''), "
+                "COALESCE(archive.reply_to_content, '') "
+                "FROM group_message_archive AS archive"
+            )
+        )
+        log.info("Rebuilt group message archive FTS5 index: rows=%d", archive_count)
+    return True
+
+
+async def _sqlite_ensure_group_message_archive_embeddings(conn) -> bool:
+    """Maintain durable pending jobs for the archive embedding projection.
+
+    Embedding generation is intentionally not performed in a SQLite trigger.
+    The trigger only records that a source row needs asynchronous indexing.
+    Existing archives are backfilled idempotently, and any searchable source
+    edit invalidates the previous vector before it can be recalled.
+    """
+
+    if not await _sqlite_table_exists(conn, "group_message_archive"):
+        return False
+    if not await _sqlite_table_exists(
+        conn,
+        "group_message_archive_embeddings",
+    ):
+        return False
+
+    inserted = await conn.execute(
+        text(
+            "INSERT OR IGNORE INTO group_message_archive_embeddings ("
+            "archive_id, group_id, message_key, source_hash, space_id, "
+            "dimensions, encoding, embedding, embedding_norm, "
+            "status, attempt_count, next_attempt_at, last_error, "
+            "created_at, updated_at"
+            ") SELECT id, group_id, message_key, '', '', 0, 'f16le', "
+            "NULL, NULL, 'pending', 0, NULL, '', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP "
+            "FROM group_message_archive"
+        )
+    )
+
+    trigger_sql = {
+        "trg_group_message_archive_embedding_insert": (
+            "AFTER INSERT ON group_message_archive BEGIN "
+            "INSERT OR IGNORE INTO group_message_archive_embeddings ("
+            "archive_id, group_id, message_key, source_hash, space_id, "
+            "dimensions, encoding, embedding, embedding_norm, "
+            "status, attempt_count, next_attempt_at, last_error, "
+            "created_at, updated_at"
+            ") VALUES (new.id, new.group_id, new.message_key, '', '', 0, "
+            "'f16le', NULL, NULL, 'pending', 0, NULL, '', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP); END"
+        ),
+        "trg_group_message_archive_embedding_update": (
+            "AFTER UPDATE OF group_id, message_key, content, raw_text, "
+            "derived_text, sender_display_name, sender_username, "
+            "reply_to_content ON group_message_archive BEGIN "
+            "DELETE FROM group_message_archive_embeddings "
+            "WHERE archive_id = old.id; "
+            "INSERT INTO group_message_archive_embeddings ("
+            "archive_id, group_id, message_key, source_hash, space_id, "
+            "dimensions, encoding, embedding, embedding_norm, "
+            "status, attempt_count, next_attempt_at, last_error, "
+            "created_at, updated_at"
+            ") VALUES (new.id, new.group_id, new.message_key, '', '', 0, "
+            "'f16le', NULL, NULL, 'pending', 0, NULL, '', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP); END"
+        ),
+    }
+    for trigger_name, body in trigger_sql.items():
+        await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name}"))
+        await conn.execute(text(f"CREATE TRIGGER {trigger_name} {body}"))
+
+    backfilled = max(0, int(inserted.rowcount or 0))
+    if backfilled:
+        log.info(
+            "Created %d pending archive embedding job(s)",
+            backfilled,
+        )
+    return True
+
+
 async def _sqlite_migrate_join_verifications(conn) -> bool:
     """Convert captcha/link-token rows into durable permission releases.
 
@@ -1267,13 +1682,26 @@ async def init_db(
                     "ON message_vectors (group_id, created_at)"
                 )
             )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_message_vectors_message_id "
-                    "ON message_vectors (message_id)"
-                )
-            )
             await _sqlite_migrate_message_vector_timestamps(conn)
+            await _sqlite_ensure_message_vector_unique_key(conn)
+            for archive_index_sql in (
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_group_message_archive_group_message_key "
+                "ON group_message_archive (group_id, message_key)",
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_group_message_archive_group_sent_id "
+                "ON group_message_archive (group_id, sent_at, id)",
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_group_message_archive_group_telegram_message "
+                "ON group_message_archive (group_id, telegram_message_id)",
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_group_message_archive_group_reply_to_message "
+                "ON group_message_archive (group_id, reply_to_message_id)",
+            ):
+                await conn.execute(text(archive_index_sql))
+            await _sqlite_backfill_group_message_archive(conn)
+            await _sqlite_ensure_group_message_archive_fts(conn)
+            await _sqlite_ensure_group_message_archive_embeddings(conn)
             await _sqlite_migrate_join_verifications(conn)
             await _sqlite_ensure_column(
                 conn,

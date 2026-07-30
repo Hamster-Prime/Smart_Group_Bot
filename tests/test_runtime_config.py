@@ -51,6 +51,15 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settings.bot.main_model.max_tokens, 2048)
         self.assertEqual(self.settings.bot.max_context_tokens, 256000)
         self.assertEqual(self.settings.bot.max_output_tokens, 2048)
+        self.assertEqual(self.settings.bot.memory_recent_messages, 500)
+        self.assertEqual(self.settings.bot.memory_retention_days, 7)
+        self.assertEqual(
+            self.settings.bot.memory_archive_max_messages_per_group,
+            50000,
+        )
+        self.assertTrue(self.settings.bot.memory_recall_enabled)
+        self.assertEqual(self.settings.bot.memory_recall_max_results, 8)
+        self.assertFalse(self.settings.bot.memory_automatic_compaction)
         self.assertEqual(self.settings.bot.reply_batch_timeout_seconds, 45.0)
         self.assertTrue(self.settings.bot.disable_link_preview)
         self.assertTrue(self.manager.config.bot.disable_link_preview)
@@ -75,6 +84,8 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.payload["models"]["providers"][0]["api_key"], "")
             self.assertEqual(row.payload["movie_info"]["tmdb_read_access_token"], "")
             self.assertTrue(row.payload["bot"]["disable_link_preview"])
+            self.assertEqual(row.payload["bot"]["memory_recent_messages"], 500)
+            self.assertEqual(row.payload["bot"]["memory_retention_days"], 7)
 
     async def test_link_preview_setting_save_apply_and_persist(self) -> None:
         payload = self.manager.config.public_payload()
@@ -564,6 +575,7 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.revision, 1)
 
     async def test_hcaptcha_can_be_selected_and_keeps_turnstile_secrets(self) -> None:
+        self.settings.miniapp_public_base_url = "https://verify.example.test"
         payload = self.manager.config.public_payload()
         payload["verification"].update(
             {

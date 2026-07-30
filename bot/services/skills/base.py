@@ -39,6 +39,7 @@ class SkillContext:
     sticker_file_id: str = ""
     tts_sent: bool = False
     tts_text: str = ""
+    tts_telegram_message_ids: tuple[int, ...] = ()
     embedded_reply_sent: bool = False
     embedded_reply_text: str = ""
     suppress_followup_text: bool = False
@@ -69,6 +70,7 @@ class SkillAnswerResult:
     sticker_file_id: str = ""
     tts_sent: bool = False
     tts_text: str = ""
+    tts_telegram_message_ids: tuple[int, ...] = ()
     delivery_confirmed: bool = False
     # A non-text skill (for example music or a vote prompt) may deliver the
     # reply directly through Telegram. Keep that proof separate from handled,

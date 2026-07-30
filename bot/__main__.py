@@ -19,6 +19,7 @@ from bot.middlewares.member_roster import MemberRosterMiddleware
 from bot.middlewares.update_dedup import DurableInboxUpdateDedupMiddleware
 from bot.middlewares.verification_gate import PendingVerificationGateMiddleware
 from bot.services import memory_holder
+from bot.services.archive_vector import SQLiteArchiveVectorRecallProvider
 from bot.services.authz import warm_privileged_operator_cache
 from bot.services.join_verification import (
     JoinVerificationSweeper,
@@ -308,10 +309,16 @@ async def _initialize_runtime_services(
             "请在 /settings 的 Bot 行为中调高上下文预算。",
             settings.bot.max_context_tokens,
         )
+    vector_recall_provider = SQLiteArchiveVectorRecallProvider(
+        session_factory=session_factory,
+        llm=llm,
+        retention_days=settings.bot.memory_retention_days,
+    )
     memory = MemoryService(
         settings.bot,
         llm,
         session_factory=session_factory,
+        vector_recall_provider=vector_recall_provider,
     )
     await memory.bootstrap()
     memory_holder.init(memory)
@@ -473,7 +480,23 @@ async def main() -> None:
                 embed=settings.bot.embed_model,
                 max_context_tokens=settings.bot.max_context_tokens,
             )
+            archive_policy_before = (
+                getattr(memory, "memory_retention_days", None),
+                getattr(memory, "memory_archive_max_messages_per_group", None),
+            )
             memory.reconfigure(settings.bot)
+            archive_policy_after = (
+                getattr(memory, "memory_retention_days", None),
+                getattr(memory, "memory_archive_max_messages_per_group", None),
+            )
+            if archive_policy_after != archive_policy_before:
+                prune_archive = getattr(
+                    memory,
+                    "prune_expired_archive_globally",
+                    None,
+                )
+                if callable(prune_archive):
+                    await prune_archive()
             sweeper.check_interval_seconds = max(
                 5.0,
                 float(settings.join_verification_check_interval_seconds),
@@ -590,6 +613,14 @@ async def main() -> None:
                 name="resource-health-watchdog",
             ),
         ]
+        archive_maintenance = getattr(memory, "run_archive_maintenance", None)
+        if callable(archive_maintenance):
+            background_tasks.append(
+                asyncio.create_task(
+                    archive_maintenance(),
+                    name="memory-archive-maintenance",
+                )
+            )
 
         await _run_with_background_supervision(
             run_update_delivery(

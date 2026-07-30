@@ -101,6 +101,22 @@ class FindKeywordReplyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SendKeywordReplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detailed_send_returns_telegram_message_for_archiving(self) -> None:
+        message = _message()
+        sent = SimpleNamespace(message_id=778)
+        with patch(
+            "bot.services.keyword_reply.answer_with_auto_delete",
+            new=AsyncMock(return_value=sent),
+        ):
+            result = await send_keyword_reply(
+                message,
+                _rule(),
+                _settings(),
+                return_message=True,
+            )
+
+        self.assertIs(result, sent)
+
     async def test_send_uses_keyword_auto_delete_category(self) -> None:
         message = _message()
         sent = SimpleNamespace(message_id=777)

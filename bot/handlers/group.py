@@ -158,6 +158,7 @@ from bot.utils.telegram import (
     sanitize_outgoing_text,
     schedule_message_auto_delete_durable,
     ReplyMessageOverlay,
+    TelegramDeliveryResult,
     send_reply,
     typing_action,
 )
@@ -493,6 +494,195 @@ def _resolve_sender_identity(message: Message) -> _SenderIdentity:
         display_name=display_name,
         is_chat=False,
     )
+
+
+def _archive_json_value(value: Any, *, depth: int = 0) -> Any:
+    """Convert selected Telegram model values into bounded JSON primitives."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if depth >= 3:
+        return str(value)[:500]
+    if isinstance(value, (list, tuple)):
+        return [_archive_json_value(item, depth=depth + 1) for item in value[:32]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _archive_json_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:64]
+        }
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            return _archive_json_value(
+                dump(mode="json", exclude_none=True),
+                depth=depth + 1,
+            )
+        except (TypeError, ValueError):
+            pass
+    return str(value)[:500]
+
+
+def _message_media_metadata(message: Message) -> dict[str, Any]:
+    media_fields = (
+        "animation",
+        "audio",
+        "document",
+        "photo",
+        "sticker",
+        "video",
+        "video_note",
+        "voice",
+        "contact",
+    )
+    metadata: dict[str, Any] = {}
+    for field_name in media_fields:
+        value = getattr(message, field_name, None)
+        if value is None:
+            continue
+        # Photo is an ordered size list; the largest variant is enough for a
+        # stable archive reference while avoiding duplicated payload.
+        if field_name == "photo" and isinstance(value, (list, tuple)):
+            value = value[-1] if value else None
+        if value is None:
+            continue
+        allowed = (
+            "file_id",
+            "file_unique_id",
+            "file_name",
+            "mime_type",
+            "file_size",
+            "width",
+            "height",
+            "duration",
+            "emoji",
+            "set_name",
+            "is_animated",
+            "is_video",
+            "user_id",
+            "first_name",
+            "last_name",
+        )
+        item = {
+            name: _archive_json_value(getattr(value, name, None))
+            for name in allowed
+            if getattr(value, name, None) is not None
+        }
+        metadata[field_name] = item
+    return metadata
+
+
+def _message_archive_metadata(
+    message: Message,
+    *,
+    sender_identity: _SenderIdentity,
+    raw_text: str,
+    derived_text: str = "",
+    sender_is_owner: bool | None = None,
+    sender_is_tg_admin: bool | None = None,
+) -> dict[str, Any]:
+    user = getattr(message, "from_user", None)
+    sender_chat = getattr(message, "sender_chat", None)
+    reply = getattr(message, "reply_to_message", None)
+    reply_sender = _resolve_sender_identity(reply) if reply is not None else None
+    reply_text = ""
+    if reply is not None:
+        reply_text, _reply_type = extract_message_text(reply)
+
+    telegram_raw_text = getattr(message, "text", None)
+    if telegram_raw_text is None:
+        telegram_raw_text = getattr(message, "caption", None)
+    if telegram_raw_text is None:
+        telegram_raw_text = raw_text
+
+    if sender_identity.is_chat:
+        sender_kind = (
+            "anonymous_admin"
+            if int(getattr(sender_chat, "id", 0) or 0)
+            == int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+            else "chat"
+        )
+    elif bool(getattr(user, "is_bot", False)):
+        sender_kind = "bot"
+    else:
+        sender_kind = "user"
+
+    entities = [
+        _archive_json_value(item)
+        for item in (
+            list(getattr(message, "entities", None) or [])
+            + list(getattr(message, "caption_entities", None) or [])
+        )[:64]
+    ]
+    forward_metadata: dict[str, Any] = {}
+    forward_origin = getattr(message, "forward_origin", None)
+    if forward_origin is not None:
+        dumped = _archive_json_value(forward_origin)
+        if isinstance(dumped, dict):
+            forward_metadata = dumped
+
+    extra_metadata = {
+        "chat_id": int(getattr(getattr(message, "chat", None), "id", 0) or 0),
+        "chat_type": str(getattr(getattr(message, "chat", None), "type", "") or ""),
+        "chat_title": str(getattr(getattr(message, "chat", None), "title", "") or "")[:255],
+        "chat_username": str(getattr(getattr(message, "chat", None), "username", "") or "")[:255],
+        "has_protected_content": bool(
+            getattr(message, "has_protected_content", False)
+        ),
+        "via_bot_id": int(getattr(getattr(message, "via_bot", None), "id", 0) or 0),
+        "quote": _archive_json_value(getattr(message, "quote", None)),
+        "external_reply": _archive_json_value(
+            getattr(message, "external_reply", None)
+        ),
+    }
+    if sender_is_owner is not None:
+        extra_metadata["sender_is_owner"] = bool(sender_is_owner)
+    if sender_is_tg_admin is not None:
+        extra_metadata["sender_is_tg_admin"] = bool(sender_is_tg_admin)
+        extra_metadata["trusted_source"] = (
+            "tg_admin" if sender_is_tg_admin else "none"
+        )
+    return {
+        "telegram_message_id": int(getattr(message, "message_id", 0) or 0) or None,
+        "direction": "inbound",
+        "sender_kind": sender_kind,
+        "sender_id": sender_identity.actor_id or None,
+        "sender_username": sender_identity.username,
+        "sender_first_name": str(getattr(user, "first_name", "") or ""),
+        "sender_last_name": str(getattr(user, "last_name", "") or ""),
+        "sender_display_name": sender_identity.display_name,
+        "sender_is_bot": (
+            bool(getattr(user, "is_bot", False)) if user is not None else None
+        ),
+        "sender_is_premium": getattr(user, "is_premium", None),
+        "sender_language_code": str(getattr(user, "language_code", "") or ""),
+        "sender_chat_id": int(getattr(sender_chat, "id", 0) or 0) or None,
+        "sender_chat_type": str(getattr(sender_chat, "type", "") or ""),
+        "sender_chat_title": str(getattr(sender_chat, "title", "") or ""),
+        "author_signature": str(getattr(message, "author_signature", "") or ""),
+        "raw_text": str(telegram_raw_text),
+        "derived_text": derived_text,
+        "edited_at": getattr(message, "edit_date", None),
+        "is_reply": reply is not None,
+        "reply_to_message_id": (
+            int(getattr(reply, "message_id", 0) or 0) or None
+            if reply is not None
+            else None
+        ),
+        "reply_to_sender_id": (
+            reply_sender.actor_id if reply_sender is not None else None
+        ),
+        "reply_to_sender_name": (
+            reply_sender.display_name if reply_sender is not None else ""
+        ),
+        "reply_to_content": reply_text,
+        "message_thread_id": int(getattr(message, "message_thread_id", 0) or 0)
+        or None,
+        "media_group_id": str(getattr(message, "media_group_id", "") or ""),
+        "media_metadata": _message_media_metadata(message),
+        "forward_metadata": forward_metadata,
+        "entities": entities,
+        "extra_metadata": extra_metadata,
+    }
 
 
 def _build_user_mention(*, user_id: int, username: str, full_name: str) -> str:
@@ -3519,6 +3709,34 @@ class _ReplyDeliveryPlan:
     reply_to_message_id: int | None = None
 
 
+@dataclass(slots=True)
+class _ReplyDeliveryEvidence:
+    plan: _ReplyDeliveryPlan
+    telegram_message_ids: tuple[int, ...] = ()
+    sent_at: datetime | None = None
+
+
+def _telegram_delivery_evidence(value: Any) -> tuple[tuple[int, ...], datetime | None]:
+    """Normalize detailed and legacy Telegram send results for archiving."""
+
+    if isinstance(value, TelegramDeliveryResult):
+        messages = value.messages
+        ids = value.message_ids
+    else:
+        message_id = int(getattr(value, "message_id", 0) or 0)
+        messages = (value,) if message_id else ()
+        ids = (message_id,) if message_id else ()
+    sent_at = next(
+        (
+            sent_date
+            for message in messages
+            if (sent_date := getattr(message, "date", None)) is not None
+        ),
+        None,
+    )
+    return ids, sent_at
+
+
 _PENDING_REPLY_LOCK = asyncio.Lock()
 _PENDING_REPLY_BATCHES: dict[tuple[int, int], _PendingReplyBatch] = {}
 _PENDING_REPLY_EXECUTION_CAPACITY = 4
@@ -3950,6 +4168,9 @@ _MEMORY_COMPACT_RERUN: set[int] = set()
 def _schedule_memory_compaction(memory: Any, group_id: int) -> None:
     """Run compaction off the hot path; it only matters before the NEXT prompt build."""
 
+    if not bool(getattr(memory, "automatic_compaction_enabled", True)):
+        return
+
     existing = _MEMORY_COMPACT_TASKS.get(group_id)
     if existing is not None and not existing.done():
         _MEMORY_COMPACT_RERUN.add(group_id)
@@ -4063,6 +4284,7 @@ async def _deliver_reply_plans(
     progress_overlay_factory: (
         Callable[[], Awaitable[ReplyMessageOverlay | None]] | None
     ) = None,
+    delivery_evidence: list[_ReplyDeliveryEvidence] | None = None,
 ) -> tuple[bool, bool, list[str]]:
     """Deliver every plan, falling back to text per failed voice item."""
 
@@ -4073,6 +4295,29 @@ async def _deliver_reply_plans(
     tts_sent_ok = tts_already_sent
     sent_messages: list[str] = []
     overlay_claimed = False
+
+    def _record_plan_delivery(
+        plan: _ReplyDeliveryPlan,
+        delivery: Any,
+        *,
+        additional_ids: tuple[int, ...] = (),
+    ) -> None:
+        if delivery_evidence is None:
+            return
+        ids, sent_at = _telegram_delivery_evidence(delivery)
+        tts_ids = tuple(
+            int(message_id)
+            for message_id in getattr(delivery, "telegram_message_ids", ())
+            if int(message_id or 0)
+        )
+        combined_ids = tuple(dict.fromkeys((*additional_ids, *tts_ids, *ids)))
+        delivery_evidence.append(
+            _ReplyDeliveryEvidence(
+                plan=plan,
+                telegram_message_ids=combined_ids,
+                sent_at=sent_at,
+            )
+        )
 
     async def _claim_progress_overlay(
         *,
@@ -4147,18 +4392,19 @@ async def _deliver_reply_plans(
 
             if delivery.complete:
                 sent_messages.append(plan.text)
+                _record_plan_delivery(plan, delivery)
                 sent_ok = True
                 tts_sent_ok = True
                 visible_delivery_seen = True
                 continue
             if delivery.any_sent:
                 visible_delivery_seen = True
-                remaining_sent = False
+                remaining_delivery: Any = False
                 if delivery.remaining_text:
                     fallback_overlay = await _claim_progress_overlay(
                         allowed=False,
                     )
-                    remaining_sent = await send_reply(
+                    remaining_delivery = await send_reply(
                         message,
                         delivery.remaining_text,
                         delivery_mode=plan.delivery_mode,
@@ -4175,11 +4421,26 @@ async def _deliver_reply_plans(
                         on_delivery=_confirm_plan_delivery,
                         on_ambiguous=on_ambiguous,
                         overlay=fallback_overlay,
+                        return_result=delivery_evidence is not None,
                     )
+                remaining_sent = bool(remaining_delivery)
                 sent_messages.append(
                     plan.text
                     if remaining_sent
                     else delivery.delivered_text
+                )
+                _record_plan_delivery(
+                    plan,
+                    remaining_delivery,
+                    additional_ids=tuple(
+                        int(message_id)
+                        for message_id in getattr(
+                            delivery,
+                            "telegram_message_ids",
+                            (),
+                        )
+                        if int(message_id or 0)
+                    ),
                 )
                 sent_ok = True
                 tts_sent_ok = True
@@ -4196,7 +4457,7 @@ async def _deliver_reply_plans(
             fallback_overlay = await _claim_progress_overlay(
                 allowed=not visible_delivery_seen,
             )
-            text_ok = await send_reply(
+            text_delivery = await send_reply(
                 message,
                 plan.text,
                 delivery_mode=plan.delivery_mode,
@@ -4210,9 +4471,12 @@ async def _deliver_reply_plans(
                 on_delivery=_confirm_plan_delivery,
                 on_ambiguous=on_ambiguous,
                 overlay=fallback_overlay,
+                return_result=delivery_evidence is not None,
             )
+            text_ok = bool(text_delivery)
             if text_ok:
                 sent_messages.append(plan.text)
+                _record_plan_delivery(plan, text_delivery)
                 sent_ok = True
                 visible_delivery_seen = True
             elif plan_receipt[0]:
@@ -4235,7 +4499,7 @@ async def _deliver_reply_plans(
         current_overlay = await _claim_progress_overlay(
             allowed=not tts_already_sent,
         )
-        text_ok = await send_reply(
+        text_delivery = await send_reply(
             message,
             plan.text,
             delivery_mode=plan.delivery_mode,
@@ -4251,9 +4515,12 @@ async def _deliver_reply_plans(
             on_delivery=_confirm_plan_delivery,
             on_ambiguous=on_ambiguous,
             overlay=current_overlay,
+            return_result=delivery_evidence is not None,
         )
+        text_ok = bool(text_delivery)
         if text_ok:
             sent_messages.append(plan.text)
+            _record_plan_delivery(plan, text_delivery)
             sent_ok = True
         elif plan_receipt[0]:
             sent_ok = True
@@ -4532,6 +4799,7 @@ async def _process_pending_reply_batch(
             sticker_file = ""
             delivery_mode = "reply"
             tts_text = ""
+            tts_telegram_message_ids: tuple[int, ...] = ()
             embedded_reply_text = ""
             explicit_no_reply = False
             force_reply = bool(action_forced and action == "casual")
@@ -4556,6 +4824,13 @@ async def _process_pending_reply_batch(
                 await progress.start()
                 history = await memory.get_history_for_llm(
                     group_id,
+                    recall_query=merged_input_text,
+                    recall_exclude_message_keys=[
+                        f"{group_id}:"
+                        f"{int(getattr(item.message, 'message_id', 0) or 0)}"
+                        for item in items
+                        if int(getattr(item.message, "message_id", 0) or 0) > 0
+                    ],
                     prompt_payload_builder=lambda candidate_history: skill.build_answer_prompt_payload(
                         merged_input_text,
                         history=_exclude_batch_messages(candidate_history, memory_entries),
@@ -4632,6 +4907,15 @@ async def _process_pending_reply_batch(
                     )
                     sticker_file = skill_result.sticker_file_id or ""
                     tts_text = skill_result.tts_text or ""
+                    tts_telegram_message_ids = tuple(
+                        int(message_id)
+                        for message_id in getattr(
+                            skill_result,
+                            "tts_telegram_message_ids",
+                            (),
+                        )
+                        if int(message_id or 0)
+                    )
                     embedded_reply_text = str(
                         getattr(skill_result, "embedded_reply_text", "") or ""
                     ).strip()
@@ -4864,6 +5148,7 @@ async def _process_pending_reply_batch(
                 context="pending_reply_pre_delivery",
             )
 
+            reply_delivery_evidence: list[_ReplyDeliveryEvidence] = []
             if action != "skip" and delivery_plans:
                 text_delivery_expected = bool(
                     not tts_sent_ok
@@ -4891,6 +5176,7 @@ async def _process_pending_reply_batch(
                     on_ambiguous=_mark_delivery_ambiguous,
                     progress_overlay=progress_overlay,
                     progress_overlay_factory=_handoff_progress_overlay,
+                    delivery_evidence=reply_delivery_evidence,
                 )
                 sent_ok = sent_ok or delivered
                 if delivered and not delivery_ambiguous:
@@ -4915,8 +5201,30 @@ async def _process_pending_reply_batch(
                 return True
 
             stored_reply_messages = list(sent_reply_messages)
+            unmatched_delivery_evidence = list(reply_delivery_evidence)
             if not stored_reply_messages and tts_text and tts_sent_ok:
                 stored_reply_messages = [tts_text]
+                if tts_telegram_message_ids:
+                    unmatched_delivery_evidence.append(
+                        _ReplyDeliveryEvidence(
+                            plan=_ReplyDeliveryPlan(
+                                text=tts_text,
+                                delivery_mode="reply",
+                                reply_to_message_id=(
+                                    int(
+                                        getattr(
+                                            latest.message,
+                                            "message_id",
+                                            0,
+                                        )
+                                        or 0
+                                    )
+                                    or None
+                                ),
+                            ),
+                            telegram_message_ids=tts_telegram_message_ids,
+                        )
+                    )
             if (
                 not stored_reply_messages
                 and embedded_reply_text
@@ -4927,14 +5235,119 @@ async def _process_pending_reply_batch(
                 current_task = asyncio.current_task()
                 if current_task is not None and current_task.cancelling():
                     raise asyncio.CancelledError
+                unmatched_plans = list(delivery_plans)
+                trigger_message_ids = [
+                    int(getattr(item.message, "message_id", 0) or 0)
+                    for item in items
+                    if int(getattr(item.message, "message_id", 0) or 0) > 0
+                ]
                 for stored_reply in stored_reply_messages:
+                    matched_plan: _ReplyDeliveryPlan | None = None
+                    for plan_index, plan in enumerate(unmatched_plans):
+                        if plan.text == stored_reply:
+                            matched_plan = unmatched_plans.pop(plan_index)
+                            break
+                    matched_evidence: _ReplyDeliveryEvidence | None = None
+                    if matched_plan is not None:
+                        for evidence_index, evidence in enumerate(
+                            unmatched_delivery_evidence
+                        ):
+                            if evidence.plan is matched_plan:
+                                matched_evidence = unmatched_delivery_evidence.pop(
+                                    evidence_index
+                                )
+                                break
+                    elif unmatched_delivery_evidence:
+                        # Partial TTS delivery stores only its delivered prefix,
+                        # so it cannot text-match the original full plan.
+                        matched_evidence = unmatched_delivery_evidence.pop(0)
+                        matched_plan = matched_evidence.plan
+                    resolved_delivery_mode = (
+                        matched_plan.delivery_mode if matched_plan is not None else "reply"
+                    )
+                    reply_target_id = (
+                        matched_plan.reply_to_message_id
+                        if matched_plan is not None
+                        else None
+                    )
+                    if resolved_delivery_mode != "message" and not reply_target_id:
+                        reply_target_id = int(
+                            getattr(latest.message, "message_id", 0) or 0
+                        ) or None
+                    reply_target_message = next(
+                        (
+                            item.message
+                            for item in items
+                            if int(getattr(item.message, "message_id", 0) or 0)
+                            == int(reply_target_id or 0)
+                        ),
+                        None,
+                    )
+                    reply_target_text = ""
+                    reply_target_sender = ""
+                    reply_target_sender_id: int | None = None
+                    if reply_target_message is not None:
+                        reply_target_text, _target_type = extract_message_text(
+                            reply_target_message
+                        )
+                        target_identity = _resolve_sender_identity(reply_target_message)
+                        reply_target_sender = target_identity.display_name
+                        reply_target_sender_id = target_identity.actor_id or None
+                    telegram_message_ids = (
+                        matched_evidence.telegram_message_ids
+                        if matched_evidence is not None
+                        else ()
+                    )
+                    telegram_message_id = (
+                        telegram_message_ids[0] if telegram_message_ids else None
+                    )
+                    delivery_metadata: dict[str, Any] = {
+                        "source": reply_source,
+                        "delivery_mode": resolved_delivery_mode,
+                        "trigger_message_ids": trigger_message_ids,
+                        "merged_input_count": merged_count,
+                    }
+                    if telegram_message_ids:
+                        delivery_metadata["telegram_message_ids"] = list(
+                            telegram_message_ids
+                        )
+                    else:
+                        delivery_metadata["telegram_message_id_unavailable"] = True
                     await memory.add_message(
                         group_id,
                         "assistant",
                         stored_reply,
                         message_type="assistant_reply",
+                        message_id=(
+                            str(telegram_message_id)
+                            if telegram_message_id is not None
+                            else None
+                        ),
+                        created_at=(
+                            matched_evidence.sent_at
+                            if matched_evidence is not None
+                            else None
+                        ),
                         defer_persistence=True,
                         completions=_unique_pending_reply_completions(items),
+                        archive_metadata={
+                            "telegram_message_id": telegram_message_id,
+                            "direction": "outbound",
+                            "sender_kind": "bot",
+                            "sender_display_name": "bot",
+                            "sender_is_bot": True,
+                            "is_reply": bool(reply_target_id),
+                            "reply_to_message_id": reply_target_id,
+                            "reply_to_sender_id": reply_target_sender_id,
+                            "reply_to_sender_name": reply_target_sender,
+                            "reply_to_content": reply_target_text,
+                            "message_thread_id": int(
+                                getattr(latest.message, "message_thread_id", 0)
+                                or 0
+                            )
+                            or None,
+                            "extra_metadata": delivery_metadata,
+                        },
                     )
                 _schedule_memory_compaction(memory, group_id)
             log.info(
@@ -5487,6 +5900,22 @@ async def on_group_message(
     if not text:
         return
     input_text = text
+    memory = memory_holder.get_optional()
+    if memory is not None:
+        await memory.archive_message(
+            group_id,
+            "user",
+            input_text,
+            message_id=str(message.message_id),
+            created_at=message.date,
+            message_type=msg_type,
+            defer_persistence=True,
+            **_message_archive_metadata(
+                message,
+                sender_identity=sender_identity,
+                raw_text=text,
+            ),
+        )
     flow_started = time.perf_counter()
     bot_me = await message.bot.me()
 
@@ -5529,6 +5958,22 @@ async def on_group_message(
         input_text, bot_vision_text = await _append_image_context(
             message, llm, input_text, msg_type
         )
+        if memory is not None and (input_text != text or bot_vision_text):
+            await memory.archive_message(
+                group_id,
+                "user",
+                input_text,
+                message_id=str(message.message_id),
+                created_at=message.date,
+                message_type=msg_type,
+                defer_persistence=True,
+                **_message_archive_metadata(
+                    message,
+                    sender_identity=sender_identity,
+                    raw_text=text,
+                    derived_text=bot_vision_text,
+                ),
+            )
         # Placeholder-only media ("[voice]", "[video]", failed-vision images)
         # carry nothing to judge; a trivially-clean verdict must not credit a
         # pass toward the permanent whitelist, so skip them entirely.
@@ -5580,11 +6025,13 @@ async def on_group_message(
     tg_admin_flag = "yes" if sender_is_tg_admin else "no"
     trusted_source = "tg_admin" if sender_is_tg_admin else "none"
     sender_username_tag = f"@{sender_username}" if sender_username else "(none)"
+    history_display_name = re.sub(r"\s+", " ", display_name).strip()[:160]
+    history_display_name = history_display_name.replace("[", "［").replace("]", "］")
     # Keep id/admin flags at the front so trust metadata survives truncation/compression.
     user_tag = (
         f"id:{user_id} username:{sender_username_tag} "
         f"is_owner:{owner_flag} is_tg_admin:{tg_admin_flag} trusted_source:{trusted_source} "
-        f"name:{display_name}"
+        f"name:{history_display_name}"
     )
 
     llm = LLMService(
@@ -5601,6 +6048,26 @@ async def on_group_message(
     reply_context = await _build_reply_context_for_llm(message, llm)
     if reply_context:
         input_text = f"{input_text}\n{reply_context}"
+    # Refresh the same archive event after authority/reply/media enrichment so
+    # its sender snapshot is useful even when the message needed no AI vision.
+    if memory is not None:
+        await memory.archive_message(
+            group_id,
+            "user",
+            input_text,
+            message_id=str(message.message_id),
+            created_at=message.date,
+            message_type=msg_type,
+            defer_persistence=True,
+            **_message_archive_metadata(
+                message,
+                sender_identity=sender_identity,
+                raw_text=text,
+                derived_text=vision_text,
+                sender_is_owner=sender_is_owner,
+                sender_is_tg_admin=sender_is_tg_admin,
+            ),
+        )
     if msg_type == "sticker":
         try:
             learned = await sticker_library.learn_from_message(
@@ -6060,17 +6527,19 @@ async def on_group_message(
         if called:
             # The summon replaces the AI reply, but the report still belongs
             # to group history like any other user message.
-            await memory_holder.get().add_message(
-                group_id,
-                "user",
-                f"[{user_tag}] {input_text}",
-                user_id=user_id,
-                sender_name=display_name,
-                message_type=msg_type,
-                message_id=str(message.message_id),
-                created_at=message.date,
-                defer_persistence=True,
-            )
+            if memory is not None:
+                await memory.add_message(
+                    group_id,
+                    "user",
+                    f"[{user_tag}] {input_text}",
+                    user_id=user_id,
+                    sender_name=display_name,
+                    message_type=msg_type,
+                    message_id=str(message.message_id),
+                    created_at=message.date,
+                    defer_persistence=True,
+                    persist_archive=False,
+                )
             log.info(
                 "[%s]【结束】呼叫管理员 | user=%s | 总耗时=%dms",
                 group_id,
@@ -6116,8 +6585,6 @@ async def on_group_message(
             await session.rollback()
             log.exception("[%s] keyword reply lookup failed", group_id)
 
-    memory = memory_holder.get()
-
     await _best_effort_commit(
         session,
         group_id=group_id,
@@ -6126,7 +6593,7 @@ async def on_group_message(
 
     should_index_user_memory = msg_type != "contact"
     memory_entry = ""
-    if should_index_user_memory:
+    if should_index_user_memory and memory is not None:
         memory_entry = f"[{user_tag}] {input_text}"
         await memory.add_message(
             group_id,
@@ -6138,10 +6605,13 @@ async def on_group_message(
             message_id=str(message.message_id),
             created_at=message.date,
             defer_persistence=True,
+            persist_archive=False,
         )
         _schedule_memory_compaction(memory, group_id)
-    else:
+    elif not should_index_user_memory:
         log.info("[%s] memory indexing skipped | reason=contact_message", group_id)
+    else:
+        log.warning("[%s] memory indexing skipped | reason=service_unavailable", group_id)
 
     if msg_type == "text" and not sender_identity.is_chat:
         try:
@@ -6163,7 +6633,60 @@ async def on_group_message(
             log.exception("[%s] speech style collection failed", group_id)
 
     if keyword_rule is not None:
-        sent_ok = await send_keyword_reply(message, keyword_rule, settings)
+        keyword_delivery = await send_keyword_reply(
+            message,
+            keyword_rule,
+            settings,
+            return_message=True,
+        )
+        sent_ok = bool(keyword_delivery)
+        if sent_ok and memory is not None:
+            keyword_message_ids, keyword_sent_at = _telegram_delivery_evidence(
+                keyword_delivery
+            )
+            keyword_message_id = (
+                keyword_message_ids[0] if keyword_message_ids else None
+            )
+            keyword_metadata: dict[str, Any] = {
+                "source": "keyword_reply",
+                "keyword_rule_id": int(keyword_rule.id),
+            }
+            if keyword_message_ids:
+                keyword_metadata["telegram_message_ids"] = list(
+                    keyword_message_ids
+                )
+            else:
+                keyword_metadata["telegram_message_id_unavailable"] = True
+            await memory.add_message(
+                group_id,
+                "assistant",
+                str(keyword_rule.reply_text or ""),
+                message_type="assistant_keyword_reply",
+                message_id=(
+                    str(keyword_message_id)
+                    if keyword_message_id is not None
+                    else None
+                ),
+                created_at=keyword_sent_at,
+                defer_persistence=True,
+                archive_metadata={
+                    "telegram_message_id": keyword_message_id,
+                    "direction": "outbound",
+                    "sender_kind": "bot",
+                    "sender_display_name": "bot",
+                    "sender_is_bot": True,
+                    "is_reply": True,
+                    "reply_to_message_id": int(message.message_id or 0) or None,
+                    "reply_to_sender_id": user_id or None,
+                    "reply_to_sender_name": display_name,
+                    "reply_to_content": text,
+                    "message_thread_id": int(
+                        getattr(message, "message_thread_id", 0) or 0
+                    )
+                    or None,
+                    "extra_metadata": keyword_metadata,
+                },
+            )
         log.info(
             "[%s]【结束】关键词回复 | 规则=%s 关键词=%s 已发送=%s | 总耗时=%dms",
             group_id,
@@ -6262,3 +6785,69 @@ async def on_group_message(
         int((time.perf_counter() - flow_started) * 1000),
     )
     return
+
+
+@router.edited_message(
+    F.text
+    | F.caption
+    | F.sticker
+    | F.voice
+    | F.photo
+    | F.video
+    | F.animation
+    | F.document
+    | F.audio
+    | F.video_note
+    | F.contact
+)
+async def on_group_message_edited(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+) -> None:
+    """Refresh the retained raw event when Telegram delivers an edit.
+
+    Edited updates are archived without entering the reply pipeline: an edit
+    should update memory truth, not trigger a second answer or moderation side
+    effect. ``edited_at`` remains available for audit and recall display.
+    """
+
+    if not is_group(message):
+        return
+    if not await ensure_group_authorized(message, session, settings):
+        return
+    text, msg_type = extract_message_text(message)
+    if not text:
+        return
+    sender_identity = _resolve_sender_identity(message)
+    user = message.from_user
+    sender_is_owner = bool(
+        user
+        and not sender_identity.is_chat
+        and is_super_admin_user_id(user.id, settings)
+    )
+    sender_chat = getattr(message, "sender_chat", None)
+    sender_is_group_identity = bool(
+        sender_identity.is_chat
+        and sender_chat
+        and getattr(sender_chat, "id", None) == message.chat.id
+    )
+    sender_is_tg_admin = sender_is_group_identity or await _is_user_admin_cached(
+        message
+    )
+    await memory_holder.get().archive_message(
+        message.chat.id,
+        "user",
+        text,
+        message_id=str(message.message_id),
+        created_at=message.date,
+        message_type=msg_type,
+        defer_persistence=True,
+        **_message_archive_metadata(
+            message,
+            sender_identity=sender_identity,
+            raw_text=text,
+            sender_is_owner=sender_is_owner,
+            sender_is_tg_admin=sender_is_tg_admin,
+        ),
+    )

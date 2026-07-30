@@ -851,6 +851,169 @@ class MessageVector(Base):
     )
 
 
+class GroupMessageArchive(Base):
+    """Lossless, group-scoped source record for long-horizon memory recall.
+
+    ``MessageVector`` remains the compact working-memory/index row.  This table
+    deliberately keeps Telegram identity, reply topology, sender snapshots and
+    raw metadata separately so retention or retrieval work never has to infer
+    those details from a rendered prompt string.
+    """
+
+    __tablename__ = "group_message_archive"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    role: Mapped[str] = mapped_column(String(16), default="user")
+    direction: Mapped[str] = mapped_column(String(16), default="inbound")
+
+    sender_kind: Mapped[str] = mapped_column(String(32), default="unknown")
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sender_username: Mapped[str] = mapped_column(String(255), default="")
+    sender_first_name: Mapped[str] = mapped_column(String(255), default="")
+    sender_last_name: Mapped[str] = mapped_column(String(255), default="")
+    sender_display_name: Mapped[str] = mapped_column(String(255), default="")
+    sender_is_bot: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    sender_is_premium: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    sender_language_code: Mapped[str] = mapped_column(String(32), default="")
+
+    sender_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sender_chat_type: Mapped[str] = mapped_column(String(32), default="")
+    sender_chat_title: Mapped[str] = mapped_column(String(255), default="")
+    author_signature: Mapped[str] = mapped_column(String(255), default="")
+
+    message_type: Mapped[str] = mapped_column(String(64), default="text")
+    content: Mapped[str] = mapped_column(Text, default="")
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    derived_text: Mapped[str] = mapped_column(Text, default="")
+
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    is_reply: Mapped[bool] = mapped_column(Boolean, default=False)
+    reply_to_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reply_to_sender_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reply_to_sender_name: Mapped[str] = mapped_column(String(255), default="")
+    reply_to_content: Mapped[str] = mapped_column(Text, default="")
+
+    message_thread_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    media_group_id: Mapped[str] = mapped_column(String(128), default="")
+    media_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    forward_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    entities: Mapped[list] = mapped_column(JSON, default=list)
+    extra_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_accessed: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_group_message_archive_group_message_key",
+            "group_id",
+            "message_key",
+            unique=True,
+        ),
+        Index(
+            "ix_group_message_archive_group_sent_id",
+            "group_id",
+            "sent_at",
+            "id",
+        ),
+        Index(
+            "ix_group_message_archive_group_telegram_message",
+            "group_id",
+            "telegram_message_id",
+        ),
+        Index(
+            "ix_group_message_archive_group_reply_to_message",
+            "group_id",
+            "reply_to_message_id",
+        ),
+    )
+
+
+class GroupMessageArchiveEmbedding(Base):
+    """Durable semantic-index projection for one archive message.
+
+    ``GroupMessageArchive`` is the source of truth for message content and
+    metadata.  This table is deliberately a replaceable projection: a source
+    edit, embedding-model change, or a failed provider call can invalidate the
+    row without touching the raw archive.  ``space_id`` identifies the exact
+    embedding space (provider/model/endpoint), while ``status`` lets a
+    write-behind worker retry indexing without blocking message ingestion.
+    """
+
+    __tablename__ = "group_message_archive_embeddings"
+
+    archive_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("group_message_archive.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), default="")
+    space_id: Mapped[str] = mapped_column(String(128), default="")
+    dimensions: Mapped[int] = mapped_column(Integer, default=0)
+    encoding: Mapped[str] = mapped_column(String(16), default="f16le")
+    embedding: Mapped[bytes | None] = mapped_column(nullable=True)
+    embedding_norm: Mapped[float | None] = mapped_column(nullable=True)
+
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+    last_error: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=now_shanghai_naive,
+        onupdate=now_shanghai_naive,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_group_message_archive_embeddings_group_status_retry",
+            "group_id",
+            "status",
+            "next_attempt_at",
+            "archive_id",
+        ),
+        Index(
+            "ix_group_message_archive_embeddings_group_space_status",
+            "group_id",
+            "space_id",
+            "status",
+            "archive_id",
+        ),
+        Index(
+            "ix_group_message_archive_embeddings_group_message_key",
+            "group_id",
+            "message_key",
+            unique=True,
+        ),
+    )
+
+
 class StickerLibraryRecord(Base):
     __tablename__ = "sticker_library"
 

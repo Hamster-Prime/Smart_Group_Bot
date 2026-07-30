@@ -22,6 +22,7 @@ from bot.services.resource_health import register_resource_health_provider
 from bot.services.skills.base import Skill, SkillAnswerResult, SkillContext, SkillRunResult
 from bot.services.skills.api_model_query import ApiModelQuerySkill
 from bot.services.skills.bilibili_search import BilibiliSearchSkill
+from bot.services.skills.conversation_recall import ConversationRecallSkill
 from bot.services.skills.doubao_tts import DoubaoTTSSkill
 from bot.services.skills.memory_manage import MemoryManageSkill
 from bot.services.skills.mihomo_doc import MihomoDocSkill
@@ -93,6 +94,7 @@ _SKILL_PROGRESS_TEXTS: dict[str, tuple[str, str, str]] = {
     "doubao_tts": ("正在生成语音", "已生成语音", "生成语音失败"),
     "send_sticker": ("正在选择贴纸", "已发送贴纸", "发送贴纸失败"),
     "vote_ban": ("正在发起群投票", "已发起群投票", "发起群投票失败"),
+    "conversation_recall": ("正在查找群聊历史", "已查找群聊历史", "查找群聊历史失败"),
     "memory_manage": ("正在更新群聊记忆", "已更新群聊记忆", "更新群聊记忆失败"),
     "rule_manage": ("正在更新群规则", "已更新群规则", "更新群规则失败"),
 }
@@ -265,6 +267,7 @@ class SkillService:
         self.max_total_tool_calls = max(1, int(max_total_tool_calls))
         self.default_sticker_file_ids = [x.strip() for x in (default_sticker_file_ids or []) if x.strip()]
         self.skills: dict[str, Skill] = {}
+        self._register(ConversationRecallSkill())
         self._register(MemoryManageSkill())
         self._register(RuleManageSkill())
         self._register(SendStickerSkill())
@@ -920,6 +923,7 @@ class SkillService:
                 "sticker_file_id",
                 "tts_sent",
                 "tts_text",
+                "tts_telegram_message_ids",
                 "embedded_reply_sent",
                 "embedded_reply_text",
                 "suppress_followup_text",
@@ -2459,6 +2463,7 @@ class SkillService:
                 sticker_file_id=context.sticker_file_id,
                 tts_sent=context.tts_sent,
                 tts_text=context.tts_text,
+                tts_telegram_message_ids=context.tts_telegram_message_ids,
                 delivery_confirmed=context.delivery_confirmed,
                 embedded_reply_sent=context.embedded_reply_sent,
                 embedded_reply_text=context.embedded_reply_text,

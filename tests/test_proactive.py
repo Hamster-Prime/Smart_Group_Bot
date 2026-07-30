@@ -297,6 +297,60 @@ class ProactiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
         claim = get_cooldown_task_state(persisted_settings)["delivery_claim"]
         self.assertEqual(claim["activity_revision"], 1)
 
+    async def test_sent_topic_archives_real_telegram_message_id(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
+        initial_settings = _due_settings(now)
+        service = self._service(fresh_settings=initial_settings)
+        persisted_settings = initial_settings
+        sent_at = datetime(2026, 7, 11, 12, 1, tzinfo=timezone.utc)
+
+        async def commit_settings(_group_id: int, mutate: object) -> bool:
+            nonlocal persisted_settings
+            persisted_settings = mutate(persisted_settings)
+            return True
+
+        with (
+            patch.object(
+                service,
+                "_load_group_settings",
+                new=AsyncMock(return_value=initial_settings),
+            ),
+            patch.object(
+                service,
+                "_deliver_topic",
+                new=AsyncMock(
+                    return_value=proactive_module._TopicDeliveryResult(
+                        True,
+                        "新话题",
+                        telegram_message_ids=(8123,),
+                        sent_at=sent_at,
+                    )
+                ),
+            ),
+            patch.object(
+                service,
+                "_commit_fresh_settings",
+                new=AsyncMock(side_effect=commit_settings),
+            ),
+            patch("bot.services.proactive._now_local", return_value=now),
+        ):
+            handled = await service._run_group_cooldown_task(-100123, now=now)
+
+        self.assertTrue(handled)
+        kwargs = service.memory.add_message.await_args.kwargs
+        self.assertEqual(kwargs["message_id"], "8123")
+        self.assertEqual(kwargs["created_at"], sent_at)
+        archive = kwargs["archive_metadata"]
+        self.assertEqual(archive["telegram_message_id"], 8123)
+        self.assertEqual(
+            archive["extra_metadata"]["telegram_message_ids"],
+            [8123],
+        )
+        self.assertNotIn(
+            "telegram_message_id_unavailable",
+            archive["extra_metadata"],
+        )
+
     async def test_active_delivery_claim_prevents_restart_resend(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc).astimezone()
         claimed_settings, applied = proactive_module._claim_cooldown_delivery(

@@ -25,7 +25,11 @@ from bot.utils.prompts import get_prompt, with_persona
 from bot.utils.project_info import build_bot_project_info_context
 from bot.utils.runtime_context import build_current_time_context
 from bot.utils.security import build_defended_system, clean_text, sanitize_history_for_llm
-from bot.utils.telegram import configured_auto_delete_seconds, send_chat_message
+from bot.utils.telegram import (
+    TelegramDeliveryResult,
+    configured_auto_delete_seconds,
+    send_chat_message,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,8 @@ class _TopicDeliveryResult:
     sent: bool
     memory_text: str = ""
     interrupted: bool = False
+    telegram_message_ids: tuple[int, ...] = ()
+    sent_at: datetime | None = None
 
     def __bool__(self) -> bool:
         return self.sent
@@ -573,6 +579,7 @@ class ProactiveTopicService:
         history = await self.memory.get_history_for_llm(
             group_id,
             reserve_tokens=768,
+            recall_query=task_brief,
             prompt_payload_builder=lambda candidate_history: build_proactive_prompt_payload(
                 task_brief=task_brief,
                 history=candidate_history,
@@ -701,13 +708,40 @@ class ProactiveTopicService:
             raise asyncio.CancelledError
 
         if delivery.memory_text:
+            telegram_message_id = (
+                delivery.telegram_message_ids[0]
+                if delivery.telegram_message_ids
+                else None
+            )
+            archive_extra: dict[str, Any] = {"source": "proactive_topic"}
+            if delivery.telegram_message_ids:
+                archive_extra["telegram_message_ids"] = list(
+                    delivery.telegram_message_ids
+                )
+            else:
+                archive_extra["telegram_message_id_unavailable"] = True
             await self.memory.add_message(
                 group_id,
                 "assistant",
                 delivery.memory_text,
                 message_type="assistant_proactive",
+                message_id=(
+                    str(telegram_message_id)
+                    if telegram_message_id is not None
+                    else None
+                ),
+                created_at=delivery.sent_at,
+                archive_metadata={
+                    "telegram_message_id": telegram_message_id,
+                    "direction": "outbound",
+                    "sender_kind": "bot",
+                    "sender_display_name": "bot",
+                    "sender_is_bot": True,
+                    "extra_metadata": archive_extra,
+                },
             )
-            await self.memory.compact_if_needed(group_id)
+            if bool(getattr(self.memory, "automatic_compaction_enabled", True)):
+                await self.memory.compact_if_needed(group_id)
         log.info("[%s] proactive topic sent | %s", group_id, reply[:80])
         return True
 
@@ -771,6 +805,24 @@ class ProactiveTopicService:
             nonlocal delivery_confirmed
             delivery_confirmed = True
 
+        def _telegram_ids(value: Any) -> tuple[tuple[int, ...], datetime | None]:
+            if isinstance(value, TelegramDeliveryResult):
+                messages = value.messages
+                ids = value.message_ids
+            else:
+                message_id = int(getattr(value, "message_id", 0) or 0)
+                messages = (value,) if message_id else ()
+                ids = (message_id,) if message_id else ()
+            sent_at = next(
+                (
+                    sent_date
+                    for sent_message in messages
+                    if (sent_date := getattr(sent_message, "date", None)) is not None
+                ),
+                None,
+            )
+            return ids, sent_at
+
         tts_mode = normalize_tts_mode(fresh_settings)
         if is_tts_always_enabled(tts_mode):
             tts_service = DoubaoTTSService(self.settings)
@@ -832,12 +884,24 @@ class ProactiveTopicService:
                     return _TopicDeliveryResult(True)
                 raise
             if delivery.complete:
-                return _TopicDeliveryResult(True, reply)
+                return _TopicDeliveryResult(
+                    True,
+                    reply,
+                    telegram_message_ids=tuple(
+                        int(message_id)
+                        for message_id in getattr(
+                            delivery,
+                            "telegram_message_ids",
+                            (),
+                        )
+                        if int(message_id or 0)
+                    ),
+                )
             if delivery.any_sent:
-                remaining_sent = False
+                remaining_delivery: Any = False
                 if delivery.remaining_text:
                     try:
-                        remaining_sent = await send_chat_message(
+                        remaining_delivery = await send_chat_message(
                             self.bot,
                             group_id,
                             delivery.remaining_text,
@@ -853,26 +917,49 @@ class ProactiveTopicService:
                                 )
                             ),
                             on_delivery=_confirm_delivery,
+                            return_result=True,
                         )
                     except asyncio.CancelledError:
                         return _TopicDeliveryResult(
                             True,
                             delivery.delivered_text,
                             interrupted=True,
+                            telegram_message_ids=tuple(
+                                int(message_id)
+                                for message_id in getattr(
+                                    delivery,
+                                    "telegram_message_ids",
+                                    (),
+                                )
+                                if int(message_id or 0)
+                            ),
                         )
+                remaining_ids, remaining_sent_at = _telegram_ids(remaining_delivery)
+                tts_ids = tuple(
+                    int(message_id)
+                    for message_id in getattr(
+                        delivery,
+                        "telegram_message_ids",
+                        (),
+                    )
+                    if int(message_id or 0)
+                )
+                combined_ids = tuple(dict.fromkeys((*tts_ids, *remaining_ids)))
                 log.warning(
                     "[%s] proactive topic partially delivered by TTS | "
                     "sent=%d total=%d text_fallback=%s",
                     group_id,
                     delivery.sent_segment_count,
                     len(delivery.requested_segments),
-                    remaining_sent,
+                    bool(remaining_delivery),
                 )
                 # Some content is already externally visible. Retrying the full
                 # topic would duplicate the delivered prefix.
                 return _TopicDeliveryResult(
                     True,
-                    reply if remaining_sent else delivery.delivered_text,
+                    reply if bool(remaining_delivery) else delivery.delivered_text,
+                    telegram_message_ids=combined_ids,
+                    sent_at=remaining_sent_at,
                 )
             if delivery_confirmed:
                 return _TopicDeliveryResult(True)
@@ -882,7 +969,7 @@ class ProactiveTopicService:
                 log.warning("[%s] proactive topic always-tts send failed", group_id)
             return _TopicDeliveryResult(False)
         try:
-            complete = await send_chat_message(
+            text_delivery = await send_chat_message(
                 self.bot,
                 group_id,
                 reply,
@@ -897,6 +984,7 @@ class ProactiveTopicService:
                     )
                 ),
                 on_delivery=_confirm_delivery,
+                return_result=True,
             )
         except asyncio.CancelledError:
             if delivery_confirmed:
@@ -910,9 +998,12 @@ class ProactiveTopicService:
                 )
                 return _TopicDeliveryResult(True)
             raise
+        text_message_ids, text_sent_at = _telegram_ids(text_delivery)
         return _TopicDeliveryResult(
-            bool(complete or delivery_confirmed),
-            reply if complete else "",
+            bool(text_delivery or delivery_confirmed),
+            reply if bool(text_delivery) else "",
+            telegram_message_ids=text_message_ids,
+            sent_at=text_sent_at,
         )
 
     async def _commit_fresh_settings(

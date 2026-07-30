@@ -206,7 +206,14 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(ok=True, audio_bytes=b"first", error=""),
             SimpleNamespace(ok=False, audio_bytes=b"", error="synthesis_failed"),
         ]
-        bot = SimpleNamespace(send_voice=AsyncMock(return_value=SimpleNamespace()))
+        bot = SimpleNamespace(
+            send_voice=AsyncMock(
+                return_value=SimpleNamespace(
+                    message_id=1234,
+                    chat=SimpleNamespace(id=-10001),
+                )
+            )
+        )
 
         with (
             patch.object(service, "split_text", return_value=["第一段。", "第二段。"]),
@@ -230,6 +237,7 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.complete)
         self.assertEqual(result.delivered_text, "第一段。")
         self.assertEqual(result.remaining_text, "第二段。")
+        self.assertEqual(result.telegram_message_ids, (1234,))
         bot.send_voice.assert_awaited_once()
 
     async def test_tts_skill_sends_only_remaining_text_after_partial_voice(self) -> None:
@@ -237,6 +245,7 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
             requested_segments=("第一段。", "第二段。"),
             sent_segment_count=1,
             error="synthesis_failed",
+            telegram_message_ids=(4321,),
         )
         tts_service = SimpleNamespace(
             send_message_tts_result=AsyncMock(return_value=delivery),
@@ -260,6 +269,7 @@ class TTSModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertTrue(context.handled)
         self.assertTrue(context.tts_sent)
+        self.assertEqual(context.tts_telegram_message_ids, (4321,))
         self.assertEqual(context.tts_text, "第一段。\n第二段。")
         self.assertTrue(context.suppress_followup_text)
         self.assertTrue(result.payload["text_fallback_sent"])

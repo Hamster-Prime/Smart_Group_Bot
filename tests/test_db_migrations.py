@@ -13,7 +13,13 @@ from bot.db.engine import (
     _SQLITE_VOTE_BAN_INDEX_SQL,
     init_db,
 )
-from bot.db.models import Base, KeywordReply, ScheduledMessage, VoteBanSession
+from bot.db.models import (
+    Base,
+    GroupMessageArchive,
+    KeywordReply,
+    ScheduledMessage,
+    VoteBanSession,
+)
 from bot.utils.timezone import now_shanghai_naive
 
 
@@ -71,6 +77,453 @@ class PerformanceIndexTests(unittest.TestCase):
         for table, index_name in expected.items():
             names = {index["name"] for index in inspector.get_indexes(table)}
             self.assertIn(index_name, names, table)
+
+
+class GroupMessageArchiveSchemaTests(unittest.TestCase):
+    def test_archive_has_lossless_fields_and_group_scoped_indexes(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        inspector = inspect(engine)
+
+        columns = {
+            column["name"]
+            for column in inspector.get_columns(GroupMessageArchive.__tablename__)
+        }
+        self.assertTrue(
+            {
+                "id",
+                "group_id",
+                "message_key",
+                "telegram_message_id",
+                "role",
+                "direction",
+                "sender_kind",
+                "sender_id",
+                "sender_username",
+                "sender_first_name",
+                "sender_last_name",
+                "sender_display_name",
+                "sender_is_bot",
+                "sender_is_premium",
+                "sender_language_code",
+                "sender_chat_id",
+                "sender_chat_type",
+                "sender_chat_title",
+                "author_signature",
+                "message_type",
+                "content",
+                "raw_text",
+                "derived_text",
+                "sent_at",
+                "edited_at",
+                "ingested_at",
+                "is_reply",
+                "reply_to_message_id",
+                "reply_to_sender_id",
+                "reply_to_sender_name",
+                "reply_to_content",
+                "message_thread_id",
+                "media_group_id",
+                "media_metadata",
+                "forward_metadata",
+                "entities",
+                "extra_metadata",
+                "access_count",
+                "last_accessed",
+            }
+            <= columns
+        )
+
+        indexes = {
+            index["name"]: index
+            for index in inspector.get_indexes(GroupMessageArchive.__tablename__)
+        }
+        expected = {
+            "ix_group_message_archive_group_message_key": (
+                ["group_id", "message_key"],
+                True,
+            ),
+            "ix_group_message_archive_group_sent_id": (
+                ["group_id", "sent_at", "id"],
+                False,
+            ),
+            "ix_group_message_archive_group_telegram_message": (
+                ["group_id", "telegram_message_id"],
+                False,
+            ),
+            "ix_group_message_archive_group_reply_to_message": (
+                ["group_id", "reply_to_message_id"],
+                False,
+            ),
+        }
+        for name, (expected_columns, unique) in expected.items():
+            self.assertIn(name, indexes)
+            self.assertEqual(indexes[name]["column_names"], expected_columns)
+            self.assertEqual(bool(indexes[name]["unique"]), unique)
+
+
+class GroupMessageArchiveMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fts5_projection_is_backfilled_and_tracks_edits_and_deletes(
+        self,
+    ) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        engine = None
+        try:
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            async with session_factory() as session:
+                trigger_names = set(
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type='trigger' "
+                                "AND name LIKE 'trg_group_message_archive_fts_%'"
+                            )
+                        )
+                    ).scalars()
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO groups (id, title, settings) "
+                        "VALUES (-123, 'fts', '{}')"
+                    )
+                )
+                session.add(
+                    GroupMessageArchive(
+                        group_id=-123,
+                        message_key="-123:1",
+                        role="user",
+                        direction="inbound",
+                        sender_kind="user",
+                        message_type="text",
+                        content="蓝绿发布 deployment",
+                        raw_text="蓝绿发布 deployment",
+                        sent_at=now_shanghai_naive(),
+                        ingested_at=now_shanghai_naive(),
+                    )
+                )
+                await session.commit()
+                inserted = (
+                    await session.execute(
+                        text(
+                            "SELECT archive.message_key "
+                            "FROM group_message_archive_fts "
+                            "JOIN group_message_archive AS archive "
+                            "ON archive.id = group_message_archive_fts.rowid "
+                            "WHERE group_message_archive_fts MATCH "
+                            "'group_scope : \"group_n_123\" "
+                            "AND {content raw_text} : \"蓝绿发布\"' "
+                            "AND archive.group_id = -123 "
+                            "ORDER BY bm25(group_message_archive_fts)"
+                        )
+                    )
+                ).scalars().all()
+                await session.execute(
+                    text(
+                        "UPDATE group_message_archive "
+                        "SET content='金丝雀发布', raw_text='金丝雀发布' "
+                        "WHERE group_id=-123 AND message_key='-123:1'"
+                    )
+                )
+                await session.commit()
+                old_count = (
+                    await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM group_message_archive_fts "
+                            "WHERE group_message_archive_fts MATCH '\"蓝绿发布\"'"
+                        )
+                    )
+                ).scalar_one()
+                new_count = (
+                    await session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM group_message_archive_fts "
+                            "WHERE group_message_archive_fts MATCH '\"金丝雀发布\"'"
+                        )
+                    )
+                ).scalar_one()
+                await session.execute(
+                    text(
+                        "DELETE FROM group_message_archive "
+                        "WHERE group_id=-123 AND message_key='-123:1'"
+                    )
+                )
+                await session.commit()
+                final_count = (
+                    await session.execute(
+                        text("SELECT COUNT(*) FROM group_message_archive_fts")
+                    )
+                ).scalar_one()
+
+            self.assertEqual(len(trigger_names), 3)
+            self.assertEqual(inserted, ["-123:1"])
+            self.assertEqual(old_count, 0)
+            self.assertEqual(new_count, 1)
+            self.assertEqual(final_count, 0)
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_legacy_vectors_are_backfilled_without_rewriting_either_table(
+        self,
+    ) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE message_vectors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id BIGINT NOT NULL,
+                message_id VARCHAR(64) NOT NULL,
+                role VARCHAR(16) NOT NULL DEFAULT 'user',
+                importance_score FLOAT NOT NULL DEFAULT 0,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                vector_id VARCHAR(64) NOT NULL DEFAULT '',
+                sender_id BIGINT,
+                sender_name TEXT NOT NULL DEFAULT '',
+                message_type VARCHAR(64) NOT NULL DEFAULT 'text',
+                content TEXT NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                last_accessed DATETIME
+            );
+            INSERT INTO message_vectors (
+                group_id, message_id, role, access_count, vector_id,
+                sender_id, sender_name, message_type, content,
+                created_at, last_accessed
+            ) VALUES
+                (-100, '-100:77', 'user', 3, '-100:77',
+                 42, 'Alice', 'text', 'legacy hello',
+                 '2026-07-20 01:02:03', '2026-07-20 02:03:04'),
+                (-100, '-100:bot-a', 'assistant', 1, '-100:bot-a',
+                 NULL, 'Smart Bot', 'text', 'legacy reply',
+                 '2026-07-20 01:03:00', NULL);
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        engine = None
+        try:
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            async with session_factory() as session:
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT message_key, telegram_message_id, role, "
+                            "direction, sender_kind, sender_id, "
+                            "sender_display_name, sender_is_bot, message_type, "
+                            "content, raw_text, derived_text, sent_at, "
+                            "ingested_at, access_count, last_accessed "
+                            "FROM group_message_archive ORDER BY id"
+                        )
+                    )
+                ).all()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                tuple(rows[0]),
+                (
+                    "-100:77",
+                    77,
+                    "user",
+                    "inbound",
+                    "user",
+                    42,
+                    "Alice",
+                    0,
+                    "text",
+                    "legacy hello",
+                    "legacy hello",
+                    "legacy hello",
+                    "2026-07-20 09:02:03",
+                    "2026-07-20 09:02:03",
+                    3,
+                    "2026-07-20 10:03:04",
+                ),
+            )
+            self.assertEqual(
+                rows[1][0:8],
+                (
+                    "-100:bot-a",
+                    None,
+                    "assistant",
+                    "outbound",
+                    "bot",
+                    None,
+                    "Smart Bot",
+                    1,
+                ),
+            )
+            await engine.dispose()
+            engine = None
+
+            connection = sqlite3.connect(path)
+            message_indexes = {
+                row[1]: bool(row[2])
+                for row in connection.execute(
+                    "PRAGMA index_list(message_vectors)"
+                ).fetchall()
+            }
+            self.assertTrue(message_indexes["ix_message_vectors_message_id"])
+            connection.execute(
+                "UPDATE group_message_archive SET sender_username='richer' "
+                "WHERE message_key='-100:77'"
+            )
+            connection.execute(
+                "INSERT INTO message_vectors ("
+                "group_id, message_id, role, vector_id, sender_id, sender_name, "
+                "message_type, content, created_at"
+                ") VALUES (-100, '-100:78', 'user', '-100:78', 43, 'Bob', "
+                "'text', 'arrived later', '2026-07-21 12:00:00')"
+            )
+            connection.commit()
+            connection.close()
+
+            engine, session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            async with session_factory() as session:
+                archive_count = (
+                    await session.execute(
+                        text("SELECT COUNT(*) FROM group_message_archive")
+                    )
+                ).scalar_one()
+                original_rows = (
+                    await session.execute(
+                        text(
+                            "SELECT message_id, content FROM message_vectors "
+                            "ORDER BY id"
+                        )
+                    )
+                ).all()
+                preserved_username = (
+                    await session.execute(
+                        text(
+                            "SELECT sender_username FROM group_message_archive "
+                            "WHERE message_key='-100:77'"
+                        )
+                    )
+                ).scalar_one()
+                later_timestamp = (
+                    await session.execute(
+                        text(
+                            "SELECT sent_at FROM group_message_archive "
+                            "WHERE message_key='-100:78'"
+                        )
+                    )
+                ).scalar_one()
+
+            self.assertEqual(archive_count, 3)
+            self.assertEqual(
+                original_rows,
+                [
+                    ("-100:77", "legacy hello"),
+                    ("-100:bot-a", "legacy reply"),
+                    ("-100:78", "arrived later"),
+                ],
+            )
+            self.assertEqual(preserved_username, "richer")
+            self.assertEqual(later_timestamp, "2026-07-21 12:00:00")
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
+
+    async def test_legacy_unscoped_message_ids_become_group_scoped_and_unique(
+        self,
+    ) -> None:
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE message_vectors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id BIGINT NOT NULL,
+                message_id VARCHAR(64) NOT NULL,
+                role VARCHAR(16) NOT NULL DEFAULT 'user',
+                importance_score FLOAT NOT NULL DEFAULT 0,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                vector_id VARCHAR(64) NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                last_accessed DATETIME
+            );
+            CREATE INDEX ix_message_vectors_message_id
+                ON message_vectors (message_id);
+            INSERT INTO message_vectors (
+                group_id, message_id, role, vector_id, content, created_at
+            ) VALUES
+                (-100, '77', 'user', '77', 'group one', '2026-07-20 01:00:00'),
+                (-200, '77', 'user', '77', 'group two', '2026-07-20 01:00:01');
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        engine = None
+        try:
+            engine, _session_factory = await init_db(
+                f"sqlite+aiosqlite:///{path}"
+            )
+            await engine.dispose()
+            engine = None
+
+            connection = sqlite3.connect(path)
+            self.addCleanup(connection.close)
+            rows = connection.execute(
+                "SELECT group_id, message_id, vector_id FROM message_vectors "
+                "ORDER BY group_id DESC"
+            ).fetchall()
+            indexes = {
+                row[1]: bool(row[2])
+                for row in connection.execute(
+                    "PRAGMA index_list(message_vectors)"
+                ).fetchall()
+            }
+            archive_rows = connection.execute(
+                "SELECT group_id, message_key FROM group_message_archive "
+                "ORDER BY group_id DESC"
+            ).fetchall()
+
+            self.assertEqual(
+                rows,
+                [(-100, "-100:77", "-100:77"), (-200, "-200:77", "-200:77")],
+            )
+            self.assertTrue(indexes["ix_message_vectors_message_id"])
+            self.assertEqual(
+                archive_rows,
+                [(-100, "-100:77"), (-200, "-200:77")],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO message_vectors ("
+                    "group_id, message_id, role, vector_id, content"
+                    ") VALUES (-100, '-100:77', 'user', 'duplicate', 'duplicate')"
+                )
+        finally:
+            if engine is not None:
+                await engine.dispose()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except OSError:
+                    pass
 
 
 class LinkPreviewMigrationTests(unittest.IsolatedAsyncioTestCase):

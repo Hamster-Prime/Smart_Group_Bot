@@ -51,6 +51,21 @@ class SettingsFrontendRegressionTests(unittest.TestCase):
         self.assertEqual(script_version.group(1), style_version.group(1))
         self.assertIn("unified-save-layout", script_version.group(1))
 
+    def test_bot_page_exposes_layered_memory_controls(self) -> None:
+        source = _APP_JS.read_text(encoding="utf-8")
+
+        for path in (
+            "bot.memory_recent_messages",
+            "bot.memory_retention_days",
+            "bot.memory_archive_max_messages_per_group",
+            "bot.memory_recall_max_results",
+            "bot.memory_recall_enabled",
+            "bot.memory_automatic_compaction",
+        ):
+            self.assertIn(path, source)
+        self.assertIn("上下文与长期记忆", source)
+        self.assertIn("默认 500；每个群分别维护", source)
+
     def test_global_policy_lists_support_independent_search(self) -> None:
         source = _APP_JS.read_text(encoding="utf-8")
         styles = _STYLES_CSS.read_text(encoding="utf-8")

@@ -124,6 +124,11 @@ class DoubaoTTSSkill:
 
         context.handled = True
         context.tts_sent = True
+        context.tts_telegram_message_ids = tuple(
+            int(message_id)
+            for message_id in delivery.telegram_message_ids
+            if int(message_id or 0)
+        )
         context.suppress_followup_text = True
         remaining_text_sent = False
         if not delivery.complete and delivery.remaining_text:

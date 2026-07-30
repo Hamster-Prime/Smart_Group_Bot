@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +28,16 @@ from bot.services.request_priority import ReservedCapacityGate
 from bot.services.resource_health import register_resource_health_provider
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingBatchResult:
+    """Vectors generated in one stable embedding space."""
+
+    vectors: list[list[float]]
+    space_id: str
+    model: str
+    dimensions: int
 
 # Keep slow/upstream-broken providers from consuming every Telegram update
 # worker at once.  The semaphore is process-wide because LLMService instances
@@ -2395,15 +2407,57 @@ class LLMService:
             preview_limit=80,
         )
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings."""
-        candidates = self._embed_candidates(self.embed_config)
-        total = len(candidates)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._stage_deadline_seconds(
-            "embed",
-            candidates[0] if candidates else None,
+    @classmethod
+    def embedding_space_id(cls, cfg: EmbedEndpointConfig) -> str:
+        """Return a secret-free identity for one exact embedding endpoint."""
+
+        provider = str(getattr(cfg, "provider", "") or "").strip().lower()
+        model = str(getattr(cfg, "model", "") or "").strip()
+        if not provider:
+            provider = model.partition("/")[0].strip().lower()
+        api_base = cls._resolve_request_api_base(
+            provider=provider,
+            api_base=getattr(cfg, "api_base", None),
+            endpoint_path=getattr(cfg, "endpoint_path", "/v1beta/models"),
+            model=model,
         )
+        payload = "\x00".join(
+            (
+                "embedding-space-v1",
+                provider,
+                model,
+                str(api_base or "").rstrip("/"),
+                str(getattr(cfg, "endpoint_path", "") or ""),
+            )
+        )
+        return "emb-v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:48]
+
+    def primary_embedding_space_id(self) -> str:
+        """Return the configured primary embedding-space identity."""
+
+        candidates = self._embed_candidates(self.embed_config)
+        return self.embedding_space_id(candidates[0]) if candidates else ""
+
+    async def _embed_from_candidates(
+        self,
+        texts: list[str],
+        *,
+        candidates: list[EmbedEndpointConfig],
+        total_deadline_sec: float | None = None,
+    ) -> tuple[list[list[float]], EmbedEndpointConfig] | None:
+        """Generate embeddings and report the endpoint that produced them."""
+
+        total = len(candidates)
+        if not total:
+            return None
+        loop = asyncio.get_running_loop()
+        configured_deadline = self._stage_deadline_seconds("embed", candidates[0])
+        deadline_seconds = (
+            configured_deadline
+            if total_deadline_sec is None
+            else max(0.05, float(total_deadline_sec))
+        )
+        deadline = loop.time() + deadline_seconds
         for idx, cfg in enumerate(candidates, start=1):
             if self._circuit_is_open(cfg, stage="embed"):
                 log.warning(
@@ -2416,7 +2470,7 @@ class LLMService:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     log.error("LLM total deadline exhausted | stage=embed")
-                    return []
+                    return None
                 kwargs = self._build_embed_kwargs(cfg, texts)
                 timeout_sec = min(
                     self._attempt_timeout_seconds(cfg, attempt),
@@ -2463,7 +2517,7 @@ class LLMService:
                         len(embeddings[0]),
                     )
                     self._record_circuit_success(cfg, stage="embed")
-                    return embeddings
+                    return embeddings, cfg
                 except asyncio.TimeoutError:
                     if attempt < total_attempts:
                         log.warning(
@@ -2509,6 +2563,64 @@ class LLMService:
             self._record_circuit_failure(cfg, stage="embed")
             if idx < total:
                 continue
-            log.error("LLM exhausted | stage=embed | model=%s | no_fallback_left", cfg.model)
-            return []
-        return []
+            log.error(
+                "LLM exhausted | stage=embed | model=%s | no_fallback_left",
+                cfg.model,
+            )
+            return None
+        return None
+
+    async def embed_primary_with_space(
+        self,
+        texts: list[str],
+        *,
+        total_deadline_sec: float | None = None,
+    ) -> EmbeddingBatchResult | None:
+        """Embed using only the configured primary endpoint.
+
+        A fallback vector belongs to a different mathematical space, so this
+        method intentionally refuses fallback models for persistent indexes.
+        """
+
+        candidates = self._embed_candidates(self.embed_config)
+        if not candidates or not texts:
+            return None
+        result = await self._embed_from_candidates(
+            texts,
+            candidates=candidates[:1],
+            total_deadline_sec=total_deadline_sec,
+        )
+        if result is None:
+            return None
+        vectors, cfg = result
+        if len(vectors) != len(texts):
+            log.error(
+                "LLM embedding count mismatch | model=%s expected=%d actual=%d",
+                cfg.model,
+                len(texts),
+                len(vectors),
+            )
+            return None
+        dimensions = len(vectors[0]) if vectors else 0
+        if dimensions <= 0 or any(len(vector) != dimensions for vector in vectors):
+            log.error(
+                "LLM embedding dimension mismatch | model=%s texts=%d",
+                cfg.model,
+                len(texts),
+            )
+            return None
+        return EmbeddingBatchResult(
+            vectors=vectors,
+            space_id=self.embedding_space_id(cfg),
+            model=str(cfg.model or ""),
+            dimensions=dimensions,
+        )
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings, retaining legacy model-fallback behavior."""
+
+        result = await self._embed_from_candidates(
+            texts,
+            candidates=self._embed_candidates(self.embed_config),
+        )
+        return result[0] if result is not None else []

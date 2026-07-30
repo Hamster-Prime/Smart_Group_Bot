@@ -241,12 +241,17 @@ class MemoryServiceCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
             engine, session_factory = await init_db(self._sqlite_url(db_path))
             memory = MemoryService(
-                BotConfig(max_context_tokens=4096, max_output_tokens=2048),
+                BotConfig(
+                    max_context_tokens=4096,
+                    max_output_tokens=2048,
+                    memory_retention_days=365,
+                ),
                 _StubLLM(),
                 session_factory=session_factory,
             )
             await memory.bootstrap()
             history = memory.get_history(12345)
+            await memory.shutdown(timeout_seconds=1.0)
             await engine.dispose()
 
             self.assertEqual(len(history), 1)

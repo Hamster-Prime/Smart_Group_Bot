@@ -17,3 +17,9 @@ def init(mem: MemoryService) -> None:
 def get() -> MemoryService:
     assert _instance is not None, "MemoryService not initialized"
     return _instance
+
+
+def get_optional() -> MemoryService | None:
+    """Return the service when startup completed, else ``None`` for dry handlers/tests."""
+
+    return _instance

@@ -897,11 +897,17 @@
           <p class="field-hint">勾选的类别按所选方式清理：「自动删除」按右侧秒数定时删除（留空用全局秒数）；「删除按钮」在消息下方提供管理员可用的内联删除按钮，两者互斥。</p>
         </section>
         <section class="settings-section">
-          ${sectionHead("上下文预算")}
+          ${sectionHead("上下文与长期记忆", "常规对话只保留最近消息；更早的原文按群归档并按需召回，不再依赖自动压缩替代原文。")}
           <div class="field-grid three">
             ${field("bot.decision_context_items", "决策上下文条数", { type: "number", min: 0, max: 20, step: 1, required: true })}
             ${field("bot.max_context_tokens", "最大上下文 Token", { type: "number", min: 1024, max: 2000000, step: 1, required: true })}
             ${field("bot.max_output_tokens", "全局最大输出 Token", { type: "number", min: 256, max: 2000000, step: 1, required: true })}
+            ${field("bot.memory_recent_messages", "近期消息窗口", { type: "number", min: 50, max: 2000, step: 1, required: true, hint: "默认 500；每个群分别维护" })}
+            ${field("bot.memory_retention_days", "原文保留天数", { type: "number", min: 1, max: 365, step: 1, required: true, hint: "默认 7 天，过期后按群清理" })}
+            ${field("bot.memory_archive_max_messages_per_group", "每群归档硬上限", { type: "number", min: 1000, max: 1000000, step: 1000, required: true, hint: "防止高流量群在保留期内无限增长" })}
+            ${field("bot.memory_recall_max_results", "召回索引候选数", { type: "number", min: 1, max: 20, step: 1, required: true })}
+            ${toggle("bot.memory_recall_enabled", "启用长期记忆召回", "按当前问题从本群原始档案中检索相关消息")}
+            ${toggle("bot.memory_automatic_compaction", "兼容旧自动压缩", "默认关闭；开启后仍只压缩热窗口，原始档案不会删除")}
           </div>
         </section>
         <section class="settings-section">

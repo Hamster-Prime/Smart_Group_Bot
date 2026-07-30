@@ -138,6 +138,15 @@ class BotConfig(BaseModel):
     embed_model: EmbedConfig = EmbedConfig()
     max_context_tokens: int = 256000
     max_output_tokens: int = 2048
+    # Two-tier group memory: a bounded hot window plus a lossless, per-group
+    # archive used by relevance-based recall.  The archive is the source of
+    # truth; context compaction is retained only as an opt-in legacy feature.
+    memory_recent_messages: int = 500
+    memory_retention_days: int = 7
+    memory_archive_max_messages_per_group: int = 50000
+    memory_recall_enabled: bool = True
+    memory_recall_max_results: int = 8
+    memory_automatic_compaction: bool = False
 
 
 class ModerationConfig(BaseModel):
@@ -233,6 +242,12 @@ class Settings(BaseSettings):
     # Legacy one-time migration input. Runtime settings use seconds.
     bot_auto_delete_minutes: int = 0
     bot_decision_context_items: int = 5
+    bot_memory_recent_messages: int = 500
+    bot_memory_retention_days: int = 7
+    bot_memory_archive_max_messages_per_group: int = 50000
+    bot_memory_recall_enabled: bool = True
+    bot_memory_recall_max_results: int = 8
+    bot_memory_automatic_compaction: bool = False
     bot_proactive_default_enabled: bool = False
     bot_proactive_idle_minutes: int = 180
     bot_proactive_jitter_minutes: int = 60
@@ -773,6 +788,17 @@ def load_settings(config_path: str = "config.toml") -> Settings:
                 120.0,
                 max(5.0, float(bot_data["reply_batch_timeout_seconds"])),
             )
+        for key in (
+            "memory_recent_messages",
+            "memory_retention_days",
+            "memory_archive_max_messages_per_group",
+            "memory_recall_max_results",
+        ):
+            if key in bot_data:
+                setattr(settings.bot, key, int(bot_data[key]))
+        for key in ("memory_recall_enabled", "memory_automatic_compaction"):
+            if key in bot_data:
+                setattr(settings.bot, key, bool(bot_data[key]))
 
     if "moderation" in toml_data:
         settings.moderation = ModerationConfig(**toml_data["moderation"])
@@ -807,6 +833,23 @@ def load_settings(config_path: str = "config.toml") -> Settings:
     settings.bot.auto_delete_seconds = max(0, configured_auto_delete_seconds)
     settings.bot.auto_delete_minutes = settings.bot.auto_delete_seconds // 60
     settings.bot.decision_context_items = min(20, max(0, settings.bot_decision_context_items))
+    settings.bot.memory_recent_messages = min(
+        2000, max(50, int(settings.bot_memory_recent_messages))
+    )
+    settings.bot.memory_retention_days = min(
+        365, max(1, int(settings.bot_memory_retention_days))
+    )
+    settings.bot.memory_archive_max_messages_per_group = min(
+        1_000_000,
+        max(1000, int(settings.bot_memory_archive_max_messages_per_group)),
+    )
+    settings.bot.memory_recall_enabled = bool(settings.bot_memory_recall_enabled)
+    settings.bot.memory_recall_max_results = min(
+        20, max(1, int(settings.bot_memory_recall_max_results))
+    )
+    settings.bot.memory_automatic_compaction = bool(
+        settings.bot_memory_automatic_compaction
+    )
     settings.bot.proactive_default_enabled = settings.bot_proactive_default_enabled
     settings.bot.proactive_idle_minutes = max(180, int(settings.bot_proactive_idle_minutes))
     settings.bot.proactive_jitter_minutes = max(0, int(settings.bot_proactive_jitter_minutes))

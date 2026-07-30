@@ -51,6 +51,43 @@ class ReplyMessageOverlay:
     ] = "pending"
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramDeliveryResult:
+    """Optional detailed receipt for a Telegram send operation.
+
+    The public send helpers continue to return ``bool`` by default for
+    backwards compatibility.  Callers which need durable provenance can pass
+    ``return_result=True`` and receive the concrete Telegram ``Message``
+    objects accepted by the API (including multipart sends and an adopted
+    progress overlay).
+    """
+
+    sent: bool = False
+    messages: tuple[Message, ...] = ()
+
+    @property
+    def message_ids(self) -> tuple[int, ...]:
+        return tuple(
+            int(message_id)
+            for message in self.messages
+            if (message_id := getattr(message, "message_id", None))
+            not in (None, 0)
+        )
+
+    @property
+    def first_message_id(self) -> int | None:
+        ids = self.message_ids
+        return ids[0] if ids else None
+
+    @property
+    def last_message_id(self) -> int | None:
+        ids = self.message_ids
+        return ids[-1] if ids else None
+
+    def __bool__(self) -> bool:
+        return self.sent
+
+
 _TELEGRAM_BACKGROUND_TASKS: set[asyncio.Task[object]] = set()
 _TELEGRAM_BACKGROUND_STARTED: dict[asyncio.Task[object], float] = {}
 _TELEGRAM_CLEANUP_SCHEDULER: TelegramCleanupScheduler | None = None
@@ -1726,7 +1763,8 @@ async def send_reply(
     overlay: ReplyMessageOverlay | None = None,
     overlay_remove_after: float = 2.0,
     rich: bool = False,
-) -> bool:
+    return_result: bool = False,
+) -> bool | TelegramDeliveryResult:
     """Send reply in normal mode or stream-like incremental edits.
 
     Guarantees best effort to land full content:
@@ -1734,6 +1772,31 @@ async def send_reply(
     - stream mode force-syncs final full text
     - fallback keeps editing the same message (no delete-and-resend)
     """
+
+    delivered_messages: list[Message] = []
+    delivered_message_keys: set[tuple[int, int] | tuple[str, int]] = set()
+
+    def _record_delivered_message(sent: Message) -> None:
+        chat_id = int(getattr(getattr(sent, "chat", None), "id", 0) or 0)
+        message_id = int(getattr(sent, "message_id", 0) or 0)
+        key: tuple[int, int] | tuple[str, int]
+        if message_id:
+            key = (chat_id, message_id)
+        else:
+            key = ("object", id(sent))
+        if key in delivered_message_keys:
+            return
+        delivered_message_keys.add(key)
+        delivered_messages.append(sent)
+
+    def _result(sent: bool) -> bool | TelegramDeliveryResult:
+        complete = bool(sent)
+        if not return_result:
+            return complete
+        return TelegramDeliveryResult(
+            sent=complete,
+            messages=tuple(delivered_messages),
+        )
 
     mode = (delivery_mode or "reply").strip().lower()
     send_as_reply = mode != "message"
@@ -1827,6 +1890,7 @@ async def send_reply(
                         parse_mode=parse_mode,
                         **link_preview_kwargs,
                     )
+                _record_delivered_message(sent)
                 confirm_telegram_delivery(on_delivery)
                 if schedule_cleanup:
                     await _schedule_delivered_message_cleanup(
@@ -2271,7 +2335,7 @@ async def send_reply(
         monospace=pre_rendered_html,
     )
     if not payload:
-        return False
+        return _result(False)
     # Incrementally editing a half-open fence cannot produce a valid Telegram
     # code entity. Code answers are finalized in one edit; an adopted progress
     # overlay already carries the useful intermediate state.
@@ -2343,6 +2407,7 @@ async def send_reply(
                             plain_body=plain_body,
                         )
                         if sent is not None:
+                            _record_delivered_message(sent)
                             continue
                         if overlay.outcome == "ambiguous":
                             return False
@@ -2372,10 +2437,10 @@ async def send_reply(
 
     try:
         async with asyncio.timeout(_send_total_deadline_seconds()):
-            return await _deliver_payload()
+            return _result(await _deliver_payload())
     except TimeoutError:
         log.error("Telegram reply total deadline exceeded | chat_id=%s", message.chat.id)
-        return False
+        return _result(False)
 
 
 async def send_reply_messages(
@@ -2411,7 +2476,7 @@ async def send_reply_messages(
             auto_delete_seconds=auto_delete_seconds,
             disable_link_preview=disable_link_preview,
         )
-        results.append(ok)
+        results.append(bool(ok))
     return results
 
 
@@ -2426,11 +2491,23 @@ async def send_chat_message(
     auto_delete_seconds: int = 0,
     disable_link_preview: bool | None = None,
     on_delivery: Callable[[], None] | None = None,
-) -> bool:
+    return_result: bool = False,
+) -> bool | TelegramDeliveryResult:
+    delivered_messages: list[Message] = []
+
+    def _result(sent: bool) -> bool | TelegramDeliveryResult:
+        complete = bool(sent)
+        if not return_result:
+            return complete
+        return TelegramDeliveryResult(
+            sent=complete,
+            messages=tuple(delivered_messages),
+        )
+
     payload = sanitize_outgoing_text((text or "").strip())
     payload = sanitize_outgoing_mentions(payload, monospace=False)
     if not payload:
-        return False
+        return _result(False)
 
     fallback_prefix_html = ""
     if fallback_mention_user_id:
@@ -2464,6 +2541,7 @@ async def send_chat_message(
                     reply_to_message_id=current_reply_id,
                     **link_preview_kwargs,
                 )
+                delivered_messages.append(sent)
                 confirm_telegram_delivery(on_delivery)
                 await _schedule_delivered_message_cleanup(
                     sent,
@@ -2525,10 +2603,10 @@ async def send_chat_message(
                             retries=2,
                         )
                     ok = ok and bool(sent)
-                return ok
+                return _result(ok)
     except TimeoutError:
         log.error("Telegram scheduled send total deadline exceeded | chat_id=%s", chat_id)
-        return False
+        return _result(False)
 
 
 def extract_message_text(message: Message) -> tuple[str, str]:

@@ -89,8 +89,10 @@ async def send_keyword_reply(
     message: Message,
     rule: KeywordReply,
     settings: Settings,
-) -> bool:
-    """Send one keyword reply; returns False if Telegram rejected the send."""
+    *,
+    return_message: bool = False,
+) -> bool | Message | None:
+    """Send one keyword reply, optionally returning Telegram's message object."""
     auto_delete_seconds = (
         configured_auto_delete_seconds(settings, "keyword") if rule.auto_delete else 0
     )
@@ -120,7 +122,7 @@ async def send_keyword_reply(
             rule.group_id,
             rule.id,
         )
-        return False
+        return None if return_message else False
     if rule.pin_message and sent is not None:
         try:
             await message.bot.pin_chat_message(
@@ -134,4 +136,4 @@ async def send_keyword_reply(
                 rule.group_id,
                 rule.id,
             )
-    return True
+    return sent if return_message else True

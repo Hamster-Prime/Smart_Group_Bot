@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -9,7 +10,7 @@ from bot.handlers import group
 from bot.services.doubao_tts import TTSDeliveryResult
 from bot.services.skills.base import SkillAnswerResult
 from bot.services.update_completion import UpdateCompletionReceipt
-from bot.utils.telegram import ReplyMessageOverlay
+from bot.utils.telegram import ReplyMessageOverlay, TelegramDeliveryResult
 
 
 def _settings(delay: float = 5.0) -> SimpleNamespace:
@@ -191,8 +192,15 @@ class PendingReplyAdminRevalidationTests(unittest.IsolatedAsyncioTestCase):
             group_id: int,
             *,
             prompt_payload_builder: object,
+            recall_query: str = "",
+            recall_exclude_message_keys: list[str] | None = None,
         ) -> list[dict[str, str]]:
             nonlocal history_ready
+            self.assertEqual(recall_query, message.text)
+            self.assertEqual(
+                recall_exclude_message_keys,
+                [f"{message.chat.id}:{message.message_id}"],
+            )
             prompt_payload_builder([])
             history_ready = True
             return []
@@ -291,12 +299,32 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             chat=SimpleNamespace(id=-10001, type="supergroup"),
         )
 
+    def _assert_archived_assistant_reply(
+        self,
+        memory: SimpleNamespace,
+        item: group._PendingReplyItem,
+        text: str,
+    ) -> None:
+        memory.add_message.assert_awaited_once()
+        args = memory.add_message.await_args.args
+        kwargs = memory.add_message.await_args.kwargs
+        self.assertEqual(args, (item.group_id, "assistant", text))
+        self.assertEqual(kwargs["message_type"], "assistant_reply")
+        self.assertTrue(kwargs["defer_persistence"])
+        self.assertEqual(kwargs["completions"], ())
+        archive = kwargs["archive_metadata"]
+        self.assertEqual(archive["direction"], "outbound")
+        self.assertEqual(archive["sender_kind"], "bot")
+        self.assertEqual(archive["reply_to_message_id"], item.message.message_id)
+        self.assertIn(item.message.message_id, archive["extra_metadata"]["trigger_message_ids"])
+
     async def _run_guarded(
         self,
         skill_result: SkillAnswerResult | Exception,
         *,
         memory_error: Exception | None = None,
         progress_handoff: ReplyMessageOverlay | None = None,
+        send_result: object = True,
     ) -> tuple[
         group._PendingReplyOutcome,
         group._PendingReplyItem,
@@ -340,7 +368,7 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             close=AsyncMock(),
         )
         notify_failure = AsyncMock(return_value=True)
-        send_text_reply = AsyncMock(return_value=True)
+        send_text_reply = AsyncMock(return_value=send_result)
         schedule_compaction = Mock()
         self._last_fake_progress = fake_progress
         self._last_send_text_reply = send_text_reply
@@ -379,6 +407,71 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         return outcome, item, memory, notify_failure, schedule_compaction
 
+    async def test_text_reply_archives_real_telegram_id_and_reply_relation(self) -> None:
+        sent_at = datetime(2026, 7, 30, 8, 15, tzinfo=timezone.utc)
+        telegram_message = SimpleNamespace(
+            message_id=9001,
+            date=sent_at,
+            chat=SimpleNamespace(id=-10001),
+        )
+
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(
+                SkillAnswerResult(handled=True, text="带真实 ID 的回复"),
+                send_result=TelegramDeliveryResult(
+                    sent=True,
+                    messages=(telegram_message,),
+                ),
+            )
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+        schedule_compaction.assert_called_once_with(memory, item.group_id)
+        kwargs = memory.add_message.await_args.kwargs
+        self.assertEqual(kwargs["message_id"], "9001")
+        self.assertEqual(kwargs["created_at"], sent_at)
+        archive = kwargs["archive_metadata"]
+        self.assertEqual(archive["telegram_message_id"], 9001)
+        self.assertEqual(archive["reply_to_message_id"], item.message.message_id)
+        self.assertTrue(archive["is_reply"])
+        self.assertEqual(
+            archive["extra_metadata"]["telegram_message_ids"],
+            [9001],
+        )
+        self.assertNotIn(
+            "telegram_message_id_unavailable",
+            archive["extra_metadata"],
+        )
+        self.assertTrue(
+            self._last_send_text_reply.await_args.kwargs["return_result"]
+        )
+
+    async def test_tts_skill_reply_archives_voice_message_id(self) -> None:
+        outcome, item, memory, notify_failure, schedule_compaction = (
+            await self._run_guarded(
+                SkillAnswerResult(
+                    handled=True,
+                    tts_sent=True,
+                    tts_text="语音回复",
+                    tts_telegram_message_ids=(9010,),
+                )
+            )
+        )
+
+        self.assertTrue(outcome.succeeded)
+        notify_failure.assert_not_awaited()
+        schedule_compaction.assert_called_once_with(memory, item.group_id)
+        kwargs = memory.add_message.await_args.kwargs
+        self.assertEqual(kwargs["message_id"], "9010")
+        archive = kwargs["archive_metadata"]
+        self.assertEqual(archive["telegram_message_id"], 9010)
+        self.assertEqual(archive["reply_to_message_id"], item.message.message_id)
+        self.assertEqual(
+            archive["extra_metadata"]["telegram_message_ids"],
+            [9010],
+        )
+
     async def test_embedded_music_and_vote_deliveries_do_not_emit_failure(self) -> None:
         for embedded_text in ("这首《稻香》给你。", "民主投票已经发起。"):
             with self.subTest(embedded_text=embedded_text):
@@ -394,13 +487,10 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(outcome.succeeded)
                 notify_failure.assert_not_awaited()
-                memory.add_message.assert_awaited_once_with(
-                    item.group_id,
-                    "assistant",
+                self._assert_archived_assistant_reply(
+                    memory,
+                    item,
                     embedded_text,
-                    message_type="assistant_reply",
-                    defer_persistence=True,
-                    completions=(),
                 )
                 schedule_compaction.assert_called_once_with(memory, item.group_id)
 
@@ -474,14 +564,7 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self._last_fake_progress.dismiss.assert_not_awaited()
         self._last_fake_progress.finish.assert_not_awaited()
-        memory.add_message.assert_awaited_once_with(
-            item.group_id,
-            "assistant",
-            "最终正文",
-            message_type="assistant_reply",
-            defer_persistence=True,
-            completions=(),
-        )
+        self._assert_archived_assistant_reply(memory, item, "最终正文")
         schedule_compaction.assert_called_once_with(memory, item.group_id)
 
     async def test_mandatory_text_after_skill_tts_does_not_reorder_progress(
@@ -506,13 +589,10 @@ class PendingReplyEmbeddedDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self._last_send_text_reply.await_args.kwargs["overlay"]
         )
         self._last_fake_progress.dismiss.assert_awaited_once_with()
-        memory.add_message.assert_awaited_once_with(
-            item.group_id,
-            "assistant",
+        self._assert_archived_assistant_reply(
+            memory,
+            item,
             "必须显示的文字说明",
-            message_type="assistant_reply",
-            defer_persistence=True,
-            completions=(),
         )
         schedule_compaction.assert_called_once_with(memory, item.group_id)
 

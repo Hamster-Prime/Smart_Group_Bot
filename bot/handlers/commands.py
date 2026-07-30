@@ -1046,6 +1046,14 @@ async def cmd_compact(
         return
 
     memory = memory_holder.get()
+    if not bool(getattr(memory, "automatic_compaction_enabled", True)):
+        await _answer(
+            message,
+            settings,
+            "<b>原文记忆模式已启用</b>\n"
+            "当前群使用最近消息窗口 + 原始档案按需召回，不再用摘要替代旧消息，因此无需执行 /compact。",
+        )
+        return
     async with typing_action(message, enabled=settings.bot.enable_typing):
         result = await memory.compact_now(message.chat.id)
 

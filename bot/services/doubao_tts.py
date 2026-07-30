@@ -238,6 +238,7 @@ class TTSDeliveryResult:
     requested_segments: tuple[str, ...] = ()
     sent_segment_count: int = 0
     error: str = ""
+    telegram_message_ids: tuple[int, ...] = ()
 
     @property
     def any_sent(self) -> bool:
@@ -1002,7 +1003,7 @@ class DoubaoTTSService:
         caption: str = "",
         parse_mode: str | None = None,
         on_delivery: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> Message | None:
         filename = f"tts_{index + 1}{self.file_extension}"
         send_as_reply = (delivery_mode or "reply").strip().lower() != "message"
         requested_reply_target = int(reply_to_message_id or 0) or None
@@ -1083,11 +1084,11 @@ class DoubaoTTSService:
                     log.exception(
                         "tts auto-delete scheduling failed after confirmed delivery"
                     )
-                return True
+                return sent
             except TelegramRetryAfter as exc:
                 wait_s = max(0.5, float(getattr(exc, "retry_after", 1.0))) + 0.2
                 if wait_s > 10.0:
-                    return False
+                    return None
                 await asyncio.sleep(wait_s)
                 attempt += 1
             except TelegramBadRequest as exc:
@@ -1097,14 +1098,14 @@ class DoubaoTTSService:
                     attempt += 1
                     continue
                 log.warning("tts telegram send failed: %s", exc)
-                return False
+                return None
             except Exception:
                 if attempt >= 2:
                     log.exception("tts telegram send failed")
-                    return False
+                    return None
                 attempt += 1
                 await asyncio.sleep(0.6 * attempt)
-        return False
+        return None
 
     async def send_message_tts(
         self,
@@ -1168,6 +1169,7 @@ class DoubaoTTSService:
             )
 
         sent_segment_count = 0
+        telegram_message_ids: list[int] = []
         for idx, segment in enumerate(segments):
             if self.audio_format == "ogg_opus":
                 result = await self.synthesize_voice_payload(
@@ -1193,9 +1195,10 @@ class DoubaoTTSService:
                 return TTSDeliveryResult(
                     requested_segments=segments,
                     sent_segment_count=sent_segment_count,
+                    telegram_message_ids=tuple(telegram_message_ids),
                     error=result.error or "synthesis_failed",
                 )
-            ok = await self._send_to_message(
+            sent = await self._send_to_message(
                 message,
                 audio_bytes=result.audio_bytes,
                 index=idx,
@@ -1204,16 +1207,21 @@ class DoubaoTTSService:
                 auto_delete_seconds=auto_delete_seconds,
                 on_delivery=on_delivery,
             )
-            if not ok:
+            if not sent:
                 return TTSDeliveryResult(
                     requested_segments=segments,
                     sent_segment_count=sent_segment_count,
+                    telegram_message_ids=tuple(telegram_message_ids),
                     error="telegram_send_failed",
                 )
+            telegram_message_id = int(getattr(sent, "message_id", 0) or 0)
+            if telegram_message_id:
+                telegram_message_ids.append(telegram_message_id)
             sent_segment_count += 1
         return TTSDeliveryResult(
             requested_segments=segments,
             sent_segment_count=sent_segment_count,
+            telegram_message_ids=tuple(telegram_message_ids),
         )
 
     async def send_chat_tts(
@@ -1289,6 +1297,7 @@ class DoubaoTTSService:
             fallback_caption_html = f'<a href="tg://user?id={fallback_mention_user_id}">@{shown}</a>'
 
         sent_segment_count = 0
+        telegram_message_ids: list[int] = []
         for idx, segment in enumerate(segments):
             if self.audio_format == "ogg_opus":
                 result = await self.synthesize_voice_payload(
@@ -1314,6 +1323,7 @@ class DoubaoTTSService:
                 return TTSDeliveryResult(
                     requested_segments=segments,
                     sent_segment_count=sent_segment_count,
+                    telegram_message_ids=tuple(telegram_message_ids),
                     error=result.error or "synthesis_failed",
                 )
 
@@ -1365,6 +1375,7 @@ class DoubaoTTSService:
                         return TTSDeliveryResult(
                             requested_segments=segments,
                             sent_segment_count=sent_segment_count,
+                            telegram_message_ids=tuple(telegram_message_ids),
                             error="retry_after_too_long",
                         )
                     await asyncio.sleep(wait_s)
@@ -1382,6 +1393,7 @@ class DoubaoTTSService:
                     return TTSDeliveryResult(
                         requested_segments=segments,
                         sent_segment_count=sent_segment_count,
+                        telegram_message_ids=tuple(telegram_message_ids),
                         error="telegram_bad_request",
                     )
                 except Exception:
@@ -1390,6 +1402,7 @@ class DoubaoTTSService:
                         return TTSDeliveryResult(
                             requested_segments=segments,
                             sent_segment_count=sent_segment_count,
+                            telegram_message_ids=tuple(telegram_message_ids),
                             error="telegram_send_failed",
                         )
                     attempt += 1
@@ -1398,10 +1411,15 @@ class DoubaoTTSService:
                 return TTSDeliveryResult(
                     requested_segments=segments,
                     sent_segment_count=sent_segment_count,
+                    telegram_message_ids=tuple(telegram_message_ids),
                     error="telegram_send_failed",
                 )
+            telegram_message_id = int(getattr(sent, "message_id", 0) or 0)
+            if telegram_message_id:
+                telegram_message_ids.append(telegram_message_id)
             sent_segment_count += 1
         return TTSDeliveryResult(
             requested_segments=segments,
             sent_segment_count=sent_segment_count,
+            telegram_message_ids=tuple(telegram_message_ids),
         )

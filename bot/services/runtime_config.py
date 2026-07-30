@@ -260,6 +260,16 @@ class BotBehaviorConfig(StrictModel):
     decision_context_items: int = Field(default=5, ge=0, le=20)
     max_context_tokens: int = Field(default=256000, ge=1024, le=2_000_000)
     max_output_tokens: int = Field(default=2048, ge=256, le=2_000_000)
+    memory_recent_messages: int = Field(default=500, ge=50, le=2000)
+    memory_retention_days: int = Field(default=7, ge=1, le=365)
+    memory_archive_max_messages_per_group: int = Field(
+        default=50000,
+        ge=1000,
+        le=1_000_000,
+    )
+    memory_recall_enabled: bool = True
+    memory_recall_max_results: int = Field(default=8, ge=1, le=20)
+    memory_automatic_compaction: bool = False
     proactive_default_enabled: bool = False
     proactive_idle_minutes: int = Field(default=180, ge=180, le=43200)
     proactive_jitter_minutes: int = Field(default=60, ge=0, le=1440)
@@ -828,6 +838,16 @@ class RuntimeConfig(StrictModel):
         settings.bot.decision_context_items = bot.decision_context_items
         settings.bot.max_context_tokens = bot.max_context_tokens
         settings.bot.max_output_tokens = bot.max_output_tokens
+        settings.bot.memory_recent_messages = bot.memory_recent_messages
+        settings.bot.memory_retention_days = bot.memory_retention_days
+        settings.bot.memory_archive_max_messages_per_group = (
+            bot.memory_archive_max_messages_per_group
+        )
+        settings.bot.memory_recall_enabled = bot.memory_recall_enabled
+        settings.bot.memory_recall_max_results = bot.memory_recall_max_results
+        settings.bot.memory_automatic_compaction = (
+            bot.memory_automatic_compaction
+        )
         settings.bot.proactive_default_enabled = bot.proactive_default_enabled
         settings.bot.proactive_idle_minutes = bot.proactive_idle_minutes
         settings.bot.proactive_jitter_minutes = bot.proactive_jitter_minutes
@@ -1393,6 +1413,17 @@ def _apply_legacy_toml(settings: Settings, config_path: str) -> None:
                 120.0,
                 max(5.0, float(bot_data["reply_batch_timeout_seconds"])),
             )
+        for key in (
+            "memory_recent_messages",
+            "memory_retention_days",
+            "memory_archive_max_messages_per_group",
+            "memory_recall_max_results",
+        ):
+            if key in bot_data:
+                setattr(settings.bot, key, int(bot_data[key]))
+        for key in ("memory_recall_enabled", "memory_automatic_compaction"):
+            if key in bot_data:
+                setattr(settings.bot, key, bool(bot_data[key]))
     moderation_data = data.get("moderation") if isinstance(data, dict) else None
     if isinstance(moderation_data, dict):
         settings.moderation = ModerationConfig(**moderation_data)
@@ -1531,6 +1562,42 @@ def build_legacy_runtime_config(
             decision_context_items=settings.bot_decision_context_items,
             max_context_tokens=settings.max_context_tokens,
             max_output_tokens=settings.max_output_tokens,
+            memory_recent_messages=(
+                settings.bot_memory_recent_messages
+                if "bot_memory_recent_messages"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_recent_messages
+            ),
+            memory_retention_days=(
+                settings.bot_memory_retention_days
+                if "bot_memory_retention_days"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_retention_days
+            ),
+            memory_archive_max_messages_per_group=(
+                settings.bot_memory_archive_max_messages_per_group
+                if "bot_memory_archive_max_messages_per_group"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_archive_max_messages_per_group
+            ),
+            memory_recall_enabled=(
+                settings.bot_memory_recall_enabled
+                if "bot_memory_recall_enabled"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_recall_enabled
+            ),
+            memory_recall_max_results=(
+                settings.bot_memory_recall_max_results
+                if "bot_memory_recall_max_results"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_recall_max_results
+            ),
+            memory_automatic_compaction=(
+                settings.bot_memory_automatic_compaction
+                if "bot_memory_automatic_compaction"
+                in getattr(settings, "model_fields_set", set())
+                else settings.bot.memory_automatic_compaction
+            ),
             proactive_default_enabled=settings.bot_proactive_default_enabled,
             proactive_idle_minutes=settings.bot_proactive_idle_minutes,
             proactive_jitter_minutes=settings.bot_proactive_jitter_minutes,

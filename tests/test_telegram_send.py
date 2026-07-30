@@ -11,6 +11,7 @@ from bot.services.message_templates import render_data_brief
 from bot.utils import telegram
 from bot.utils.telegram import (
     ReplyMessageOverlay,
+    TelegramDeliveryResult,
     answer_with_auto_delete,
     send_chat_message,
     send_reply,
@@ -19,6 +20,40 @@ from bot.utils.telegram import (
 
 
 class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_reply_can_return_concrete_message_id(self) -> None:
+        sent = SimpleNamespace(message_id=701, chat=SimpleNamespace(id=-10001))
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-10001),
+            answer=AsyncMock(return_value=sent),
+        )
+
+        result = await send_reply(
+            message,
+            "可归档回复",
+            delivery_mode="message",
+            return_result=True,
+        )
+
+        self.assertIsInstance(result, TelegramDeliveryResult)
+        self.assertTrue(result)
+        self.assertEqual(result.message_ids, (701,))
+        self.assertIs(result.messages[0], sent)
+
+    async def test_send_chat_message_can_return_concrete_message_id(self) -> None:
+        sent = SimpleNamespace(message_id=702, chat=SimpleNamespace(id=-10001))
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=sent))
+
+        result = await send_chat_message(
+            bot,
+            -10001,
+            "主动消息",
+            return_result=True,
+        )
+
+        self.assertIsInstance(result, TelegramDeliveryResult)
+        self.assertTrue(result)
+        self.assertEqual(result.message_ids, (702,))
+
     async def test_sticker_cleanup_failure_does_not_undo_delivery(self) -> None:
         sent = SimpleNamespace(message_id=76, chat=SimpleNamespace(id=-10001))
         message = SimpleNamespace(reply_sticker=AsyncMock(return_value=sent))
@@ -739,16 +774,19 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "```html\n<b>@literal</b>\n```"
         )
 
-        ok = await send_reply(
+        result = await send_reply(
             message,
             source,
             stream=True,
             overlay=overlay,
             overlay_remove_after=0.01,
+            return_result=True,
         )
         await asyncio.sleep(0.04)
 
-        self.assertTrue(ok)
+        self.assertIsInstance(result, TelegramDeliveryResult)
+        self.assertTrue(result)
+        self.assertEqual(result.message_ids, (89,))
         self.assertEqual(overlay.outcome, "attached")
         message.reply.assert_not_awaited()
         message.answer.assert_not_awaited()
