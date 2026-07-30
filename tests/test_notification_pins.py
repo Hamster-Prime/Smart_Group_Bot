@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.services.notification_pins import unpin_notification_message
+from bot.services.notification_pins import (
+    pin_notification_message,
+    unpin_notification_message,
+)
 
 
 class NotificationPinTests(unittest.IsolatedAsyncioTestCase):
@@ -38,19 +41,55 @@ class NotificationPinTests(unittest.IsolatedAsyncioTestCase):
             unpin_chat_message=AsyncMock(
                 side_effect=TelegramBadRequest(
                     method=SimpleNamespace(),
-                    message="Bad Request: not enough rights to unpin a message",
+                    message=(
+                        "Bad Request: not enough rights to manage pinned "
+                        "messages in the chat"
+                    ),
                 )
             )
         )
 
-        released = await unpin_notification_message(
-            bot,
-            chat_id=-100,
-            message_id=77,
-            kind="raid_guard",
-        )
+        with self.assertLogs(
+            "bot.services.notification_pins",
+            level="WARNING",
+        ) as captured:
+            released = await unpin_notification_message(
+                bot,
+                chat_id=-100,
+                message_id=77,
+                kind="raid_guard",
+            )
 
         self.assertFalse(released)
+        self.assertEqual(len(captured.records), 1)
+        self.assertIsNone(captured.records[0].exc_info)
+        self.assertIn("requires operator action", captured.records[0].getMessage())
+
+    async def test_pin_permission_error_is_logged_without_traceback(self) -> None:
+        bot = SimpleNamespace(
+            pin_chat_message=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=SimpleNamespace(),
+                    message="Bad Request: CHAT_ADMIN_REQUIRED",
+                )
+            )
+        )
+
+        with self.assertLogs(
+            "bot.services.notification_pins",
+            level="WARNING",
+        ) as captured:
+            pinned = await pin_notification_message(
+                bot,
+                chat_id=-100,
+                message_id=77,
+                kind="vote_ban",
+            )
+
+        self.assertFalse(pinned)
+        self.assertEqual(len(captured.records), 1)
+        self.assertIsNone(captured.records[0].exc_info)
+        self.assertIn("requires operator action", captured.records[0].getMessage())
 
 
 if __name__ == "__main__":

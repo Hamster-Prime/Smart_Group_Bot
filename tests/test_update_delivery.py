@@ -50,11 +50,15 @@ def _dispatcher() -> SimpleNamespace:
 
 
 class _MiddlewareEndpoint:
+    def __init__(self) -> None:
+        self.outer_middlewares: list[object] = []
+        self.middlewares: list[object] = []
+
     def outer_middleware(self, _middleware: object) -> None:
-        return None
+        self.outer_middlewares.append(_middleware)
 
     def middleware(self, _middleware: object) -> None:
-        return None
+        self.middlewares.append(_middleware)
 
 
 class _MainDispatcher(dict):
@@ -62,6 +66,7 @@ class _MainDispatcher(dict):
         super().__init__()
         self.update = _MiddlewareEndpoint()
         self.message = _MiddlewareEndpoint()
+        self.edited_message = _MiddlewareEndpoint()
         self.callback_query = _MiddlewareEndpoint()
         self.chat_member = _MiddlewareEndpoint()
         self.my_chat_member = _MiddlewareEndpoint()
@@ -2617,6 +2622,22 @@ class WebhookOrphanHealthTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MainLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edited_message_observer_gets_database_session_middleware(
+        self,
+    ) -> None:
+        from bot import __main__ as bot_main
+        from bot.middlewares.db import DbSessionMiddleware
+
+        dispatcher = _MainDispatcher()
+        session_factory = object()
+
+        bot_main._register_update_middlewares(dispatcher, session_factory)
+
+        self.assertEqual(len(dispatcher.edited_message.middlewares), 1)
+        middleware = dispatcher.edited_message.middlewares[0]
+        self.assertIsInstance(middleware, DbSessionMiddleware)
+        self.assertIs(middleware.session_factory, session_factory)
+
     async def test_bootstrap_validation_runs_before_database_initialization(self) -> None:
         from bot import __main__ as bot_main
 

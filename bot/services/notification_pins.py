@@ -25,13 +25,29 @@ _ALREADY_UNPINNED_MARKERS = (
     "message not found",
     "message to unpin not found",
     "message to be unpinned not found",
-    "message_id_invalid",
+    "message id invalid",
+)
+_OPERATOR_ACTION_MARKERS = (
+    "chat admin required",
+    "not enough rights",
+    "bot is not an administrator",
+    "need administrator rights",
+    "administrator rights are required",
 )
 
 
+def _telegram_error_detail(exc: BaseException) -> str:
+    return " ".join(str(exc).replace("_", " ").lower().split())
+
+
 def _already_unpinned(exc: TelegramBadRequest) -> bool:
-    detail = str(exc or "").strip().lower()
+    detail = _telegram_error_detail(exc)
     return any(marker in detail for marker in _ALREADY_UNPINNED_MARKERS)
+
+
+def _requires_operator_action(exc: TelegramBadRequest) -> bool:
+    detail = _telegram_error_detail(exc)
+    return any(marker in detail for marker in _OPERATOR_ACTION_MARKERS)
 
 
 def notification_pin_enabled(
@@ -78,6 +94,25 @@ async def pin_notification_message(
         return True
     except asyncio.CancelledError:
         raise
+    except TelegramBadRequest as exc:
+        if _requires_operator_action(exc):
+            log.warning(
+                "notification pin requires operator action | "
+                "kind=%s chat=%s message=%s error=%s",
+                kind,
+                chat_id,
+                message_id,
+                exc,
+            )
+            return False
+        log.warning(
+            "notification pin rejected | kind=%s chat=%s message=%s",
+            kind,
+            chat_id,
+            message_id,
+            exc_info=True,
+        )
+        return False
     except Exception:
         log.warning(
             "notification pin failed | kind=%s chat=%s message=%s",
@@ -116,6 +151,16 @@ async def unpin_notification_message(
                 message_id,
             )
             return True
+        if _requires_operator_action(exc):
+            log.warning(
+                "notification unpin requires operator action | "
+                "kind=%s chat=%s message=%s error=%s",
+                kind,
+                chat_id,
+                message_id,
+                exc,
+            )
+            return False
         log.warning(
             "notification unpin rejected | kind=%s chat=%s message=%s",
             kind,

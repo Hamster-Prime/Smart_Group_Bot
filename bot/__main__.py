@@ -325,6 +325,36 @@ async def _initialize_runtime_services(
     return runtime_config, llm, memory
 
 
+def _register_update_middlewares(dispatcher: Any, session_factory: Any) -> None:
+    """Install middleware on every update observer that needs its services."""
+
+    dispatcher.update.outer_middleware(
+        DurableInboxUpdateDedupMiddleware(session_factory)
+    )
+    dispatcher.message.outer_middleware(
+        GlobalBanEnforcementMiddleware(session_factory)
+    )
+    # A member racing the join-verification mute must not get messages through
+    # (or consume profile-screening LLM capacity) before the challenge exists.
+    dispatcher.message.outer_middleware(
+        PendingVerificationGateMiddleware(session_factory)
+    )
+    # Roster tracking feeds the profile patrol; outer so every sender is seen.
+    dispatcher.message.outer_middleware(MemberRosterMiddleware(session_factory))
+    dispatcher.message.middleware(LoggingMiddleware())
+    # No throttle middleware: it silently drops rapid consecutive messages,
+    # which breaks inbound batch merging and lets a fast second violating
+    # message skip moderation. Burst smoothing is handled by the pending-reply
+    # debounce in bot.handlers.group instead.
+    dispatcher.message.middleware(DbSessionMiddleware(session_factory))
+    # edited_message is a separate aiogram observer; message middleware is not
+    # inherited by edit handlers that also require a database session.
+    dispatcher.edited_message.middleware(DbSessionMiddleware(session_factory))
+    dispatcher.callback_query.middleware(DbSessionMiddleware(session_factory))
+    dispatcher.chat_member.middleware(DbSessionMiddleware(session_factory))
+    dispatcher.my_chat_member.middleware(DbSessionMiddleware(session_factory))
+
+
 async def main() -> None:
     settings = load_bootstrap_settings()
     validate_bootstrap_settings(settings)
@@ -349,22 +379,7 @@ async def main() -> None:
     if warmed_operators:
         log.info("Preloaded %d delegated privileged operator scope(s)", warmed_operators)
 
-    dp.update.outer_middleware(DurableInboxUpdateDedupMiddleware(session_factory))
-    dp.message.outer_middleware(GlobalBanEnforcementMiddleware(session_factory))
-    # A member racing the join-verification mute must not get messages through
-    # (or consume profile-screening LLM capacity) before the challenge exists.
-    dp.message.outer_middleware(PendingVerificationGateMiddleware(session_factory))
-    # Roster tracking feeds the profile patrol; outer so every sender is seen.
-    dp.message.outer_middleware(MemberRosterMiddleware(session_factory))
-    dp.message.middleware(LoggingMiddleware())
-    # No throttle middleware: it silently drops rapid consecutive messages,
-    # which breaks inbound batch merging and lets a fast second violating
-    # message skip moderation. Burst smoothing is handled by the pending-reply
-    # debounce in bot.handlers.group instead.
-    dp.message.middleware(DbSessionMiddleware(session_factory))
-    dp.callback_query.middleware(DbSessionMiddleware(session_factory))
-    dp.chat_member.middleware(DbSessionMiddleware(session_factory))
-    dp.my_chat_member.middleware(DbSessionMiddleware(session_factory))
+    _register_update_middlewares(dp, session_factory)
 
     dp.include_router(commands.router)
     dp.include_router(admin.router)
