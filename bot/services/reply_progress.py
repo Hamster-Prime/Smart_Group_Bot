@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
-from bot.services.message_templates import render_expandable_blockquote
+from bot.services.message_templates import card_field, render_expandable_blockquote
 from bot.utils.telegram import ReplyMessageOverlay, schedule_message_auto_delete_durable
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,7 @@ _TELEGRAM_RENDER_BUDGET = 3900
 _STATUS_RENDER_BUDGET = 2800
 _REFERENCE_URL_LIMIT = 512
 _HANDOFF_RENDER_BUDGET = 1200
+_PROGRESS_TITLE = "消息回复"
 
 
 def _compact_text(value: object, *, limit: int) -> str:
@@ -363,7 +364,10 @@ class ReplyProgressTracker:
             try:
                 async with asyncio.timeout(_TELEGRAM_IO_TIMEOUT_SECONDS):
                     await sent.edit_text(
-                        "<blockquote>⚠️ 01　处理已结束</blockquote>",
+                        (
+                            f"<b>{_PROGRESS_TITLE} · 未完成</b>\n\n"
+                            f"<blockquote>{card_field('当前', '⚠️ 处理已结束')}</blockquote>"
+                        ),
                         parse_mode="HTML",
                         disable_web_page_preview=self._disable_link_preview,
                     )
@@ -689,33 +693,89 @@ class ReplyProgressTracker:
 
     def _render(self, *, max_units: int = _TELEGRAM_RENDER_BUDGET) -> str:
         render_budget = max(256, min(_TELEGRAM_RENDER_BUDGET, int(max_units)))
-        lines: list[str] = []
-        for index, item in enumerate(self._updates.values(), start=1):
-            number = f"{index:02d}"
-            text = html.escape(_compact_text(item.text, limit=_STATUS_TEXT_LIMIT))
-            if item.state == "completed":
-                lines.append(f"{number}　{text}")
-            elif item.state == "failed":
-                lines.append(f"⚠️ {number}　{text}")
-            else:
-                lines.append(f"<b>{number}　{text}</b>")
-
         parts: list[str] = []
-        if lines:
-            shown_lines = list(lines)
-            omitted_updates = 0
-            while True:
-                rendered_lines = list(shown_lines)
+        updates = list(self._updates.values())
+        if updates:
+            current_index = next(
+                (
+                    index
+                    for index in range(len(updates) - 1, -1, -1)
+                    if updates[index].state == "running"
+                ),
+                len(updates) - 1,
+            )
+            if self._terminal == "failed":
+                current_index = next(
+                    (
+                        index
+                        for index in range(len(updates) - 1, -1, -1)
+                        if updates[index].state == "failed"
+                    ),
+                    current_index,
+                )
+
+            current_item = updates[current_index]
+            history_lines: list[str] = []
+            for index, item in enumerate(updates):
+                if index == current_index:
+                    continue
+                text = html.escape(
+                    _compact_text(item.text, limit=_STATUS_TEXT_LIMIT)
+                )
+                if item.state == "completed":
+                    history_lines.append(f"<s>{text}</s>")
+                elif item.state == "failed":
+                    history_lines.append(f"⚠️ {text}")
+                else:
+                    history_lines.append(text)
+
+            current_text = html.escape(
+                _compact_text(current_item.text, limit=_STATUS_TEXT_LIMIT)
+            )
+            if current_item.state == "failed":
+                current_text = f"⚠️ {current_text}"
+
+            if self._terminal == "completed":
+                title_status = "已完成"
+            elif self._terminal == "failed":
+                title_status = "未完成"
+            else:
+                title_status = "处理中"
+
+            next_step = ""
+            if self._terminal is None:
+                next_step = (
+                    "发送回答"
+                    if current_item.key == "composing"
+                    else "整理并发送回答"
+                )
+
+            def _status_part(
+                shown_history: list[str],
+                omitted_updates: int,
+            ) -> str:
+                status_lines = list(shown_history)
                 if omitted_updates:
-                    rendered_lines.insert(
-                        min(1, len(rendered_lines)),
+                    status_lines.insert(
+                        min(1, len(status_lines)),
                         f"… 另有 {omitted_updates} 个较早步骤未展开",
                     )
-                status_part = f"<blockquote>{'\n'.join(rendered_lines)}</blockquote>"
+                status_lines.append(card_field("当前", current_text))
+                if next_step:
+                    status_lines.append(card_field("下一步", next_step))
+                return (
+                    f"<b>{_PROGRESS_TITLE} · {title_status}</b>\n\n"
+                    f"<blockquote>{'\n'.join(status_lines)}</blockquote>"
+                )
+
+            shown_lines = list(history_lines)
+            omitted_updates = 0
+            while True:
+                status_part = _status_part(shown_lines, omitted_updates)
                 if (
                     _utf16_units(status_part)
                     <= min(_STATUS_RENDER_BUDGET, render_budget)
-                    or len(shown_lines) <= 1
+                    or not shown_lines
                 ):
                     parts.append(status_part)
                     break
@@ -733,12 +793,12 @@ class ReplyProgressTracker:
                 references: list[ProgressReference],
             ) -> str:
                 reference_lines = ["<b>参考资料</b>"]
-                for index, reference in enumerate(references, start=1):
+                for reference in references:
                     label = html.escape(reference.title)
                     if reference.url:
                         url = html.escape(reference.url, quote=True)
                         label = f'<a href="{url}">{label}</a>'
-                    reference_lines.append(f"{index:02d}　{label}")
+                    reference_lines.append(f"• {label}")
                 omitted = len(all_references) - len(references)
                 if omitted > 0:
                     reference_lines.append(f"另有 {omitted} 个来源未展开")

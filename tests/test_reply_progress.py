@@ -56,8 +56,13 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("正在处理</b>", body)
         self.assertEqual(
             body,
-            "<blockquote><b>01　正在理解问题</b></blockquote>",
+            "<b>消息回复 · 处理中</b>\n\n"
+            "<blockquote><b>当前</b>　正在理解问题\n"
+            "<b>下一步</b>　整理并发送回答</blockquote>",
         )
+        self.assertNotIn("01　", body)
+        self.assertNotIn("02　", body)
+        self.assertNotIn("03　", body)
         await tracker.close()
 
     async def test_same_key_updates_one_line_and_history_accumulates(self) -> None:
@@ -82,9 +87,14 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
 
         body = sent.edit_text.await_args.args[0]
         self.assertEqual(body.count("搜索官方资料"), 1)
-        self.assertIn("01　已理解问题", body)
-        self.assertIn("02　已搜索官方资料", body)
-        self.assertIn("<b>03　正在读取 DNS 文档</b>", body)
+        self.assertIn("<b>消息回复 · 处理中</b>", body)
+        self.assertIn("<s>已理解问题</s>", body)
+        self.assertIn("<s>已搜索官方资料</s>", body)
+        self.assertIn("<b>当前</b>　正在读取 DNS 文档", body)
+        self.assertIn("<b>下一步</b>　整理并发送回答", body)
+        self.assertNotIn("01　", body)
+        self.assertNotIn("02　", body)
+        self.assertNotIn("03　", body)
         self.assertLess(body.index("已理解问题"), body.index("已搜索官方资料"))
         self.assertLess(body.index("已搜索官方资料"), body.index("正在读取 DNS"))
         await tracker.close()
@@ -129,6 +139,9 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('href="https://example.com/docs"', body)
         self.assertNotIn("a=1", body)
         self.assertNotIn("token=hidden", body)
+        self.assertNotIn("01　", body)
+        self.assertNotIn("02　", body)
+        self.assertNotIn("03　", body)
         await tracker.close()
 
     async def test_invalid_reference_url_is_not_emitted_as_link(self) -> None:
@@ -220,8 +233,11 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         await tracker.fail("读取资料失败")
 
         body = sent.edit_text.await_args.args[0]
-        self.assertNotIn("处理未完成", body)
-        self.assertIn("⚠️ 01　读取资料失败", body)
+        self.assertIn("<b>消息回复 · 未完成</b>", body)
+        self.assertIn("<b>当前</b>　⚠️ 读取资料失败", body)
+        self.assertNotIn("01　", body)
+        self.assertNotIn("02　", body)
+        self.assertNotIn("03　", body)
         self.assertNotIn("✅", body)
         self.assertNotIn("⏳", body)
         await tracker.close()
@@ -305,7 +321,12 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
             await tracker.dismiss()
 
         sent.edit_text.assert_awaited_once()
-        self.assertIn("处理已结束", sent.edit_text.await_args.args[0])
+        body = sent.edit_text.await_args.args[0]
+        self.assertIn("<b>消息回复 · 未完成</b>", body)
+        self.assertIn("<b>当前</b>　⚠️ 处理已结束", body)
+        self.assertNotIn("01　", body)
+        self.assertNotIn("02　", body)
+        self.assertNotIn("03　", body)
         schedule.assert_awaited_once_with(sent, 30)
         self.assertFalse(tracker.visible)
 
@@ -369,8 +390,13 @@ class ReplyProgressTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("正在处理", overlay.status_html)
         self.assertEqual(
             overlay.status_html,
-            "<blockquote>01　已理解问题\n02　已整理并发送回答</blockquote>",
+            "<b>消息回复 · 已完成</b>\n\n"
+            "<blockquote><s>已理解问题</s>\n"
+            "<b>当前</b>　已整理并发送回答</blockquote>",
         )
+        self.assertNotIn("01　", overlay.status_html)
+        self.assertNotIn("02　", overlay.status_html)
+        self.assertNotIn("03　", overlay.status_html)
         sent.delete.assert_not_awaited()
         await tracker.close()
 

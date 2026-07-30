@@ -19,6 +19,13 @@ from bot.utils.telegram import (
 )
 
 
+_COMPLETED_REPLY_PROGRESS_HTML = (
+    "<b>消息回复 · 已完成</b>\n\n"
+    "<blockquote><s>已理解问题</s>\n"
+    "<b>当前</b>　已整理并发送回答</blockquote>"
+)
+
+
 class ScheduledSendFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_reply_can_return_concrete_message_id(self) -> None:
         sent = SimpleNamespace(message_id=701, chat=SimpleNamespace(id=-10001))
@@ -762,10 +769,7 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         overlay = ReplyMessageOverlay(
             message=progress_sent,
-            status_html=(
-                "<blockquote>01　已理解问题\n"
-                "02　已整理并发送回答</blockquote>"
-            ),
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
             reply_to_message_id=321,
             sent_as_reply=True,
         )
@@ -818,7 +822,7 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         overlay = ReplyMessageOverlay(
             message=progress_sent,
-            status_html="<blockquote>01　已理解问题</blockquote>",
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
             reply_to_message_id=321,
             sent_as_reply=True,
         )
@@ -882,7 +886,7 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         overlay = ReplyMessageOverlay(
             message=progress_sent,
-            status_html="<blockquote>01　已理解问题</blockquote>",
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
             reply_to_message_id=321,
             sent_as_reply=True,
         )
@@ -927,7 +931,7 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         overlay = ReplyMessageOverlay(
             message=progress_sent,
-            status_html="<blockquote>01　已理解问题</blockquote>",
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
             reply_to_message_id=321,
             sent_as_reply=True,
         )
@@ -976,7 +980,7 @@ class TelegramMarkdownDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         overlay = ReplyMessageOverlay(
             message=progress_sent,
-            status_html="<blockquote>01　已理解问题</blockquote>",
+            status_html=_COMPLETED_REPLY_PROGRESS_HTML,
             reply_to_message_id=321,
             sent_as_reply=True,
         )
