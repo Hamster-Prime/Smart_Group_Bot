@@ -226,6 +226,75 @@ class ModerationConfidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict.rule.id, regex_rule.id)
         service.llm.moderation.assert_not_awaited()
 
+    async def test_regex_rule_matches_telegram_command_alias_locally(self) -> None:
+        regex_rule = ModerationRule(
+            id=14,
+            group_id=-100,
+            rule_type="regex",
+            pattern=r"^(?:lucky_checkin|aq_lucky_bot)$",
+            action="delete",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([regex_rule])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(
+            self.session,
+            -100,
+            "/lucky_checkin@aq_lucky_bot",
+        )
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        self.assertEqual(verdict.confidence, 1.0)
+        self.assertEqual(verdict.rule.id, regex_rule.id)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_keyword_rule_matches_telegram_command_locally(self) -> None:
+        keyword = ModerationRule(
+            id=15,
+            group_id=-100,
+            rule_type="keyword",
+            pattern="lucky_checkin",
+            action="delete",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([keyword])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(
+            self.session,
+            -100,
+            "/lucky_checkin@aq_lucky_bot",
+        )
+
+        self.assertTrue(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        self.assertEqual(verdict.rule.id, keyword.id)
+        service.llm.moderation.assert_not_awaited()
+
+    async def test_anchored_regex_does_not_alias_inline_command_text(self) -> None:
+        regex_rule = ModerationRule(
+            id=16,
+            group_id=-100,
+            rule_type="regex",
+            pattern=r"^lucky_checkin$",
+            action="warn",
+            enabled=True,
+        )
+        self.session.execute.return_value = _RowsResult([regex_rule])
+        service = self._service(RuntimeError("LLM must not run"))
+
+        verdict = await service.evaluate(
+            self.session,
+            -100,
+            "prefix /lucky_checkin@aq_lucky_bot suffix",
+        )
+
+        self.assertFalse(verdict.violated)
+        self.assertTrue(verdict.conclusive)
+        service.llm.moderation.assert_not_awaited()
+
     async def test_invalid_regex_is_inconclusive_instead_of_crashing(self) -> None:
         invalid = ModerationRule(
             id=11,

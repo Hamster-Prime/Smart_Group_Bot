@@ -23,6 +23,40 @@ from bot.utils.security import build_defended_system, clean_text, wrap_untrusted
 log = logging.getLogger(__name__)
 
 
+# Telegram represents a command addressed to a bot as
+# ``/command@bot_username``.  Moderation rules are configured against the
+# human-readable command/token, so keep the raw message match intact and add
+# narrowly parsed aliases for deterministic rules.  Requiring a command at
+# the beginning of the text and a token boundary avoids treating ordinary
+# paths such as ``/foo/bar`` as Telegram commands.
+_TELEGRAM_COMMAND_TOKEN_RE = re.compile(
+    r"^\s*/(?P<command>[A-Za-z0-9_]{1,32})"
+    r"(?:@(?P<target>[A-Za-z0-9_]{1,32}))?(?=$|\s)",
+)
+
+
+def _moderation_match_candidates(text: str) -> tuple[str, ...]:
+    """Return raw text plus safe aliases for a leading Telegram command."""
+
+    raw = str(text or "")
+    candidates: list[str] = [raw]
+    command_match = _TELEGRAM_COMMAND_TOKEN_RE.match(raw)
+    if command_match is None:
+        return (raw,)
+
+    command = command_match.group("command") or ""
+    target = command_match.group("target") or ""
+    if target:
+        candidates.append(f"{command}@{target}")
+    if command:
+        candidates.append(command)
+    if target:
+        candidates.append(target)
+
+    # Keep candidate order stable while avoiding duplicate regex evaluations.
+    return tuple(dict.fromkeys(candidates))
+
+
 @dataclass(slots=True)
 class ModerationVerdict:
     """LLM verdict for one message.
@@ -257,7 +291,10 @@ class ModerationService:
         deterministic_inconclusive = False
         llm_rules: list[ModerationRule] = []
         normalized_text = text or ""
-        folded_text = normalized_text.casefold()
+        match_candidates = _moderation_match_candidates(normalized_text)
+        folded_candidates = tuple(
+            candidate.casefold() for candidate in match_candidates
+        )
         regex_deadline = time.perf_counter() + 0.1
         for rule in rules:
             rule_type = (rule.rule_type or "keyword").strip().lower()
@@ -271,7 +308,10 @@ class ModerationService:
                         rule.id,
                     )
                     continue
-                if pattern.casefold() in folded_text:
+                folded_pattern = pattern.casefold()
+                if any(
+                    folded_pattern in candidate for candidate in folded_candidates
+                ):
                     log.info("审核命中本地关键词: group=%s rule_id=%s", group_id, rule.id)
                     return make_verdict(
                         violated=True,
@@ -290,40 +330,41 @@ class ModerationService:
                         rule.id,
                     )
                     continue
-                remaining_regex_budget = regex_deadline - time.perf_counter()
-                if remaining_regex_budget <= 0:
-                    deterministic_inconclusive = True
-                    log.warning(
-                        "regex moderation total budget exhausted: group=%s rule=%s",
-                        group_id,
-                        rule.id,
-                    )
-                    continue
-                try:
-                    matched = safe_regex.search(
-                        pattern,
-                        normalized_text,
-                        flags=safe_regex.IGNORECASE,
-                        timeout=min(0.02, remaining_regex_budget),
-                    )
-                except (safe_regex.error, TimeoutError) as exc:
-                    deterministic_inconclusive = True
-                    log.warning(
-                        "regex moderation rule invalid or timed out: group=%s rule=%s error=%s",
-                        group_id,
-                        rule.id,
-                        exc,
-                    )
-                    continue
-                if matched is not None:
-                    log.info("审核命中本地正则: group=%s rule_id=%s", group_id, rule.id)
-                    return make_verdict(
-                        violated=True,
-                        reason="命中正则规则",
-                        rule=rule,
-                        conclusive=True,
-                        confidence=1.0,
-                    )
+                for candidate in match_candidates:
+                    remaining_regex_budget = regex_deadline - time.perf_counter()
+                    if remaining_regex_budget <= 0:
+                        deterministic_inconclusive = True
+                        log.warning(
+                            "regex moderation total budget exhausted: group=%s rule=%s",
+                            group_id,
+                            rule.id,
+                        )
+                        break
+                    try:
+                        matched = safe_regex.search(
+                            pattern,
+                            candidate,
+                            flags=safe_regex.IGNORECASE,
+                            timeout=min(0.02, remaining_regex_budget),
+                        )
+                    except (safe_regex.error, TimeoutError) as exc:
+                        deterministic_inconclusive = True
+                        log.warning(
+                            "regex moderation rule invalid or timed out: group=%s rule=%s error=%s",
+                            group_id,
+                            rule.id,
+                            exc,
+                        )
+                        break
+                    if matched is not None:
+                        log.info("审核命中本地正则: group=%s rule_id=%s", group_id, rule.id)
+                        return make_verdict(
+                            violated=True,
+                            reason="命中正则规则",
+                            rule=rule,
+                            conclusive=True,
+                            confidence=1.0,
+                        )
                 continue
             # Unknown legacy rule types are treated as semantic rules rather
             # than silently ignored.

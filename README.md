@@ -471,6 +471,7 @@ python start.py
 - 要收到其他 bot 的群消息，需在 @BotFather 中为本 bot 开启 **Bot-to-Bot Communication Mode**（Bot API 10.0+）
 - 低置信度 `ban` 规则质询依赖已配置的 Turnstile / hCaptcha 与公网地址，否则不会发起
 - 审核相关通知默认归入 `moderation` 自动删除类别
+- Telegram 命令消息（`/command` 或 `/command@bot`）的本地关键词/正则会同时尝试原文、命令名和目标 bot 用户名；需要严格匹配原文时，请在规则中保留 `/` 与 `@`。
 
 </details>
 
