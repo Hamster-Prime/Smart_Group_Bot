@@ -125,13 +125,13 @@ class UnsupportedParamTests(unittest.TestCase):
             api_key="sk-x",
             chat_endpoint="responses",
             endpoint_path="/responses",
-            reasoning_effort="low",
+            request_params={"reasoning": {"effort": "low"}},
         )
         kwargs = LLMService._build_responses_kwargs(
-            cfg, exclude_params={"max_tokens", "reasoning_effort"}
+            cfg, exclude_params={"max_tokens"}
         )
         self.assertNotIn("max_output_tokens", kwargs)
-        self.assertNotIn("reasoning", kwargs)
+        self.assertEqual(kwargs["extra_body"], {"reasoning": {"effort": "low"}})
 
 
 class ResponsesToolFormatTests(unittest.TestCase):

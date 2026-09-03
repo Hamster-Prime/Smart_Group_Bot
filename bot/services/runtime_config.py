@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -25,9 +26,9 @@ from bot.config import (
     Settings,
     _build_chat_config,
     _build_embed_config,
+    _build_litellm_model,
     _collect_provider_profiles,
     _load_raw_env,
-    _normalize_reasoning_effort,
     _parse_fallbacks,
     _resolve_provider_profile,
 )
@@ -76,6 +77,8 @@ class ProviderConfig(StrictModel):
 class ModelFallbackConfig(StrictModel):
     provider: str = Field(min_length=1, max_length=64)
     model: str = Field(default="", max_length=255)
+    # Provider-specific JSON for this concrete fallback model only.
+    request_params: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -86,6 +89,35 @@ class ModelFallbackConfig(StrictModel):
     @classmethod
     def _clean_model(cls, value: object) -> str:
         return str(value or "").strip()
+
+    @field_validator("request_params", mode="before")
+    @classmethod
+    def _clean_request_params(cls, value: object) -> dict[str, Any]:
+        return _normalize_request_params(value)
+
+
+_REQUEST_PARAMS_MAX_BYTES = 64 * 1024
+
+
+def _normalize_request_params(value: object) -> dict[str, Any]:
+    """Validate and copy one provider-specific JSON object.
+
+    Runtime settings arrive from an untrusted Mini App request.  Normalizing
+    through the stdlib JSON codec guarantees that values are JSON-compatible
+    before they are persisted and bounds the size of one parameter object.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("request_params 必须是 JSON 对象")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("request_params 必须只包含 JSON 可序列化值") from exc
+    if len(encoded.encode("utf-8")) > _REQUEST_PARAMS_MAX_BYTES:
+        raise ValueError("request_params 不能超过 64 KiB")
+    return normalized
 
 
 class ChatRoleConfig(StrictModel):
@@ -99,7 +131,8 @@ class ChatRoleConfig(StrictModel):
     total_deadline_sec: float = Field(
         default=0.0, ge=0.0, le=3600.0, allow_inf_nan=False
     )
-    reasoning_effort: Literal["", "none", "minimal", "low", "medium", "high"] = ""
+    # Provider-specific JSON for this role's concrete primary model only.
+    request_params: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -111,10 +144,10 @@ class ChatRoleConfig(StrictModel):
     def _clean_model(cls, value: object) -> str:
         return str(value or "").strip()
 
-    @field_validator("reasoning_effort", mode="before")
+    @field_validator("request_params", mode="before")
     @classmethod
-    def _clean_effort(cls, value: object) -> str:
-        return _normalize_reasoning_effort(str(value or ""))
+    def _clean_request_params(cls, value: object) -> dict[str, Any]:
+        return _normalize_request_params(value)
 
 
 class EmbedRoleConfig(StrictModel):
@@ -126,6 +159,8 @@ class EmbedRoleConfig(StrictModel):
     total_deadline_sec: float = Field(
         default=0.0, ge=0.0, le=3600.0, allow_inf_nan=False
     )
+    # Provider-specific JSON for this role's concrete embedding model only.
+    request_params: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -136,6 +171,11 @@ class EmbedRoleConfig(StrictModel):
     @classmethod
     def _clean_model(cls, value: object) -> str:
         return str(value or "").strip()
+
+    @field_validator("request_params", mode="before")
+    @classmethod
+    def _clean_request_params(cls, value: object) -> dict[str, Any]:
+        return _normalize_request_params(value)
 
 
 class ModelSettingsConfig(StrictModel):
@@ -149,7 +189,6 @@ class ModelSettingsConfig(StrictModel):
             temperature=0.7,
             max_tokens=2048,
             timeout_sec=12.0,
-            reasoning_effort="low",
         )
     )
     vision: ChatRoleConfig = Field(
@@ -157,7 +196,6 @@ class ModelSettingsConfig(StrictModel):
             temperature=0.7,
             max_tokens=2048,
             timeout_sec=15.0,
-            reasoning_effort="none",
         )
     )
     decision: ChatRoleConfig = Field(
@@ -165,7 +203,6 @@ class ModelSettingsConfig(StrictModel):
             temperature=0.1,
             max_tokens=512,
             timeout_sec=6.0,
-            reasoning_effort="none",
         )
     )
     moderation: ChatRoleConfig = Field(
@@ -173,7 +210,6 @@ class ModelSettingsConfig(StrictModel):
             temperature=0.1,
             max_tokens=1024,
             timeout_sec=8.0,
-            reasoning_effort="none",
         )
     )
     compress: ChatRoleConfig = Field(
@@ -181,7 +217,6 @@ class ModelSettingsConfig(StrictModel):
             temperature=0.3,
             max_tokens=1024,
             timeout_sec=12.0,
-            reasoning_effort="none",
         )
     )
     embed: EmbedRoleConfig = Field(default_factory=EmbedRoleConfig)
@@ -671,6 +706,10 @@ class RuntimeConfig(StrictModel):
             for item in items
         )
 
+    @staticmethod
+    def _fallback_request_params(items: list[ModelFallbackConfig]) -> list[dict[str, Any]]:
+        return [dict(item.request_params) for item in items]
+
     def _provider_profiles(self) -> dict[str, ProviderProfile]:
         profiles: dict[str, ProviderProfile] = {}
         for item in self.models.providers:
@@ -755,7 +794,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=main.timeout_sec,
             total_deadline_sec=main.total_deadline_sec,
             fallback_spec=self._fallback_spec(main.fallbacks),
-            reasoning_effort=main.reasoning_effort,
+            request_params=main.request_params,
+            fallback_request_params=self._fallback_request_params(main.fallbacks),
             **common_retry,
         )
         settings.bot.vision_model = _build_chat_config(
@@ -767,7 +807,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=models.vision.timeout_sec,
             total_deadline_sec=models.vision.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.vision.fallbacks),
-            reasoning_effort=models.vision.reasoning_effort,
+            request_params=models.vision.request_params,
+            fallback_request_params=self._fallback_request_params(models.vision.fallbacks),
             **common_retry,
         )
         settings.bot.decision_model = _build_chat_config(
@@ -779,7 +820,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=models.decision.timeout_sec,
             total_deadline_sec=models.decision.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.decision.fallbacks),
-            reasoning_effort=models.decision.reasoning_effort,
+            request_params=models.decision.request_params,
+            fallback_request_params=self._fallback_request_params(models.decision.fallbacks),
             **common_retry,
         )
         settings.bot.moderation_model = _build_chat_config(
@@ -791,7 +833,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=models.moderation.timeout_sec,
             total_deadline_sec=models.moderation.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.moderation.fallbacks),
-            reasoning_effort=models.moderation.reasoning_effort,
+            request_params=models.moderation.request_params,
+            fallback_request_params=self._fallback_request_params(models.moderation.fallbacks),
             **common_retry,
         )
         settings.bot.compress_model = _build_chat_config(
@@ -803,7 +846,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=models.compress.timeout_sec,
             total_deadline_sec=models.compress.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.compress.fallbacks),
-            reasoning_effort=models.compress.reasoning_effort,
+            request_params=models.compress.request_params,
+            fallback_request_params=self._fallback_request_params(models.compress.fallbacks),
             **common_retry,
         )
         settings.bot.embed_model = _build_embed_config(
@@ -813,6 +857,8 @@ class RuntimeConfig(StrictModel):
             timeout_sec=models.embed.timeout_sec,
             total_deadline_sec=models.embed.total_deadline_sec,
             fallback_spec=self._fallback_spec(models.embed.fallbacks),
+            request_params=models.embed.request_params,
+            fallback_request_params=self._fallback_request_params(models.embed.fallbacks),
             **common_retry,
         )
 
@@ -1015,7 +1061,13 @@ ConfigAppliedCallback = Callable[[RuntimeConfig], Awaitable[None] | None]
 def _normalize_deprecated_runtime_payload(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
-    """Normalize retired global settings before strict schema validation."""
+    """Normalize retired settings before strict schema validation.
+
+    ``reasoning_effort`` used to be a first-class role field.  The first
+    request-JSON revision then added role defaults and a global model override
+    map.  Both older shapes are expanded into concrete primary/fallback model
+    entries before the strict model rejects the retired fields.
+    """
 
     normalized = dict(payload)
     changed = False
@@ -1036,6 +1088,157 @@ def _normalize_deprecated_runtime_payload(
     if "sub2api" in normalized:
         normalized.pop("sub2api", None)
         changed = True
+
+    models_payload = normalized.get("models")
+    if isinstance(models_payload, dict):
+        migrated_models = dict(models_payload)
+        models_changed = False
+
+        # Build enough provider metadata to recognize the final LiteLLM model
+        # keys used by the previous global override editor.  Raw model and
+        # provider/model aliases remain valid fallbacks when metadata is old or
+        # incomplete.
+        provider_profiles: dict[str, dict[str, str]] = {}
+        raw_providers = models_payload.get("providers")
+        if isinstance(raw_providers, list):
+            for raw_provider in raw_providers:
+                if not isinstance(raw_provider, dict):
+                    continue
+                name = str(raw_provider.get("name") or "").strip().lower()
+                if name:
+                    provider_profiles[name] = {
+                        "provider": str(raw_provider.get("provider") or "").strip().lower(),
+                        "api_base": str(raw_provider.get("api_base") or "").strip(),
+                    }
+
+        legacy_overrides_raw = models_payload.get("model_overrides")
+        legacy_overrides: dict[str, dict[str, Any]] = {}
+        if isinstance(legacy_overrides_raw, dict):
+            for raw_key, raw_params in legacy_overrides_raw.items():
+                key = str(raw_key or "").strip().lower()
+                if key and isinstance(raw_params, dict):
+                    legacy_overrides[key] = dict(raw_params)
+
+        missing = object()
+
+        role_parents = {
+            "vision": "main",
+            "decision": "main",
+            "moderation": "decision",
+            "compress": "main",
+        }
+
+        def effective_role_ref(role_name: str) -> tuple[str, str]:
+            role = models_payload.get(role_name)
+            role = role if isinstance(role, dict) else {}
+            if role_name == "embed":
+                main_provider, _ = effective_role_ref("main")
+                return (
+                    str(role.get("provider") or main_provider).strip().lower(),
+                    str(role.get("model") or "text-embedding-004").strip(),
+                )
+            parent_name = role_parents.get(role_name)
+            if parent_name:
+                parent_provider, parent_model = effective_role_ref(parent_name)
+            else:
+                parent_provider, parent_model = "", ""
+            provider = str(role.get("provider") or parent_provider).strip().lower()
+            model = str(role.get("model") or parent_model).strip()
+            return provider, model
+
+        def override_for(provider_ref: object, model_name: object) -> dict[str, Any] | object:
+            model = str(model_name or "").strip()
+            provider_name = str(provider_ref or "").strip().lower()
+            if not model or not legacy_overrides:
+                return missing
+            profile = provider_profiles.get(provider_name, {})
+            protocol = str(profile.get("provider") or provider_name).strip().lower()
+            api_base = profile.get("api_base") or None
+            keys: list[str] = []
+            try:
+                resolved = _build_litellm_model(protocol, model, api_base=api_base)
+            except Exception:
+                resolved = ""
+            if resolved:
+                keys.append(str(resolved).strip().lower())
+            keys.append(model.lower())
+            if provider_name:
+                keys.append(f"{provider_name}/{model}".lower())
+            if protocol:
+                keys.append(f"{protocol}/{model}".lower())
+            for key in keys:
+                if key and key in legacy_overrides:
+                    return dict(legacy_overrides[key])
+            return missing
+
+        for role_name in ("main", "vision", "decision", "moderation", "compress", "embed"):
+            role_payload = models_payload.get(role_name)
+            if not isinstance(role_payload, dict):
+                continue
+            migrated_role = dict(role_payload)
+            role_changed = False
+            effective_provider, effective_model = effective_role_ref(role_name)
+
+            if "reasoning_effort" in migrated_role:
+                old_effort = migrated_role.pop("reasoning_effort")
+                if (
+                    "request_params" not in migrated_role
+                    or migrated_role.get("request_params") is None
+                ):
+                    migrated_role["request_params"] = {"reasoning_effort": old_effort}
+                role_changed = True
+
+            role_default = migrated_role.get("request_params")
+            if not isinstance(role_default, dict):
+                role_default = {}
+            primary_override = override_for(
+                effective_provider,
+                effective_model,
+            )
+            if primary_override is not missing:
+                migrated_role["request_params"] = primary_override
+                role_changed = True
+
+            raw_fallbacks = migrated_role.get("fallbacks")
+            if isinstance(raw_fallbacks, list):
+                migrated_fallbacks: list[Any] = []
+                for raw_fallback in raw_fallbacks:
+                    if not isinstance(raw_fallback, dict):
+                        migrated_fallbacks.append(raw_fallback)
+                        continue
+                    migrated_fallback = dict(raw_fallback)
+                    fallback_model = migrated_fallback.get("model") or effective_model
+                    fallback_override = override_for(
+                        migrated_fallback.get("provider"),
+                        fallback_model,
+                    )
+                    # Prior role defaults applied to every fallback. Copy them
+                    # only when the old payload had no concrete fallback value;
+                    # current documents already contain this field.
+                    if (
+                        "request_params" not in migrated_fallback
+                        or migrated_fallback.get("request_params") is None
+                    ) and role_default:
+                        migrated_fallback["request_params"] = dict(role_default)
+                        role_changed = True
+                    if fallback_override is not missing:
+                        migrated_fallback["request_params"] = fallback_override
+                        role_changed = True
+                    migrated_fallbacks.append(migrated_fallback)
+                if migrated_fallbacks != raw_fallbacks:
+                    migrated_role["fallbacks"] = migrated_fallbacks
+                    role_changed = True
+
+            if role_changed:
+                migrated_models[role_name] = migrated_role
+                models_changed = True
+
+        if "model_overrides" in migrated_models:
+            migrated_models.pop("model_overrides", None)
+            models_changed = True
+        if models_changed:
+            normalized["models"] = migrated_models
+            changed = True
     return (normalized, True) if changed else (payload, False)
 
 
@@ -1330,11 +1533,22 @@ def _redact_database_url(url: str) -> str:
     return f"{scheme}://{credentials}@{host}"
 
 
-def _legacy_fallbacks(raw: str) -> list[ModelFallbackConfig]:
-    return [
-        ModelFallbackConfig(provider=provider, model=model or "")
-        for provider, model in _parse_fallbacks(raw)
-    ]
+def _legacy_fallbacks(
+    raw: str,
+    configured: list[object] | None = None,
+) -> list[ModelFallbackConfig]:
+    configured = configured or []
+    result: list[ModelFallbackConfig] = []
+    for index, (provider, model) in enumerate(_parse_fallbacks(raw)):
+        source = configured[index] if index < len(configured) else None
+        result.append(
+            ModelFallbackConfig(
+                provider=provider,
+                model=model or "",
+                request_params=dict(getattr(source, "request_params", {}) or {}),
+            )
+        )
+    return result
 
 
 def _env_bool(
@@ -1472,59 +1686,78 @@ def build_legacy_runtime_config(
         main=ChatRoleConfig(
             provider=main_provider,
             model=settings.main_model.strip() or "gemini-2.0-flash",
-            fallbacks=_legacy_fallbacks(settings.main_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.main_fallbacks,
+                settings.bot.main_model.fallbacks,
+            ),
             temperature=settings.bot.main_model.temperature,
             max_tokens=max(1, settings.max_output_tokens),
             timeout_sec=settings.main_timeout_sec,
             total_deadline_sec=max(0.0, settings.main_total_deadline_sec),
-            reasoning_effort=settings.main_reasoning_effort,
+            request_params=dict(settings.bot.main_model.request_params),
         ),
         vision=ChatRoleConfig(
             provider=role_provider(settings.vision_provider_name),
             model=settings.vision_model.strip(),
-            fallbacks=_legacy_fallbacks(settings.vision_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.vision_fallbacks,
+                settings.bot.vision_model.fallbacks,
+            ),
             temperature=settings.bot.vision_model.temperature,
             max_tokens=settings.bot.vision_model.max_tokens,
             timeout_sec=settings.vision_timeout_sec,
             total_deadline_sec=max(0.0, settings.vision_total_deadline_sec),
-            reasoning_effort=settings.vision_reasoning_effort,
+            request_params=dict(settings.bot.vision_model.request_params),
         ),
         decision=ChatRoleConfig(
             provider=role_provider(settings.decision_provider_name),
             model=settings.decision_model.strip(),
-            fallbacks=_legacy_fallbacks(settings.decision_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.decision_fallbacks,
+                settings.bot.decision_model.fallbacks,
+            ),
             temperature=settings.bot.decision_model.temperature,
             max_tokens=settings.bot.decision_model.max_tokens,
             timeout_sec=settings.decision_timeout_sec,
             total_deadline_sec=max(0.0, settings.decision_total_deadline_sec),
-            reasoning_effort=settings.decision_reasoning_effort,
+            request_params=dict(settings.bot.decision_model.request_params),
         ),
         moderation=ChatRoleConfig(
             provider=role_provider(settings.moderation_provider_name),
             model=settings.moderation_model.strip(),
-            fallbacks=_legacy_fallbacks(settings.moderation_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.moderation_fallbacks,
+                settings.bot.moderation_model.fallbacks,
+            ),
             temperature=settings.bot.moderation_model.temperature,
             max_tokens=settings.bot.moderation_model.max_tokens,
             timeout_sec=settings.moderation_timeout_sec,
             total_deadline_sec=max(0.0, settings.moderation_total_deadline_sec),
-            reasoning_effort=settings.moderation_reasoning_effort,
+            request_params=dict(settings.bot.moderation_model.request_params),
         ),
         compress=ChatRoleConfig(
             provider=role_provider(settings.compress_provider_name),
             model=settings.compress_model.strip(),
-            fallbacks=_legacy_fallbacks(settings.compress_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.compress_fallbacks,
+                settings.bot.compress_model.fallbacks,
+            ),
             temperature=settings.bot.compress_model.temperature,
             max_tokens=settings.bot.compress_model.max_tokens,
             timeout_sec=settings.compress_timeout_sec,
             total_deadline_sec=max(0.0, settings.compress_total_deadline_sec),
-            reasoning_effort=settings.compress_reasoning_effort,
+            request_params=dict(settings.bot.compress_model.request_params),
         ),
         embed=EmbedRoleConfig(
             provider=role_provider(settings.embed_provider_name),
             model=settings.embed_model.strip() or "text-embedding-004",
-            fallbacks=_legacy_fallbacks(settings.embed_fallbacks),
+            fallbacks=_legacy_fallbacks(
+                settings.embed_fallbacks,
+                settings.bot.embed_model.fallbacks,
+            ),
             timeout_sec=settings.embed_timeout_sec,
             total_deadline_sec=max(0.0, settings.embed_total_deadline_sec),
+            request_params=dict(settings.bot.embed_model.request_params),
         ),
         retry_attempts=settings.llm_retry_attempts,
         retry_backoff_sec=settings.llm_retry_backoff_sec,

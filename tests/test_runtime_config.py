@@ -324,6 +324,11 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
                 "http_timeout_sec": 15.0,
                 "check_timeout_sec": 45.0,
             }
+            old_main = dict(payload["models"]["main"])
+            old_main.pop("request_params", None)
+            old_main["reasoning_effort"] = "low"
+            payload["models"] = dict(payload["models"])
+            payload["models"]["main"] = old_main
             row.payload = payload
             row.revision = 7
             session.add(
@@ -360,10 +365,19 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             reloaded.api_document()["config"]["bot"]["disable_link_preview"]
         )
+        self.assertEqual(
+            reloaded.config.models.main.request_params,
+            {"reasoning_effort": "low"},
+        )
         async with self.session_factory() as session:
             row = await session.get(RuntimeConfigRecord, 1)
             self.assertEqual(row.revision, 7)
             self.assertFalse(row.payload["bot"]["drop_pending_updates"])
+            self.assertNotIn("reasoning_effort", row.payload["models"]["main"])
+            self.assertEqual(
+                row.payload["models"]["main"]["request_params"],
+                {"reasoning_effort": "low"},
+            )
             self.assertNotIn("sub2api", row.payload)
             self.assertIsNone(
                 await session.get(RuntimeConfigSecret, "sub2api.api_key")

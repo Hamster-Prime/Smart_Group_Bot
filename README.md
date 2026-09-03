@@ -338,7 +338,7 @@ python start.py
 | 分区 | 可配置内容 |
 | :--- | :--- |
 | **概览** | 运行状态与启动参数一览 |
-| **模型** | 供应商、API 密钥、六种角色模型、fallback 回退链、推理强度、超时与重试参数 |
+| **模型** | 供应商、API 密钥、六种角色模型、每个模型独立请求参数 JSON、fallback 回退链、超时与重试参数 |
 | **Prompts** | 全部模块的系统提示词，可直接在线编辑 |
 | **Bot 行为** | 消息处理、流式输出、上下文长度、主动话题、按类别配置的自动删除策略 |
 | **审核验证** | 内容审核开关与阈值、Cloudflare Turnstile / hCaptcha、每日巡检时间与批大小、质询超时 |
@@ -381,7 +381,7 @@ python start.py
 
 #### 功能特点
 
-- **六种模型角色**：可分别选择供应商、模型、推理强度和回退链，未指定的辅助角色自动复用上级模型
+- **六种模型角色**：可分别选择供应商、模型、主模型请求参数 JSON 和回退链；每个回退模型也可单独填写请求参数，未指定的辅助角色自动复用上级模型但不复用参数
 - **多供应商接入**：通过 LiteLLM 支持 OpenAI、Anthropic、Gemini，以及任意 OpenAI 兼容网关
 - **自动降级**：每个角色都可配置 fallback 链，上游故障时逐级回退
 - **流式输出**：默认开启，按 36 字符分块、每 1.0 秒编辑一次消息
@@ -393,24 +393,36 @@ python start.py
 
 #### 模型角色表
 
-| 角色 | 用途 | 默认超时 | 默认推理强度 | 未配置时 |
+| 角色 | 用途 | 默认超时 | 请求参数 | 未配置时 |
 | :--- | :--- | :--- | :--- | :--- |
-| **main** | 聊天回复、技能工具调用 | 12.0s | low | 必须配置 |
-| **decision** | 判断是否回复（skip / casual） | 6.0s | none | 复用 main |
-| **moderation** | 内容审核 | 8.0s | none | 复用 decision |
-| **vision** | 图片 / 贴纸理解 | 15.0s | none | 复用 main |
-| **compress** | 上下文压缩摘要、风格蒸馏 | 12.0s | none | 复用 main |
-| **embed** | 向量嵌入 | 10.0s | — | 复用 main 供应商，默认 `text-embedding-004` |
+| **main** | 聊天回复、技能工具调用 | 12.0s | 主模型独立 JSON | 必须配置 |
+| **decision** | 判断是否回复（skip / casual） | 6.0s | 主模型独立 JSON | 复用 main |
+| **moderation** | 内容审核 | 8.0s | 主模型独立 JSON | 复用 decision |
+| **vision** | 图片 / 贴纸理解 | 15.0s | 主模型独立 JSON | 复用 main |
+| **compress** | 上下文压缩摘要、风格蒸馏 | 12.0s | 主模型独立 JSON | 复用 main |
+| **embed** | 向量嵌入 | 10.0s | 主模型独立 JSON | 复用 main 供应商，默认 `text-embedding-004` |
 
-默认重试参数：重试 2 次、退避 0.8 秒、每次重试超时递增系数 1.35。上下文上限默认 256000 tokens，单次输出上限 2048 tokens。推理强度可选 `none` / `minimal` / `low` / `medium` / `high`。
+默认重试参数：重试 2 次、退避 0.8 秒、每次重试超时递增系数 1.35。上下文上限默认 256000 tokens，单次输出上限 2048 tokens。
+
+每个模型角色的主模型，以及回退链中的每个模型，都可以填写独立的供应商请求参数 JSON，例如：
+
+```json
+{
+  "thinking": {"type": "enabled"},
+  "reasoning_effort": "low"
+}
+```
+
+主模型 JSON 只对该角色的主模型生效；回退行中的 JSON 只对对应回退模型生效，模型之间不会互相继承。`model`、`messages`、`input`、`tools`、凭据、超时和输出上限等系统字段由程序维护，不允许被覆盖。
 
 #### 供应商兼容处理
 
 - **provider 别名归一**：`google→gemini`、`claude→anthropic`、`doubao`/`ark→volcengine`、`qwen`/`alibaba→dashscope`、`kimi`/`moonshotai→moonshot`、`grok→xai`、`minimaxi→minimax`
 - **openai 前缀回退**：LiteLLM 无原生适配器且配置了自定义 `api_base` 时，自动规范为 `openai/<model>` 前缀
 - **端点自适应**：根据 `api_base` 后缀自动识别 `/chat/completions`、`/responses`、`/v1/messages`、`/v1beta/models` 等形态
+- **自定义 JSON 透传**：OpenAI / OpenAI 兼容端点通过 `extra_body` 将模型 JSON 合并到最终请求体顶层，避免 LiteLLM 按模型白名单拦截 `thinking`、`reasoning_effort` 等字段
 - **think 标签剥离**：推理模型输出的思考标签在进入回复前被清理
-- **参数拒绝重试**：上游拒绝某个参数时自动去掉该参数重试
+- **系统参数拒绝重试**：上游拒绝温度、输出上限等系统参数时自动去掉该参数重试
 
 #### 说话风格模仿
 

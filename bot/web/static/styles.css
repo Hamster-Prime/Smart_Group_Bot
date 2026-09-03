@@ -1033,6 +1033,15 @@ button:disabled {
   font-size: 10px;
 }
 
+.fallback-row .field.full {
+  grid-column: 1 / -1;
+}
+
+.fallback-row .field.full textarea {
+  min-height: 108px;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .secret-control {
   display: grid;
   gap: 6px;
@@ -2557,6 +2566,10 @@ button:disabled {
   .permission-override-grid,
   .permission-window-fields {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fallback-row .field.full {
+    grid-column: 1 / -1;
   }
 
   .section-heading {

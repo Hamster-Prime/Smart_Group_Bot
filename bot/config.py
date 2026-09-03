@@ -4,7 +4,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,8 +55,9 @@ class ChatEndpointConfig(BaseModel):
     # Total wall-clock budget across all attempts and fallbacks for one call.
     # 0 = use the built-in per-stage default.
     total_deadline_sec: float = 0.0
-    # "" = do not send the param; none/minimal/low/medium/high are forwarded.
-    reasoning_effort: str = ""
+    # Provider-specific JSON parameters. The request builder protects the
+    # routing and transport fields owned by this config.
+    request_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelConfig(ChatEndpointConfig):
@@ -76,6 +77,8 @@ class EmbedEndpointConfig(BaseModel):
     # Total wall-clock budget across all attempts and fallbacks for one call.
     # 0 = use the built-in per-stage default.
     total_deadline_sec: float = 0.0
+    # Provider-specific JSON parameters for this concrete embedding model.
+    request_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class EmbedConfig(EmbedEndpointConfig):
@@ -190,35 +193,30 @@ class Settings(BaseSettings):
     main_timeout_sec: float = 12.0
     # Total budget across all attempts and fallbacks; 0 = built-in default.
     main_total_deadline_sec: float = 0.0
-    main_reasoning_effort: str = "low"
 
     vision_provider_name: str = ""
     vision_model: str = ""
     vision_fallbacks: str = ""
     vision_timeout_sec: float = 15.0
     vision_total_deadline_sec: float = 0.0
-    vision_reasoning_effort: str = "none"
 
     decision_provider_name: str = ""
     decision_model: str = ""
     decision_fallbacks: str = ""
     decision_timeout_sec: float = 6.0
     decision_total_deadline_sec: float = 0.0
-    decision_reasoning_effort: str = "none"
 
     moderation_provider_name: str = ""
     moderation_model: str = ""
     moderation_fallbacks: str = ""
     moderation_timeout_sec: float = 8.0
     moderation_total_deadline_sec: float = 0.0
-    moderation_reasoning_effort: str = "none"
 
     compress_provider_name: str = ""
     compress_model: str = ""
     compress_fallbacks: str = ""
     compress_timeout_sec: float = 12.0
     compress_total_deadline_sec: float = 0.0
-    compress_reasoning_effort: str = "none"
 
     embed_provider_name: str = ""
     embed_model: str = "text-embedding-004"
@@ -430,26 +428,6 @@ def _env_truthy(value: str | None) -> bool:
     return normalized in {"1", "true", "yes", "on", "y", "t"}
 
 
-_VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high"}
-_REASONING_EFFORT_ALIASES = {
-    "off": "none",
-    "disable": "none",
-    "disabled": "none",
-    "0": "none",
-    "false": "none",
-}
-
-
-def _normalize_reasoning_effort(raw: str | None) -> str:
-    value = (raw or "").strip().lower()
-    if not value:
-        return ""
-    value = _REASONING_EFFORT_ALIASES.get(value, value)
-    if value in _VALID_REASONING_EFFORTS:
-        return value
-    return ""
-
-
 _API_BASE_SUFFIX_RULES: tuple[
     tuple[str, str, str, Literal["chat_completions", "responses"]],
     ...,
@@ -638,18 +616,23 @@ def _build_chat_config(
     retry_backoff_sec: float,
     retry_timeout_multiplier: float,
     fallback_spec: str,
-    reasoning_effort: str = "",
     total_deadline_sec: float = 0.0,
+    request_params: Mapping[str, Any] | None = None,
+    fallback_request_params: Sequence[Mapping[str, Any] | None] | None = None,
 ) -> ModelConfig:
     if not provider_name:
         raise ValueError("provider name is required")
     if not model_name:
         raise ValueError("model name is required")
 
-    effort = _normalize_reasoning_effort(reasoning_effort)
     profile = _get_profile(profiles, provider_name)
+    resolved_model = _build_litellm_model(
+        profile.provider,
+        model_name,
+        api_base=profile.api_base,
+    )
     cfg = ModelConfig(
-        model=_build_litellm_model(profile.provider, model_name, api_base=profile.api_base),
+        model=resolved_model,
         provider=profile.provider,
         api_key=profile.api_key,
         api_base=profile.api_base,
@@ -663,19 +646,26 @@ def _build_chat_config(
         retry_backoff_sec=retry_backoff_sec,
         retry_timeout_multiplier=retry_timeout_multiplier,
         total_deadline_sec=max(0.0, total_deadline_sec),
-        reasoning_effort=effort,
+        # Parameters belong to this concrete primary model.  They are never
+        # inherited by fallback endpoints.
+        request_params=dict(request_params or {}),
         fallbacks=[],
     )
 
-    for fb_provider_name, fb_model_name in _parse_fallbacks(fallback_spec):
+    for index, (fb_provider_name, fb_model_name) in enumerate(_parse_fallbacks(fallback_spec)):
         fb_profile = _get_profile(profiles, fb_provider_name)
+        fallback_model_name = fb_model_name or model_name
+        fallback_model = _build_litellm_model(
+            fb_profile.provider,
+            fallback_model_name,
+            api_base=fb_profile.api_base,
+        )
+        params = {}
+        if fallback_request_params is not None and index < len(fallback_request_params):
+            params = dict(fallback_request_params[index] or {})
         cfg.fallbacks.append(
             ChatEndpointConfig(
-                model=_build_litellm_model(
-                    fb_profile.provider,
-                    fb_model_name or model_name,
-                    api_base=fb_profile.api_base,
-                ),
+                model=fallback_model,
                 provider=fb_profile.provider,
                 api_key=fb_profile.api_key,
                 api_base=fb_profile.api_base,
@@ -689,7 +679,7 @@ def _build_chat_config(
                 retry_backoff_sec=retry_backoff_sec,
                 retry_timeout_multiplier=retry_timeout_multiplier,
                 total_deadline_sec=max(0.0, total_deadline_sec),
-                reasoning_effort=effort,
+                request_params=params,
             )
         )
     return cfg
@@ -706,6 +696,8 @@ def _build_embed_config(
     retry_timeout_multiplier: float,
     fallback_spec: str,
     total_deadline_sec: float = 0.0,
+    request_params: Mapping[str, Any] | None = None,
+    fallback_request_params: Sequence[Mapping[str, Any] | None] | None = None,
 ) -> EmbedConfig:
     if not provider_name:
         raise ValueError("provider name is required")
@@ -724,11 +716,15 @@ def _build_embed_config(
         retry_backoff_sec=retry_backoff_sec,
         retry_timeout_multiplier=retry_timeout_multiplier,
         total_deadline_sec=max(0.0, total_deadline_sec),
+        request_params=dict(request_params or {}),
         fallbacks=[],
     )
 
-    for fb_provider_name, fb_model_name in _parse_fallbacks(fallback_spec):
+    for index, (fb_provider_name, fb_model_name) in enumerate(_parse_fallbacks(fallback_spec)):
         fb_profile = _get_profile(profiles, fb_provider_name)
+        params = {}
+        if fallback_request_params is not None and index < len(fallback_request_params):
+            params = dict(fallback_request_params[index] or {})
         cfg.fallbacks.append(
             EmbedEndpointConfig(
                 model=_build_litellm_model(
@@ -745,6 +741,7 @@ def _build_embed_config(
                 retry_backoff_sec=retry_backoff_sec,
                 retry_timeout_multiplier=retry_timeout_multiplier,
                 total_deadline_sec=max(0.0, total_deadline_sec),
+                request_params=params,
             )
         )
     return cfg
@@ -957,7 +954,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.main_total_deadline_sec)),
         fallback_spec=settings.main_fallbacks,
-        reasoning_effort=settings.main_reasoning_effort,
+        request_params=settings.bot.main_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.main_model.fallbacks
+        ],
     )
     settings.bot.vision_model = _build_chat_config(
         profiles=profiles,
@@ -971,7 +971,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.vision_total_deadline_sec)),
         fallback_spec=settings.vision_fallbacks,
-        reasoning_effort=settings.vision_reasoning_effort,
+        request_params=settings.bot.vision_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.vision_model.fallbacks
+        ],
     )
     settings.bot.decision_model = _build_chat_config(
         profiles=profiles,
@@ -985,7 +988,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.decision_total_deadline_sec)),
         fallback_spec=settings.decision_fallbacks,
-        reasoning_effort=settings.decision_reasoning_effort,
+        request_params=settings.bot.decision_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.decision_model.fallbacks
+        ],
     )
     settings.bot.moderation_model = _build_chat_config(
         profiles=profiles,
@@ -999,7 +1005,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.moderation_total_deadline_sec)),
         fallback_spec=settings.moderation_fallbacks,
-        reasoning_effort=settings.moderation_reasoning_effort,
+        request_params=settings.bot.moderation_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.moderation_model.fallbacks
+        ],
     )
     settings.bot.compress_model = _build_chat_config(
         profiles=profiles,
@@ -1013,7 +1022,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.compress_total_deadline_sec)),
         fallback_spec=settings.compress_fallbacks,
-        reasoning_effort=settings.compress_reasoning_effort,
+        request_params=settings.bot.compress_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.compress_model.fallbacks
+        ],
     )
     settings.bot.embed_model = _build_embed_config(
         profiles=profiles,
@@ -1025,6 +1037,10 @@ def load_settings(config_path: str = "config.toml") -> Settings:
         retry_timeout_multiplier=max(1.0, float(settings.llm_retry_timeout_multiplier)),
         total_deadline_sec=max(0.0, float(settings.embed_total_deadline_sec)),
         fallback_spec=settings.embed_fallbacks,
+        request_params=settings.bot.embed_model.request_params,
+        fallback_request_params=[
+            item.request_params for item in settings.bot.embed_model.fallbacks
+        ],
     )
 
     settings.bot.max_context_tokens = settings.max_context_tokens

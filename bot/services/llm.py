@@ -10,7 +10,7 @@ import re
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from inspect import isawaitable
 from types import SimpleNamespace
 from typing import Any
@@ -492,16 +492,11 @@ class LLMService:
             "max_tokens": cfg.max_tokens,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
         }
+        kwargs.update(cls._custom_request_kwargs(cfg))
         if bool(getattr(cfg, "stream", False)) if stream is None else bool(stream):
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
-        reasoning_effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-            # Some providers (gemini via litellm, older gateways) reject the
-            # param; drop_params keeps the request usable instead of erroring.
-            kwargs["drop_params"] = True
         resolved_api_base = cls._resolve_request_api_base(
             provider=getattr(cfg, "provider", ""),
             api_base=cfg.api_base,
@@ -533,13 +528,11 @@ class LLMService:
             "max_output_tokens": cfg.max_tokens,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 12.0) or 12.0)),
         }
+        kwargs.update(cls._custom_request_kwargs(cfg))
         if bool(getattr(cfg, "stream", False)) if stream is None else bool(stream):
             kwargs["stream"] = True
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
-        reasoning_effort = str(getattr(cfg, "reasoning_effort", "") or "").strip()
-        if reasoning_effort:
-            kwargs["reasoning"] = {"effort": reasoning_effort}
         resolved_api_base = cls._resolve_request_api_base(
             provider=provider,
             api_base=cfg.api_base,
@@ -551,12 +544,76 @@ class LLMService:
         responses_param_names = {
             "temperature": "temperature",
             "max_tokens": "max_output_tokens",
-            "reasoning_effort": "reasoning",
             "top_p": "top_p",
         }
         for name in exclude_params:
             kwargs.pop(responses_param_names.get(name, name), None)
         return kwargs
+
+    # Parameters that identify/control the request are always derived from
+    # the validated model config and call site. Provider-specific JSON may add
+    # body fields, including endpoint-native reasoning fields, without being
+    # able to redirect credentials or budgets.
+    _PROTECTED_REQUEST_PARAMS = frozenset(
+        {
+            "model",
+            "messages",
+            "input",
+            "provider",
+            "api_key",
+            "api_base",
+            "custom_llm_provider",
+            "endpoint_path",
+            "chat_endpoint",
+            "stream",
+            "timeout",
+            "temperature",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "base_url",
+            "num_retries",
+            "tools",
+            "tool_choice",
+            "drop_params",
+            "allowed_openai_params",
+        }
+    )
+
+    @classmethod
+    def _custom_request_params(cls, cfg: ChatEndpointConfig | EmbedEndpointConfig) -> dict[str, Any]:
+        raw = getattr(cfg, "request_params", None)
+        if not isinstance(raw, Mapping):
+            return {}
+        params: dict[str, Any] = {}
+        for name, value in raw.items():
+            clean_name = str(name).strip()
+            if clean_name and clean_name.lower() not in cls._PROTECTED_REQUEST_PARAMS:
+                params[clean_name] = value
+        return params
+
+    @classmethod
+    def _uses_openai_compatible_transport(cls, cfg: ChatEndpointConfig | EmbedEndpointConfig) -> bool:
+        """Whether LiteLLM will route this endpoint through an OpenAI-style body."""
+
+        provider = str(getattr(cfg, "provider", "") or "").strip().lower()
+        model_prefix = str(getattr(cfg, "model", "") or "").partition("/")[0].strip().lower()
+        return provider in {"openai", "openai_compatible"} or model_prefix == "openai"
+
+    @classmethod
+    def _custom_request_kwargs(cls, cfg: ChatEndpointConfig | EmbedEndpointConfig) -> dict[str, Any]:
+        """Build LiteLLM kwargs while preserving custom fields in the HTTP body.
+
+        LiteLLM validates recognized-looking fields such as ``thinking`` and
+        ``reasoning_effort`` against each model's capability list. OpenAI-style
+        ``extra_body`` bypasses that adapter validation and is merged into the
+        final JSON sent by the compatible gateway.
+        """
+
+        params = cls._custom_request_params(cfg)
+        if not params or not cls._uses_openai_compatible_transport(cfg):
+            return params
+        return {"extra_body": params}
 
     @classmethod
     def _build_embed_kwargs(cls, cfg: EmbedEndpointConfig, texts: list[str]) -> dict[str, Any]:
@@ -565,6 +622,7 @@ class LLMService:
             "input": texts,
             "timeout": max(1.0, float(getattr(cfg, "timeout_sec", 10.0) or 10.0)),
         }
+        kwargs.update(cls._custom_request_kwargs(cfg))
         if cfg.api_key:
             kwargs["api_key"] = cfg.api_key
         resolved_api_base = cls._resolve_request_api_base(
@@ -595,7 +653,7 @@ class LLMService:
                 retry_backoff_sec=cfg.retry_backoff_sec,
                 retry_timeout_multiplier=cfg.retry_timeout_multiplier,
                 total_deadline_sec=getattr(cfg, "total_deadline_sec", 0.0),
-                reasoning_effort=getattr(cfg, "reasoning_effort", ""),
+                request_params=dict(getattr(cfg, "request_params", {}) or {}),
             ),
             *cfg.fallbacks,
         ]
@@ -615,6 +673,7 @@ class LLMService:
                 retry_backoff_sec=cfg.retry_backoff_sec,
                 retry_timeout_multiplier=cfg.retry_timeout_multiplier,
                 total_deadline_sec=getattr(cfg, "total_deadline_sec", 0.0),
+                request_params=dict(getattr(cfg, "request_params", {}) or {}),
             ),
             *cfg.fallbacks,
         ]
@@ -1084,7 +1143,7 @@ class LLMService:
     # request can be retried without the offending param instead of failing
     # the whole candidate (e.g. kimi-k3: "invalid temperature: only 1 is
     # allowed for this model").
-    _DROPPABLE_PARAMS = ("temperature", "max_tokens", "reasoning_effort", "top_p")
+    _DROPPABLE_PARAMS = ("temperature", "max_tokens", "top_p")
 
     @classmethod
     def _unsupported_param_from_error(cls, exc: Exception) -> str:

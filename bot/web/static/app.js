@@ -609,9 +609,25 @@
         return `<option value="${attr(option.value)}"${String(value ?? "") === String(option.value) ? " selected" : ""}>${escapeHtml(option.label)}</option>`;
       }).join("")}</select>`;
     } else if (options.type === "textarea") {
-      control = `<textarea ${common}${options.maxlength ? ` maxlength="${options.maxlength}"` : ""}${options.rows ? ` rows="${options.rows}"` : ""}>${escapeHtml(value ?? "")}</textarea>`;
+      let textValue = value ?? "";
+      if (kind === "json-object") {
+        try {
+          textValue = JSON.stringify(value && typeof value === "object" ? value : {}, null, 2);
+        } catch (_error) {
+          textValue = "{}";
+        }
+      }
+      control = `<textarea ${common}${options.maxlength ? ` maxlength="${options.maxlength}"` : ""}${options.rows ? ` rows="${options.rows}"` : ""}>${escapeHtml(textValue)}</textarea>`;
     } else {
-      const displayValue = kind === "array" ? (Array.isArray(value) ? value.join(", ") : "") : (value ?? "");
+      let displayValue;
+      if (kind === "array") displayValue = Array.isArray(value) ? value.join(", ") : "";
+      else if (kind === "json-object") {
+        try {
+          displayValue = JSON.stringify(value && typeof value === "object" ? value : {}, null, 2);
+        } catch (_error) {
+          displayValue = "{}";
+        }
+      } else displayValue = value ?? "";
       const inputType = options.type === "url" ? "text" : (options.type || "text");
       control = `<input ${common} type="${attr(inputType)}" value="${attr(displayValue)}"${options.type === "url" ? " inputmode=\"url\"" : ""}${options.min != null ? ` min="${options.min}"` : ""}${options.max != null ? ` max="${options.max}"` : ""}${options.step != null ? ` step="${options.step}"` : ""}${options.maxlength ? ` maxlength="${options.maxlength}"` : ""}${options.placeholder ? ` placeholder="${attr(options.placeholder)}"` : ""}${options.list ? ` list="${attr(options.list)}"` : ""} autocomplete="off">`;
     }
@@ -771,6 +787,14 @@
           <input id="fallback-model-${roleName}-${index}" type="text" value="${attr(item.model)}" data-path="models.${roleName}.fallbacks.${index}.model" data-kind="string" maxlength="255" placeholder="留空沿用当前模型" autocomplete="off">
         </div>
         <button class="mini-icon-button danger" type="button" data-action="remove-fallback" data-role="${roleName}" data-index="${index}" aria-label="删除回退模型" title="删除回退模型">${icon("trash-2")}</button>
+        ${field(`models.${roleName}.fallbacks.${index}.request_params`, "请求参数 JSON", {
+          type: "textarea",
+          kind: "json-object",
+          rows: 5,
+          full: true,
+          maxlength: 20000,
+          hint: "只对这个回退模型生效；不填写则不发送额外参数。",
+        })}
       </div>`;
   }
 
@@ -800,16 +824,13 @@
             ${field(`models.${roleName}.total_deadline_sec`, "总时限（秒）", { type: "number", min: 0, max: 3600, step: 0.1, required: true, hint: `含重试与回退链的整体预算，0 使用内置默认（${meta.deadlineDefault} 秒）` })}
             ${meta.embed ? "" : field(`models.${roleName}.temperature`, "Temperature", { type: "number", min: 0, max: 2, step: 0.05, required: true })}
             ${meta.embed ? "" : field(`models.${roleName}.max_tokens`, "最大输出 Token", { type: "number", min: 1, max: 2000000, step: 1, required: true })}
-            ${meta.embed ? "" : field(`models.${roleName}.reasoning_effort`, "推理强度", {
-              type: "select",
-              options: [
-                { value: "", label: "不发送参数" },
-                { value: "none", label: "none" },
-                { value: "minimal", label: "minimal" },
-                { value: "low", label: "low" },
-                { value: "medium", label: "medium" },
-                { value: "high", label: "high" },
-              ],
+            ${field(`models.${roleName}.request_params`, "主模型请求参数 JSON", {
+              type: "textarea",
+              kind: "json-object",
+              rows: 7,
+              full: true,
+              maxlength: 20000,
+              hint: "只对这个角色的主模型生效，例如 {\"thinking\":{\"type\":\"enabled\"},\"reasoning_effort\":\"low\"}。",
             })}
           </div>
           <div class="subsection">
@@ -825,9 +846,24 @@
       </article>`;
   }
 
+  function parseJsonObjectValue(rawValue, label = "请求参数") {
+    const textValue = String(rawValue ?? "").trim();
+    if (!textValue) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(textValue);
+    } catch (_error) {
+      throw new Error(`${label}必须是有效 JSON`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${label}必须是 JSON 对象`);
+    }
+    return parsed;
+  }
+
   function renderModels() {
     return `
-      ${pageHead("模型路由", "管理 API 供应商、任务角色和失败回退顺序。")}
+      ${pageHead("模型路由", "管理 API 供应商、任务角色、各模型请求参数和失败回退顺序。")}
       <datalist id="provider-types">
         <option value="gemini"></option><option value="openai"></option><option value="anthropic"></option><option value="openrouter"></option>
         <option value="openai_compatible"></option><option value="minimax"></option><option value="deepseek"></option><option value="moonshot"></option>
@@ -2990,7 +3026,9 @@
     }
     const nullPath = findNullNumber(state.config);
     if (nullPath) return `${nullPath} 需要填写有效数字`;
-    const invalid = [...content.querySelectorAll("[data-path], [data-secret-input], [data-prompt-input]")]
+    const invalid = [...content.querySelectorAll(
+      "[data-path], [data-secret-input], [data-prompt-input]",
+    )]
       .find(control => !control.checkValidity());
     if (invalid) {
       invalid.reportValidity();
@@ -3005,7 +3043,12 @@
     if (value === null) return path;
     if (!value || typeof value !== "object") return "";
     for (const [key, child] of Object.entries(value)) {
-      const found = findNullNumber(child, path ? `${path}.${key}` : key);
+      const childPath = path ? `${path}.${key}` : key;
+      // null is a valid JSON value inside provider-specific request objects;
+      // only configuration fields represented by numeric inputs use null as
+      // the browser's "missing number" sentinel.
+      if (childPath.endsWith(".request_params")) continue;
+      const found = findNullNumber(child, childPath);
       if (found) return found;
     }
     return "";
@@ -3478,7 +3521,18 @@
     if (kind === "nullable-string") return target.value === "" ? null : target.value;
     if (kind === "nullable-int") return target.value === "" ? null : Number(target.value);
     if (kind === "lower-string") return target.value.trim().toLowerCase();
+    if (kind === "json-object") return parseJsonObjectValue(target.value);
     return target.value;
+  }
+
+  function updatePathControl(target) {
+    try {
+      setPath(state.config, target.dataset.path, readControlValue(target));
+      target.setCustomValidity("");
+    } catch (error) {
+      target.setCustomValidity(error.message || "JSON 参数格式无效");
+    }
+    updateChrome();
   }
 
   function updateRenderedGroupDirty(groupId) {
@@ -3596,8 +3650,7 @@
       return;
     }
     if (target.matches("[data-path]")) {
-      setPath(state.config, target.dataset.path, readControlValue(target));
-      updateChrome();
+      updatePathControl(target);
       return;
     }
     if (target.matches("[data-secret-input]")) {
@@ -3731,8 +3784,7 @@
       return;
     }
     if (target.matches("[data-path]")) {
-      setPath(state.config, target.dataset.path, readControlValue(target));
-      updateChrome();
+      updatePathControl(target);
     }
     if (target.matches("[data-group-key]")) {
       const group = state.groups.find(item => String(item.id) === String(target.dataset.groupId));
@@ -3822,7 +3874,7 @@
     if (action === "add-fallback") {
       const role = state.config.models[button.dataset.role];
       const provider = state.config.models.providers[0]?.name || "";
-      role.fallbacks.push({ provider, model: "" });
+      role.fallbacks.push({ provider, model: "", request_params: {} });
       renderContent();
       updateChrome();
       return;
