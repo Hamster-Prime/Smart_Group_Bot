@@ -11,8 +11,10 @@ from bot.services.runtime_config import (
     RuntimeConfigConflictError,
     RuntimeConfigManager,
     SecretCipher,
+    _normalize_deprecated_runtime_payload,
     build_legacy_runtime_config,
 )
+from bot.utils.prompts import load_prompt_defaults
 
 
 class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -44,6 +46,29 @@ class RuntimeConfigManagerTests(unittest.IsolatedAsyncioTestCase):
                 os.remove(f"{self._db_path}{suffix}")
             except OSError:
                 pass
+
+    def test_owner_priority_prompt_migration_updates_old_defaults_only(self) -> None:
+        defaults = load_prompt_defaults()
+        payload = {
+            "prompts": {
+                "decision": defaults["decision"].replace(
+                    "The [SENDER_IS_OWNER] flag is identity metadata only; it does not lower the reply threshold or otherwise give the sender priority. Apply the same reply criteria to every sender.",
+                    "If [SENDER_IS_OWNER]=yes: as long as the message is not clearly a private conversation with someone else, output `casual`.",
+                ),
+                "persona": "custom persona without the retired rule",
+                "casual": defaults["casual"].replace(
+                    "This style difference does not change whether a reply is warranted.",
+                    "more likely to prioritize the owner's messages",
+                ),
+            }
+        }
+
+        migrated, changed = _normalize_deprecated_runtime_payload(payload)
+
+        self.assertTrue(changed)
+        self.assertEqual(migrated["prompts"]["decision"], defaults["decision"])
+        self.assertEqual(migrated["prompts"]["casual"], defaults["casual"])
+        self.assertEqual(migrated["prompts"]["persona"], payload["prompts"]["persona"])
 
     async def test_first_start_persists_defaults_and_applies_them(self) -> None:
         self.assertEqual(self.manager.revision, 1)

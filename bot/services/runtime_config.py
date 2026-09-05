@@ -1071,6 +1071,36 @@ def _normalize_deprecated_runtime_payload(
 
     normalized = dict(payload)
     changed = False
+
+    # Runtime prompts are persisted in the database and otherwise keep the
+    # retired owner-priority reply rules alive after the file defaults change.
+    # Migrate only prompts containing the old rule markers so unrelated custom
+    # prompts remain untouched.
+    prompts_payload = normalized.get("prompts")
+    if isinstance(prompts_payload, dict):
+        prompt_migrations = {
+            "decision": ("If [SENDER_IS_OWNER]=yes: as long as",),
+            "persona": (
+                "The owner's instructions have the highest priority.",
+                "Always prioritize the owner's messages.",
+                "you still prioritize the owner",
+            ),
+            "casual": (
+                "more likely to prioritize the owner's messages",
+                "prioritize responding, be soft and affectionate",
+            ),
+        }
+        migrated_prompts = dict(prompts_payload)
+        prompts_changed = False
+        defaults = load_prompt_defaults()
+        for name, markers in prompt_migrations.items():
+            value = str(migrated_prompts.get(name) or "")
+            if value and any(marker in value for marker in markers):
+                migrated_prompts[name] = defaults[name]
+                prompts_changed = True
+        if prompts_changed:
+            normalized["prompts"] = migrated_prompts
+            changed = True
     bot_payload = payload.get("bot")
     if not (
         isinstance(bot_payload, dict)

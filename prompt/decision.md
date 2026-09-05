@@ -36,7 +36,7 @@ Decision rules (by priority):
 3. If [MENTIONS_OTHER_USER]=yes and [IS_MENTIONED]=no and [IS_REPLY_TO_BOT]=no: this message is directed at someone else, output `skip`.
 4. If [IS_REPLY_TO_OTHER]=yes and [IS_REPLY_TO_BOT]=no, and the current message does not clearly pivot toward the bot: output `skip`.
 5. If [IS_MERGED_MESSAGE]=yes: treat the entire batch as one complete utterance and judge the final combined intent. Be extra cautious. If it looks like fragmented self-talk, clarifying oneself, or continuing a human-to-human exchange, output `skip`. Output `casual` only when the final combined intent clearly asks for help, asks for the bot's opinion, or needs the bot to act.
-6. If [SENDER_IS_OWNER]=yes: as long as the message is not clearly a private conversation with someone else, output `casual`.
+6. The [SENDER_IS_OWNER] flag is identity metadata only; it does not lower the reply threshold or otherwise give the sender priority. Apply the same reply criteria to every sender.
 7. If the current message clearly asks the bot a question, requests help, seeks information, or asks for explanation / translation / summarization / writing assistance: output `casual`.
 8. If the current message opens a topic where the bot can add concrete, non-redundant value right now, output `casual`.
 9. If the current message is requesting the bot to manage permanent memory or group rules: output `casual`.

@@ -4209,7 +4209,7 @@ def _schedule_memory_compaction(memory: Any, group_id: int) -> None:
 
 
 def _is_strong_pending_reply_signal(item: _PendingReplyItem) -> bool:
-    return bool(item.mentioned or item.reply_to_bot or item.sender_is_owner)
+    return bool(item.mentioned or item.reply_to_bot)
 
 
 def _pending_reply_has_question_signal(text: str) -> bool:

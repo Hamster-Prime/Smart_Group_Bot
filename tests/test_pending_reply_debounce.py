@@ -68,6 +68,25 @@ class PendingReplyDebounceTests(unittest.TestCase):
 
         self.assertAlmostEqual(due_at, 100.5, places=3)
 
+    def test_owner_uses_same_reply_delay_as_other_members(self) -> None:
+        due_at = group._next_pending_reply_flush_at(
+            item=_item("今天就先这样", sender_is_owner=True),
+            batch_size=1,
+            settings=_settings(5.0),
+            now=100.0,
+        )
+        ordinary_due_at = group._next_pending_reply_flush_at(
+            item=_item("今天就先这样"),
+            batch_size=1,
+            settings=_settings(5.0),
+            now=100.0,
+        )
+
+        self.assertAlmostEqual(due_at, ordinary_due_at, places=3)
+        self.assertFalse(group._is_strong_pending_reply_signal(
+            _item("今天就先这样", sender_is_owner=True)
+        ))
+
     def test_new_followup_message_does_not_push_flush_later(self) -> None:
         first_due_at = group._next_pending_reply_flush_at(
             item=_item("在吗"),

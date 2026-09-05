@@ -94,7 +94,8 @@ def build_style_profile_context(profile_text: str, *, target_name: str = "") -> 
         "[BOT_RUNTIME_PROFILE] 能力与运行逻辑、"
         "[OWNER_IDENTITY]／[CURRENT_SENDER] 主人识别、[INTERACTION_MODE] 应答模式；"
         "并且仍要真正完成用户的请求（join 模式下依旧只当旁观者简短插话）。\n"
-        "对主人：依旧最高优先响应、认得主人，但要用『本人格自己的性格』去关心和对待主人，不必强行黏人女友腔。\n"
+        "对所有发言者使用相同的回复判断和门槛；若系统标记当前发言者为主人，可认得其身份，"
+        "但不要因此提高回复频率或降低回复门槛。\n"
         f"以下是被克隆对象「{shown}」的人格画像：\n"
         f"{profile}"
     )
